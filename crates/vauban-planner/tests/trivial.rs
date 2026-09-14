@@ -146,9 +146,10 @@ fn one_row_plans_to_one_row() {
 }
 
 #[test]
-fn filter_project_over_scan_keeps_its_shape() {
-    // A unique index on the filtered column, declared to the planner: no seek rule is
-    // written yet, so it changes nothing. That rule inverts this assertion.
+fn filter_project_over_scan_becomes_a_seek_under_the_project() {
+    // A unique index on the filtered column, declared to the planner: the seek rule
+    // replaces the Filter over the TableScan with an IndexSeek, and the Project above it
+    // keeps its columns (`tests/seek.rs`).
     let catalog = FakeCatalog::new().with_index(
         TableId(7),
         &[KeyColumn {
@@ -172,16 +173,9 @@ fn filter_project_over_scan_keeps_its_shape() {
         panic!("expected a Project, got {planned:?}")
     };
     assert_eq!(exprs.len(), 1);
-    let PhysicalPlan::Filter { input, .. } = input.as_ref() else {
-        panic!("expected a Filter under the Project, got {input:?}")
-    };
     assert!(
-        matches!(input.as_ref(), PhysicalPlan::TableScan { table, .. } if *table == TableId(7)),
-        "expected a TableScan, got {input:?}"
-    );
-    assert!(
-        !matches!(input.as_ref(), PhysicalPlan::IndexSeek { .. }),
-        "no rule chooses an index yet"
+        matches!(input.as_ref(), PhysicalPlan::IndexSeek { .. }),
+        "expected an IndexSeek under the Project, got {input:?}"
     );
 }
 

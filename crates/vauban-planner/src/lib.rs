@@ -14,10 +14,11 @@
 //! [`LogicalPlan::OneRow`](vauban_binder::LogicalPlan::OneRow),
 //! `Values`, `Scan`, `Filter`, `Project` and `Limit`, become
 //! [`PhysicalPlan::OneRow`], `Values`, [`TableScan`](PhysicalPlan::TableScan), `Filter`,
-//! `Project` and [`Top`](PhysicalPlan::Top). No planning rule is written yet: a `Filter`
-//! over a scan keeps its shape even when the catalogue declares a unique index on the
-//! filtered column (`tests/trivial.rs`, `filter_project_over_scan_keeps_its_shape`), and
-//! the six other nodes of [`LogicalPlan`](vauban_binder::LogicalPlan) — `Join`,
+//! `Project` and [`Top`](PhysicalPlan::Top). A `Filter` over a scan becomes an
+//! [`IndexSeek`](PhysicalPlan::IndexSeek) when its predicate covers a prefix of an index
+//! of the scanned table (`seek.rs`; `tests/trivial.rs`,
+//! `filter_project_over_scan_becomes_a_seek_under_the_project`). The six other nodes of
+//! [`LogicalPlan`](vauban_binder::LogicalPlan) — `Join`,
 //! `Aggregate`, `Sort`, `Distinct`, `SetOp`, `Subquery` — answer an internal error saying
 //! they are not implemented yet (`tests/trivial.rs`, `join_is_not_implemented_yet`,
 //! `aggregate_sort_and_distinct_are_not_implemented_yet`,
@@ -43,11 +44,11 @@
 //! | `dml.rs` | `INSERT`, `UPDATE` and `DELETE` |
 //! | `setop.rs` | `UNION`, `EXCEPT` and `INTERSECT` |
 //!
-//! Each rule file holds the entry point `plan.rs` calls, and that entry point answers for
-//! its form until the rule is written: an internal error for a node that has to be built
-//! ([`plan`] then fails), `Ok(None)` for the two hooks that rewrite a node `plan.rs`
-//! already builds — a seek in place of a filter (`seek::try_index_seek`) and a top-N in
-//! place of a sort followed by a top (`sort::try_top_n`).
+//! Each rule file holds the entry point `plan.rs` calls. Until its rule is written, that
+//! entry point answers for its form: an internal error for a node that has to be built
+//! ([`plan`] then fails), `Ok(None)` for a hook that rewrites a node `plan.rs` already
+//! builds, as the top-N in place of a sort followed by a top (`sort::try_top_n`) still
+//! does. The seek in place of a filter (`seek::try_index_seek`) is written.
 //!
 //! # Where the context comes from
 //!

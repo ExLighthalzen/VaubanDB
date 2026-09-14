@@ -121,7 +121,7 @@ pub enum PhysicalPlan {
         /// The columns this node produces, in the same order as `columns`.
         schema: OutputSchema,
     },
-    /// Reads the rows an index serves for a range of keys. Not produced yet.
+    /// Reads the rows an index serves for a range of keys.
     ///
     /// `index` is what [`Storage::seek`](vauban_storage::Storage::seek) takes, and it
     /// identifies the table on its own: the trait keys an index by `IndexId` alone.
