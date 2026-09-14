@@ -57,8 +57,8 @@ use std::time::{Duration, Instant};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::{RowId, TableId, TxnId};
 
-use crate::LockTimeout;
 use crate::deadlock::{self, DeadlockMonitor};
+use crate::{LockInfo, LockStatus, LockTimeout};
 
 /// Longest single [`Condvar::wait_timeout`] a waiter performs, so that a raised
 /// cancellation flag is seen within one slice.
@@ -272,6 +272,9 @@ struct Waiter {
     mode: LockMode,
     /// `true` when the transaction already holds a weaker mode of the same family here.
     conversion: bool,
+    /// When the request joined the queue, what `waiting_ms` of
+    /// [`crate::LockInfo`] counts from.
+    since: Instant,
 }
 
 /// The holders and the queue of one resource.
@@ -357,6 +360,7 @@ impl LockTable {
             txn,
             mode: asked,
             conversion,
+            since: Instant::now(),
         };
         if conversion {
             // The one exception to the fair queue: a conversion waits for the other
@@ -691,6 +695,48 @@ impl LockManager {
     #[must_use]
     pub fn waiters(&self) -> Vec<(TxnId, LockResource, LockMode)> {
         self.state().waiters()
+    }
+
+    /// Holders and waiters together, read under **one** guard of the table: resource by
+    /// resource in the order of [`LockManager::held`], the holders of a resource before
+    /// its queue, the queue in grant order. The body of
+    /// [`crate::TransactionManager::active_locks`].
+    ///
+    /// A holder is [`LockStatus::Grant`]; a queued request is [`LockStatus::Convert`]
+    /// when the transaction already holds a weaker mode of the same family here, and
+    /// [`LockStatus::Wait`] otherwise. `waiting_ms` is counted from the moment the request
+    /// joined the queue, and is `0` for a holder.
+    pub(crate) fn lines(&self) -> Vec<LockInfo> {
+        let state = self.state();
+        let now = Instant::now();
+        let mut resources: Vec<&LockResource> = state.entries.keys().collect();
+        resources.sort_unstable();
+        resources
+            .into_iter()
+            .flat_map(|res| {
+                let entry = &state.entries[res];
+                let holders = entry.holders.iter().map(move |h| LockInfo {
+                    txn: h.txn,
+                    resource: *res,
+                    mode: h.mode,
+                    status: LockStatus::Grant,
+                    waiting_ms: 0,
+                });
+                let waiters = entry.queue.iter().map(move |w| LockInfo {
+                    txn: w.txn,
+                    resource: *res,
+                    mode: w.mode,
+                    status: if w.conversion {
+                        LockStatus::Convert
+                    } else {
+                        LockStatus::Wait
+                    },
+                    waiting_ms: u64::try_from(now.saturating_duration_since(w.since).as_millis())
+                        .unwrap_or(u64::MAX),
+                });
+                holders.chain(waiters)
+            })
+            .collect()
     }
 }
 

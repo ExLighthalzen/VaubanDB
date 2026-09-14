@@ -106,7 +106,7 @@ impl DeadlockMonitor {
 
     /// The `DEADLOCK_PRIORITY` of a transaction: [`PRIORITY_NORMAL`] until
     /// [`DeadlockMonitor::set_priority`] sets one for it.
-    fn priority(&self, txn: TxnId) -> i16 {
+    pub(crate) fn priority(&self, txn: TxnId) -> i16 {
         self.state().get(&txn).copied().unwrap_or(PRIORITY_NORMAL)
     }
 

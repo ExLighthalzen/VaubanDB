@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::SystemTime;
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::{DbId, RowId, SavepointId, Snapshot, Storage, TableId, TxnId, TxnStatus};
@@ -46,8 +47,8 @@ use crate::actions::ActionLog;
 use crate::lock::{LockManager, LockMode, LockResource, LockWait};
 use crate::snapshot_modes::OptionsMap;
 use crate::{
-    CommitAction, IsolationLevel, LockTimeout, RollbackAction, TxnHandle, TxnInfo, VersioningMode,
-    WriteDecision,
+    CommitAction, IsolationLevel, LockStatus, LockTimeout, RollbackAction, TxnHandle, TxnInfo,
+    TxnState, VersioningMode, WriteDecision,
 };
 
 /// The database [`TransactionManager::begin`] opens on: the identifier a fresh
@@ -85,7 +86,9 @@ fn unknown_savepoint(sp: SavepointId, id: TxnId) -> SqlError {
 struct Open {
     /// Identifier and isolation level, as published by
     /// [`TransactionManager::active_sessions`].
-    info: TxnInfo,
+    handle: TxnHandle,
+    /// When [`TransactionManager::begin`] opened it, the `began_at` of its [`TxnInfo`].
+    began_at: SystemTime,
     /// The deferred drops, the compensations and the savepoints of this transaction, in
     /// registration order.
     log: ActionLog,
@@ -117,7 +120,7 @@ struct State {
 impl State {
     /// Position of `id` in [`State::open`], or `None` when the transaction is closed.
     fn position(&self, id: TxnId) -> Option<usize> {
-        self.open.iter().position(|txn| txn.info.id == id)
+        self.open.iter().position(|txn| txn.handle.id == id)
     }
 
     /// The action log of `id`, or `None` when the transaction is closed.
@@ -128,7 +131,7 @@ impl State {
 
     /// The smallest identifier still open, or `None` when the list is empty.
     fn oldest_open(&self) -> Option<TxnId> {
-        self.open.iter().map(|txn| txn.info.id).min()
+        self.open.iter().map(|txn| txn.handle.id).min()
     }
 
     /// A snapshot for `own` built from this state, the shape
@@ -138,7 +141,7 @@ impl State {
         let active: Vec<TxnId> = self
             .open
             .iter()
-            .map(|open| open.info.id)
+            .map(|open| open.handle.id)
             .filter(|&id| id != own)
             .collect();
         Snapshot {
@@ -251,7 +254,8 @@ impl TransactionManager {
         };
         state.next_id = state.next_id.saturating_add(1);
         state.open.push(Open {
-            info: TxnInfo::of(&handle),
+            handle: handle.clone(),
+            began_at: SystemTime::now(),
             log: ActionLog::default(),
             db,
             pinned: None,
@@ -666,12 +670,40 @@ impl TransactionManager {
     /// [`TransactionManager::begin`] appends to the list;
     /// [`TransactionManager::commit`] and [`TransactionManager::rollback`] remove their entry
     /// once `storage` has accepted the outcome (`tests/txn_basic.rs`,
-    /// `commit_and_rollback_close_the_transaction`).
+    /// `commit_and_rollback_close_the_transaction`). `locks_held` and `state` are read off
+    /// one [`TransactionManager::active_locks`] taken while the list is held, so the two
+    /// fields of one call describe the lock table at one instant (`tests/info.rs`,
+    /// `a_waiting_txn_is_visible`); `deadlock_priority` is the value
+    /// [`TransactionManager::set_deadlock_priority`] kept, `0` without a call.
     pub fn active_sessions(&self) -> Vec<TxnInfo> {
-        self.lock()
+        let state = self.lock();
+        let lines = self.active_locks();
+        let monitor = self.locks().monitor();
+        state
             .open
             .iter()
-            .map(|open| open.info.clone())
+            .map(|open| {
+                let id = open.handle.id;
+                let mine = lines.iter().filter(|line| line.txn == id);
+                let locks_held = mine
+                    .clone()
+                    .filter(|line| line.status == LockStatus::Grant)
+                    .count();
+                let txn_state = mine
+                    .clone()
+                    .find(|line| line.status != LockStatus::Grant)
+                    .map_or(TxnState::Active, |line| TxnState::Waiting {
+                        on: line.resource,
+                    });
+                TxnInfo {
+                    id,
+                    isolation: open.handle.isolation,
+                    state: txn_state,
+                    began_at: open.began_at,
+                    locks_held: u32::try_from(locks_held).unwrap_or(u32::MAX),
+                    deadlock_priority: monitor.priority(id),
+                }
+            })
             .collect()
     }
 }

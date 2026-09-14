@@ -43,9 +43,12 @@
 //! What that manager does **not** decide is filled in around it: the numbers 1222 and 1205
 //! and the wait-for graph (`deadlock.rs`), the two database options and the `SNAPSHOT`
 //! conflict (`snapshot_modes.rs`), the table hints and escalation (`table_lock.rs`), and
-//! the `sys.dm_tran_*` views (`info.rs`). Until the latter two are served, the table hints
-//! `TABLOCK` and `TABLOCKX` are carried without effect and `active_sessions` is the one
-//! view.
+//! what the `sys.dm_tran_*` views will read (`info.rs`): [`TxnInfo`] with its [`TxnState`]
+//! from [`TransactionManager::active_sessions`], and [`LockInfo`] with its [`LockStatus`]
+//! from [`TransactionManager::active_locks`], holders and waiters copied under one guard of
+//! the lock table (`tests/info.rs`). No view, row or column is built here: that belongs to
+//! the catalog. Until the table hints are served, `TABLOCK` and `TABLOCKX` are carried
+//! without effect.
 //!
 //! # The two database options
 //!
@@ -84,7 +87,7 @@
 //! | File | Content |
 //! |---|---|
 //! | `ids.rs` | [`IsolationLevel`], [`LockTimeout`], [`WriteDecision`] |
-//! | `handle.rs` | [`TxnHandle`], [`TxnInfo`] |
+//! | `handle.rs` | [`TxnHandle`] |
 //! | `manager.rs` | [`TransactionManager`]: life cycle, snapshots and horizon; savepoints, registrations and deferred actions; the [`LockManager`] behind `lock_row` and the release at commit |
 //! | `actions.rs` | [`CommitAction`], [`RollbackAction`] and the log that holds them by savepoint |
 //! | `lock.rs` | [`LockManager`], [`LockMode`], [`LockResource`], [`LockOutcome`], [`LockWait`] |
@@ -93,7 +96,7 @@
 //! | `snapshot_modes.rs` | [`VersioningOptions`], [`VersioningMode`], [`TransactionManager::begin_in`] and the mode a read is served at under the two database options |
 //! | `table_lock.rs` | `TABLOCK`, `TABLOCKX`, `ROWLOCK`, escalation — empty |
 //! | `schema_lock.rs` | [`TransactionManager::schema_stability_lock`] and [`TransactionManager::schema_modify_lock`], and the table of who takes which |
-//! | `info.rs` | `TxnInfo` and `LockInfo` for `sys.dm_tran_*` — empty |
+//! | `info.rs` | [`TxnInfo`], [`TxnState`], [`LockInfo`], [`LockStatus`], `Display` of [`LockMode`] and [`LockStatus`], [`LockResource::resource_kind`], [`TransactionManager::active_locks`] |
 //!
 //! Visibility is served by two engines: MVCC snapshots for what a statement reads, and locks
 //! for what a transaction holds against others.
@@ -111,8 +114,9 @@ mod snapshot_modes;
 mod table_lock;
 
 pub use actions::{CommitAction, RollbackAction};
-pub use handle::{TxnHandle, TxnInfo};
+pub use handle::TxnHandle;
 pub use ids::{IsolationLevel, LockTimeout, WriteDecision};
+pub use info::{LockInfo, LockStatus, TxnInfo, TxnState};
 pub use isolation::{LockIntent, ReadAccess};
 pub use lock::{LockManager, LockMode, LockOutcome, LockResource, LockWait};
 pub use manager::TransactionManager;

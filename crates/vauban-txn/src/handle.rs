@@ -1,4 +1,4 @@
-//! The handle a caller holds on an open transaction, and the row `sys.dm_tran_*` reads.
+//! The handle a caller holds on an open transaction.
 
 use crate::IsolationLevel;
 use vauban_storage::TxnId;
@@ -28,30 +28,4 @@ pub struct TxnHandle {
     pub id: TxnId,
     /// Isolation level asked for when the transaction started.
     pub isolation: IsolationLevel,
-}
-
-/// One open transaction, as published to the `sys.dm_tran_*` views by
-/// [`TransactionManager::active_sessions`](crate::TransactionManager::active_sessions).
-///
-/// Separate from [`TxnHandle`]: a handle lets its owner act on the transaction, a `TxnInfo`
-/// describes it without giving that power. `#[non_exhaustive]` for the same reason as
-/// [`TxnHandle`]: the columns those views need (start time, state, session) are added when
-/// the views are served.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct TxnInfo {
-    /// Identifier of the transaction.
-    pub id: TxnId,
-    /// Isolation level asked for when the transaction started.
-    pub isolation: IsolationLevel,
-}
-
-impl TxnInfo {
-    /// The description of the transaction named by `handle`.
-    pub(crate) fn of(handle: &TxnHandle) -> Self {
-        Self {
-            id: handle.id,
-            isolation: handle.isolation,
-        }
-    }
 }
