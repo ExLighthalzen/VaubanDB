@@ -175,8 +175,11 @@
 //! two; the type rule above moves more arguments to that side. Lifting it needs a second
 //! check in `sysfn` and a state for `RIGHT` in `errors`.
 
-use vauban_binder::{BoundExpr, BoundExprKind, BoundStatement, BoundTop, LogicalPlan};
+use std::ops::Bound;
+
+use vauban_binder::{BoundExpr, BoundExprKind, BoundTop, SortKey};
 use vauban_errors::{InternalError, SqlError, SqlResult};
+use vauban_planner::{KeyRangeExpr, PhysicalPlan, PhysicalStatement};
 use vauban_sysfn::FunctionDef;
 use vauban_types::{SqlType, TypeInfo, Value, convert};
 
@@ -200,13 +203,19 @@ const LENGTH_ARGUMENT: [(&str, usize, &str); 3] = [
     ("SUBSTRING", 2, "substring"),
 ];
 
-/// Runs the compile-time checks of one bound statement.
+/// Runs the compile-time checks of one physical statement.
 ///
 /// `Ok(())` means the statement reaches execution, which is what makes its column metadata
 /// go out; an `Err` here is an error the client sees **without** a result set.
 /// [`crate::execute`] calls this first, so a caller that only knows `execute` still gets
 /// the checks in the right order; `session` calls it on its own to know where to send the
 /// metadata.
+///
+/// The checks walk the expressions a statement carries, wherever the statement puts
+/// them: the nodes of a query, the source of an `INSERT`, the assignments of an
+/// `UPDATE`, the condition of an `IF`, the value of a `SET`. A statement whose execution
+/// is not written yet still compiles here; it is its execution that answers the internal
+/// error 50000.
 ///
 /// Residual folding differences, `DATEPART` over a literal and `NULLIF` under a length
 /// argument among them, are described in the module documentation.
@@ -218,38 +227,65 @@ const LENGTH_ARGUMENT: [(&str, usize, &str); 3] = [
 /// 50000 for the two `TOP PERCENT` numbers this crate does not raise yet (1031 and 1014)
 /// — those two are compilation errors on SQL Server as well, so their **scope** is right
 /// here even while their number is not.
-pub fn compile(stmt: &BoundStatement, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
-    // No `_ =>` arm, as in `execute`: a variant added to `BoundStatement` breaks this file
-    // rather than skipping its checks in silence.
+pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+    // No `_ =>` arm, as in `execute`: a variant added to `PhysicalStatement` breaks this
+    // file rather than skipping its checks in silence.
     match stmt {
-        BoundStatement::Query(plan) => compile_plan(plan, ctx),
+        PhysicalStatement::Query(plan) => compile_plan(plan, ctx),
         // Nothing to check and nothing to fold: a DDL statement carries no expression this
         // crate evaluates, and the checks it does have are the catalogue's, at execution.
         // SQL Server puts them there too: a batch opening with `SELECT 1;` gets its result
         // set before the DDL error — 3701 of a `DROP TABLE`, 226 and 574 of the
         // transaction gate (`ddl.rs`). A `USE` is the same: `session` acts on it after
         // the statement runs.
-        BoundStatement::Ddl(_) | BoundStatement::Use { .. } => Ok(()),
-        // The statements that are bound but not executed yet: each answers the internal
-        // error 50000 until its arm, and its compile-time checks, are written.
-        BoundStatement::Insert(_) => Err(bug("compile: INSERT is not implemented yet")),
-        BoundStatement::Update(_) | BoundStatement::Delete(_) => {
-            Err(bug("compile: UPDATE and DELETE are not implemented yet"))
+        PhysicalStatement::Ddl(_) | PhysicalStatement::Use { .. } => Ok(()),
+        PhysicalStatement::Insert(insert) => compile_plan(&insert.source, ctx),
+        PhysicalStatement::Update(update) => {
+            compile_plan(&update.input, ctx)?;
+            for (_, expr) in &update.assignments {
+                compile_expr(expr, ctx)?;
+            }
+            Ok(())
         }
-        BoundStatement::SetVariable { .. }
-        | BoundStatement::Declare(_)
-        | BoundStatement::If { .. }
-        | BoundStatement::While { .. }
-        | BoundStatement::Block(_)
-        | BoundStatement::Break
-        | BoundStatement::Continue
-        | BoundStatement::Return(_)
-        | BoundStatement::Print(_) => Err(bug(
-            "compile: variables and control of flow are not implemented yet",
-        )),
-        BoundStatement::Transaction(_) => Err(bug(
-            "compile: the transaction statements are not implemented yet",
-        )),
+        PhysicalStatement::Delete(delete) => compile_plan(&delete.input, ctx),
+        PhysicalStatement::SetVariable { value, .. } => compile_expr(value, ctx),
+        PhysicalStatement::Declare(declarations) => {
+            for declaration in declarations {
+                if let Some(value) = &declaration.value {
+                    compile_expr(value, ctx)?;
+                }
+            }
+            Ok(())
+        }
+        PhysicalStatement::If {
+            condition,
+            then_,
+            else_,
+        } => {
+            compile_expr(condition, ctx)?;
+            compile(then_, ctx)?;
+            match else_ {
+                Some(else_) => compile(else_, ctx),
+                None => Ok(()),
+            }
+        }
+        PhysicalStatement::While { condition, body } => {
+            compile_expr(condition, ctx)?;
+            compile(body, ctx)
+        }
+        PhysicalStatement::Block(statements) => {
+            for statement in statements {
+                compile(statement, ctx)?;
+            }
+            Ok(())
+        }
+        PhysicalStatement::Break
+        | PhysicalStatement::Continue
+        | PhysicalStatement::Return(None)
+        | PhysicalStatement::Transaction(_) => Ok(()),
+        PhysicalStatement::Return(Some(expr)) | PhysicalStatement::Print(expr) => {
+            compile_expr(expr, ctx)
+        }
     }
 }
 
@@ -258,10 +294,10 @@ pub fn compile(stmt: &BoundStatement, ctx: &mut ExecContext<'_>) -> SqlResult<()
 /// Depth first and input first, so that the select list is checked before the `TOP` above
 /// it: `SELECT TOP (-1) SUBSTRING('abc', 1, -1);` answers **536** and not 127, the two
 /// checks being both compile-time ones (`compile::tests::compilation_comes_before_execution`).
-fn compile_plan(plan: &LogicalPlan, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+fn compile_plan(plan: &PhysicalPlan, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
     match plan {
-        LogicalPlan::OneRow => Ok(()),
-        LogicalPlan::Values { rows, .. } => {
+        PhysicalPlan::OneRow => Ok(()),
+        PhysicalPlan::Values { rows, .. } => {
             for row in rows {
                 for expr in row {
                     compile_expr(expr, ctx)?;
@@ -269,37 +305,145 @@ fn compile_plan(plan: &LogicalPlan, ctx: &mut ExecContext<'_>) -> SqlResult<()> 
             }
             Ok(())
         }
-        LogicalPlan::Filter { input, predicate } => {
+        // A scan holds no expression: its columns were resolved against the catalogue
+        // while the statement was bound, and its `schema` is already what
+        // `PhysicalPlan::schema` answers. Nothing is left to fold or to check here, and
+        // the table is opened when the plan runs, not when it compiles.
+        PhysicalPlan::TableScan { .. } => Ok(()),
+        PhysicalPlan::IndexSeek { range, .. } => compile_range(range, ctx),
+        PhysicalPlan::Filter { input, predicate } => {
             compile_plan(input, ctx)?;
             compile_expr(predicate, ctx)
         }
-        LogicalPlan::Project { input, exprs, .. } => {
+        PhysicalPlan::Project { input, exprs, .. } => {
             compile_plan(input, ctx)?;
             for projection in exprs {
                 compile_expr(&projection.expr, ctx)?;
             }
             Ok(())
         }
-        LogicalPlan::Limit { input, top } => {
+        PhysicalPlan::Top { input, top } => {
             compile_plan(input, ctx)?;
             compile_expr(&top.expr, ctx)?;
             compile_top(top, ctx)
         }
-        // A `Scan` holds no expression: its columns were resolved against the catalogue
-        // while the statement was bound, and its `schema` is already what
-        // `LogicalPlan::schema` answers. Nothing is left to fold or to check here, and the
-        // table is opened when the plan runs, not when it compiles.
-        LogicalPlan::Scan { .. } => Ok(()),
-        // The relational operators that are bound but not executed yet.
-        LogicalPlan::Join { .. } => Err(bug("compile_plan: Join is not implemented yet")),
-        LogicalPlan::Aggregate { .. } => Err(bug("compile_plan: Aggregate is not implemented yet")),
-        LogicalPlan::Sort { .. } | LogicalPlan::Distinct(_) => Err(bug(
-            "compile_plan: Sort and Distinct are not implemented yet",
-        )),
-        LogicalPlan::Subquery { .. } => {
-            Err(bug("compile_plan: a derived table is not implemented yet"))
+        PhysicalPlan::NestedLoopJoin {
+            outer, inner, on, ..
+        } => {
+            compile_plan(outer, ctx)?;
+            compile_plan(inner, ctx)?;
+            match on {
+                Some(on) => compile_expr(on, ctx),
+                None => Ok(()),
+            }
         }
-        LogicalPlan::SetOp { .. } => Err(bug("compile_plan: SetOp is not implemented yet")),
+        PhysicalPlan::HashJoin {
+            build,
+            probe,
+            keys,
+            residual,
+            ..
+        } => {
+            compile_plan(build, ctx)?;
+            compile_plan(probe, ctx)?;
+            for (left, right) in keys {
+                compile_expr(left, ctx)?;
+                compile_expr(right, ctx)?;
+            }
+            match residual {
+                Some(residual) => compile_expr(residual, ctx),
+                None => Ok(()),
+            }
+        }
+        PhysicalPlan::HashAggregate {
+            input,
+            group_by,
+            aggregates,
+            ..
+        }
+        | PhysicalPlan::StreamAggregate {
+            input,
+            group_by,
+            aggregates,
+            ..
+        } => {
+            compile_plan(input, ctx)?;
+            for key in group_by {
+                compile_expr(key, ctx)?;
+            }
+            for aggregate in aggregates {
+                if let Some(arg) = &aggregate.arg {
+                    compile_expr(arg, ctx)?;
+                }
+            }
+            Ok(())
+        }
+        PhysicalPlan::Sort { input, keys } => {
+            compile_plan(input, ctx)?;
+            compile_keys(keys, ctx)
+        }
+        PhysicalPlan::TopN { input, keys, top } => {
+            compile_plan(input, ctx)?;
+            compile_keys(keys, ctx)?;
+            compile_expr(&top.expr, ctx)?;
+            compile_top(top, ctx)
+        }
+        PhysicalPlan::Distinct(input) => compile_plan(input, ctx),
+        PhysicalPlan::SubqueryEval {
+            input, subplans, ..
+        } => {
+            compile_plan(input, ctx)?;
+            for subplan in subplans {
+                compile_plan(&subplan.plan, ctx)?;
+            }
+            Ok(())
+        }
+        PhysicalPlan::Union { inputs, .. }
+        | PhysicalPlan::Except { inputs, .. }
+        | PhysicalPlan::Intersect { inputs, .. } => {
+            for input in inputs {
+                compile_plan(input, ctx)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Runs the compile-time checks of the keys of a sort.
+fn compile_keys(keys: &[SortKey], ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+    for key in keys {
+        compile_expr(&key.expr, ctx)?;
+    }
+    Ok(())
+}
+
+/// Runs the compile-time checks of the bounds of an index seek.
+fn compile_range(range: &KeyRangeExpr, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+    match range {
+        KeyRangeExpr::Point(keys) => {
+            for key in keys {
+                compile_expr(key, ctx)?;
+            }
+            Ok(())
+        }
+        KeyRangeExpr::Between(low, high) => {
+            compile_bound(low, ctx)?;
+            compile_bound(high, ctx)
+        }
+        KeyRangeExpr::Full => Ok(()),
+    }
+}
+
+/// Runs the compile-time checks of one bound of an index seek.
+fn compile_bound(bound: &Bound<Vec<BoundExpr>>, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+    match bound {
+        Bound::Included(keys) | Bound::Excluded(keys) => {
+            for key in keys {
+                compile_expr(key, ctx)?;
+            }
+            Ok(())
+        }
+        Bound::Unbounded => Ok(()),
     }
 }
 
@@ -573,11 +717,11 @@ mod tests {
     use vauban_binder::{BindContext, SessionOptions, bind};
     use vauban_errors::SqlError;
     use vauban_parser::{ParseOptions, parse_batch};
+    use vauban_planner::{NoIndexes, PlanContext, plan};
     use vauban_sysfn::{StaticContext, register_builtins};
 
     use super::*;
-    use crate::row::ExecOutcome;
-    use crate::statement::execute;
+    use crate::statement::execute_collect;
 
     /// Runs the compile-time checks of `text`, going through the whole chain: a hand-built
     /// `BoundExpr` would say nothing about what a client's text folds to.
@@ -585,27 +729,34 @@ mod tests {
         with_chain(text, compile)
     }
 
-    /// Runs `text` in full, compile-time checks included, and answers what it produced.
+    /// Runs `text` in full, compile-time checks included, and answers how many rows it
+    /// produced.
     fn executed(text: &str) -> SqlResult<usize> {
-        with_chain(text, |bound, ctx| match execute(bound, ctx)? {
-            ExecOutcome::Rows(set) => Ok(set.rows.len()),
-            ExecOutcome::NoRows => Ok(0),
+        with_chain(text, |stmt, ctx| {
+            execute_collect(stmt, ctx).map(|(_, set)| set.rows.len())
         })
     }
 
-    /// Parses, binds and hands the single statement of `text` to `run`.
+    /// Parses, binds, plans and hands the single statement of `text` to `run`.
     fn with_chain<T>(
         text: &str,
-        run: impl FnOnce(&BoundStatement, &mut ExecContext<'_>) -> SqlResult<T>,
+        run: impl FnOnce(&PhysicalStatement, &mut ExecContext<'_>) -> SqlResult<T>,
     ) -> SqlResult<T> {
         // The registry is global and idempotent, like in the test files of the crate.
         register_builtins();
         let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
         let bind_ctx = BindContext::scalar(text, SessionOptions::default());
         let bound = bind(&batch.statements[0], &bind_ctx).expect("the statement binds");
+        let physical = plan(
+            bound,
+            &PlanContext {
+                catalog: &NoIndexes,
+            },
+        )
+        .expect("the statement plans");
         let eval = StaticContext::default();
         let mut ctx = ExecContext::scalar(&eval, SessionOptions::default());
-        run(&bound, &mut ctx)
+        run(&physical, &mut ctx)
     }
 
     /// A DDL statement and a `USE` have nothing to compile: `compile` answers `Ok(())`
@@ -618,12 +769,7 @@ mod tests {
             "DROP TABLE dbo.t;",
             "USE master;",
         ] {
-            let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
-            let bind_ctx = BindContext::scalar(text, SessionOptions::default());
-            let bound = bind(&batch.statements[0], &bind_ctx).expect("the statement binds");
-            let eval = StaticContext::default();
-            let mut ctx = ExecContext::scalar(&eval, SessionOptions::default());
-            compile(&bound, &mut ctx).expect("nothing to check at compile time");
+            compiled(text).expect("nothing to check at compile time");
         }
     }
 

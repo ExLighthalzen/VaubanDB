@@ -3,7 +3,7 @@
 //! `types` and `sysfn` raise the number, the severity, the state and the message; the
 //! **line** is the executor's, because it is the first layer to hold a `BoundExpr` and a
 //! `BoundExpr` carries the line of the AST node it came from. Each vector below therefore
-//! starts from SQL text and goes through the whole chain — parse, bind, execute — since a
+//! starts from SQL text and goes through the whole chain — parse, bind, plan, execute — since a
 //! hand-built `BoundExpr` would prove nothing about the line.
 //!
 //! The line is counted on the **text of the batch**, 1-based, exactly as the server counts
@@ -17,12 +17,13 @@
 
 use vauban_binder::{BindContext, SessionOptions, bind};
 use vauban_errors::SqlError;
-use vauban_executor::{ExecContext, ExecOutcome, RowSet, execute};
+use vauban_executor::{ExecContext, ExecOutcome, RowSet, execute_collect};
 use vauban_parser::{ParseOptions, parse_batch};
+use vauban_planner::{NoIndexes, PlanContext, plan};
 use vauban_sysfn::{StaticContext, register_builtins};
 
 // ---------------------------------------------------------------------------------------
-// The chain: parse, bind, execute
+// The chain: parse, bind, plan, execute
 // ---------------------------------------------------------------------------------------
 
 /// The error the first failing statement of `text` raises.
@@ -30,7 +31,7 @@ fn err(text: &str) -> SqlError {
     outcomes(text).expect_err("the batch does not execute")
 }
 
-/// Parses, binds and executes each statement of `text`, stopping at the first error.
+/// Parses, binds, plans and executes each statement of `text`, stopping at the first error.
 ///
 /// Stopping is the point of the `?`: the executor runs one statement, and a statement that
 /// raised produces nothing more. What the *batch* does next belongs to `session`.
@@ -44,9 +45,15 @@ fn outcomes(text: &str) -> Result<Vec<RowSet>, SqlError> {
     let mut sets = Vec::with_capacity(batch.statements.len());
     for statement in &batch.statements {
         let bound = bind(statement, &bind_ctx)?;
-        match execute(&bound, &mut ctx)? {
-            ExecOutcome::Rows(set) => sets.push(set),
-            ExecOutcome::NoRows => panic!("a `SELECT` produces a result set"),
+        let physical = plan(
+            bound,
+            &PlanContext {
+                catalog: &NoIndexes,
+            },
+        )?;
+        match execute_collect(&physical, &mut ctx)? {
+            (ExecOutcome::Rows(_), set) => sets.push(set),
+            (other, _) => panic!("a `SELECT` produces a result set, not {other:?}"),
         }
     }
     Ok(sets)

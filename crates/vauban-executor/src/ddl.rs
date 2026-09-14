@@ -216,9 +216,10 @@ fn in_a_user_transaction(ctx: &ExecContext<'_>) -> bool {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use vauban_binder::{BindContext, BoundStatement, SessionOptions, bind};
+    use vauban_binder::{BindContext, SessionOptions, bind};
     use vauban_catalog::{ColumnId, IndexDef, SortedColumn, TableDef};
     use vauban_parser::{ParseOptions, parse_batch};
+    use vauban_planner::{NoIndexes, PhysicalPlan, PhysicalStatement, PlanContext, plan};
     use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
     use vauban_sysfn::StaticContext;
     use vauban_txn::{IsolationLevel, TransactionManager};
@@ -299,15 +300,23 @@ mod tests {
             .with_engine(fixture.storage.as_ref(), &fixture.txn, &snap)
             .with_catalog(&fixture.catalog)
             .with_handle(handle);
-        crate::statement::execute(&bound, &mut ctx)
+        crate::statement::execute_collect(&bound, &mut ctx).map(|(outcome, _)| outcome)
     }
 
-    /// The single statement of `text`, bound against the scalar context (`master`, `dbo`).
-    fn bound(text: &str) -> BoundStatement {
+    /// The single statement of `text`, bound against the scalar context (`master`, `dbo`)
+    /// and planned.
+    fn bound(text: &str) -> PhysicalStatement {
         let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
         assert_eq!(batch.statements.len(), 1, "one statement per call");
         let bind_ctx = BindContext::scalar(text, SessionOptions::default());
-        bind(&batch.statements[0], &bind_ctx).expect("the statement binds")
+        let bound = bind(&batch.statements[0], &bind_ctx).expect("the statement binds");
+        plan(
+            bound,
+            &PlanContext {
+                catalog: &NoIndexes,
+            },
+        )
+        .expect("the statement plans")
     }
 
     /// A `TableDef` of one `int` column named `name` in `master.dbo`, built without the
@@ -337,7 +346,7 @@ mod tests {
     /// the statement, so the test does not guess how `MemoryStorage` numbers its tables.
     #[test]
     fn create_table_then_scan_is_empty() {
-        use vauban_binder::{ColumnBinding, LockHints, LogicalPlan, OutputColumn, OutputSchema};
+        use vauban_binder::{ColumnBinding, OutputColumn, OutputSchema};
 
         let fixture = Fixture::new();
         let before = fixture.tables();
@@ -355,7 +364,7 @@ mod tests {
         assert_eq!(created.len(), 1, "the statement created one table");
 
         let ty = TypeInfo::new(SqlType::Int, true);
-        let plan = LogicalPlan::Scan {
+        let plan = PhysicalPlan::TableScan {
             table: created[0],
             columns: vec![ColumnBinding {
                 column: ColumnId(1),
@@ -364,7 +373,6 @@ mod tests {
                 ty: ty.clone(),
             }],
             alias: "t".to_owned(),
-            hints: LockHints::default(),
             schema: OutputSchema {
                 columns: vec![OutputColumn {
                     name: "a".to_owned(),
@@ -380,7 +388,8 @@ mod tests {
             &fixture.txn,
             &snap,
         );
-        let set = crate::plan::execute_plan(&plan, &mut ctx).expect("the scan runs");
+        let (_, set) = crate::statement::execute_collect(&PhysicalStatement::Query(plan), &mut ctx)
+            .expect("the scan runs");
         assert_eq!(set.rows.len(), 0, "a table just created holds no row");
         assert_eq!(set.schema.columns.len(), 1);
         assert_eq!(set.schema.columns[0].name, "a");

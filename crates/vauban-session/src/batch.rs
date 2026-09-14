@@ -6,8 +6,9 @@
 //! # The chain
 //!
 //! `run_batch` prepares each statement through `parser::parse_batch` -> `binder::bind` ->
-//! `executor::compile` before executing the first one, then turns execution into `ResultSink`
-//! calls. `planner` is not in the chain: the executor compiles the bound statement itself.
+//! `planner::plan` -> `executor::compile` before executing the first one, then turns
+//! execution into `ResultSink` calls: the executor collects the rows of a statement and
+//! this layer sends them, until [`ResultSink`] implements `executor::RowSink` itself.
 //!
 //! # What is left of the fake engine
 //!
@@ -78,8 +79,8 @@
 //!
 //! The line is the one the failing **statement** starts on, not the line of the
 //! sub-expression that raised, as on SQL Server. `executor` cannot know it: a line lives
-//! on `binder::BoundExpr` and there alone, and `BoundStatement::Query` holds a bare
-//! `LogicalPlan`. So it answers the line of the failing sub-expression, and `run_prepared`
+//! on `binder::BoundExpr` and there alone, and `PhysicalStatement::Query` holds a bare
+//! `PhysicalPlan`. So it answers the line of the failing sub-expression, and `run_prepared`
 //! puts the statement's over it. This is the layer that holds the datum: the `&Statement`
 //! and its `Span`.
 //!
@@ -122,11 +123,12 @@
 
 use std::sync::{Arc, OnceLock};
 
-use vauban_binder::{BindContext, BoundStatement, OutputSchema};
+use vauban_binder::{BindContext, OutputSchema};
 use vauban_catalog::CatalogSnapshot;
-use vauban_errors::{BatchErrorScope, SqlError, SqlResult};
-use vauban_executor::{ExecContext, ExecOutcome};
+use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
+use vauban_executor::{CancelToken, ExecContext, ExecOutcome, RowSet};
 use vauban_parser::{Statement, parse_batch};
+use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange, Rpc, RpcProc};
 use vauban_txn::IsolationLevel;
 use vauban_types::{TypeInfo, Value};
@@ -216,16 +218,17 @@ enum PreparedStatement {
     Set(String),
     /// A statement the binder does not bind, still served by the deliberately narrow fallback.
     Fallback { text: String, error: SqlError },
-    /// A bound and compile-checked query, ready to execute without another compilation pass.
+    /// A bound, planned and compile-checked statement, ready to execute without another
+    /// compilation pass.
     Bound {
-        statement: BoundStatement,
+        statement: PhysicalStatement,
         line: u32,
     },
     /// A `USE` whose target was **found** in the catalogue while the batch was bound: a
     /// name that is not there raises 911 at that moment and no statement of the batch
     /// runs, which is where SQL Server raises it too ([`Session::bind_batch`]).
     Use {
-        statement: BoundStatement,
+        statement: PhysicalStatement,
         /// Name of the target as the **catalogue** spells it, which is the one the
         /// ENVCHANGE and the INFO 5701 carry (unit test
         /// `use_existing_database_changes_state_and_sends_5701`).
@@ -430,14 +433,20 @@ impl Session {
                 Err(error) => return Err(error),
             };
 
+            // The planner reads the indexes of the storage; the rules that would choose
+            // one are not written, so a read is planned as a scan.
+            let indexes = StorageIndexes(self.engine.storage.as_ref());
+            let physical = vauban_planner::plan(bound, &PlanContext { catalog: &indexes })
+                .map_err(|error| at_statement(error, statement_line(statement)))?;
+
             // The compiler folds what it can, so the context it gets reads the same
             // catalogue as the binder: `snapshot` (`eval_context.rs`).
             let eval = SessionEvalContext::new(&state, Some(snapshot));
             let mut exec = ExecContext::scalar(&eval, state.options.to_binder());
-            vauban_executor::compile(&bound, &mut exec)
+            vauban_executor::compile(&physical, &mut exec)
                 .map_err(|error| at_statement(error, statement_line(statement)))?;
 
-            if let BoundStatement::Use { database } = &bound {
+            if let PhysicalStatement::Use { database } = &physical {
                 let found = snapshot
                     .database(database)
                     .map(|target| target.name.clone())
@@ -450,7 +459,7 @@ impl Session {
                 // (`use_moves_the_binding_of_the_rest_of_the_batch`).
                 state.database = found.clone();
                 prepared.push(PreparedStatement::Use {
-                    statement: bound,
+                    statement: physical,
                     database: found,
                     line,
                 });
@@ -458,7 +467,7 @@ impl Session {
             }
 
             prepared.push(PreparedStatement::Bound {
-                statement: bound,
+                statement: physical,
                 line: statement_line(statement),
             });
         }
@@ -509,7 +518,7 @@ impl Session {
         // and the `commit`/`rollback` of `execute_in_a_transaction` would leave that
         // transaction open.
         match bound {
-            BoundStatement::Query(plan) => {
+            PhysicalStatement::Query(plan) => {
                 sink.columns(&column_metadata(plan.schema()))?;
             }
             // A DDL statement sends no column metadata, and its DONE carries neither
@@ -519,27 +528,28 @@ impl Session {
             // too. Hence `NoRows` -> `done(None, more)` below. What a `USE` sends instead of
             // metadata, before that DONE, is [`Session::switch_database`] (unit test
             // `a_ddl_statement_sends_no_metadata_and_a_done_without_a_count`).
-            BoundStatement::Ddl(_) | BoundStatement::Use { .. } => {}
+            PhysicalStatement::Ddl(_) | PhysicalStatement::Use { .. } => {}
             // The other statements send no column metadata of their own before they run.
-            BoundStatement::Insert(_)
-            | BoundStatement::Update(_)
-            | BoundStatement::Delete(_)
-            | BoundStatement::SetVariable { .. }
-            | BoundStatement::Declare(_)
-            | BoundStatement::If { .. }
-            | BoundStatement::While { .. }
-            | BoundStatement::Block(_)
-            | BoundStatement::Break
-            | BoundStatement::Continue
-            | BoundStatement::Return(_)
-            | BoundStatement::Print(_)
-            | BoundStatement::Transaction(_) => {}
+            PhysicalStatement::Insert(_)
+            | PhysicalStatement::Update(_)
+            | PhysicalStatement::Delete(_)
+            | PhysicalStatement::SetVariable { .. }
+            | PhysicalStatement::Declare(_)
+            | PhysicalStatement::If { .. }
+            | PhysicalStatement::While { .. }
+            | PhysicalStatement::Block(_)
+            | PhysicalStatement::Break
+            | PhysicalStatement::Continue
+            | PhysicalStatement::Return(_)
+            | PhysicalStatement::Print(_)
+            | PhysicalStatement::Transaction(_) => {}
         }
         let outcome = self.execute_in_a_transaction(bound);
         match outcome {
-            Ok(ExecOutcome::Rows(rows)) => {
-                // The metadata is already out; `rows.schema` is `plan.schema()` cloned
-                // (`executor`, `plan.rs`), so there is nothing more to send about it.
+            Ok((ExecOutcome::Rows(_), rows)) => {
+                // The metadata is already out; `rows.schema` is the schema the executor
+                // announced to its collecting sink, so there is nothing more to send
+                // about it.
                 for row in &rows.rows {
                     sink.row(row)?;
                 }
@@ -573,13 +583,37 @@ impl Session {
             // the shape of `CREATE TABLE`, `DROP TABLE` and `USE` (comment on that match).
             // `NOCOUNT` is not read here: those DONEs carry no count under `SET NOCOUNT
             // OFF` either.
-            Ok(ExecOutcome::NoRows) => {
+            Ok((ExecOutcome::NoRows, _)) => {
                 if let Some(database) = target {
                     self.switch_database(database, line, sink)?;
                 }
                 sink.done(None, more)?;
                 self.state.rowcount = 0;
                 Ok(Flow::Continue)
+            }
+            // The token handed to the executor cannot be raised, and the outcomes of the
+            // control of flow have no statement to produce them yet: each is reported as
+            // an internal error rather than mapped to a DONE this layer cannot justify.
+            Ok((
+                outcome @ (ExecOutcome::Cancelled
+                | ExecOutcome::Return(_)
+                | ExecOutcome::Break
+                | ExecOutcome::Continue),
+                _,
+            )) => {
+                let err = SqlError::from(InternalError::Bug(format!(
+                    "run_prepared: the executor answered {outcome:?}, which this layer does \
+                     not handle"
+                )));
+                self.fail(&err, sink).map(|()| Flow::Stop)
+            }
+            // A batch-scoped error: sent like a run-time error, and the batch stops.
+            Ok((ExecOutcome::BatchAbort(err), _)) => {
+                let err = at_statement(err, line);
+                self.state.last_error = err.number;
+                sink.error(&err)?;
+                sink.done(None, false)?;
+                Ok(Flow::Stop)
             }
             // A run-time error stops its statement. Its catalogued scope and XACT_ABORT decide
             // whether the rest of the batch runs. It is not handed to the fake engine
@@ -661,7 +695,10 @@ impl Session {
     /// to commit, the internal error of the transaction manager. A `rollback` that fails
     /// after a statement error keeps that error: the client is owed the number of what it
     /// asked for, and the manager's own failure is a bug of this engine.
-    fn execute_in_a_transaction(&self, bound: &BoundStatement) -> SqlResult<ExecOutcome> {
+    fn execute_in_a_transaction(
+        &self,
+        bound: &PhysicalStatement,
+    ) -> SqlResult<(ExecOutcome, RowSet)> {
         let handle = self.engine.txn.begin(IsolationLevel::ReadCommitted);
         let snap = self.engine.txn.statement_snapshot(&handle);
         // The context borrows the state and the handle; the block ends both borrows so
@@ -676,11 +713,15 @@ impl Session {
             // committed, where the snapshot of the binding predates the whole batch (header
             // of `prepare_batch`).
             let eval = SessionEvalContext::deferred(&self.state, &self.engine.catalog, &handle);
+            // The ATTENTION of this layer (`cancel.rs`) is not wired to the executor's
+            // token yet: the statement runs to its end and the rows are collected here.
+            let never = CancelToken::never();
             let mut exec = ExecContext::scalar(&eval, self.state.options.to_binder())
                 .with_engine(self.engine.storage.as_ref(), &self.engine.txn, &snap)
                 .with_catalog(&self.engine.catalog)
-                .with_handle(&handle);
-            vauban_executor::execute(bound, &mut exec)
+                .with_handle(&handle)
+                .with_cancel(&never);
+            vauban_executor::execute_collect(bound, &mut exec)
         };
         match outcome {
             Ok(outcome) => self.engine.txn.commit(handle).map(|()| outcome),
@@ -796,8 +837,8 @@ fn column_metadata(schema: &OutputSchema) -> Vec<ColumnMeta> {
 ///
 /// # Which variants have a case, and why
 ///
-/// A `SELECT` ([`BoundStatement::Query`]), the DDL of databases, tables and indexes
-/// ([`BoundStatement::Ddl`]) and `USE` ([`BoundStatement::Use`]). These are the statements
+/// A `SELECT` ([`PhysicalStatement::Query`]), the DDL of databases, tables and indexes
+/// ([`PhysicalStatement::Ddl`]) and `USE` ([`PhysicalStatement::Use`]). These are the statements
 /// whose run-time errors reach [`at_statement`], and whose fragment
 /// [`Session::bind_batch`] pads with `line - 1` newlines before rebinding it, so that a
 /// binding error lands on its line of the batch instead of line 1. A variant without a

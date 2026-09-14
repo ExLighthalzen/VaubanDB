@@ -13,6 +13,8 @@ vauban-binder.workspace = true
 # and the transaction manager that hands out their snapshot.
 vauban-catalog.workspace = true
 vauban-errors.workspace = true
+# The physical statement and plan this crate runs.
+vauban-planner.workspace = true
 vauban-storage.workspace = true
 vauban-sysfn.workspace = true
 vauban-txn.workspace = true

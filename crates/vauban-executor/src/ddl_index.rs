@@ -205,9 +205,10 @@ fn bug(what: &str) -> SqlError {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use vauban_binder::{BindContext, BoundStatement, SessionOptions, bind};
+    use vauban_binder::{BindContext, SessionOptions, bind};
     use vauban_catalog::{CatalogSnapshot, IndexMeta, ObjectId, SortedColumn, TableMeta};
     use vauban_parser::{ParseOptions, parse_batch};
+    use vauban_planner::{NoIndexes, PhysicalStatement, PlanContext, plan};
     use vauban_storage::{IndexShape, MemoryStorage, Storage, TableId};
     use vauban_sysfn::StaticContext;
     use vauban_txn::{IsolationLevel, TransactionManager};
@@ -270,7 +271,7 @@ mod tests {
                 .with_engine(fixture.storage.as_ref(), &fixture.txn, &snap)
                 .with_catalog(&fixture.catalog)
                 .with_handle(&handle);
-            crate::statement::execute(&bound, &mut ctx)
+            crate::statement::execute_collect(&bound, &mut ctx).map(|(outcome, _)| outcome)
         };
         match outcome {
             Ok(outcome) => {
@@ -287,13 +288,21 @@ mod tests {
         }
     }
 
-    /// The single statement of `text`, bound against `master`, `dbo` and `snapshot`.
-    fn bound(text: &str, snapshot: &CatalogSnapshot) -> BoundStatement {
+    /// The single statement of `text`, bound against `master`, `dbo` and `snapshot`, and
+    /// planned.
+    fn bound(text: &str, snapshot: &CatalogSnapshot) -> PhysicalStatement {
         let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
         assert_eq!(batch.statements.len(), 1, "one statement per call");
         let mut bind_ctx = BindContext::scalar(text, SessionOptions::default());
         bind_ctx.catalog = Some(snapshot);
-        bind(&batch.statements[0], &bind_ctx).expect("the statement binds")
+        let bound = bind(&batch.statements[0], &bind_ctx).expect("the statement binds");
+        plan(
+            bound,
+            &PlanContext {
+                catalog: &NoIndexes,
+            },
+        )
+        .expect("the statement plans")
     }
 
     /// `CREATE INDEX`, checked on both sides of the engine.

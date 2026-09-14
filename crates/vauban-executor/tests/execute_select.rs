@@ -1,7 +1,7 @@
 //! What a `SELECT` without `FROM` answers — schema, values, number of rows.
 //!
-//! Each vector starts from SQL text, parsed, bound and executed by [`run`]: this is the
-//! whole chain, and the last link `session` needs before a client sees a row.
+//! Each vector starts from SQL text, parsed, bound, planned and executed by [`run`]: this
+//! is the whole chain, and the last link `session` needs before a client sees a row.
 //!
 //! `RowSet.rows.len()` is deliberately asserted on each vector: it is the number
 //! `session` puts in the `DONE` token and in `@@ROWCOUNT`, and the executor's only say in
@@ -9,13 +9,14 @@
 
 use vauban_binder::{BindContext, SessionOptions, bind};
 use vauban_errors::SqlError;
-use vauban_executor::{ExecContext, ExecOutcome, RowSet, execute};
+use vauban_executor::{ExecContext, ExecOutcome, RowSet, execute_collect};
 use vauban_parser::{ParseOptions, parse_batch};
+use vauban_planner::{NoIndexes, PlanContext, plan};
 use vauban_sysfn::{StaticContext, register_builtins};
 use vauban_types::{Len, SqlString, SqlType, Value};
 
 // ---------------------------------------------------------------------------------------
-// The chain: parse, bind, execute
+// The chain: parse, bind, plan, execute
 // ---------------------------------------------------------------------------------------
 
 /// The `RowSet` of the **first** statement of `text`.
@@ -39,7 +40,7 @@ fn err(text: &str) -> SqlError {
     outcomes(text).expect_err("the batch does not execute")
 }
 
-/// Parses, binds and executes each statement of `text`, stopping at the first error.
+/// Parses, binds, plans and executes each statement of `text`, stopping at the first error.
 fn outcomes(text: &str) -> Result<Vec<RowSet>, SqlError> {
     // The registry is global and idempotent; every test that reaches a function call
     // registers, like the tests of `binder` do.
@@ -51,10 +52,16 @@ fn outcomes(text: &str) -> Result<Vec<RowSet>, SqlError> {
     let mut sets = Vec::with_capacity(batch.statements.len());
     for statement in &batch.statements {
         let bound = bind(statement, &bind_ctx)?;
-        match execute(&bound, &mut ctx)? {
-            ExecOutcome::Rows(set) => sets.push(set),
+        let physical = plan(
+            bound,
+            &PlanContext {
+                catalog: &NoIndexes,
+            },
+        )?;
+        match execute_collect(&physical, &mut ctx)? {
+            (ExecOutcome::Rows(_), set) => sets.push(set),
             // This file runs nothing but `SELECT`s, which always have a result set.
-            ExecOutcome::NoRows => panic!("a `SELECT` produces a result set"),
+            (other, _) => panic!("a `SELECT` produces a result set, not {other:?}"),
         }
     }
     Ok(sets)

@@ -213,17 +213,24 @@ mod tests {
 
     use super::*;
 
-    fn run(sql: &str) -> SqlResult<crate::ExecOutcome> {
+    fn run(sql: &str) -> SqlResult<crate::RowSet> {
         let batch = parse_batch(sql, &ParseOptions::default())?;
         let bound = bind(
             &batch.statements[0],
             &BindContext::scalar(sql, SessionOptions::default()),
         )?;
+        let physical = vauban_planner::plan(
+            bound,
+            &vauban_planner::PlanContext {
+                catalog: &vauban_planner::NoIndexes,
+            },
+        )?;
         let context = StaticContext::default();
-        crate::execute(
-            &bound,
+        crate::execute_collect(
+            &physical,
             &mut ExecContext::scalar(&context, SessionOptions::default()),
         )
+        .map(|(_, set)| set)
     }
 
     #[test]
@@ -268,10 +275,7 @@ mod tests {
                 "SELECT CASE WHEN {predicate} THEN 1 WHEN NOT ({predicate}) THEN 0 ELSE -1 END;"
             ))
             .unwrap();
-            let crate::ExecOutcome::Rows(rows) = result else {
-                panic!("expected rows")
-            };
-            assert_eq!(rows.rows, vec![vec![Value::I32(expected)]]);
+            assert_eq!(result.rows, vec![vec![Value::I32(expected)]]);
         }
     }
 }

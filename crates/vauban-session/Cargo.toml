@@ -21,6 +21,7 @@ vauban-storage.workspace = true
 vauban-errors.workspace = true
 vauban-parser.workspace = true
 vauban-binder.workspace = true
+vauban-planner.workspace = true
 vauban-executor.workspace = true
 vauban-sysfn.workspace = true
 vauban-catalog.workspace = true
