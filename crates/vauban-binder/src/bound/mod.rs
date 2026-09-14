@@ -40,13 +40,44 @@ pub enum BoundStatement {
     Delete(DeletePlan),
     /// `SET @x = e`, the assignment of one variable..
     ///
-    /// `SELECT @x = e` binds to this variant too: the two spellings assign, and the second
-    /// one is not a query (`query.rs`, `assignment`).
+    /// `SELECT @x = e` without a `FROM` binds to this variant too: the two spellings
+    /// assign, and the second one is not a query (`variables.rs`). The form with a `FROM`
+    /// is [`BoundStatement::SelectAssign`].
     SetVariable {
-        /// The name, `@` included, as `DECLARE` wrote it.
+        /// The name, `@` included, as the assignment wrote it: after `DECLARE @x int`,
+        /// `SET @X = 1` carries `@X` (`tests/bind_variables.rs`,
+        /// `select_assign_with_from_binds_input_and_targets`, on the `SELECT` spelling).
+        /// The scope looks a variable up without regard to case, and so must whoever
+        /// stores the value.
         name: String,
         /// The value, already converted to the declared type of the variable.
         value: BoundExpr,
+    },
+    /// `SELECT @x = a, @y = b FROM t …`, the assignment of variables from the rows of a
+    /// plan..
+    ///
+    /// The statement answers no result set. For each row `input` produces, the values are
+    /// evaluated in written order against that row and each one is stored before the
+    /// next is evaluated, so `SELECT @x = a, @y = @x FROM t` leaves `@y` at the `a` of
+    /// the row. The last row `input` produced wins; which row that is follows the `ORDER
+    /// BY` when one was written and is not a guaranteed order otherwise. Over zero rows
+    /// the variables keep their values, where `SET @x = (SELECT …)` over zero rows stores
+    /// `NULL`.
+    ///
+    /// `input` is the plan the same statement would have as a query, with the `Project`
+    /// of its select list taken out: the `Scan`, `Join`, `Filter`, `Sort` and `Limit` of
+    /// the clauses written, so that an `ORDER BY` on a column the list does not carry
+    /// still orders the rows (`tests/bind_variables.rs`,
+    /// `select_assign_with_from_keeps_where_and_order_by`).
+    SelectAssign {
+        /// The rows to assign from.
+        input: Box<LogicalPlan>,
+        /// One `@x = e` per entry, in written order: the name as the assignment wrote it,
+        /// `@` included, and the value bound against the row of `input`, wrapped in a
+        /// [`BoundExprKind::Convert`] towards the declared type of the variable in each
+        /// entry, the value that already has that type included
+        /// (`tests/bind_variables.rs`, `select_assign_with_from_binds_input_and_targets`).
+        assignments: Vec<(String, BoundExpr)>,
     },
     /// `DECLARE @a int, @b varchar(10) = 'x'`, in the order the declarations were written.
     ///.

@@ -24,6 +24,7 @@
 //! | `SET @x += e` (and `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`) | `SetVariable` of `@x <op> e` |
 //! | `SELECT @x = e` | `SetVariable { name, value }` |
 //! | `SELECT @x = e, @y = f` | `Block([SetVariable, SetVariable])`, in written order |
+//! | `SELECT @x = e, @y = f FROM t …` | `SelectAssign { input, assignments }`, in written order |
 //!
 //! A value is bound, then wrapped in a [`BoundExprKind::Convert`] towards the declared type
 //! when its own type differs, so that the executor stores the declared type and nothing
@@ -44,15 +45,27 @@
 //! (`SELECT @x = 1, 2;`, `SELECT 2, @x = 1;`) is error **141**, raised after the 137 of an
 //! undeclared target: `SELECT @z = 1, 2;` without a `DECLARE` answers 137.
 //!
-//! The forms that need a plan — a `FROM`, a `WHERE`, a `TOP`, `GROUP BY`, `HAVING`, `ORDER
-//! BY`, `INTO`, a set operator — are **not bound here**: they answer an internal error
-//! naming the clause (`tests/bind_variables.rs`, `select_assign_with_from_is_deferred`). Their
-//! semantics, for whoever binds them: over a source of several rows the variable takes the
-//! value of the last row the engine met, which without an `ORDER BY` is not a guaranteed
-//! order; over zero rows the variable keeps its value, where `SET @x = (SELECT …)` over zero
-//! rows stores `NULL`; `SELECT @x = 1 WHERE 1 = 0;` and `SELECT TOP (0) @x = 1;` assign
-//! nothing. `DISTINCT` is accepted here: over the single row of a `SELECT` without `FROM`
-//! it removes nothing.
+//! # `SELECT @x = e FROM t` assigns from a plan
+//!
+//! With a `FROM`, the statement binds to a [`BoundStatement::SelectAssign`]: the values
+//! become the select list of the same statement read as a query, which `query.rs` binds
+//! with the scope of the `FROM`, its `WHERE`, `TOP` and `ORDER BY`; the `Project` of that
+//! plan is then taken out, its input is the `input` of the variant and its expressions,
+//! each wrapped in a `Convert` towards the declared type, are the values of the
+//! `assignments` (`tests/bind_variables.rs`,
+//! `select_assign_with_from_binds_input_and_targets`,
+//! `select_assign_with_from_keeps_where_and_order_by`). The targets are checked before the
+//! query is bound: `SELECT @z = nosuch FROM t` without a `DECLARE` is 137, and 207 once
+//! `@z` is declared (`select_assign_with_from_checks_137_before_141`). The semantics the
+//! variant carries are written on it in `bound/mod.rs`.
+//!
+//! The forms that need a plan and have no `FROM` — a `WHERE`, a `TOP`, an `ORDER BY` over
+//! the one row of a `SELECT` without `FROM` — and `SELECT DISTINCT @x = a FROM t`, whose
+//! deduplication sits between the values and the assignment, are **not bound here**: they
+//! answer an internal error naming the clause (`tests/bind_variables.rs`,
+//! `select_assign_without_from_defers_the_clauses_that_need_a_plan`). For the record,
+//! `SELECT @x = 1 WHERE 1 = 0;` and `SELECT TOP (0) @x = 1;` assign nothing. `DISTINCT`
+//! without a `FROM` is accepted: over the single row it removes nothing.
 //!
 //! # Out of scope
 //!
@@ -63,17 +76,19 @@
 
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{
-    AssignOp, AssignTarget, BinaryOp as AstBinaryOp, DeclareItem, DeclareStatement, Expr,
-    QueryBody, SelectItem, SelectStatement, SetStatement, SetValue, Span,
+    AliasStyle, AssignOp, AssignTarget, BinaryOp as AstBinaryOp, DeclareItem, DeclareStatement,
+    Expr, QueryBody, QuerySpec, SelectItem, SelectStatement, SetStatement, SetValue, Span,
 };
 use vauban_types::{SqlType, TypeInfo, Value, implicit_result_type};
 
-use crate::bound::{BoundDeclaration, BoundExpr, BoundExprKind, BoundStatement};
+use crate::bound::{
+    BoundDeclaration, BoundExpr, BoundExprKind, BoundProjection, BoundStatement, LogicalPlan,
+};
 use crate::context::{BindContext, VariableScope};
 use crate::datatype::resolve_data_type;
 use crate::errors::{line_of, on_the_statement};
 use crate::expr::{Scope, bind_expr};
-use crate::query::not_implemented;
+use crate::query::{bind_select, bug, not_implemented};
 use crate::subquery;
 
 /// The variables a batch has declared so far, with their declared types.
@@ -258,7 +273,8 @@ pub(crate) fn is_assignment_select(stmt: &SelectStatement) -> bool {
 }
 
 /// Binds a `SELECT @x = e [, @y = f]` without a `FROM` into one
-/// [`BoundStatement::SetVariable`], or a [`BoundStatement::Block`] of them in written order.
+/// [`BoundStatement::SetVariable`], or a [`BoundStatement::Block`] of them in written
+/// order, and the same list with a `FROM` into a [`BoundStatement::SelectAssign`].
 ///
 /// See the module documentation for what is bound here and what is deferred.
 ///
@@ -266,8 +282,10 @@ pub(crate) fn is_assignment_select(stmt: &SelectStatement) -> bool {
 ///
 /// In this order: 137, state 1, on the first target not in scope; 141 when an item of the
 /// list is not an assignment; an internal error naming the clause when the statement
-/// needs a plan (`FROM`, `WHERE`, `TOP`, …); then the errors of each value, 206 included.
-/// 137 carries the line of the assignment it names, 141 the line of the statement.
+/// needs a plan and has no `FROM` (`WHERE`, `TOP`, …), or is a `DISTINCT` over a `FROM`;
+/// then, with a `FROM`, the errors of the query (207, 208, …); then the errors of each
+/// value, 206 included. 137 carries the line of the assignment it names, 141 the line of
+/// the statement.
 pub(crate) fn bind_select_assignment(
     stmt: &SelectStatement,
     ctx: &BindContext<'_>,
@@ -306,6 +324,9 @@ pub(crate) fn bind_select_assignment(
     if returns_a_column {
         return Err(SqlError::assignment_mixed_with_data_retrieval().with_line(line_of(&spec.span)));
     }
+    if !spec.from.is_empty() {
+        return bind_select_assign_from(stmt, spec, &assignments, ctx);
+    }
     if let Some(clause) = clause_needing_a_plan(stmt) {
         return Err(not_implemented(&format!(
             "SELECT @x = e with {clause}, which assigns from a plan"
@@ -325,17 +346,101 @@ pub(crate) fn bind_select_assignment(
     Ok(BoundStatement::Block(bound))
 }
 
-/// The first clause of `stmt` that makes the assignment need a plan, named for the
-/// internal error, or `None` for a bare `SELECT [DISTINCT] @x = e`.
+/// Binds `SELECT @x = e, @y = f FROM t …` into a [`BoundStatement::SelectAssign`], the
+/// targets having been checked by [`bind_select_assignment`].
+///
+/// The statement is read as the query `SELECT e, f FROM t …` and bound by
+/// [`bind_select`], so that its `FROM`, `WHERE`, `TOP` and `ORDER BY` are bound once, in
+/// `query.rs`; the `Project` of that plan is then detached ([`detach_projection`]).
+///
+/// # Errors
+///
+/// An internal error for `DISTINCT`; the errors of the query; 206, on the line of the
+/// assignment, for a value whose type has no implicit conversion to the declared one.
+fn bind_select_assign_from(
+    stmt: &SelectStatement,
+    spec: &QuerySpec,
+    assignments: &[(&str, &Expr, &Span, TypeInfo)],
+    ctx: &BindContext<'_>,
+) -> SqlResult<BoundStatement> {
+    if spec.distinct {
+        return Err(not_implemented(
+            "SELECT DISTINCT @x = e FROM, which deduplicates the values before assigning them",
+        ));
+    }
+    let items = assignments
+        .iter()
+        .map(|(_, value, _, _)| SelectItem::Expr {
+            expr: (*value).clone(),
+            alias: None,
+            alias_style: AliasStyle::As,
+        })
+        .collect();
+    let query = SelectStatement {
+        with: stmt.with.clone(),
+        body: QueryBody::Select(Box::new(QuerySpec {
+            items,
+            ..spec.clone()
+        })),
+        order_by: stmt.order_by.clone(),
+        offset_fetch: stmt.offset_fetch.clone(),
+        for_clause: stmt.for_clause.clone(),
+        span: stmt.span,
+    };
+    let (input, values) = detach_projection(bind_select(&query, ctx)?)?;
+    if values.len() != assignments.len() {
+        return Err(bug(format!(
+            "variables::bind_select_assign_from: {} assignments, {} projected values",
+            assignments.len(),
+            values.len()
+        )));
+    }
+    let mut bound: Vec<(String, BoundExpr)> = Vec::with_capacity(assignments.len());
+    for ((name, _, span, ty), projection) in assignments.iter().zip(values) {
+        let value = check_convertible(projection.expr, ty, line_of(span))?;
+        bound.push(((*name).to_owned(), convert_always(value, ty.ty)));
+    }
+    Ok(BoundStatement::SelectAssign {
+        input: Box::new(input),
+        assignments: bound,
+    })
+}
+
+/// Splits the plan of a query into the plan under its `Project` and the expressions of
+/// that `Project`, looking through the `Limit` a `TOP` puts above it.
+///
+/// `query.rs` builds the `Project` at the top of a plan, or directly under the `Limit`;
+/// `sort.rs` keeps a `Sort` written without `DISTINCT` under it, so the `Sort` stays in
+/// the plan handed back (`tests/bind_variables.rs`,
+/// `select_assign_with_from_keeps_where_and_order_by`).
+fn detach_projection(plan: LogicalPlan) -> SqlResult<(LogicalPlan, Vec<BoundProjection>)> {
+    match plan {
+        LogicalPlan::Limit { input, top } => {
+            let (source, exprs) = detach_projection(*input)?;
+            Ok((
+                LogicalPlan::Limit {
+                    input: Box::new(source),
+                    top,
+                },
+                exprs,
+            ))
+        }
+        LogicalPlan::Project { input, exprs, .. } => Ok((*input, exprs)),
+        other => Err(bug(format!(
+            "variables::detach_projection: no projection at the top of the plan of an \
+             assignment: {other:?}"
+        ))),
+    }
+}
+
+/// The first clause of a `stmt` without `FROM` that makes the assignment need a plan,
+/// named for the internal error, or `None` for a bare `SELECT [DISTINCT] @x = e`.
 fn clause_needing_a_plan(stmt: &SelectStatement) -> Option<&'static str> {
     let QueryBody::Select(spec) = &stmt.body else {
         return Some("a set operator");
     };
     if stmt.with.is_some() {
         return Some("WITH");
-    }
-    if !spec.from.is_empty() {
-        return Some("FROM");
     }
     if spec.where_.is_some() {
         return Some("WHERE");
@@ -400,13 +505,24 @@ fn assigned_value(
 ///
 /// 206 when the two types have no implicit conversion, the value's type named first.
 fn converted(value: BoundExpr, target: &TypeInfo, line: u32) -> SqlResult<BoundExpr> {
+    let value = check_convertible(value, target, line)?;
+    Ok(convert_to(value, target.ty))
+}
+
+/// `value` itself when its type has an implicit conversion to `target`, or when it is an
+/// untyped `NULL`.
+///
+/// # Errors
+///
+/// 206 otherwise, the value's type named first, on `line`.
+fn check_convertible(value: BoundExpr, target: &TypeInfo, line: u32) -> SqlResult<BoundExpr> {
     let untyped_null = matches!(value.kind, BoundExprKind::Literal(Value::Null));
     if !untyped_null && implicit_result_type(&value.ty, target).is_err() {
         return Err(
             SqlError::operand_type_clash(value.ty.ty.name(), target.ty.name()).with_line(line),
         );
     }
-    Ok(convert_to(value, target.ty))
+    Ok(value)
 }
 
 /// `expr` wrapped in the `Convert` node that takes it to `target`, or `expr` itself when it
@@ -415,6 +531,12 @@ fn convert_to(expr: BoundExpr, target: SqlType) -> BoundExpr {
     if expr.ty.ty == target {
         return expr;
     }
+    convert_always(expr, target)
+}
+
+/// `expr` wrapped in the `Convert` node that takes it to `target`, its own type being
+/// `target` or not. The result is nullable, as [`convert_to`]'s is.
+fn convert_always(expr: BoundExpr, target: SqlType) -> BoundExpr {
     let ty = TypeInfo::new(target, true);
     let line = expr.line;
     BoundExpr {

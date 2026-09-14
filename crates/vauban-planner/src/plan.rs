@@ -36,6 +36,10 @@ pub fn plan(stmt: BoundStatement, ctx: &PlanContext<'_>) -> SqlResult<PhysicalSt
         BoundStatement::SetVariable { name, value } => {
             Ok(PhysicalStatement::SetVariable { name, value })
         }
+        BoundStatement::SelectAssign { .. } => Err(not_implemented(
+            "plan",
+            "a SELECT that assigns variables from a FROM",
+        )),
         BoundStatement::Declare(declarations) => Ok(PhysicalStatement::Declare(declarations)),
         BoundStatement::If {
             condition,

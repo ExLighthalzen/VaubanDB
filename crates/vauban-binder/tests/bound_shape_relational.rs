@@ -261,6 +261,10 @@ fn every_statement_variant_exists() {
             name: "@x".to_owned(),
             value: literal(),
         },
+        BoundStatement::SelectAssign {
+            input: Box::new(source("c")),
+            assignments: vec![("@x".to_owned(), literal())],
+        },
         BoundStatement::Declare(vec![BoundDeclaration {
             name: "@x".to_owned(),
             ty: int(),
@@ -285,7 +289,7 @@ fn every_statement_variant_exists() {
             mark: None,
         }),
     ];
-    assert_eq!(values.len(), 13, "one value per variant");
+    assert_eq!(values.len(), 14, "one value per variant");
     let mut matched = 0;
     for value in &values {
         matched += match value {
@@ -293,6 +297,7 @@ fn every_statement_variant_exists() {
             BoundStatement::Update(plan) => usize::from(plan.assignments.len() == 1),
             BoundStatement::Delete(plan) => usize::from(plan.table == TableId(1)),
             BoundStatement::SetVariable { name, .. } => usize::from(name == "@x"),
+            BoundStatement::SelectAssign { assignments, .. } => usize::from(assignments.len() == 1),
             BoundStatement::Declare(declarations) => usize::from(declarations.len() == 1),
             BoundStatement::If { else_, .. } => usize::from(else_.is_some()),
             BoundStatement::While { .. }

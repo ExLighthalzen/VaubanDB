@@ -471,33 +471,169 @@ fn mixing_assignment_and_column_is_141() {
     assert!(error.message.contains("\"@z\""), "{}", error.message);
 }
 
-/// `SELECT @x = a FROM t` is not bound yet: the internal error 50000 names the `FROM`.
-/// The 137 of an undeclared target comes before it, as does the 141 of a mixed list.
-/// `WHERE`, `TOP` and `ORDER BY` are deferred the same way.
+/// The `(input, assignments)` of a `SelectAssign`.
+fn select_assign(stmt: &BoundStatement) -> (&LogicalPlan, &[(String, BoundExpr)]) {
+    match stmt {
+        BoundStatement::SelectAssign { input, assignments } => (input, assignments),
+        other => panic!("expected a SelectAssign, got {other:?}"),
+    }
+}
+
+/// `DECLARE @x int; SELECT @x = a FROM t;` binds to a `SelectAssign` whose `input` is the
+/// plan of `SELECT a FROM t` without its projection, the `Scan` of `t`, and whose one
+/// assignment names `@x` and carries a `Convert` to `int` over the column `a`, the
+/// column being an `int` already. The name is the one the assignment wrote: `@X` after
+/// `DECLARE @x`. A `varchar(10)` target converts the same way, and a target the column
+/// does not convert to is 206 on the line of the assignment.
 #[test]
-fn select_assign_with_from_is_deferred() {
-    let error = err("DECLARE @x int; SELECT @x = a FROM t;");
-    assert_eq!(error.number, 50000);
-    assert!(error.message.contains("FROM"), "{}", error.message);
+fn select_assign_with_from_binds_input_and_targets() {
+    let bound = binds("DECLARE @x int; SELECT @x = a FROM t;");
+    assert_eq!(bound.len(), 2);
     assert!(
-        error.message.contains("not implemented"),
-        "{}",
-        error.message
+        !matches!(&bound[1], BoundStatement::Query(_)),
+        "an assignment is not a query, got {:?}",
+        bound[1]
+    );
+    let (input, assignments) = select_assign(&bound[1]);
+    let LogicalPlan::Scan { alias, columns, .. } = input else {
+        panic!("expected the Scan of t, got {input:?}");
+    };
+    assert_eq!(alias, "t");
+    assert_eq!(columns.len(), 2);
+    assert_eq!(assignments.len(), 1);
+    let (name, value) = &assignments[0];
+    assert_eq!(name, "@x");
+    let (ty, inner) = convert_of(value);
+    assert_eq!(*ty, TypeInfo::new(SqlType::Int, true));
+    assert!(
+        matches!(&inner.kind, BoundExprKind::ColumnRef(column) if column.name == "a"),
+        "the operand is the column a, got {:?}",
+        inner.kind
     );
 
-    let error = err("SELECT @x = a FROM t;");
+    let bound = binds("DECLARE @x int; SELECT @X = a FROM t;");
+    let (_, assignments) = select_assign(&bound[1]);
+    assert_eq!(assignments[0].0, "@X");
+
+    let bound = binds("DECLARE @s varchar(10); SELECT @s = a FROM t;");
+    let (_, assignments) = select_assign(&bound[1]);
+    let (ty, _) = convert_of(&assignments[0].1);
+    assert_eq!(ty.ty, SqlType::VarChar(Len::Fixed(10)));
+
+    let error = err("DECLARE @g uniqueidentifier;
+SELECT @g = a FROM t;");
+    assert_eq!((error.number, error.line), (206, 2));
+    assert_eq!(
+        error.message,
+        SqlError::operand_type_clash("int", "uniqueidentifier").message
+    );
+}
+
+/// `SELECT @x = a, @y = @x FROM t` binds two assignments in written order, the second
+/// one's value being the variable node, not a column of a projection: the executor
+/// evaluates it after it stored the first.
+#[test]
+fn select_assign_with_from_keeps_the_written_order() {
+    let bound = binds("DECLARE @x int, @y int; SELECT @x = a, @y = @x FROM t;");
+    let (input, assignments) = select_assign(&bound[1]);
+    assert!(matches!(input, LogicalPlan::Scan { .. }), "got {input:?}");
+    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments[0].0, "@x");
+    assert_eq!(assignments[1].0, "@y");
+    let (_, inner) = convert_of(&assignments[1].1);
+    assert!(
+        matches!(&inner.kind, BoundExprKind::Variable { name } if name == "@x"),
+        "got {:?}",
+        inner.kind
+    );
+}
+
+/// `SELECT @z = a, b FROM t` without a `DECLARE` is 137, state 1; with `DECLARE @z int`
+/// it is 141. The 137 also comes before the 207 of an unknown column, and the 207 comes
+/// once the target is declared.
+#[test]
+fn select_assign_with_from_checks_137_before_141() {
+    let error = err("SELECT @z = a, b FROM t;");
+    assert_eq!((error.number, error.state, error.line), (137, 1, 1));
+    assert!(error.message.contains("\"@z\""), "{}", error.message);
+
+    let error = err("DECLARE @z int;\nSELECT @z = a, b FROM t;");
+    assert_eq!((error.number, error.severity, error.state), (141, 15, 1));
+    assert_eq!(error.line, 2);
+
+    let error = err("SELECT @z = nosuch FROM t;");
     assert_eq!((error.number, error.state), (137, 1));
+    let error = err("DECLARE @z int; SELECT @z = nosuch FROM t;");
+    assert_eq!(error.number, 207);
+    let error = err("DECLARE @z int; SELECT @z = a FROM nosuch;");
+    assert_eq!(error.number, 208);
+}
 
-    let error = err("DECLARE @x int; SELECT @x = a, b FROM t;");
-    assert_eq!(error.number, 141);
+/// `SELECT TOP (1) @x = a FROM t WHERE a > 1 ORDER BY b` keeps the `WHERE` and the
+/// `ORDER BY` in `input`: a `Limit` over the `Sort` over the `Filter` over the `Scan`,
+/// the `Sort` keyed on `b`, a column the assignment does not read.
+#[test]
+fn select_assign_with_from_keeps_where_and_order_by() {
+    let bound = binds("DECLARE @x int; SELECT TOP (1) @x = a FROM t WHERE a > 1 ORDER BY b;");
+    let (input, assignments) = select_assign(&bound[1]);
+    assert_eq!(assignments.len(), 1);
+    let LogicalPlan::Limit { input: sorted, top } = input else {
+        panic!("expected a Limit, got {input:?}");
+    };
+    assert!(!top.percent && !top.with_ties, "got {top:?}");
+    let LogicalPlan::Sort {
+        input: filtered,
+        keys,
+    } = &**sorted
+    else {
+        panic!("expected a Sort, got {sorted:?}");
+    };
+    assert_eq!(keys.len(), 1);
+    assert!(
+        matches!(&keys[0].expr.kind, BoundExprKind::ColumnRef(column) if column.name == "b"),
+        "got {:?}",
+        keys[0].expr.kind
+    );
+    let LogicalPlan::Filter {
+        input: scanned,
+        predicate,
+    } = &**filtered
+    else {
+        panic!("expected a Filter, got {filtered:?}");
+    };
+    assert!(predicate.is_predicate());
+    assert!(
+        matches!(&**scanned, LogicalPlan::Scan { .. }),
+        "got {scanned:?}"
+    );
 
+    // Without TOP, the Sort is the root of the input.
+    let bound = binds("DECLARE @x int; SELECT @x = a FROM t ORDER BY a DESC;");
+    let (input, _) = select_assign(&bound[1]);
+    let LogicalPlan::Sort { keys, .. } = input else {
+        panic!("expected a Sort, got {input:?}");
+    };
+    assert!(keys[0].desc);
+}
+
+/// Without a `FROM`, a `WHERE`, a `TOP` and an `ORDER BY` are not bound: the internal
+/// error 50000 names the clause. `SELECT DISTINCT @x = a FROM t` is deferred the same way,
+/// naming `DISTINCT`.
+#[test]
+fn select_assign_without_from_defers_the_clauses_that_need_a_plan() {
     for (text, clause) in [
         ("DECLARE @x int; SELECT @x = 1 WHERE 1 = 0;", "WHERE"),
         ("DECLARE @x int; SELECT TOP (0) @x = 1;", "TOP"),
         ("DECLARE @x int; SELECT @x = 1 ORDER BY 1;", "ORDER BY"),
+        ("DECLARE @x int; SELECT DISTINCT @x = a FROM t;", "DISTINCT"),
     ] {
         let error = err(text);
         assert_eq!(error.number, 50000, "{text}");
         assert!(error.message.contains(clause), "{text}: {}", error.message);
+        assert!(
+            error.message.contains("not implemented"),
+            "{text}: {}",
+            error.message
+        );
     }
 }
