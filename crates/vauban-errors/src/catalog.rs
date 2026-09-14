@@ -334,6 +334,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "The transaction count changed across EXECUTE: BEGIN and COMMIT are unbalanced (before %ld, after %ld).",
     },
     ErrorDef {
+        number: 271,
+        severity: 16,
+        template: "The column \"%.*ls\" cannot be modified: it is computed, or it comes out of a UNION.",
+    },
+    ErrorDef {
         number: 281,
         severity: 16,
         template: "Style %d is not defined for converting %ls to a character string.",
@@ -948,6 +953,7 @@ mod tests {
         (263, 16, &[]),
         (264, 16, &["%.*ls"]),
         (266, 16, &["%ld", "%ld"]),
+        (271, 16, &["%.*ls"]),
         (281, 16, &["%d", "%ls"]),
         (289, 16, &["%ls"]),
         (292, 16, &["%ls"]),

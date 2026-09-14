@@ -386,7 +386,8 @@ fn error_of(text: &str) -> vauban_errors::SqlError {
 /// bound shape in `tests/bind_txn_stmt.rs`, `variables.rs` binds `DECLARE` and `SET @x`
 /// and reads theirs in `tests/bind_variables.rs`, `join.rs` binds the `FROM` of more than
 /// one source and reads its shape in `tests/bind_join.rs`, `insert.rs` binds `INSERT` and
-/// reads its shape in `tests/bind_insert.rs`.
+/// reads its shape in `tests/bind_insert.rs`, `update_delete.rs` binds `UPDATE` and
+/// `DELETE` and reads theirs in `tests/bind_update_delete.rs`.
 ///
 /// The number is the internal 50000 of a bug, not a user-facing number: the 209, 8120,
 /// 205, 213, 137, 116 and 145 of those forms are raised once they are bound.
@@ -410,8 +411,7 @@ fn an_unimplemented_form_names_itself() {
         ("SELECT 1 UNION SELECT 2", "UNION, EXCEPT and INTERSECT"),
         ("SELECT 1 EXCEPT SELECT 2", "UNION, EXCEPT and INTERSECT"),
         // `INSERT INTO a (c) VALUES (1)` is bound (`tests/bind_insert.rs`).
-        ("UPDATE a SET c = 1", "UPDATE"),
-        ("DELETE FROM a", "DELETE"),
+        // `UPDATE a SET c = 1` and `DELETE FROM a` are bound (`tests/bind_update_delete.rs`).
         ("IF 1 = 1 SELECT 1", "IF"),
         ("WHILE 1 = 1 BREAK", "WHILE"),
         ("PRINT 'a'", "PRINT"),

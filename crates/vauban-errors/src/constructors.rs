@@ -2698,6 +2698,19 @@ impl SqlError {
         from_catalog(8102, 1, &[Arg::Str(column)])
     }
 
+    /// Error 271, severity 16, state 1 (`UPDATE dbo.tc SET c = 1;` where `c` is a computed
+    /// column): an `UPDATE` writes a computed column.
+    ///
+    /// `column` is the column name as the catalogue spells it, unqualified (`"c"`): the
+    /// template puts it between double quotes, where 8102 uses single ones.
+    ///
+    /// ```text
+    /// The column "c" cannot be modified: it is computed, or it comes out of a UNION.
+    /// ```
+    pub fn cannot_update_computed_column(column: &str) -> Self {
+        from_catalog(271, 1, &[Arg::Str(column)])
+    }
+
     /// Error 8121, severity 16, state 1
     /// (`SELECT a FROM dbo.t2 GROUP BY a HAVING b > 1;`): a `HAVING` names a column that
     /// is neither grouped nor aggregated.
@@ -3605,6 +3618,7 @@ mod tests {
             SqlError::cannot_add_column_to_non_empty_table("b", "notempty"),
             SqlError::identity_insert_requires_column_list("dbo.ident"),
             SqlError::cannot_update_identity_column("id"),
+            SqlError::cannot_update_computed_column("c"),
             SqlError::column_invalid_in_having("dbo.t2", "b"),
             SqlError::column_count_does_not_match_table(),
             SqlError::identity_insert_is_off("ident"),
@@ -5846,6 +5860,25 @@ mod tests {
         states.sort_unstable();
         states.dedup();
         assert_eq!(states, vec![0, 1, 3, 4, 5, 6, 7]);
+    }
+
+    /// Error 271 quotes the column between double quotes, where 8102 uses single ones
+    /// (`UPDATE dbo.tc SET c = 1;` over a computed column `c`).
+    #[test]
+    fn computed_column_271_is_rendered() {
+        let error = SqlError::cannot_update_computed_column("c");
+        assert_eq!((error.number, error.severity, error.state), (271, 16, 1));
+        assert_eq!(
+            error.message,
+            "The column \"c\" cannot be modified: it is computed, or it comes out of a UNION."
+        );
+        assert_eq!(error.line, 0);
+        let identity = SqlError::cannot_update_identity_column("id");
+        assert_eq!(
+            (identity.number, identity.severity, identity.state),
+            (8102, 16, 1)
+        );
+        assert_eq!(identity.message, "Identity column 'id' cannot be updated.");
     }
 
     /// The DML, flow control, transaction and concurrency constructors, on four fields:

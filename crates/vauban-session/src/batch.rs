@@ -882,7 +882,9 @@ fn statement_line(stmt: &Statement) -> u32 {
         | Statement::DropIndex(_)
         | Statement::AlterDatabase(_)
         | Statement::Use { .. }
-        | Statement::Insert(_) => statement_span(stmt).line,
+        | Statement::Insert(_)
+        | Statement::Update(_)
+        | Statement::Delete(_) => statement_span(stmt).line,
         _ => 0,
     }
 }
@@ -1249,8 +1251,8 @@ mod tests {
         assert_eq!(statement_line(&parse("SET nocount on")[0]), 0);
     }
 
-    /// The DDL variants, `USE` and `INSERT` answer the line of their first token, like a
-    /// `SELECT`.
+    /// The DDL variants, `USE`, `INSERT`, `UPDATE` and `DELETE` answer the line of their
+    /// first token, like a `SELECT`.
     ///
     /// Each statement below starts on line 2 and spreads over line 3: a case that read the
     /// last line of the statement would answer 3, and a missing case 0, which is what the
@@ -1266,6 +1268,9 @@ mod tests {
             "SELECT 1;\nDROP INDEX ix ON\n  dbo.t;",
             "SELECT 1;\nUSE\n  d;",
             "SELECT 1;\nINSERT INTO dbo.t\n  (a) VALUES (1);",
+            "SELECT 1;\nUPDATE dbo.t\n  SET a = 1;",
+            "SELECT 1;\nDELETE FROM\n  dbo.t;",
+            "SELECT 1;\nDELETE\n  dbo.t WHERE a = 1;",
         ] {
             assert_eq!(statement_line(&parse(text)[1]), 2, "{text}");
         }
