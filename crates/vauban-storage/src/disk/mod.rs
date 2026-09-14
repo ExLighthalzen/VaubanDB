@@ -37,13 +37,14 @@ use file::DataFile;
 use heap::Heap;
 use index::DiskIndex;
 use meta::{Catalogue, IndexEntry, TableEntry};
-use page::{Lsn, PageId};
+use page::{Lsn, PageId, PageKind};
 use recover::Recovery;
 use version::{HeapTable, TableState};
 use wal::{WalHandle, WalRecordKind};
 
 use crate::{
-    DbId, IndexId, IndexShape, KeyColumn, Snapshot, TableId, TableShape, TxnId, TxnStatus,
+    DbId, IndexId, IndexShape, KeyColumn, SavepointId, Snapshot, TableId, TableShape, TxnId,
+    TxnStatus,
 };
 
 // The page header carries accessors reached from the tests alone: `flags`, `set_kind`, the pair
@@ -280,7 +281,68 @@ impl DiskStorage {
         let root = storage.control()?.meta_root;
         storage.catalogue = Mutex::new(meta::load(&storage, root)?);
         storage.recovery = recover::recover(&storage)?;
+        storage.rebuild_indexes()?;
         Ok(storage)
+    }
+
+    /// Rebuilds the B+tree of each index the catalogue names with a root of its own.
+    ///
+    /// The journal names no index page: the tree of an index comes back through the
+    /// pages that reached `data` at a checkpoint, and the pages a running transaction dirtied
+    /// are lost with its pool. The contract of the trait ("the indexes are maintained by the
+    /// implementation") lets the caller rebuild them from the versions that survive the redo,
+    /// which is what [`index::DiskIndex::create`] does at `create_index`; this pass runs
+    /// here over each index whose root the catalogue names, so a reopen that took no
+    /// checkpoint answers `seek` the way an instance that ran through to the close would
+    /// (`indexes_are_rebuilt_at_open`).
+    ///
+    /// An index that shares the tree of its clustered table ([`DiskStorage::create_index`]) is
+    /// left alone: its entries **are** the versions, and the redo brings the tree itself back.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`index::DiskIndex::create`] on a table whose pages read back damaged.
+    fn rebuild_indexes(&self) -> Result<(), InternalError> {
+        let entries: Vec<IndexEntry> = {
+            let catalogue = self.lock_catalogue()?;
+            catalogue.all_indexes().into_iter().cloned().collect()
+        };
+        for entry in entries {
+            let Some(old_root) = entry.root else {
+                continue;
+            };
+            // Free the tree the crashed instance left behind, unless the root reads back as
+            // a free page — the pages the pool held when the process ended did not reach `data`, and
+            // `allocate` already gave them back. Freeing a free page would list it twice.
+            let kind = {
+                let pin = self.pool.pin(old_root)?;
+                let k = pin.with_page(|page| page.kind())?;
+                drop(pin);
+                k?
+            };
+            if kind != PageKind::Free {
+                index::free_tree(self, old_root)?;
+            }
+            let new_root = self
+                .with_rows(entry.table, |store| {
+                    let fresh =
+                        index::DiskIndex::create(self, entry.index, &entry.shape, store.source())?;
+                    Ok(fresh.root())
+                })
+                .map_err(|e: SqlError| {
+                    InternalError::Corruption(format!(
+                        "the index rebuild at the open of instance {} failed: {}",
+                        self.dir.display(),
+                        e.message
+                    ))
+                })?;
+            let mut catalogue = self.lock_catalogue()?;
+            catalogue.add_index(IndexEntry {
+                root: Some(new_root),
+                ..entry
+            });
+        }
+        Ok(())
     }
 
     /// What the recovery of this `open` found in the journal and did with it.
@@ -502,6 +564,38 @@ impl DiskStorage {
         self.dir.join(CONTROL_FILE_NAME)
     }
 
+    /// Runs `vacuum(horizon)` on each table of each database the catalogue holds.
+    ///
+    /// The catalogue locks are taken and released for each table, so two passes do not deadlock.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the tables and of the indexes.
+    pub(crate) fn vacuum(&self, horizon: TxnId) -> SqlResult<()> {
+        let catalogue = self.lock_catalogue()?;
+        let dbs: Vec<DbId> = catalogue
+            .databases()
+            .into_iter()
+            .map(|(db, _)| db)
+            .collect();
+        drop(catalogue);
+        for db in dbs {
+            let catalogue = self.lock_catalogue()?;
+            let tables: Vec<TableId> = catalogue
+                .tables_of(db)
+                .into_iter()
+                .map(|e| e.table)
+                .collect();
+            drop(catalogue);
+            for table in tables {
+                let changes: Vec<crate::disk::index::IndexChange> =
+                    self.with_rows(table, |store| store.vacuum(horizon).map_err(SqlError::from))?;
+                self.maintain_indexes(table, &changes)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The catalogue of the instance, its lock taken.
     ///
     /// The DDL methods hold this guard from the moment they read the catalogue to the moment
@@ -666,6 +760,107 @@ impl DiskStorage {
         }
         Ok(())
     }
+
+    /// Appends a [`WalRecordKind::Savepoint`] record and records the write position of `txn`
+    /// in each table it has written in, for a later [`DiskStorage::rollback_to`].
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Bug`] for a finished transaction; the errors of the journal.
+    pub(crate) fn savepoint(&self, txn: TxnId) -> SqlResult<SavepointId> {
+        let mut register = write_lock(&self.txns);
+        if register
+            .txns
+            .get(&txn)
+            .is_some_and(|r| r.status != TxnStatus::InProgress)
+        {
+            let status = register.txns[&txn].status;
+            return Err(
+                InternalError::Bug(format!("transaction {txn} is already {status:?}")).into(),
+            );
+        }
+        let id = SavepointId(register.next_savepoint_id);
+        let Some(next) = register.next_savepoint_id.checked_add(1) else {
+            return Err(InternalError::Bug("savepoint id space exhausted".to_string()).into());
+        };
+        register.next_savepoint_id = next;
+        let record = register.txns.entry(txn).or_default();
+        record.began = true;
+        let tables: Vec<TableId> = record.tables.iter().copied().collect();
+        self.wal
+            .append(WalRecordKind::Savepoint, txn, &id.0.to_le_bytes())?;
+        // Record the current writes length per table. Tables are locked one by one, so this
+        // is a best-effort snapshot: the caller must hold the per-table lock for the whole
+        // savepoint + writes + rollback_to sequence.
+        drop(register);
+        let mut marks = HashMap::new();
+        for table in tables {
+            let mark = self.with_rows(table, |store| Ok(store.writes_len(txn)))?;
+            marks.insert(table, mark);
+        }
+        let mut register = write_lock(&self.txns);
+        let record = register.txns.get_mut(&txn).ok_or_else(|| {
+            SqlError::from(InternalError::Bug(format!(
+                "transaction {txn} vanished under the lock"
+            )))
+        })?;
+        record.savepoints.push((id, marks));
+        Ok(id)
+    }
+
+    /// Appends a [`WalRecordKind::RollbackTo`] record, flushes the journal, and rolls back
+    /// the writes of `txn` after the savepoint `sp` in each table.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Bug`] for an unknown savepoint or a finished transaction; the errors
+    /// of the journal and of the undo path.
+    pub(crate) fn rollback_to(&self, txn: TxnId, sp: SavepointId) -> SqlResult<()> {
+        let (marks, pos) = {
+            let register = read_lock(&self.txns);
+            let Some(record) = register.txns.get(&txn) else {
+                return Err(InternalError::Bug(format!(
+                    "unknown transaction {txn} for savepoint {sp}"
+                ))
+                .into());
+            };
+            if record.status != TxnStatus::InProgress {
+                return Err(InternalError::Bug(format!(
+                    "transaction {txn} is already {:?}",
+                    record.status
+                ))
+                .into());
+            }
+            let found = record
+                .savepoints
+                .iter()
+                .enumerate()
+                .find(|(_, (id, _))| *id == sp)
+                .map(|(pos, (_, marks))| (marks.clone(), pos));
+            let Some((marks, pos)) = found else {
+                return Err(InternalError::Bug(format!(
+                    "savepoint {sp} is unknown, invalidated or not owned by transaction {txn}"
+                ))
+                .into());
+            };
+            (marks, pos)
+        };
+        // Append the RollbackTo record with the savepoint id, before the undo. The recovery
+        // reads this record to know which rows of the transaction the undo took away, and
+        // leaves them out of the redo.
+        self.wal
+            .append_durable(WalRecordKind::RollbackTo, txn, &sp.0.to_le_bytes())?;
+        // Rollback per table.
+        for (table, mark) in &marks {
+            self.with_rows(*table, |store| Ok(store.rollback_to_savepoint(txn, *mark)?))?;
+        }
+        // Truncate savepoints after this one.
+        let mut register = write_lock(&self.txns);
+        if let Some(record) = register.txns.get_mut(&txn) {
+            record.savepoints.truncate(pos + 1);
+        }
+        Ok(())
+    }
 }
 
 /// What one instance knows about one transaction.
@@ -677,6 +872,9 @@ struct TxnRecord {
     began: bool,
     /// The tables the transaction wrote in, which `commit` and `rollback` walk.
     tables: BTreeSet<TableId>,
+    /// The savepoints of this transaction: each entry holds its id and the write position
+    /// per table at the moment the savepoint was taken.
+    savepoints: Vec<(SavepointId, HashMap<TableId, usize>)>,
 }
 
 impl Default for TxnRecord {
@@ -686,6 +884,7 @@ impl Default for TxnRecord {
             status: TxnStatus::InProgress,
             began: false,
             tables: BTreeSet::new(),
+            savepoints: Vec::new(),
         }
     }
 }
@@ -699,6 +898,8 @@ impl Default for TxnRecord {
 pub(crate) struct TxnRegistry {
     /// What the instance knows about each transaction it has seen.
     txns: HashMap<TxnId, TxnRecord>,
+    /// The next savepoint id to hand out.
+    pub(crate) next_savepoint_id: u64,
 }
 
 /// The read guard of `lock`, taking the contents back from a thread that panicked while it
@@ -1470,8 +1671,7 @@ mod tests {
     use super::wal::{CheckpointPayload, WalRecord, WalRecordKind};
     use super::*;
     use crate::{
-        Direction, KeyColumn, KeyRange, Row, RowId, SavepointId, Storage, TableId, TableShape,
-        TxnId, TxnStatus,
+        Direction, KeyColumn, KeyRange, Row, RowId, Storage, TableId, TableShape, TxnId, TxnStatus,
     };
 
     /// Size in bytes of a file of the instance.
@@ -2519,15 +2719,9 @@ mod tests {
                     );
                 }
                 storage.commit(TxnId(1)).expect("commit");
-                if clustered {
-                    // The rows of a clustered table live in a B+tree, which the redo of the
-                    // journal does not replay (`recover::redo`): the checkpoint is what puts
-                    // its pages in `data`
-                    // (`a_clustered_table_reopened_without_a_checkpoint_is_corruption`). A heap
-                    // comes back from the journal, which the half of this loop that takes no
-                    // checkpoint asserts.
-                    storage.checkpoint().expect("checkpoint");
-                }
+                // No checkpoint either: the clustered tree is now replayed
+                // (`a_clustered_table_reopened_without_a_checkpoint_is_redone`): the two halves
+                // of this loop both come back from the journal.
                 (table, ids)
             };
 
@@ -2974,7 +3168,7 @@ mod tests {
     }
 
     #[test]
-    fn a_clustered_table_reopened_without_a_checkpoint_is_corruption() {
+    fn a_clustered_table_reopened_without_a_checkpoint_is_redone() {
         let dir = TempDir::created("trait-reopen-no-checkpoint");
         let (heap, clustered, id) = {
             let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
@@ -2995,7 +3189,9 @@ mod tests {
             (heap, clustered, id)
         };
 
-        // No checkpoint: what `recover::redo` replays is the rows of a heap.
+        // No checkpoint: the rows of the heap and of the clustered table come back from the
+        // journal, and the tree of the clustered table is replayed on the pages
+        // [`ClusteredTable::redo_open`] formats as empty leaves.
         let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
         let rows: Vec<_> = storage
             .scan(&settled(9), heap)
@@ -3003,19 +3199,20 @@ mod tests {
             .collect::<SqlResult<Vec<_>>>()
             .expect("the rows of the heap");
         assert_eq!(rows.len(), 1, "the heap comes back from the journal");
-        // The tree of the clustered table did not reach `data`: its root reads back as the
-        // free page the allocator left there, and the scan says so rather than answering an
-        // empty table. Replaying a tree is not implemented yet.
-        let Err(err) = storage.scan(&settled(9), clustered) else {
-            panic!("the tree of the clustered table is not in `data`");
-        };
-        assert_eq!(err.number, 50000, "{}", err.message);
-        assert!(err.message.contains("B+tree"), "{}", err.message);
-        assert!(err.message.contains("Free page"), "{}", err.message);
-        let err = storage
-            .get(&settled(9), clustered, id)
-            .expect_err("the same page, through `get`");
-        assert!(err.message.contains("B+tree"), "{}", err.message);
+        let rows: Vec<_> = storage
+            .scan(&settled(9), clustered)
+            .expect("scan the clustered table")
+            .collect::<SqlResult<Vec<_>>>()
+            .expect("the rows of the clustered table");
+        assert_eq!(
+            rows,
+            vec![(id, pair(7, 11))],
+            "the tree is replayed from the journal"
+        );
+        assert_eq!(
+            storage.get(&settled(9), clustered, id).expect("get"),
+            Some(pair(7, 11))
+        );
         drop(storage);
         drop(dir);
     }
@@ -3080,18 +3277,232 @@ mod tests {
     }
 
     #[test]
-    fn savepoint_rollback_to_and_vacuum_are_not_implemented_on_disk() {
-        let (dir, storage) = empty_instance("trait-not-implemented");
-        for err in [
-            storage.savepoint(TxnId(1)).expect_err("savepoint"),
+    fn savepoint_rollback_to_partial() {
+        let dir = TempDir::created("trait-savepoint");
+        let (db, table, first_two) = {
+            let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+            let db = storage.create_database("a").expect("create the database");
+            let table = storage
+                .create_table(db, &two_ints(false))
+                .expect("create the table");
+            let a = storage
+                .insert(TxnId(1), table, &pair(1, 1))
+                .expect("insert a");
+            let b = storage
+                .insert(TxnId(1), table, &pair(2, 2))
+                .expect("insert b");
+            let sp = storage.savepoint(TxnId(1)).expect("savepoint");
+            let c = storage
+                .insert(TxnId(1), table, &pair(3, 3))
+                .expect("insert c");
+            assert_eq!(c, RowId(3));
             storage
-                .rollback_to(TxnId(1), SavepointId(1))
-                .expect_err("rollback_to"),
-            storage.vacuum(TxnId(1)).expect_err("vacuum"),
-        ] {
-            assert_eq!(err.number, 50000, "{}", err.message);
-            assert!(err.message.contains("not implemented"), "{}", err.message);
-        }
+                .rollback_to(TxnId(1), sp)
+                .expect("rollback to savepoint");
+            storage.commit(TxnId(1)).expect("commit");
+            (db, table, vec![a, b])
+        };
+        let _ = db;
+
+        let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+        let rows: Vec<_> = storage
+            .scan(&settled(9), table)
+            .expect("scan")
+            .collect::<SqlResult<Vec<_>>>()
+            .expect("the rows");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], (first_two[0], pair(1, 1)));
+        assert_eq!(rows[1], (first_two[1], pair(2, 2)));
+        assert!(
+            storage
+                .wal
+                .records()
+                .expect("journal")
+                .iter()
+                .any(|r| r.kind == WalRecordKind::Savepoint),
+            "the savepoint is journalled"
+        );
+        assert!(
+            storage
+                .wal
+                .records()
+                .expect("journal")
+                .iter()
+                .any(|r| r.kind == WalRecordKind::RollbackTo),
+            "the rollback to savepoint is journalled"
+        );
+        drop(storage);
+        drop(dir);
+    }
+
+    #[test]
+    fn vacuum_removes_dead_keeps_horizon() {
+        let (dir, storage) = empty_instance("trait-vacuum-heap");
+        let db = storage.create_database("a").expect("database");
+        let table = storage.create_table(db, &two_ints(false)).expect("table");
+        let a = storage.insert(TxnId(1), table, &pair(1, 1)).expect("a");
+        let b = storage.insert(TxnId(1), table, &pair(2, 2)).expect("b");
+        storage.commit(TxnId(1)).expect("commit 1");
+        storage.delete(TxnId(2), table, a).expect("delete a");
+        storage.commit(TxnId(2)).expect("commit 2");
+        // A snapshot taken while TxnId(3) still runs: `xmax` does not settle 3, `active`
+        // holds it, so 3's own write of b is not visible to it.
+        let held = Snapshot {
+            xmin: TxnId(1),
+            xmax: TxnId(4),
+            active: vec![TxnId(3)],
+            own: TxnId(2),
+        };
+        storage
+            .update(TxnId(3), table, b, &pair(20, 2))
+            .expect("update b");
+        storage.commit(TxnId(3)).expect("commit 3");
+
+        storage.vacuum(TxnId(3)).expect("vacuum at horizon 3");
+        assert_eq!(
+            storage.get(&held, table, b).expect("old b visible"),
+            Some(pair(2, 2)),
+            "the version a snapshot still holds is kept"
+        );
+        storage.vacuum(TxnId(4)).expect("vacuum at horizon 4");
+        assert_eq!(storage.get(&settled(9), table, a).expect("a gone"), None);
+        assert_eq!(
+            storage.get(&settled(9), table, b).expect("new b"),
+            Some(pair(20, 2))
+        );
+        let c = storage
+            .insert(TxnId(5), table, &pair(3, 3))
+            .expect("row ids are not reused");
+        assert_eq!(c, RowId(3));
+        drop(storage);
+        drop(dir);
+    }
+
+    #[test]
+    fn vacuum_drops_index_entries_of_dead_versions() {
+        let (dir, storage) = empty_instance("trait-vacuum-index");
+        let db = storage.create_database("a").expect("database");
+        let table = storage.create_table(db, &two_ints(false)).expect("table");
+        // Indexed on column 0, the one the update moves from 2 to 20.
+        let index = storage.create_index(table, &index_on(0)).expect("index");
+        let b = storage
+            .insert(TxnId(1), table, &pair(2, 2))
+            .expect("b at key 2");
+        storage.commit(TxnId(1)).expect("commit");
+        storage
+            .update(TxnId(2), table, b, &pair(20, 2))
+            .expect("move b to 20");
+        storage.commit(TxnId(2)).expect("commit");
+        // A snapshot taken while TxnId(2) still runs: it reads b under its old key.
+        let older = Snapshot {
+            xmin: TxnId(1),
+            xmax: TxnId(3),
+            active: vec![TxnId(2)],
+            own: TxnId(1),
+        };
+        let before: Vec<_> = storage
+            .seek(
+                &older,
+                index,
+                &KeyRange::Point(vec![vauban_types::Value::I32(2)]),
+                Direction::Forward,
+            )
+            .expect("seek the old key")
+            .collect::<SqlResult<Vec<_>>>()
+            .expect("rows");
+        assert_eq!(before, vec![(b, pair(2, 2))]);
+        storage.vacuum(TxnId(3)).expect("vacuum");
+        let after: Vec<_> = storage
+            .seek(
+                &settled(9),
+                index,
+                &KeyRange::Point(vec![vauban_types::Value::I32(2)]),
+                Direction::Forward,
+            )
+            .expect("seek")
+            .collect::<SqlResult<Vec<_>>>()
+            .expect("rows");
+        assert!(
+            after.is_empty(),
+            "the index lost the dead version: {after:?}"
+        );
+        drop(storage);
+        drop(dir);
+    }
+
+    #[test]
+    fn indexes_are_rebuilt_at_open() {
+        let dir = TempDir::created("trait-index-reopen");
+        let (table, index, ids) = {
+            let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+            let db = storage.create_database("a").expect("database");
+            let table = storage.create_table(db, &two_ints(false)).expect("table");
+            let index = storage.create_index(table, &index_on(0)).expect("index");
+            let mut ids = Vec::new();
+            for key in [1i32, 2, 3] {
+                ids.push(
+                    storage
+                        .insert(TxnId(1), table, &pair(key, 0))
+                        .expect("insert"),
+                );
+            }
+            storage.commit(TxnId(1)).expect("commit");
+            (table, index, ids)
+        };
+        let _ = table;
+        // No checkpoint: the tree pages of the index stayed in the pool and are gone; the row
+        // pages themselves come back from the heap and the journal.
+        let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+        let rows: Vec<_> = storage
+            .seek(
+                &settled(9),
+                index,
+                &KeyRange::Point(vec![vauban_types::Value::I32(2)]),
+                Direction::Forward,
+            )
+            .expect("seek")
+            .collect::<SqlResult<Vec<_>>>()
+            .expect("the rows");
+        assert_eq!(rows, vec![(ids[1], pair(2, 0))], "the index is back");
+        drop(storage);
+        drop(dir);
+    }
+
+    #[test]
+    fn a_loser_xmax_on_data_is_cleared() {
+        let dir = TempDir::created("trait-loser-xmax");
+        let (table, id) = {
+            let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+            let db = storage.create_database("a").expect("database");
+            let table = storage.create_table(db, &two_ints(false)).expect("table");
+            let id = storage
+                .insert(TxnId(1), table, &pair(1, 1))
+                .expect("insert");
+            storage.commit(TxnId(1)).expect("commit 1");
+            // TxnId(2) deletes the row; its page is shared with a later committed write of
+            // TxnId(3) that reaches `data`, which carries the loser's `xmax`.
+            storage.delete(TxnId(2), table, id).expect("delete");
+            storage
+                .insert(TxnId(3), table, &pair(9, 9))
+                .expect("second write");
+            storage.commit(TxnId(3)).expect("commit 3");
+            storage.checkpoint().expect("checkpoint");
+            storage.rollback(TxnId(2)).expect("rollback 2");
+            // The rollback replays the undo and clears the xmax on `data`'s copy too; a build
+            // that left it there is what this test would catch through the reopen below.
+            (table, id)
+        };
+        let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+        assert_eq!(
+            storage.get(&settled(9), table, id).expect("get"),
+            Some(pair(1, 1)),
+            "the row of a rolled-back delete is back"
+        );
+        storage
+            .update(TxnId(4), table, id, &pair(2, 2))
+            .expect("update a row whose loser xmax is cleared");
+        storage.commit(TxnId(4)).expect("commit");
+        drop(storage);
         drop(dir);
     }
 

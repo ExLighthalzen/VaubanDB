@@ -1085,7 +1085,7 @@ pub(crate) fn encode_entry_key(key: &[Value], payload: &[u8]) -> Vec<u8> {
 ///
 /// Those of [`decode_row`], and [`InternalError::Corruption`] for a row whose last value is not
 /// the [`Value::Bytes`] the payload was written as.
-fn decode_entry_key(bytes: &[u8]) -> Result<(Vec<Value>, Vec<u8>), InternalError> {
+pub(crate) fn decode_entry_key(bytes: &[u8]) -> Result<(Vec<Value>, Vec<u8>), InternalError> {
     let Row(mut values) = decode_row(bytes)?;
     match values.pop() {
         Some(Value::Bytes(payload)) => Ok((values, payload)),

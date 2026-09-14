@@ -88,9 +88,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use vauban_errors::InternalError;
 
 use super::DiskStorage;
+use super::clustered::ClusteredTable;
 use super::heap::{Heap, Rid};
 use super::meta::TableEntry;
-use super::page::{PageId, PageKind};
+use super::page::{Lsn, PageId, PageKind};
 use super::version::{VERSION_PREFIX_LEN, VersionHeader};
 use super::wal::{WalRecord, WalRecordKind};
 use super::wal_payload::RowChange;
@@ -119,6 +120,9 @@ pub(crate) struct Recovery {
     pub(crate) skipped: usize,
     /// Row records of winners naming a table no [`WalRecordKind::CreateTable`] record names.
     pub(crate) unplaced: usize,
+    /// Row records of a committed transaction that an undone savepoint took back before the
+    /// commit ([`Scan::cancelled`]). The redo leaves them out.
+    pub(crate) cancelled: BTreeSet<Lsn>,
 }
 
 impl Default for Recovery {
@@ -133,6 +137,7 @@ impl Default for Recovery {
             applied: 0,
             skipped: 0,
             unplaced: 0,
+            cancelled: BTreeSet::new(),
         }
     }
 }
@@ -242,6 +247,21 @@ pub(crate) fn install_single_heap(
 /// not hold.
 pub(crate) const PLACEHOLDER_DB: DbId = DbId(0);
 
+/// The [`crate::SavepointId`] the payload of a [`WalRecordKind::Savepoint`] or a
+/// [`WalRecordKind::RollbackTo`] carries.
+fn savepoint_id(record: &WalRecord) -> Result<u64, InternalError> {
+    let bytes: [u8; 8] = record.payload[..8].try_into().map_err(|_| {
+        InternalError::Corruption(format!(
+            "the {} record at lsn {} carries {} payload bytes, fewer than the 8 of a savepoint \
+             id",
+            record.kind.as_byte(),
+            record.lsn,
+            record.payload.len()
+        ))
+    })?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 /// What the first pass read: the outcome of each transaction and the largest identifiers.
 #[derive(Debug, Default)]
 struct Scan {
@@ -255,12 +275,23 @@ struct Scan {
     max_row_id: u64,
     /// Largest version serial a row record names.
     max_seq: u64,
+    /// Row records the redo must leave out. A [`WalRecordKind::RollbackTo`] record cancels the
+    /// row records of its transaction between the [`WalRecordKind::Savepoint`] its payload
+    /// names and itself: the undo of a rollback to a savepoint writes no record of
+    /// its own; a redo that replayed the writes the savepoint protected would put back
+    /// what the running transaction had taken away.
+    cancelled: BTreeSet<Lsn>,
 }
 
 impl Scan {
     /// Reads the records once, from the first one.
     fn of(records: &[WalRecord]) -> Result<Self, InternalError> {
         let mut scan = Self::default();
+        // The savepoints the scan has seen and not yet rolled back: the id the payload
+        // names and the LSN of the record that wrote it, per transaction.
+        let mut open: BTreeMap<(TxnId, u64), Lsn> = BTreeMap::new();
+        // The LSN of the last record seen, so the range of records a rollback takes back can
+        // be looked up in the journal without a second pass.
         for record in records {
             match record.kind {
                 WalRecordKind::Commit => {
@@ -273,6 +304,21 @@ impl Scan {
                 }
                 WalRecordKind::Begin => {
                     scan.seen.insert(record.txn);
+                }
+                WalRecordKind::Savepoint => {
+                    let id = savepoint_id(record)?;
+                    open.insert((record.txn, id), record.lsn);
+                }
+                WalRecordKind::RollbackTo => {
+                    let id = savepoint_id(record)?;
+                    let Some(at) = open.remove(&(record.txn, id)) else {
+                        continue;
+                    };
+                    for r in records {
+                        if r.txn == record.txn && r.lsn > at && r.lsn < record.lsn {
+                            scan.cancelled.insert(r.lsn);
+                        }
+                    }
                 }
                 WalRecordKind::Insert | WalRecordKind::Update | WalRecordKind::Delete => {
                     scan.seen.insert(record.txn);
@@ -322,6 +368,7 @@ impl Scan {
             applied: 0,
             skipped: 0,
             unplaced: 0,
+            cancelled: self.cancelled,
         })
     }
 }
@@ -333,22 +380,18 @@ impl Scan {
 /// formatted there, so that the table reads back as the empty heap it was
 /// (`uncommitted_insert_gone_after_reopen`).
 ///
-/// # What this pass replays: the tables without a clustered key
-///
-/// A **clustered** table is left out of this pass: its versions live in a
-/// B+tree and its `first_page` is the heap its long rows overflow into, so replaying its row
-/// records here would put version records in that overflow heap, where nothing reads them.
-/// Its rows come back through the pages of its trees, which reach `data` at a checkpoint;
-/// replaying a tree from the journal, or rebuilding the trees at `open`, is not implemented.
-/// `super::tests::insert_commit_reopen_get` shows it: its clustered half takes a checkpoint
-/// where its heap half takes none.
+/// A clustered table is left out of this pass for the row redo: the pages of its tree reach
+/// `data` at a checkpoint. The recovery rebuilds the trees at the `open` by walking the
+/// versions the DDL phase installed on the catalogue: each winner record is inserted into the
+/// tree of its clustered table in a separate pass.
 fn redo(
     storage: &DiskStorage,
     records: &[WalRecord],
     recovery: &mut Recovery,
 ) -> Result<(), InternalError> {
     let winners: BTreeSet<TxnId> = recovery.winners.iter().copied().collect();
-    let mut heaps: BTreeMap<TableId, Redo<'_>> = BTreeMap::new();
+    let mut heaps: BTreeMap<TableId, RedoHeap<'_>> = BTreeMap::new();
+    let mut clustered_tables: BTreeSet<TableId> = BTreeSet::new();
     {
         let catalogue = storage.lock_catalogue()?;
         for (&table, &first_page) in &recovery.tables {
@@ -356,21 +399,31 @@ fn redo(
                 .table(table)
                 .is_some_and(|entry| entry.shape.clustered_key.is_some());
             if clustered {
+                clustered_tables.insert(table);
                 continue;
             }
-            heaps.insert(table, Redo::over(storage, table, first_page)?);
+            heaps.insert(table, RedoHeap::over(storage, table, first_page)?);
         }
     }
+    let mut clustered_changes: BTreeMap<TableId, Vec<RowChange>> = BTreeMap::new();
     for record in records {
         let kind = record.kind;
         if !matches!(
             kind,
             WalRecordKind::Insert | WalRecordKind::Update | WalRecordKind::Delete
         ) || !winners.contains(&record.txn)
+            || recovery.cancelled.contains(&record.lsn)
         {
             continue;
         }
         let change = RowChange::decode(&record.payload)?;
+        if clustered_tables.contains(&change.table) {
+            clustered_changes
+                .entry(change.table)
+                .or_default()
+                .push(change);
+            continue;
+        }
         let Some(redo) = heaps.get_mut(&change.table) else {
             recovery.unplaced += 1;
             continue;
@@ -390,6 +443,36 @@ fn redo(
             recovery.skipped += 1;
         }
     }
+    // Apply clustered records: each winner version is inserted into the tree. The roots may
+    // hold free pages when the pages a split or an insert left dirty stayed in the pool of the
+    // instance that crashed: [`ClusteredTable::redo_open`] formats them before the replay, as
+    // [`RedoHeap::over`] does for the head page of a heap.
+    for (&table, changes) in &clustered_changes {
+        let Some(&first_page) = recovery.tables.get(&table) else {
+            continue;
+        };
+        let entry = storage.lock_catalogue()?.table(table).cloned();
+        let Some(entry) = entry else {
+            continue;
+        };
+        let (Some(tree), Some(directory)) = (entry.tree_root, entry.directory_root) else {
+            continue;
+        };
+        let mut clustered = ClusteredTable::redo_open(
+            storage,
+            table,
+            first_page,
+            (tree, directory),
+            entry.shape.clone(),
+        )?;
+        for change in changes {
+            if clustered.replay_one(change)? {
+                recovery.applied += 1;
+            } else {
+                recovery.skipped += 1;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -402,7 +485,7 @@ struct Placed {
     header: VersionHeader,
 }
 
-/// The redo of one table: its heap and the versions the heap holds, by `(RowId, seq)`.
+/// The redo of one heap table: its heap and the versions the heap holds, by `(RowId, seq)`.
 ///
 /// The directory is built by walking the heap before the first record is applied and kept up to
 /// date by the redo itself, so that the heap is walked once per table rather than once per
@@ -410,14 +493,14 @@ struct Placed {
 /// the recovery; the directory [`super::version::HeapTable`] works from is rebuilt by
 /// [`super::version::HeapTable::resume_after_recovery`], which walks the heap after the redo.
 #[derive(Debug)]
-struct Redo<'storage> {
+struct RedoHeap<'storage> {
     /// The heap the versions go to.
     heap: Heap<'storage>,
     /// The versions the heap holds, by row then serial.
     versions: BTreeMap<(RowId, u64), Placed>,
 }
 
-impl<'storage> Redo<'storage> {
+impl<'storage> RedoHeap<'storage> {
     /// Attaches to the heap of `table`, formatting its head page when that page is not one.
     ///
     /// A head page whose formatting stayed in the pool of the instance that crashed reads back

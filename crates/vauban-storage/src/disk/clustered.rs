@@ -131,7 +131,7 @@ use super::btree::{BTree, MAX_INSERT_BYTES, TreeEntry, encode_entry_key};
 use super::encode::{decode_row, encode_row};
 use super::heap::{Heap, Rid};
 use super::index::IndexChange;
-use super::page::{Lsn, PageId};
+use super::page::{Lsn, PageId, PageKind};
 use super::version::{
     NO_XMAX, TableState, UndoEntry, VERSION_PREFIX_LEN, VersionHeader, VersionView,
 };
@@ -407,8 +407,92 @@ impl<'storage> ClusteredTable<'storage> {
         Self::over(storage, table, shape, tree, directory, heap)
     }
 
-    /// The table over those three structures, with counters starting at 1.
-    fn over(
+    /// The table of the redo: attaches to the two roots and the head page the catalogue names,
+    /// formatting each root as the empty leaf [`super::recover::redo`] would have found it when
+    /// the page a split or an insert left dirty stayed in the pool of the instance that
+    /// crashed. The redo replays the row records of the winners on it with
+    /// [`ClusteredTable::replay_one`] before the first call of the engine reaches the table
+    /// (`a_clustered_table_reopened_without_a_checkpoint_is_redone`).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`BTree::open`] and of [`ClusteredTable::over`] for a root that holds pages of
+    /// another kind than a free page or a B+tree page, and of [`Self::tree_key`] for a shape
+    /// without a clustered key.
+    pub(crate) fn redo_open(
+        storage: &'storage DiskStorage,
+        table: TableId,
+        first_page: PageId,
+        roots: (PageId, PageId),
+        shape: TableShape,
+    ) -> Result<Self, InternalError> {
+        let (columns, types) = Self::tree_key(&shape, table)?;
+        let tree = Self::redo_tree(storage, roots.0, &columns, &types)?;
+        let directory = Self::redo_tree(storage, roots.1, &Self::directory_key(), &[tie_type()])?;
+        let heap = Heap::open(storage, table, first_page);
+        let mut table = Self::over(storage, table, shape, tree, directory, heap)?;
+        table.rebuild_directory_from_tree()?;
+        Ok(table)
+    }
+
+    /// Rebuilds the RowId directory by walking the tree: the entry of the largest `seq` of
+    /// each row becomes its directory entry. A clustered table reopened after a crash without
+    /// a checkpoint finds its versions in `data` — the pages a commit flushed — and its
+    /// directory lost with the pool; the redo replays what the journal adds on top of it, and
+    /// `replay_one` uses the directory to tell a version already in the tree from one the
+    /// journal adds.
+    fn rebuild_directory_from_tree(&mut self) -> Result<(), InternalError> {
+        let mut newest: std::collections::BTreeMap<RowId, (u64, Vec<Value>)> =
+            std::collections::BTreeMap::new();
+        for (key, payload_bytes) in self.tree.seek(&KeyRange::Full, Direction::Forward)? {
+            let payload = VersionPayload::decode(&payload_bytes)?;
+            let entry = newest
+                .entry(payload.header.row)
+                .or_insert((payload.header.seq, key.clone()));
+            if payload.header.seq > entry.0 {
+                *entry = (payload.header.seq, key.clone());
+            }
+        }
+        for (row, (_, key)) in newest {
+            self.set_directory(row, &key)?;
+        }
+        Ok(())
+    }
+
+    /// [`BTree::open`] on `root`, after formatting it as an empty leaf when the page is
+    /// [`PageKind::Free`]: a head page whose formatting stayed in the pool of the instance that
+    /// crashed reads back as the free page [`super::alloc::allocate`] wrote, and the redo
+    /// replays the writes of the journal on it, as [`super::recover::RedoHeap::over`] does for
+    /// a heap.
+    fn redo_tree(
+        storage: &'storage DiskStorage,
+        root: PageId,
+        columns: &[KeyColumn],
+        types: &[TypeInfo],
+    ) -> Result<BTree<'storage>, InternalError> {
+        let kind = {
+            let pin = storage.pool.pin(root)?;
+            let kind = pin.with_page(|page| page.kind())?;
+            drop(pin);
+            kind
+        };
+        if kind? == PageKind::Free {
+            let pin = storage.pool.pin(root)?;
+            pin.with_page_mut(|page| {
+                super::btree::init_leaf(page);
+            })?;
+            // The pin's guard drops the page from the frame; a pin that leaves a dirty page
+            // behind would hold back an eviction. The redo writes the entries the journal
+            // names, and each write dirties the page it lands on, so the formatting reaches
+            // `data` with them.
+        }
+        BTree::open(storage, root, columns, types)
+    }
+
+    /// Opens the table over the three structures that the redo of [`super::recover`] has built or
+    /// formatted: the tree, the directory and the overflow heap. The counters start at 1 and the
+    /// registry is empty, as for a fresh table.
+    pub(crate) fn over(
         storage: &'storage DiskStorage,
         table: TableId,
         shape: TableShape,
@@ -1367,6 +1451,170 @@ impl<'storage> ClusteredTable<'storage> {
                 )),
             },
         }
+    }
+
+    /// Number of undo entries `txn` has written in this table.
+    pub(crate) fn writes_len(&self, txn: TxnId) -> usize {
+        match self.state.txns.get(&txn) {
+            Some(state) => state.writes.len(),
+            None => 0,
+        }
+    }
+
+    /// Rolls back the writes of `txn` after position `mark`.
+    ///
+    /// # Errors
+    ///
+    /// Those of the undo path.
+    pub(crate) fn rollback_to_savepoint(
+        &mut self,
+        txn: TxnId,
+        mark: usize,
+    ) -> Result<(), InternalError> {
+        let Some(state) = self.state.txns.get_mut(&txn) else {
+            return Ok(());
+        };
+        let tail: Vec<UndoEntry> = state.writes.split_off(mark);
+        for entry in tail.into_iter().rev() {
+            self.undo(txn, entry)?;
+        }
+        Ok(())
+    }
+
+    /// Replays one row record of a winner at recovery into the tree, without journal or index
+    /// maintenance. Answers whether it wrote.
+    ///
+    /// A record whose version the tree already holds — the page of an earlier redo reached
+    /// `data` — is skipped, which is what makes the replay idempotent
+    /// (`double_open_is_idempotent` on a clustered table).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`BTree::seek`] and of [`BTree::insert`] while the entry is read and written.
+    pub(crate) fn replay_one(&mut self, change: &RowChange) -> Result<bool, InternalError> {
+        let id = change.header.row;
+        let seq = change.header.seq;
+        if change.header.xmax.is_some() {
+            // A delete, or the version an update replaces: the record names the version it
+            // hides by its `seq`, and its `xmax` is what the write set. A version the tree
+            // does not hold — its insert belonging to a transaction that is not a winner —
+            // leaves nothing to hide.
+            let Some(key) = self.current_key_of(id, seq)? else {
+                return Ok(false);
+            };
+            let stored = self.entry_at(&key, id)?;
+            if stored.header.xmax.is_some() {
+                return Ok(false);
+            }
+            let mut payload = stored.parsed()?;
+            payload.header.xmax = change.header.xmax;
+            let encoded = payload.encode();
+            self.tree.delete(&key, &stored.payload)?;
+            self.tree.insert(&key, &encoded)?;
+            return Ok(true);
+        }
+        // The version a winner created. The chain link it carries is the key of the version
+        // that came before it, which the directory names when the replay is ordered — the
+        // journal hands the records in the order of their `lsn`, and a version is created
+        // after the one it replaces. A version the tree already holds — an earlier
+        // open redid it and a checkpoint put the page on `data` — is skipped, which is what
+        // makes the replay idempotent.
+        let row = decode_row(&change.columns)?;
+        let mut current = self.directory_entry(id)?;
+        while let Some(key) = current {
+            let stored = self.entry_at(&key, id)?;
+            if stored.header.seq == seq {
+                return Ok(false);
+            }
+            let payload = stored.parsed()?;
+            current = (!payload.prev.is_empty()).then_some(payload.prev);
+        }
+        let prev = self.directory_entry(id)?.unwrap_or_default();
+        let key = self.key_of(&row, id, seq)?;
+        let mut columns = Vec::new();
+        encode_row(&row, &mut columns);
+        let mut payload = VersionPayload {
+            header: change.header,
+            prev,
+            body: Body::Inline(columns.clone()),
+        };
+        let mut bytes = payload.encode();
+        if encode_entry_key(&key, &bytes).len() > MAX_INSERT_BYTES {
+            let rid = self.overflow.insert(&columns)?;
+            payload.body = Body::Overflow(rid);
+            bytes = payload.encode();
+        }
+        self.tree.insert(&key, &bytes)?;
+        self.set_directory(id, &key)?;
+        Ok(true)
+    }
+
+    /// The key of the entry of the version `(id, seq)` of this table, `None` when the tree
+    /// holds this version.
+    ///
+    /// The tree key of a version ends with its `seq` as a tie column, so a seek on the point
+    /// range of the directory's current key does not find an older version whose key the
+    /// update moved: the walk starts at the oldest entry and follows the directory's chain
+    /// back. This is what makes a delete of a version already replaced a skip rather than a
+    /// rewrite of a version that an update already replaced.
+    fn current_key_of(&self, id: RowId, seq: u64) -> Result<Option<Vec<Value>>, InternalError> {
+        let mut key = match self.directory_entry(id)? {
+            Some(key) => key,
+            None => return Ok(None),
+        };
+        loop {
+            let stored = self.entry_at(&key, id)?;
+            if stored.header.seq == seq {
+                return Ok(Some(key));
+            }
+            let payload = stored.parsed()?;
+            if payload.prev.is_empty() {
+                return Ok(None);
+            }
+            key = payload.prev;
+        }
+    }
+
+    /// Removes the versions a `vacuum` below `horizon` would discard.
+    ///
+    /// # Errors
+    ///
+    /// The errors of reading and writing the trees.
+    pub(crate) fn vacuum(&mut self, horizon: TxnId) -> Result<Vec<IndexChange>, InternalError> {
+        let status = |t| self.status(t);
+        let entries = self.tree.seek(&KeyRange::Full, Direction::Forward)?;
+        let mut to_delete = Vec::new();
+        for (key, payload_bytes) in entries {
+            let payload = VersionPayload::decode(&payload_bytes)?;
+            let discard = match payload.header.xmax {
+                Some(x) if x < horizon && status(x) == TxnStatus::Committed => true,
+                None => false,
+                _ => false,
+            } || status(payload.header.xmin) == TxnStatus::Aborted;
+            if !discard {
+                continue;
+            }
+            to_delete.push((key, payload_bytes, payload));
+        }
+        let mut removed = Vec::new();
+        for (key, payload_bytes, payload) in to_delete {
+            self.tree.delete(&key, &payload_bytes)?;
+            // The directory names the most recent version of the row, and is taken away
+            // when the dead version is the one it points at: a version an update replaced is
+            // dead while its successor is the current one, and a delete is dead and current
+            // at once (`vacuum_removes_dead_keeps_horizon`).
+            let current = self.directory_entry(payload.header.row)?;
+            if current.is_some_and(|entry| entry == key) {
+                self.remove_directory(payload.header.row)?;
+            }
+            let row = self.columns_of(&payload)?;
+            removed.push(IndexChange::Removed {
+                row: payload.header.row,
+                seq: payload.header.seq,
+                data: row,
+            });
+        }
+        Ok(removed)
     }
 }
 

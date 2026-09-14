@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 
 use super::DiskStorage;
-use super::clustered::ClusteredTable;
+pub(crate) use super::clustered::ClusteredTable;
 use super::heap::Heap;
 use super::index::{self, DiskIndex, IndexChange, VersionSource};
 use super::meta::{self, TableEntry};
@@ -186,6 +186,34 @@ impl Store<'_> {
         match self {
             Self::Heap(table) => table.into_state(),
             Self::Clustered(table) => table.into_state(),
+        }
+    }
+
+    /// Number of undo entries `txn` has written in this store.
+    pub(crate) fn writes_len(&self, txn: TxnId) -> usize {
+        match self {
+            Self::Heap(table) => table.writes_len(txn),
+            Self::Clustered(table) => table.writes_len(txn),
+        }
+    }
+
+    /// Rolls back the writes of `txn` after `mark`.
+    pub(crate) fn rollback_to_savepoint(
+        &mut self,
+        txn: TxnId,
+        mark: usize,
+    ) -> Result<(), InternalError> {
+        match self {
+            Self::Heap(table) => table.rollback_to_savepoint(txn, mark),
+            Self::Clustered(table) => table.rollback_to_savepoint(txn, mark),
+        }
+    }
+
+    /// Removes the versions a `vacuum` below `horizon` discards and answers the index changes.
+    pub(crate) fn vacuum(&mut self, horizon: TxnId) -> Result<Vec<IndexChange>, InternalError> {
+        match self {
+            Self::Heap(table) => table.vacuum(horizon),
+            Self::Clustered(table) => table.vacuum(horizon),
         }
     }
 }
@@ -436,7 +464,11 @@ impl DiskStorage {
     ///
     /// An index that shares the tree of a clustered table takes nothing: the rows **are** its
     /// entries.
-    fn maintain_indexes(&self, table: TableId, changes: &[IndexChange]) -> SqlResult<()> {
+    pub(crate) fn maintain_indexes(
+        &self,
+        table: TableId,
+        changes: &[IndexChange],
+    ) -> SqlResult<()> {
         if changes.is_empty() {
             return Ok(());
         }
@@ -672,17 +704,11 @@ impl Storage for DiskStorage {
     }
 
     fn savepoint(&self, txn: TxnId) -> SqlResult<SavepointId> {
-        Err(InternalError::Bug(format!(
-            "savepoint of transaction {txn} on an on-disk instance is not implemented yet"
-        ))
-        .into())
+        DiskStorage::savepoint(self, txn)
     }
 
     fn rollback_to(&self, txn: TxnId, sp: SavepointId) -> SqlResult<()> {
-        Err(InternalError::Bug(format!(
-            "rollback of transaction {txn} to savepoint {sp} on an on-disk instance is not implemented yet"
-        ))
-        .into())
+        DiskStorage::rollback_to(self, txn, sp)
     }
 
     fn checkpoint(&self) -> SqlResult<()> {
@@ -691,9 +717,6 @@ impl Storage for DiskStorage {
     }
 
     fn vacuum(&self, horizon: TxnId) -> SqlResult<()> {
-        Err(InternalError::Bug(format!(
-            "vacuum below horizon {horizon} on an on-disk instance is not implemented yet"
-        ))
-        .into())
+        DiskStorage::vacuum(self, horizon)
     }
 }

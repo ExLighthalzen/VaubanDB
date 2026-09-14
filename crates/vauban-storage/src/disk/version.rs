@@ -444,12 +444,51 @@ impl<'storage> HeapTable<'storage> {
         self.state.next_seq = self.state.next_seq.max(next_seq);
         self.state.resumed();
         self.storage.register_recovered(winners, losers)?;
+        self.clear_losers_xmax(losers)?;
         self.state.directory.clear();
         for version in self.stored_versions(None)? {
             if self.status(version.header.xmin) == TxnStatus::Aborted {
                 continue;
             }
             self.state.directory.insert(version.header.row, version.rid);
+        }
+        Ok(())
+    }
+
+    /// Takes back the `xmax` a losing transaction wrote on a page that reached `data`.
+    ///
+    /// A version whose `xmax` names a loser reads back as hidden by [`Snapshot::is_visible`]
+    /// — the write did not commit — but [`HeapTable::check_current`] refuses an `update` on
+    /// it as stale, because the field is set by the reader regardless of its writer's status.
+    /// The recovery
+    /// rewrites each such version with its `xmax` cleared, so the row is writable again as
+    /// soon as the instance opens (`a_loser_xmax_on_data_is_cleared`).
+    fn clear_losers_xmax(&mut self, losers: &[TxnId]) -> Result<(), InternalError> {
+        let losers: std::collections::BTreeSet<TxnId> = losers.iter().copied().collect();
+        for version in self.stored_versions(None)? {
+            let Some(x) = version.header.xmax else {
+                continue;
+            };
+            if !losers.contains(&x) {
+                continue;
+            }
+            let Some(columns) = version.bytes.get(VERSION_PREFIX_LEN..) else {
+                return Err(InternalError::Corruption(format!(
+                    "version {} of row {} of table {} is shorter than its prefix",
+                    version.header.seq,
+                    version.header.row,
+                    self.table()
+                )));
+            };
+            let header = VersionHeader {
+                xmax: None,
+                ..version.header
+            };
+            let mut patched = Vec::with_capacity(version.bytes.len());
+            header.write_to(&mut patched);
+            patched.extend_from_slice(columns);
+            self.heap.delete(version.rid)?;
+            self.heap.insert(&patched)?;
         }
         Ok(())
     }
@@ -1203,6 +1242,79 @@ impl<'storage> HeapTable<'storage> {
         }
         versions.sort_by_key(|version| (version.header.row, version.header.seq));
         Ok(versions)
+    }
+
+    /// Number of undo entries `txn` has written in this table.
+    pub(crate) fn writes_len(&self, txn: TxnId) -> usize {
+        match self.state.txns.get(&txn) {
+            Some(state) => state.writes.len(),
+            None => 0,
+        }
+    }
+
+    /// Rolls back the writes of `txn` after position `mark`, which is what
+    /// [`Storage::rollback_to`] calls on each table the transaction wrote in.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`HeapTable::undo`].
+    pub(crate) fn rollback_to_savepoint(
+        &mut self,
+        txn: TxnId,
+        mark: usize,
+    ) -> Result<(), InternalError> {
+        let Some(state) = self.state.txns.get_mut(&txn) else {
+            return Ok(());
+        };
+        let tail: Vec<UndoEntry> = state.writes.split_off(mark);
+        for entry in tail.into_iter().rev() {
+            self.undo(txn, entry)?;
+        }
+        Ok(())
+    }
+
+    /// Removes the versions a `vacuum` below `horizon` would discard and answers the index
+    /// changes the caller passes on to the index trees.
+    ///
+    /// Passes 1 and 2 of [`crate::MemoryStorage::vacuum`] — versions deleted/replaced by a
+    /// committed txn below the horizon, then versions created by an aborted txn — adapted to
+    /// the on-disk layout. Callers drop the returned entries from the indexes of the table.
+    ///
+    /// # Errors
+    ///
+    /// The errors of reading and writing the heap.
+    pub(crate) fn vacuum(&mut self, horizon: TxnId) -> Result<Vec<IndexChange>, InternalError> {
+        let status = |t| self.status(t);
+        let mut removed = Vec::new();
+        for version in self.stored_versions(None)? {
+            let discard = match version.header.xmax {
+                Some(x) if x < horizon && status(x) == TxnStatus::Committed => true,
+                None => false,
+                _ => false,
+            } || status(version.header.xmin) == TxnStatus::Aborted;
+            if !discard {
+                continue;
+            }
+            self.heap.delete(version.rid)?;
+            let row = version.row()?;
+            removed.push(IndexChange::Removed {
+                row: version.header.row,
+                seq: version.header.seq,
+                data: row,
+            });
+        }
+        if !removed.is_empty() {
+            // The directory names the most recent version of each row: a version an update
+            // replaced is dead while its successor is the current one, and a delete is dead
+            // and current at once. Rather than tell the two apart entry by entry, the
+            // directory is rebuilt from what the heap holds now, as
+            // [`HeapTable::resume_after_recovery`] rebuilds it after the redo.
+            self.state.directory.clear();
+            for version in self.stored_versions(None)? {
+                self.state.directory.insert(version.header.row, version.rid);
+            }
+        }
+        Ok(removed)
     }
 }
 

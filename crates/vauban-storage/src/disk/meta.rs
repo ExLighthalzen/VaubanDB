@@ -263,6 +263,12 @@ impl Catalogue {
             .collect()
     }
 
+    /// The indexes of the catalogue, by increasing identifier: what the rebuild at the
+    /// `open` walks ([`super::DiskStorage::rebuild_indexes`]).
+    pub(crate) fn all_indexes(&self) -> Vec<&IndexEntry> {
+        self.indexes.values().collect()
+    }
+
     /// The head of the heap of each table, by table: what the redo of [`super::recover`]
     /// attaches its heaps to.
     pub(crate) fn heap_heads(&self) -> BTreeMap<TableId, PageId> {
