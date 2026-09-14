@@ -400,12 +400,9 @@ fn an_unimplemented_form_names_itself() {
         // (`tests/bind_aggregate.rs`).
         // `SELECT 1 FROM a ORDER BY 1` and `SELECT DISTINCT c FROM a` are bound
         // (`tests/bind_sort.rs`).
-        ("SELECT 1 WHERE EXISTS (SELECT 1)", "EXISTS"),
-        ("SELECT 1 WHERE 1 IN (SELECT 1)", "IN (SELECT …)"),
-        (
-            "SELECT 1 FROM (SELECT 1 AS c) AS d",
-            "a derived table in FROM",
-        ),
+        // `SELECT 1 WHERE EXISTS (SELECT 1)` is bound (`tests/bind_subquery.rs`).
+        // `SELECT 1 WHERE 1 IN (SELECT 1)` is bound (`tests/bind_subquery.rs`).
+        // `SELECT 1 FROM (SELECT 1 AS c) AS d` is bound (`tests/bind_subquery.rs`).
         ("SELECT 1 UNION SELECT 2", "UNION, EXCEPT and INTERSECT"),
         ("SELECT 1 EXCEPT SELECT 2", "UNION, EXCEPT and INTERSECT"),
         // `INSERT INTO a (c) VALUES (1)` is bound (`tests/bind_insert.rs`).

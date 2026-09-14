@@ -839,6 +839,16 @@ const CATALOG: &[ErrorDef] = &[
         template: "Column %d of '%.*ls' has no name.",
     },
     ErrorDef {
+        number: 8158,
+        severity: 16,
+        template: "'%.*ls' has more columns than were specified in the column list.",
+    },
+    ErrorDef {
+        number: 8159,
+        severity: 16,
+        template: "'%.*ls' has fewer columns than were specified in the column list.",
+    },
+    ErrorDef {
         number: 8168,
         severity: 16,
         template: "The name '%.*ls' is used more than once for a constraint, column, index or trigger here; names have to be unique.",
@@ -1075,6 +1085,8 @@ mod tests {
         (8153, 10, &[]),
         (8154, 15, &["%.*ls"]),
         (8155, 15, &["%d", "%.*ls"]),
+        (8158, 16, &["%.*ls"]),
+        (8159, 16, &["%.*ls"]),
         (8168, 16, &["%.*ls"]),
         (8169, 16, &[]),
         (8170, 16, &[]),

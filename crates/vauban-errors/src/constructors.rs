@@ -3517,6 +3517,26 @@ impl SqlError {
     pub fn cannot_open_login_database(requested: &str, default_database: &str) -> Self {
         from_catalog(4063, 1, &[Arg::Str(requested), Arg::Str(default_database)])
     }
+
+    /// Error 8158, severity 16, state 1 (`SELECT 1 FROM (SELECT 1 AS c, 2 AS d) AS t(x);`):
+    /// a derived table has more columns than its column list names.
+    ///
+    /// ```text
+    /// '%.*ls' has more columns than were specified in the column list.
+    /// ```
+    pub fn derived_table_more_columns_than_column_list(alias: &str) -> Self {
+        from_catalog(8158, 1, &[Arg::Str(alias)])
+    }
+
+    /// Error 8159, severity 16, state 1 (`SELECT 1 FROM (SELECT 1 AS c) AS t(x, y);`):
+    /// a derived table has fewer columns than its column list names.
+    ///
+    /// ```text
+    /// '%.*ls' has fewer columns than were specified in the column list.
+    /// ```
+    pub fn derived_table_fewer_columns_than_column_list(alias: &str) -> Self {
+        from_catalog(8159, 1, &[Arg::Str(alias)])
+    }
 }
 
 #[cfg(test)]

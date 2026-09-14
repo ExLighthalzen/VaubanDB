@@ -127,7 +127,8 @@ pub(crate) fn bind_from(
         TableRef::Apply { .. } => Err(not_yet(
             "bind_select: CROSS APPLY and OUTER APPLY in FROM are not implemented yet",
         )),
-        // Routed to `subquery.rs` by `query.rs`, like the join above.
+        // Routed to `subquery.rs` by `query.rs` before reaching this function; the arm is
+        // kept so that the `match` on `TableRef` stays exhaustive.
         TableRef::Derived { .. } => Err(not_yet(
             "bind_from: a derived table in FROM is not implemented yet",
         )),
@@ -708,17 +709,15 @@ mod tests {
     /// The references `bind_from` does not bind yet, each message naming the form.
     #[test]
     fn the_other_references_name_their_form() {
-        for (text, expected) in [
-            ("SELECT 1 FROM (SELECT 1 AS n) AS d", "derived table"),
-            ("SELECT 1 FROM dbo.t AS a CROSS APPLY dbo.t AS b", "APPLY"),
-        ] {
-            let error = err(text, &OneTable);
-            assert_eq!(error.number, 50000, "{text}: {}", error.message);
-            assert!(
-                error.message.contains(expected),
-                "{text}: {}",
-                error.message
-            );
-        }
+        // Derived tables are bound by `subquery.rs`; `APPLY` is still unimplemented.
+        assert!(bind_with("SELECT 1 FROM (SELECT 1 AS n) AS d", &OneTable).is_ok());
+        let (text, expected) = ("SELECT 1 FROM dbo.t AS a CROSS APPLY dbo.t AS b", "APPLY");
+        let error = err(text, &OneTable);
+        assert_eq!(error.number, 50000, "{text}: {}", error.message);
+        assert!(
+            error.message.contains(expected),
+            "{text}: {}",
+            error.message
+        );
     }
 }

@@ -731,23 +731,28 @@ fn the_references_are_re_read_in_from_order() {
     from_needs_the_catalogue(&err("SELECT 1 FROM u CROSS APPLY t (NOLOCK)"));
 }
 
-/// What the binder cannot observe yet, and says so rather than guessing: a `nom(…)`
-/// inside a subquery, an `EXISTS` or a derived table is behind a construct that is not
-/// bound yet, and answers that construct's internal error before any re-reading. SQL
-/// Server answers 215 in the three; binding them gets the re-reading for free,
-/// `bind_select` walking the `FROM`s it binds.
+/// A `FROM` under a subquery, `EXISTS` or derived table is now bound, so the re-reading
+/// of the arguments of a `FROM` reference happens before the construct is refused. SQL
+/// Server answers 215 in all three for `t (1)`.
 #[test]
 fn a_nested_from_answers_the_refusal_of_its_construct() {
-    for (text, what) in [
-        ("SELECT (SELECT 1 FROM t (1))", "scalar subquery"),
-        ("SELECT 1 WHERE EXISTS (SELECT 1 FROM t (1))", "EXISTS"),
-        ("SELECT 1 FROM (SELECT 1 FROM t (1)) AS d", "FROM"),
+    // The outer query has no FROM, so the subquery's FROM is the first that is walked.
+    for text in [
+        "SELECT (SELECT 1 FROM t (1))",
+        "SELECT 1 WHERE EXISTS (SELECT 1 FROM t (1))",
     ] {
         let error = err(text);
-        assert_eq!(error.number, 50000, "{text}");
-        assert!(error.message.contains(what), "{text}: {}", error.message);
-        assert!(!error.message.contains("215"), "{text}: {}", error.message);
+        assert_eq!(error.number, 215, "{text}: {}", error.message);
     }
+    // A derived table in the outer FROM cannot reach the inner one without a catalogue:
+    // the outer FROM itself is refused first.
+    let error = err("SELECT 1 FROM (SELECT 1 FROM t (1)) AS d");
+    assert_eq!(error.number, 50000, "{}", error.message);
+    assert!(
+        error.message.contains("FROM requires the catalog"),
+        "{}",
+        error.message
+    );
 }
 
 /// The same name and argument distinguish a table hint from a function argument.

@@ -139,8 +139,6 @@ impl Scope {
 
     /// The same scope, nested inside `parent`: the scope a correlated subquery binds
     /// against.
-    // Called by `subquery.rs` once it binds a subquery; dead until then.
-    #[allow(dead_code, reason = "no subquery is bound yet")]
     pub(crate) fn inside(self, parent: Scope) -> Self {
         Scope {
             sources: self.sources,
@@ -155,8 +153,6 @@ impl Scope {
     }
 
     /// The scope of the enclosing query, `None` at the top.
-    // Read by `subquery.rs` when a name of an inner query resolves outside it.
-    #[allow(dead_code, reason = "no subquery is bound yet")]
     pub(crate) fn parent(&self) -> Option<&Scope> {
         self.parent.as_deref()
     }
@@ -466,26 +462,39 @@ fn bind_column(column: &ColumnRef, scope: &Scope) -> SqlResult<BoundExpr> {
         }
         None => SqlError::invalid_column_name(&column.name.value).with_line(line),
     };
-    let Some(found) = lookup(
-        scope.sources(),
-        column.qualifier.as_ref(),
-        &column.name.value,
-    ) else {
-        return Err(unbound());
-    };
-    match found {
-        Lookup::One(binding) => Ok(BoundExpr {
-            ty: binding.ty.clone(),
-            kind: BoundExprKind::ColumnRef(binding.clone()),
-            line,
-        }),
-        // A qualifier that names the source and a column that does not exist is 207, on
-        // the column alone: the prefix was bound, the name was not.
-        Lookup::Absent => Err(SqlError::invalid_column_name(&column.name.value).with_line(line)),
-        Lookup::Ambiguous => {
-            Err(SqlError::ambiguous_column_name(&column.name.value).with_line(line))
-        }
+    // Walk the scope chain: try the current scope first, then its parent, and so on.
+    let mut current = Some(scope);
+    while let Some(sc) = current {
+        let Some(found) = lookup(sc.sources(), column.qualifier.as_ref(), &column.name.value)
+        else {
+            // If a qualifier was written, a failure means the source named by the
+            // qualifier does not exist in this scope: try the parent.
+            if column.qualifier.is_some() {
+                current = sc.parent();
+                continue;
+            }
+            // Without a qualifier, an absent source means the scope is empty or the
+            // column is unknown: try the parent.
+            current = sc.parent();
+            continue;
+        };
+        return match found {
+            // A qualifier that names the source and a column that does not exist is 207,
+            // on the column alone: the prefix was bound, the name was not.
+            Lookup::One(binding) => Ok(BoundExpr {
+                ty: binding.ty.clone(),
+                kind: BoundExprKind::ColumnRef(binding.clone()),
+                line,
+            }),
+            Lookup::Absent => {
+                Err(SqlError::invalid_column_name(&column.name.value).with_line(line))
+            }
+            Lookup::Ambiguous => {
+                Err(SqlError::ambiguous_column_name(&column.name.value).with_line(line))
+            }
+        };
     }
+    Err(unbound())
 }
 
 /// The parts of a qualified column reference joined by dots, as message 4104 prints them:
@@ -1604,7 +1613,7 @@ fn integer_digits(value: &Value) -> Option<u8> {
 /// The conversion is nullable when its source is, or when the pair of types may lose a
 /// value ([`implicit_conversion_may_be_null`]); it takes the collation of the target,
 /// which is the one `implicit_result_type` computed for the pair.
-fn convert_to(expr: BoundExpr, target: &TypeInfo) -> BoundExpr {
+pub(crate) fn convert_to(expr: BoundExpr, target: &TypeInfo) -> BoundExpr {
     if expr.ty.ty == target.ty {
         return expr;
     }

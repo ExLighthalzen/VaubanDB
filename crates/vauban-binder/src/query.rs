@@ -59,7 +59,8 @@ use vauban_sysfn::{FunctionKind, lookup};
 use vauban_types::{SqlType, TypeFamily, TypeInfo, Value};
 
 use crate::bound::{
-    BoundExpr, BoundExprKind, BoundProjection, BoundTop, LogicalPlan, OutputColumn, OutputSchema,
+    BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding, LogicalPlan, OutputColumn,
+    OutputSchema,
 };
 use crate::context::{BindContext, TableReferenceKind};
 use crate::errors::{line_of, statement_last_line};
@@ -100,6 +101,22 @@ use crate::{aggregate, join, setop, sort, subquery};
 /// - an internal error 50000 naming the form, for a clause of the table above that is not
 ///   bound yet, for `INTO`, `OFFSET … FETCH`, `WITH` and `FOR XML`.
 pub(crate) fn bind_select(stmt: &SelectStatement, ctx: &BindContext<'_>) -> SqlResult<LogicalPlan> {
+    bind_select_with_parent(stmt, ctx, &Scope::empty())
+}
+
+/// Binds a `SELECT` with a parent scope for correlated column resolution.
+///
+/// A subquery whose `WHERE` references a column of the enclosing query passes that
+/// enclosing scope as `parent`. The scope built for the inner query chains its parent
+/// link to it, so that a column not found in the inner sources is looked up in the
+/// outer ones.
+///
+/// The top-level entry point is [`bind_select`], which passes an empty parent.
+pub(crate) fn bind_select_with_parent(
+    stmt: &SelectStatement,
+    ctx: &BindContext<'_>,
+    parent: &Scope,
+) -> SqlResult<LogicalPlan> {
     if stmt.with.is_some() {
         return Err(not_yet(
             "bind_select: WITH (common table expressions) is not implemented yet",
@@ -116,7 +133,7 @@ pub(crate) fn bind_select(stmt: &SelectStatement, ctx: &BindContext<'_>) -> SqlR
         ));
     }
     let plan = match &stmt.body {
-        QueryBody::Select(spec) => bind_query_spec(spec, stmt, ctx)?,
+        QueryBody::Select(spec) => bind_query_spec(spec, stmt, ctx, parent)?,
         QueryBody::SetOp { .. } => setop::bind_set_op(&stmt.body, stmt, ctx)?,
         QueryBody::Nested(..) => {
             return Err(not_yet(
@@ -139,6 +156,7 @@ fn bind_query_spec(
     spec: &QuerySpec,
     stmt: &SelectStatement,
     ctx: &BindContext<'_>,
+    parent: &Scope,
 ) -> SqlResult<LogicalPlan> {
     for table_ref in &spec.from {
         check_table_arguments(table_ref, line_of(&stmt.span), ctx)?;
@@ -179,6 +197,28 @@ fn bind_query_spec(
                 ctx.database,
             ))
         }
+        // A derived table: the alias and the schema of the `Subquery` node are the
+        // columns the outer query sees.
+        (None, LogicalPlan::Subquery { alias, schema, .. }, Some(TableRef::Derived { .. })) => {
+            let columns: Vec<_> = schema
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| ColumnBinding {
+                    column: vauban_catalog::ColumnId(i as i32),
+                    index: i,
+                    name: col.name.clone(),
+                    ty: col.ty.clone(),
+                })
+                .collect();
+            Scope::over(Source::new(
+                alias,
+                None,
+                &columns,
+                ctx.default_schema,
+                ctx.database,
+            ))
+        }
         // An expanded view: `bind_from` put the plan of the definition where a `Scan` would
         // have been, and the columns of the outer query index the **output** of that plan
         // (`view.rs`, `source_columns`). Its alias is read off the reference, the plan having
@@ -195,6 +235,9 @@ fn bind_query_spec(
         },
         (None, _, None) => Scope::empty(),
     };
+    // Chain the scope to the parent, so that a subquery can reference columns of the
+    // enclosing query.
+    let scope = scope.inside(parent.clone());
     if let Some(condition) = &spec.where_ {
         // An aggregate in a `WHERE` is error 147, before the clause is bound: `aggregate.rs`
         // owns the rule and the line it is reported on.
