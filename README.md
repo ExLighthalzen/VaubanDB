@@ -1,4 +1,4 @@
-# VaubanDB
+# VaubanDB [![nightly](https://github.com/ExLighthalzen/VaubanDB/actions/workflows/nightly.yml/badge.svg)](https://github.com/ExLighthalzen/VaubanDB/actions/workflows/nightly.yml)
 
 **A SQL Server-compatible database server, built for containers.**
 
