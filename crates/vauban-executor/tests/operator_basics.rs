@@ -20,10 +20,8 @@ use vauban_executor::{
     CancelToken, CollectSink, ExecContext, ExecOutcome, Operator, Row, RowSink, build_operator,
     execute, ops::limit::Limit,
 };
-use vauban_planner::{KeyRangeExpr, PhysicalJoinKind, PhysicalPlan, PhysicalStatement};
-use vauban_storage::{
-    Direction, IndexId, MemoryStorage, Row as StorageRow, Snapshot, Storage, TableId, TableShape,
-};
+use vauban_planner::{PhysicalJoinKind, PhysicalPlan, PhysicalStatement};
+use vauban_storage::{MemoryStorage, Row as StorageRow, Snapshot, Storage, TableId, TableShape};
 use vauban_sysfn::StaticContext;
 use vauban_txn::{IsolationLevel, TransactionManager};
 use vauban_types::{BinaryOp, SqlType, TypeInfo, Value};
@@ -463,7 +461,7 @@ fn limit_stops_early() {
 #[test]
 fn unserved_variant_is_a_bug() {
     let input = || Box::new(values(&[1]));
-    let unserved: [(&str, PhysicalPlan); 4] = [
+    let unserved: [(&str, PhysicalPlan); 3] = [
         (
             "HashJoin",
             PhysicalPlan::HashJoin {
@@ -473,16 +471,6 @@ fn unserved_variant_is_a_bug() {
                 keys: vec![(col(0), col(0))],
                 residual: None,
                 schema: schema_of(&["v", "v"]),
-            },
-        ),
-        (
-            "IndexSeek",
-            PhysicalPlan::IndexSeek {
-                index: IndexId(1),
-                range: KeyRangeExpr::Full,
-                columns: vec![binding(0)],
-                direction: Direction::Forward,
-                schema: schema_of(&["c0"]),
             },
         ),
         (
