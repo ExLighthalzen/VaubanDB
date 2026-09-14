@@ -64,9 +64,9 @@
 //! # The hint words of a source
 //!
 //! A source written with a hint list, `FROM a (NOLOCK) JOIN b WITH (NOLOCK) ON …`, is
-//! bound by the same `names::bind_from` a single-table `FROM` goes through: the words are
-//! accepted there and the `Scan` carries [`LockHints::default`](crate::LockHints::default)
-//! until `hints.rs` reads them (`a_hint_word_on_either_side_binds`).
+//! bound by the same `names::bind_from` a single-table `FROM` goes through: `hints.rs`
+//! reads the words there, and each `Scan` carries its own
+//! [`LockHints`](crate::LockHints) (`a_hint_word_on_either_side_binds`).
 
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{Expr, JoinKind as WrittenJoinKind, TableRef};

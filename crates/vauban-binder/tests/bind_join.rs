@@ -697,7 +697,7 @@ fn a_cross_join_with_an_on_and_a_join_without_one_are_syntax_errors() {
 }
 
 /// A hint word glued to a name, and a `WITH (…)` list, are accepted on either side of a
-/// join as they are on a single-table `FROM`; the `Scan` carries no hint yet.
+/// join as they are on a single-table `FROM`; each `Scan` carries the hint of its side.
 #[test]
 fn a_hint_word_on_either_side_binds() {
     for text in [
@@ -714,7 +714,14 @@ fn a_hint_word_on_either_side_binds() {
             let LogicalPlan::Scan { hints, .. } = side else {
                 panic!("{text}: not a Scan: {side:?}");
             };
-            assert_eq!(*hints, vauban_binder::LockHints::default(), "{text}");
+            assert_eq!(
+                *hints,
+                vauban_binder::LockHints {
+                    nolock: true,
+                    ..vauban_binder::LockHints::default()
+                },
+                "{text}"
+            );
         }
     }
     // The errors of an argument list keep their numbers on either side: 215 for a

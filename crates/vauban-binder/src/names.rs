@@ -80,6 +80,7 @@ use vauban_parser::{Ident, ObjectName, TableRef};
 
 use crate::bound::{LockHints, LogicalPlan, OutputColumn, OutputSchema};
 use crate::context::{BindContext, ResolvedTable, ResolvedTableKind};
+use crate::hints;
 use crate::query::{bug, dotted, not_yet};
 use crate::view;
 
@@ -88,11 +89,12 @@ use crate::view;
 /// `statement_line` is the line the statement starts on, which is the one a 208 carries
 /// (module documentation). The reference has already been walked by
 /// `query::check_table_arguments`, so a `nom(…)` that reaches this function carries a lone
-/// hint word: its arguments were re-read as a hint and are dropped here, as a
-/// `WITH (NOLOCK)` written in full is (`hints.rs` gives hints their meaning).
+/// hint word: `hints.rs` reads it, as it reads a `WITH (NOLOCK)` written in full, into the
+/// `hints` of the `Scan`, before the name is resolved.
 ///
 /// # Errors
 ///
+/// - the errors of `hints::bind_hints` (1047 among them), before the name is looked up;
 /// - 208 when the name resolves to nothing, or when it has four parts;
 /// - the internal error 50000 for a reference the binder does not bind yet: a join, an
 ///   `APPLY`, a derived table, a table variable, `PIVOT`/`UNPIVOT`;
@@ -105,10 +107,20 @@ pub(crate) fn bind_from(
     ctx: &BindContext<'_>,
 ) -> SqlResult<LogicalPlan> {
     match table_ref {
-        TableRef::Table { name, alias, .. } => scan(name, alias.as_ref(), statement_line, ctx),
+        TableRef::Table {
+            name, alias, hints, ..
+        } => {
+            let hints = hints::bind_hints(hints, ctx)?;
+            scan(name, alias.as_ref(), hints, statement_line, ctx)
+        }
         // The arguments are the hint `check_table_arguments` accepted; anything else has
         // already answered 215, or the error one of them raised.
-        TableRef::Function { name, alias, .. } => scan(name, alias.as_ref(), statement_line, ctx),
+        TableRef::Function {
+            name, alias, args, ..
+        } => {
+            let hints = hints::bind_argument_hints(args, ctx)?;
+            scan(name, alias.as_ref(), hints, statement_line, ctx)
+        }
         // `query.rs` routes a join to `join.rs` before reaching this function; the arm is
         // kept so that the `match` on `TableRef` stays exhaustive.
         TableRef::Join { .. } => Err(not_yet("bind_from: a join in FROM is not implemented yet")),
@@ -149,13 +161,15 @@ pub(crate) fn bind_from(
 fn scan(
     name: &ObjectName,
     alias: Option<&Ident>,
+    hints: LockHints,
     statement_line: u32,
     ctx: &BindContext<'_>,
 ) -> SqlResult<LogicalPlan> {
     let resolved = resolve(name, ctx)?.ok_or_else(|| invalid_object_name(name, statement_line))?;
     match resolved.kind {
         // A view holds no row of its own: the plan of its definition takes the place of the
-        // `Scan` this function would have built (`view.rs`).
+        // `Scan` this function would have built (`view.rs`). The hints written on the
+        // reference were checked above and are not carried into that plan.
         ResolvedTableKind::View => view::expand(&resolved, name, ctx),
         ResolvedTableKind::Table => {
             let table = resolved.table.ok_or_else(|| {
@@ -176,9 +190,7 @@ fn scan(
                 columns: resolved.columns,
                 alias: alias_of(name, alias),
                 schema,
-                // The words of a hint list are accepted and dropped until `hints.rs` reads
-                // them (`bound/mod.rs`, `LockHints`).
-                hints: LockHints::default(),
+                hints,
             })
         }
     }
