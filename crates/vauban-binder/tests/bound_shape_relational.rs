@@ -378,7 +378,8 @@ fn error_of(text: &str) -> vauban_errors::SqlError {
 /// A form the binder does not bind yet answers the internal error 50000 naming that form
 /// and saying it is not implemented, one shape per stubbed file. A file that binds its
 /// form leaves the list: `txn_stmt.rs` binds the transaction statements and reads their
-/// bound shape in `tests/bind_txn_stmt.rs`.
+/// bound shape in `tests/bind_txn_stmt.rs`, `variables.rs` binds `DECLARE` and `SET @x`
+/// and reads theirs in `tests/bind_variables.rs`.
 ///
 /// The number is the internal 50000 of a bug, not a user-facing number: the 209, 8120,
 /// 205, 213, 137, 116 and 145 of those forms are raised once they are bound.
@@ -411,8 +412,6 @@ fn an_unimplemented_form_names_itself() {
         ("INSERT INTO a (c) VALUES (1)", "INSERT"),
         ("UPDATE a SET c = 1", "UPDATE"),
         ("DELETE FROM a", "DELETE"),
-        ("DECLARE @x int", "DECLARE"),
-        ("SET @x = 1", "SET @variable"),
         ("IF 1 = 1 SELECT 1", "IF"),
         ("WHILE 1 = 1 BREAK", "WHILE"),
         ("PRINT 'a'", "PRINT"),

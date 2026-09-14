@@ -1386,6 +1386,18 @@ impl SqlError {
         )
     }
 
+    /// Error 134, severity 15, state 1 (`DECLARE @x int; DECLARE @x int;`): a batch
+    /// declares a variable twice. `DECLARE @x int, @x int;` and a second `DECLARE` that
+    /// spells the name in another case (`@X` after `@x`) answer the same number; the name
+    /// quoted is the one of the second declaration, as written.
+    ///
+    /// ```text
+    /// The variable '@x' is already declared; a batch or a procedure declares each name once.
+    /// ```
+    pub fn variable_already_declared(name: &str) -> Self {
+        from_catalog(134, 1, &[Arg::Str(name)])
+    }
+
     /// Error 137, severity 15, state 1 (`SELECT @x = 1;`): a batch **assigns** a variable
     /// it never declared. Same number, same text and same severity as
     /// [`SqlError::must_declare_scalar_variable`], one state apart.
@@ -4619,6 +4631,18 @@ mod tests {
         assert_eq!(err.state, 1);
         assert_eq!(err.line, 3);
         assert_eq!(err.message, "Syntax error near the keyword 'FROM'.");
+    }
+
+    #[test]
+    fn variable_already_declared_is_134() {
+        let err = SqlError::variable_already_declared("@X");
+        assert_eq!(err.number, 134);
+        assert_eq!(err.severity, 15);
+        assert_eq!(err.state, 1);
+        assert_eq!(
+            err.message,
+            "The variable '@X' is already declared; a batch or a procedure declares each name once."
+        );
     }
 
     #[test]

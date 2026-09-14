@@ -408,14 +408,9 @@ fn bind_select_item(
             None => Err(qualified_wildcard(name)),
         },
         SelectItem::Expr {
-            expr:
-                Expr::Assign {
-                    target,
-                    value,
-                    span,
-                },
+            expr: Expr::Assign { target, span, .. },
             ..
-        } => Err(assignment(target, value, span, ctx)),
+        } => Err(assignment(target, span, ctx)),
         SelectItem::Expr { expr, alias, .. } => {
             let bound = bind_expr(expr, ctx, scope)?;
             let name = column_name(expr, &bound, alias.as_ref());
@@ -551,27 +546,23 @@ pub(crate) fn dotted(name: &ObjectName) -> String {
     .join(".")
 }
 
-/// The error `SELECT @x = e` raises.
+/// The error an `@x = e` written where a column is expected raises.
 ///
 /// An assignment produces **no column**: it stores a value into a variable, and the
-/// statement answers no result set. Without a variable in scope the answer is error
-/// **137** (`SELECT @x = 1;`, severity 15, **state 1**), where reading the same undeclared
-/// variable (`SELECT @x;`) answers state **2**. That state has its own constructor,
-/// `SqlError::must_declare_scalar_variable_assigned`, so nothing is retouched here: the
-/// number, the severity, the state and the message are the catalogue's.
-///
-/// A variable that *is* in scope is an internal error: binding the assignment into
-/// [`BoundStatement::SetVariable`](crate::bound::BoundStatement::SetVariable) is not
-/// implemented yet. The assigned expression is bound first all the same, so that
-/// `SELECT @x = 1 + 'a'` reports the type error the user would see.
-fn assignment(target: &str, value: &Expr, span: &Span, ctx: &BindContext<'_>) -> SqlError {
-    if let Err(error) = bind_expr(value, ctx, &Scope::empty()) {
-        return error;
-    }
+/// statement answers no result set. A `SELECT` whose own list assigns does not come here:
+/// `statement.rs` routes it to `variables.rs`. What can come here is an assignment under
+/// a set operator, `SELECT @x = 1 UNION SELECT 2;`, which answers error **141** (severity
+/// 15, state 1) once the variable is in scope, and error **137** (severity 15, **state
+/// 1**, the state of an assignment, where reading the same undeclared variable answers
+/// state 2) when it is not. That state has its own constructor,
+/// `SqlError::must_declare_scalar_variable_assigned`, so nothing is retouched here. The
+/// set operators are not bound yet, so that shape is refused before reaching this
+/// function.
+fn assignment(target: &str, span: &Span, ctx: &BindContext<'_>) -> SqlError {
     if ctx.variables.type_of(target).is_none() {
         return SqlError::must_declare_scalar_variable_assigned(target).with_line(line_of(span));
     }
-    not_implemented("SELECT @x = e, which assigns a variable").with_line(line_of(span))
+    SqlError::assignment_mixed_with_data_retrieval().with_line(line_of(span))
 }
 
 /// The words a lone bare identifier glued to a table name is re-read as: the table hints

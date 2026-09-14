@@ -29,7 +29,9 @@ use crate::insert::{bind_insert, bind_truncate};
 use crate::query::bind_select;
 use crate::txn_stmt::{bind_begin, bind_commit, bind_rollback, bind_save};
 use crate::update_delete::{bind_delete, bind_update};
-use crate::variables::{bind_declare, bind_set_variable};
+use crate::variables::{
+    bind_declare, bind_select_assignment, bind_set_variable, is_assignment_select,
+};
 
 /// Binds one statement of a batch against `ctx`.
 ///
@@ -52,6 +54,12 @@ use crate::variables::{bind_declare, bind_set_variable};
 /// decides, not the site.
 pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement> {
     match stmt {
+        // `SELECT @x = e` assigns a variable and is not a query: `variables.rs` binds it.
+        Statement::Select(select) if is_assignment_select(select) => {
+            bind_select_assignment(select, ctx)
+                .map_err(|err| at_statement(err, select.span.line))
+                .map_err(|err| on_the_statement(err, select.span.line))
+        }
         Statement::Select(select) => bind_select(select, ctx)
             .map(|plan| BoundStatement::Query(Box::new(plan)))
             // 8631 is raised deep in the descent, which does not know where the statement

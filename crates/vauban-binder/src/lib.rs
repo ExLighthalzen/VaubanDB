@@ -95,3 +95,4 @@ pub use context::{
     TableReferenceKind, VariableScope,
 };
 pub use statement::bind;
+pub use variables::BatchVariables;

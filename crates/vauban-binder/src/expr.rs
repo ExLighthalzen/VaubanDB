@@ -84,15 +84,16 @@ use crate::subquery;
 /// that an argument of a call sees the columns its enclosing select list sees
 /// (`SELECT ABS(b) FROM dbo.t` answers the row).
 ///
-/// Three places bind an expression against the **empty** scope even under a `FROM`:
+/// Two places bind an expression against the **empty** scope even under a `FROM`:
 ///
 /// - the arguments glued to a name in the `FROM` (`t (id)` answers 207 naming a column of
 ///   `t` itself);
 /// - the row count of a `TOP` (`SELECT TOP (a) b FROM dbo.t` answers **4115** on SQL
 ///   Server, which `vauban_errors` does not carry: VaubanDB answers 207 there, a
-///   deliberate difference);
-/// - the value of a `SELECT @x = e`, which answers 137 before the scope is consulted: no
-///   shape separates the two scopes there.
+///   deliberate difference).
+///
+/// The value of a `SELECT @x = e` is bound by `variables.rs`, without a `FROM`, against
+/// the batch variables alone; the form with a `FROM` is not bound yet.
 ///
 /// # The shape a join and a subquery need
 ///

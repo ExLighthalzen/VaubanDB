@@ -513,11 +513,11 @@ fn a_compilation_error_silences_the_whole_batch() {
 
 #[test]
 fn an_unsupported_statement_keeps_its_precise_binding_error() {
-    let events = run("SELECT 1; DECLARE @x int; SELECT 2");
+    let events = run("SELECT 1; DECLARE @t TABLE (a int); SELECT 2");
     let error = only_error(&events);
     assert_eq!(error.number, 50000, "{error:?}");
-    // The binder routes `DECLARE` to a stub that names the statement; the number and the
-    // silence of the batch are what this test guards.
+    // The binder refuses a table variable with an error that names the statement; the
+    // number and the silence of the batch are what this test guards.
     assert!(error.message.contains("DECLARE"), "{error:?}");
     assert!(rows(&events).is_empty(), "{events:#?}");
 }

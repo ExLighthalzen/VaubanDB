@@ -124,6 +124,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "Size %d of the %S_MSG '%.*ls' is larger than any data type allows (%d).",
     },
     ErrorDef {
+        number: 134,
+        severity: 15,
+        template: "The variable '%.*ls' is already declared; a batch or a procedure declares each name once.",
+    },
+    ErrorDef {
         number: 137,
         severity: 15,
         template: "The scalar variable \"%.*ls\" is not declared.",
@@ -856,6 +861,7 @@ mod tests {
         (117, 15, &["%S_MSG", "%.*ls", "%d"]),
         (127, 15, &[]),
         (131, 15, &["%d", "%S_MSG", "%.*ls", "%d"]),
+        (134, 15, &["%.*ls"]),
         (137, 15, &["%.*ls"]),
         (141, 15, &[]),
         (145, 15, &[]),
