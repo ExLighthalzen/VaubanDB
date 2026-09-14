@@ -42,12 +42,26 @@
 //!
 //! What that manager does **not** decide is filled in around it: the numbers 1222 and 1205
 //! and the wait-for graph (`deadlock.rs`), the two database options and the `SNAPSHOT`
-//! conflict 3960 (`snapshot_modes.rs`), the table hints and escalation (`table_lock.rs`), and
-//! the `sys.dm_tran_*` views (`info.rs`). Until the latter three are served, the
-//! [`Snapshot`](vauban_storage::Snapshot) [`TransactionManager::statement_snapshot`] hands
-//! out is rebuilt at each call for the five [`IsolationLevel`]s alike
-//! (`tests/txn_basic.rs`, `the_five_levels_are_served_as_read_committed`) and
-//! [`TransactionManager::check_write_conflict`] answers [`WriteDecision::Proceed`].
+//! conflict (`snapshot_modes.rs`), the table hints and escalation (`table_lock.rs`), and
+//! the `sys.dm_tran_*` views (`info.rs`). Until the latter two are served, the table hints
+//! `TABLOCK` and `TABLOCKX` are carried without effect and `active_sessions` is the one
+//! view.
+//!
+//! # The two database options
+//!
+//! `READ_COMMITTED_SNAPSHOT` and `ALLOW_SNAPSHOT_ISOLATION` are pushed per database by
+//! [`TransactionManager::set_versioning_options`] and read back by
+//! [`TransactionManager::versioning_options`]; both are off until pushed.
+//! [`TransactionManager::begin_in`] opens a transaction on a database and refuses
+//! `SNAPSHOT` where the second option is off, and [`TransactionManager::versioning_mode`]
+//! says which engine serves the reads of a transaction ([`VersioningMode`]). Under
+//! [`VersioningMode::StatementSnapshot`] a `READ COMMITTED` read takes no shared lock and
+//! comes back [`ReadAccess::Versioned`]; under [`VersioningMode::TxnSnapshot`] the
+//! [`Snapshot`](vauban_storage::Snapshot) is pinned by the first
+//! [`TransactionManager::statement_snapshot`] call and
+//! [`TransactionManager::check_write_conflict`] answers [`WriteDecision::Conflict`] on a
+//! row changed since (`tests/snapshot_modes.rs`). The tables of what SQL Server does and of
+//! the mode per level and option are in `snapshot_modes.rs`.
 //!
 //! The levels are a **policy** over that manager, in `isolation.rs`:
 //! [`TransactionManager::read_lock`] takes the mode a level and a [`LockIntent`] ask for and
@@ -76,7 +90,7 @@
 //! | `lock.rs` | [`LockManager`], [`LockMode`], [`LockResource`], [`LockOutcome`], [`LockWait`] |
 //! | `deadlock.rs` | wait-for graph, victim, 1222 and 1205 |
 //! | `isolation.rs` | [`LockIntent`], [`ReadAccess`], and the four methods that decide which mode a read takes and when it is released |
-//! | `snapshot_modes.rs` | `READ_COMMITTED_SNAPSHOT`, `ALLOW_SNAPSHOT_ISOLATION`, 3960 — empty |
+//! | `snapshot_modes.rs` | [`VersioningOptions`], [`VersioningMode`], [`TransactionManager::begin_in`] and the mode a read is served at under the two database options |
 //! | `table_lock.rs` | `TABLOCK`, `TABLOCKX`, `ROWLOCK`, escalation — empty |
 //! | `schema_lock.rs` | [`TransactionManager::schema_stability_lock`] and [`TransactionManager::schema_modify_lock`], and the table of who takes which |
 //! | `info.rs` | `TxnInfo` and `LockInfo` for `sys.dm_tran_*` — empty |
@@ -102,3 +116,4 @@ pub use ids::{IsolationLevel, LockTimeout, WriteDecision};
 pub use isolation::{LockIntent, ReadAccess};
 pub use lock::{LockManager, LockMode, LockOutcome, LockResource, LockWait};
 pub use manager::TransactionManager;
+pub use snapshot_modes::{VersioningMode, VersioningOptions};

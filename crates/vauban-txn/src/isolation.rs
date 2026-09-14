@@ -19,7 +19,14 @@
 //! | `ReadCommitted` | `S` | yes |
 //! | `RepeatableRead` | `S` | no, at the end of the transaction |
 //! | `Serializable` | `S` | no, at the end of the transaction |
-//! | `Snapshot` | served as `ReadCommitted` until the database options are served | yes |
+//! | `Snapshot` | `S`, given back, where `ALLOW_SNAPSHOT_ISOLATION` is off | yes |
+//!
+//! The row of `ReadCommitted` holds where `READ_COMMITTED_SNAPSHOT` is off and the row of
+//! `Snapshot` where `ALLOW_SNAPSHOT_ISOLATION` is off. Where the option is on, a read that
+//! would take an `S` takes no lock at all and comes back [`ReadAccess::Versioned`]
+//! (`snapshot_modes.rs`; `tests/snapshot_modes.rs`, `rcsi_on_does_not`,
+//! `snapshot_txn_reads_take_no_lock`); a `U` or an `X` a hint asked for is taken as below
+//! (`tests/snapshot_modes.rs`, `updlock_still_waits_under_rcsi`).
 //!
 //! `UPDLOCK` puts a `U` in place of the `S` and `XLOCK` an `X`, both held to the end of the
 //! transaction whatever the level (`tests/isolation.rs`, `updlock_is_held_to_the_end`,
@@ -96,7 +103,7 @@ use vauban_storage::{RowId, TableId, TxnId};
 
 use crate::deadlock;
 use crate::lock::{LockMode, LockOutcome, LockResource, LockWait};
-use crate::{IsolationLevel, LockTimeout, TransactionManager, TxnHandle};
+use crate::{IsolationLevel, LockTimeout, TransactionManager, TxnHandle, VersioningMode};
 
 /// What the plan asked for on one table, as the executor hands it to the manager.
 ///
@@ -142,6 +149,10 @@ pub enum ReadAccess {
     /// The row is locked by another transaction and `READPAST` asked to leave it out: the
     /// executor skips it.
     Skip,
+    /// No lock was taken and none was waited for: read the version the snapshot of the
+    /// statement shows. The answer of a read the database options serve from the row
+    /// versions (`snapshot_modes.rs`).
+    Versioned,
 }
 
 thread_local! {
@@ -204,8 +215,8 @@ fn read_mode(level: IsolationLevel, hints: &LockIntent) -> Option<LockMode> {
 /// `true` when the shared lock of a row read at `level` is given back by
 /// [`TransactionManager::end_row_read`] rather than at the end of the transaction.
 ///
-/// `Snapshot` answers here as `ReadCommitted` does (`ids.rs`); a `Snapshot` read served
-/// from the row versions comes with the database options.
+/// `Snapshot` answers here as `ReadCommitted` does (`ids.rs`): the `S` of either is taken
+/// where the database option is off, see [`TransactionManager::read_lock`].
 fn releases_at_end_of_row(level: IsolationLevel) -> bool {
     match level {
         IsolationLevel::RepeatableRead | IsolationLevel::Serializable => false,
@@ -245,10 +256,10 @@ impl TransactionManager {
     /// before the executor is reached (module documentation), so the order between the two
     /// fields decides nothing a client can reach.
     ///
-    /// This is the point the database options come back to: `READ_COMMITTED_SNAPSHOT` turns
-    /// a `ReadCommitted` answered here into a versioned read, and `ALLOW_SNAPSHOT_ISOLATION`
-    /// is what makes [`IsolationLevel::Snapshot`] a level a transaction may be opened at.
-    /// Keeping this method to that one job is why it reads no database option.
+    /// The database options are read after this method, in
+    /// [`TransactionManager::read_lock`]: `READ_COMMITTED_SNAPSHOT` turns a `ReadCommitted`
+    /// answered here into a versioned read, and `ALLOW_SNAPSHOT_ISOLATION` does the same
+    /// for `Snapshot`. Keeping this method to that one job is why it reads no option.
     #[must_use]
     pub fn effective_level(&self, txn: &TxnHandle, hints: &LockIntent) -> IsolationLevel {
         hints
@@ -263,11 +274,15 @@ impl TransactionManager {
     /// [`ReadAccess::Dirty`] when the effective level is `ReadUncommitted` and no `UPDLOCK`
     /// or `XLOCK` hint asked for a mode: no row lock, no intent lock, no wait
     /// (`tests/isolation.rs`, `read_uncommitted_does_not_block`,
-    /// `nolock_hint_overrides_the_level`). [`ReadAccess::Skip`] when `READPAST` was asked
-    /// for and the row lock was refused at once (`tests/isolation.rs`,
-    /// `readpast_skips_instead_of_waiting`). [`ReadAccess::Locked`] otherwise, with the
-    /// intent lock on the table and the row lock of the table in the module documentation
-    /// held.
+    /// `nolock_hint_overrides_the_level`). [`ReadAccess::Versioned`] when the read would
+    /// take an `S` and the database options serve the effective level from the row
+    /// versions — `ReadCommitted` under `READ_COMMITTED_SNAPSHOT`, `Snapshot` under
+    /// `ALLOW_SNAPSHOT_ISOLATION` — with the same three absences (`tests/snapshot_modes.rs`,
+    /// `rcsi_on_does_not`, `a_read_committed_hint_is_versioned_under_rcsi`).
+    /// [`ReadAccess::Skip`] when `READPAST` was asked for and the row lock was refused at
+    /// once (`tests/isolation.rs`, `readpast_skips_instead_of_waiting`).
+    /// [`ReadAccess::Locked`] otherwise, with the intent lock on the table and the row lock
+    /// of the table in the module documentation held.
     ///
     /// The `S` taken for a `ReadCommitted` read is given back by
     /// [`TransactionManager::end_row_read`]; the one taken for a `RepeatableRead` or a
@@ -302,6 +317,9 @@ impl TransactionManager {
         let Some(mode) = read_mode(level, hints) else {
             return Ok(ReadAccess::Dirty);
         };
+        if mode == LockMode::S && self.read_versioning(txn, level) != VersioningMode::Locking {
+            return Ok(ReadAccess::Versioned);
+        }
         let wait = if hints.nowait {
             LockTimeout::NoWait
         } else {
