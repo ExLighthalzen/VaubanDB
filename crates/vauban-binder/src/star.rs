@@ -37,6 +37,8 @@
 //! | `nosch.t.*`, `<current db>.nosch.t.*` | 107, the prefix printed whole |
 //! | `x.*` | 107 `'x'` |
 //! | `master.dbo.t.*` from a database that is not `master` | 107 `'master.dbo.t'` |
+//! | `sys.objects.*` over `FROM master.sys.objects`, from a database that is not `master` | 107 `'sys.objects'` — two parts are completed with the current database |
+//! | `master.sys.objects.*` over that same `FROM` | the columns |
 //! | `srv.master.dbo.t.*` | 117, the three-prefix maximum |
 //!
 //! The two three-part lines are what tells "three parts name nothing" from "the database
@@ -90,6 +92,9 @@ struct QualifiedName {
     schema: String,
     /// The object part, as written.
     name: String,
+    /// Whether `database` is the current one, which a two-part qualifier is completed with
+    /// before it is compared (`a_two_part_qualifier_is_completed_with_the_current_database`).
+    in_current_database: bool,
 }
 
 impl Source {
@@ -115,6 +120,10 @@ impl Source {
             database: part(name.database.as_ref(), database),
             schema: part(name.schema.as_ref(), default_schema),
             name: name.name.value.clone(),
+            in_current_database: name
+                .database
+                .as_ref()
+                .is_none_or(|written| written.value.eq_ignore_ascii_case(database)),
         });
         Source {
             alias: alias.to_owned(),
@@ -130,10 +139,16 @@ impl Source {
     /// difference from SQL Server on that one pair.
     ///
     /// The same rule serves a `t.*` and a `t.a`: one part is the alias, two parts are the
-    /// resolved schema and the object name, three parts add the database the source resolved
-    /// in, a fourth part names nothing. The error alone differs — 107 for a wildcard, 4104
-    /// for a column — and the shapes are in the module documentation and in `expr.rs`,
-    /// `bind_column`.
+    /// resolved schema and the object name **in the current database**, three parts add the
+    /// database the source resolved in, a fourth part names nothing. The error alone differs
+    /// — 107 for a wildcard, 4104 for a column — and the shapes are in the module
+    /// documentation and in `expr.rs`, `bind_column`.
+    ///
+    /// A two-part qualifier is completed with the current database before it is compared,
+    /// so it does not reach a source of another database: from a database that is not
+    /// `master`, `sys.objects.name` over `FROM master.sys.objects` answers 4104 and
+    /// `sys.objects.*` answers 107, where `master.sys.objects.name` and `objects.name` bind
+    /// (`a_two_part_qualifier_is_completed_with_the_current_database`).
     pub(crate) fn matches(&self, qualifier: &ObjectName) -> bool {
         if qualifier.server.is_some() {
             return false;
@@ -141,7 +156,8 @@ impl Source {
         match (&qualifier.database, &qualifier.schema, &self.qualified) {
             (None, None, _) => self.alias.eq_ignore_ascii_case(&qualifier.name.value),
             (None, Some(schema), Some(source)) => {
-                schema.value.eq_ignore_ascii_case(&source.schema)
+                source.in_current_database
+                    && schema.value.eq_ignore_ascii_case(&source.schema)
                     && qualifier.name.value.eq_ignore_ascii_case(&source.name)
             }
             (Some(database), Some(schema), Some(source)) => {
@@ -204,20 +220,104 @@ pub(crate) fn expand(source: &Source, line: u32) -> Vec<BoundProjection> {
         .collect()
 }
 
-/// Expands a `t.*` when `qualifier` names the source, and refuses it otherwise.
+/// Expands a `t.*` over the sources in scope: the columns of the one `qualifier` names.
 ///
 /// # Errors
 ///
 /// The 107 of a prefix that names no source, and the 117 of a four-part one — both built
-/// by [`qualified_wildcard`], which is what a `t.*` without a `FROM` answers.
+/// by [`qualified_wildcard`], which is what a `t.*` without a `FROM` answers, `sources`
+/// being empty then.
 pub(crate) fn expand_qualified(
-    source: &Source,
+    sources: &[Source],
     qualifier: &ObjectName,
 ) -> SqlResult<Vec<BoundProjection>> {
-    if source.matches(qualifier) {
-        return Ok(expand(source, line_of(&qualifier.span)));
+    match sources.iter().find(|source| source.matches(qualifier)) {
+        Some(source) => Ok(expand(source, line_of(&qualifier.span))),
+        None => Err(qualified_wildcard(qualifier)),
     }
-    Err(qualified_wildcard(qualifier))
+}
+
+// ---------------------------------------------------------------------------------------
+// A scope of several sources: the `FROM` of a join
+// ---------------------------------------------------------------------------------------
+//
+// Over `dbo.a (k int NOT NULL, c int NULL)` and `dbo.b (k int NOT NULL, c int NULL)`:
+//
+// | written | answer |
+// |---|---|
+// | `SELECT * FROM dbo.a JOIN dbo.b ON 1 = 1` | `k`, `c`, `k`, `c` — the sources in written order |
+// | `SELECT b.* FROM dbo.a JOIN dbo.b ON a.k = b.k` | `k`, `c` — the columns of `b` alone |
+// | `SELECT dbo.b.* FROM …` | the same two columns |
+// | `SELECT x.* FROM dbo.a JOIN dbo.b ON …` | 107 `'x'` |
+// | `SELECT c FROM dbo.a JOIN dbo.b ON …` | 209 `'c'` |
+// | `SELECT k FROM dbo.a JOIN dbo.b ON k = 1` | 209 `'k'`, raised in the `ON` |
+// | `SELECT a.c, b.c FROM dbo.a JOIN dbo.b ON …` | the two columns, the qualifier deciding |
+// | `SELECT x.c FROM dbo.a JOIN dbo.b ON …` | 4104 `"x.c"` |
+// | `SELECT e, c FROM dbo.a JOIN dbo.d ON …`, `d (k, e)` | the two columns: `c` is in one source |
+//
+// `tests/bind_join.rs` binds each of these shapes.
+
+impl Source {
+    /// The name a one-part qualifier is matched against: the alias, or the object part.
+    /// A join compares it across its sources to raise 1011 to 1013 (`join.rs`).
+    pub(crate) fn exposed_name(&self) -> &str {
+        &self.alias
+    }
+
+    /// The same source, its columns indexing the row of a `Join` whose left input is
+    /// `offset` columns wide: the index of each column moved by `offset`
+    /// (`bound/mod.rs`, [`LogicalPlan::Join`](crate::bound::LogicalPlan::Join)).
+    pub(crate) fn shifted_by(mut self, offset: usize) -> Self {
+        for column in &mut self.columns {
+            column.index = column.index.saturating_add(offset);
+        }
+        self
+    }
+
+    /// The same source on the side of an outer join that may be padded with `NULL`: each
+    /// column made nullable.
+    pub(crate) fn made_nullable(mut self) -> Self {
+        for column in &mut self.columns {
+            column.ty.nullable = true;
+        }
+        self
+    }
+}
+
+/// What a column reference reaches across the sources in scope: `None` when no source
+/// answers to its qualifier (the scope being empty, or the prefix naming nothing), and
+/// otherwise the [`Lookup`] of the name in the sources that do.
+///
+/// Without a qualifier, each source is asked, and a name two of them carry is
+/// [`Lookup::Ambiguous`]. With one, the sources it names are asked, and a name absent from
+/// them is [`Lookup::Absent`]: the prefix was bound, the name was not. `expr.rs`,
+/// `bind_column`, turns the three answers into 207, 209 and 4104.
+pub(crate) fn lookup<'a>(
+    sources: &'a [Source],
+    qualifier: Option<&ObjectName>,
+    name: &str,
+) -> Option<Lookup<'a>> {
+    let mut found = None;
+    for source in sources
+        .iter()
+        .filter(|source| qualifier.is_none_or(|qualifier| source.matches(qualifier)))
+    {
+        found = Some(match (found, source.column(name)) {
+            (None, lookup) | (Some(Lookup::Absent), lookup) => lookup,
+            (Some(kept), Lookup::Absent) => kept,
+            (Some(_), _) => Lookup::Ambiguous,
+        });
+    }
+    found
+}
+
+/// Expands a `*` over the sources in scope: the columns of each source, in the order the
+/// sources were written, each source in catalogue order ([`expand`]).
+pub(crate) fn expand_all(sources: &[Source], line: u32) -> Vec<BoundProjection> {
+    sources
+        .iter()
+        .flat_map(|source| expand(source, line))
+        .collect()
 }
 
 #[cfg(test)]
@@ -895,5 +995,58 @@ mod tests {
         let aliased = Source::new("z", None, &columns, "dbo", "master");
         assert!(aliased.qualified.is_none());
         assert_eq!(aliased.alias, "z");
+        // A name written without a database part resolves in the current one, whichever
+        // it is; a name written with one is in the current database when the two agree.
+        assert!(qualified.in_current_database);
+        let in_master = ObjectName {
+            database: Some(ident("MASTER")),
+            ..name.clone()
+        };
+        let same = Source::new("t", Some(&in_master), &columns, "dbo", "master");
+        assert!(same.qualified.expect("a name").in_current_database);
+        let elsewhere = Source::new("t", Some(&in_master), &columns, "dbo", "other");
+        assert!(!elsewhere.qualified.expect("a name").in_current_database);
+    }
+
+    /// A two-part qualifier is completed with the **current** database before it is
+    /// compared, so it does not reach a source of another database, where a three-part
+    /// qualifier and a one-part one do. Stated from a database that is not `master` over
+    /// `FROM master.dbo.t`; from `master`, the same two-part qualifier binds
+    /// (`a_two_part_qualifier_matches_the_resolved_schema`).
+    #[test]
+    fn a_two_part_qualifier_is_completed_with_the_current_database() {
+        crate::call::tests::registry();
+        let catalog = OneTable::t();
+        let bind = |text: &str| -> Result<LogicalPlan, SqlError> {
+            let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+            let ctx = BindContext {
+                text,
+                catalog: Some(&catalog),
+                database: "other",
+                default_schema: "dbo",
+                variables: &NoVariables,
+                options: SessionOptions::default(),
+            };
+            match crate::bind(&batch.statements[0], &ctx)? {
+                BoundStatement::Query(plan) => Ok(*plan),
+                other => panic!("not a query: {other:?}"),
+            }
+        };
+        for (text, number) in [
+            ("SELECT dbo.t.a FROM master.dbo.t", 4104),
+            ("SELECT DBO.T.a FROM master.dbo.t", 4104),
+            ("SELECT dbo.t.* FROM master.dbo.t", 107),
+        ] {
+            let error = bind(text).expect_err(text);
+            assert_eq!(error.number, number, "{text}: {}", error.message);
+        }
+        for text in [
+            "SELECT master.dbo.t.a FROM master.dbo.t",
+            "SELECT t.a FROM master.dbo.t",
+            "SELECT master.dbo.t.* FROM master.dbo.t",
+            "SELECT t.* FROM master.dbo.t",
+        ] {
+            assert!(bind(text).is_ok(), "{text}");
+        }
     }
 }

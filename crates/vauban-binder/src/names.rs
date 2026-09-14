@@ -543,25 +543,6 @@ mod tests {
         assert_eq!(error.message, "Unknown object name 'vauban.master.dbo.t'.");
     }
 
-    /// Two table references, written with a comma or with a `JOIN`, are the internal error
-    /// 50000: no `Join` operator is bound here.
-    #[test]
-    fn from_two_tables_is_internal_lot_4() {
-        for text in [
-            "SELECT 1 FROM dbo.t, dbo.t",
-            "SELECT 1 FROM dbo.t AS a JOIN dbo.t AS b ON 1 = 1",
-            "SELECT 1 FROM dbo.t AS a CROSS JOIN dbo.t AS b",
-        ] {
-            let error = err(text, &OneTable);
-            assert_eq!(error.number, 50000, "{text}: {}", error.message);
-            assert!(
-                error.message.contains("not implemented yet"),
-                "{text}: {}",
-                error.message
-            );
-        }
-    }
-
     /// A view holds no row of its own, so this module builds no `Scan` for it: it hands the
     /// name to `view.rs`, which expands the definition.
     ///

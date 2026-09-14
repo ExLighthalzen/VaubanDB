@@ -379,22 +379,16 @@ fn error_of(text: &str) -> vauban_errors::SqlError {
 /// and saying it is not implemented, one shape per stubbed file. A file that binds its
 /// form leaves the list: `txn_stmt.rs` binds the transaction statements and reads their
 /// bound shape in `tests/bind_txn_stmt.rs`, `variables.rs` binds `DECLARE` and `SET @x`
-/// and reads theirs in `tests/bind_variables.rs`.
+/// and reads theirs in `tests/bind_variables.rs`, `join.rs` binds the `FROM` of more than
+/// one source and reads its shape in `tests/bind_join.rs`.
 ///
 /// The number is the internal 50000 of a bug, not a user-facing number: the 209, 8120,
 /// 205, 213, 137, 116 and 145 of those forms are raised once they are bound.
 #[test]
 fn an_unimplemented_form_names_itself() {
     let shapes: &[(&str, &str)] = &[
-        ("SELECT 1 FROM a, b", "a FROM of more than one source"),
-        (
-            "SELECT 1 FROM a JOIN b ON 1 = 1",
-            "a FROM of more than one source",
-        ),
-        (
-            "SELECT 1 FROM a AS x CROSS JOIN b AS y",
-            "a FROM of more than one source",
-        ),
+        // `SELECT 1 FROM a, b` and `SELECT 1 FROM a JOIN b ON 1 = 1` are bound
+        // (`tests/bind_join.rs`).
         ("SELECT 1 FROM a GROUP BY c", "GROUP BY and HAVING"),
         ("SELECT 1 FROM a HAVING 1 = 1", "GROUP BY and HAVING"),
         ("SELECT COUNT(*) FROM a", "GROUP BY and HAVING"),

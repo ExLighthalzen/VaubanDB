@@ -73,7 +73,7 @@ use crate::context::BindContext;
 use crate::depth;
 use crate::errors::{line_at, line_of, trivia_len};
 use crate::literal::bind_literal;
-use crate::star::{Lookup, Source};
+use crate::star::{Lookup, Source, lookup};
 use crate::subquery;
 
 /// The names a bound expression may refer to besides the batch variables.
@@ -129,10 +129,7 @@ impl Scope {
         }
     }
 
-    /// The scope of a `FROM` over the sources of a join, in written order.
-    // Called by `join.rs` once it binds a join; the dispatch of `query.rs` reaches that
-    // file, not this constructor, so it is dead until then.
-    #[allow(dead_code, reason = "no join is bound yet")]
+    /// The scope of a `FROM` over the sources of a join, in written order (`join.rs`).
     pub(crate) fn over_all(sources: Vec<Source>) -> Self {
         Scope {
             sources,
@@ -151,18 +148,8 @@ impl Scope {
         }
     }
 
-    /// The single source in scope, which `query.rs` hands to the expansion of a `*`, and
-    /// `None` when the scope holds no source — or more than one.
-    pub(crate) fn source(&self) -> Option<&Source> {
-        match self.sources.as_slice() {
-            [only] => Some(only),
-            _ => None,
-        }
-    }
-
-    /// The sources in scope, in written order.
-    // Read by `join.rs` and `star.rs` once a `FROM` may hold more than one source.
-    #[allow(dead_code, reason = "no join is bound yet")]
+    /// The sources in scope, in written order: what `star.rs` resolves a column against
+    /// and expands a `*` over. Empty without a `FROM`.
     pub(crate) fn sources(&self) -> &[Source] {
         &self.sources
     }
@@ -460,10 +447,12 @@ fn contains_invalid_niladic(expr: &Expr) -> bool {
 ///    the reference — including a name reached through a qualifier that *does* name the
 ///    source, which SQL Server answers 207 to and not 4104.
 ///
-/// Error **209** is the fourth door, and no single-source text opens it: it wants two
-/// columns of one name in scope, which one table of the catalogue cannot hold (2705
-/// refuses them at creation) and which a join can. The unit test
-/// `two_columns_of_the_same_name_in_scope_are_209` builds that scope by hand.
+/// Error **209** is the fourth door: it wants two columns of one name in scope, which one
+/// table of the catalogue cannot hold (2705 refuses them at creation) and which a join
+/// does (`join.rs`; `tests/bind_join.rs`, `an_ambiguous_unqualified_column_is_209`). The
+/// unit test `two_columns_of_the_same_name_in_scope_are_209` builds that scope by hand.
+/// Over several sources, `star::lookup` asks the ones the qualifier names, or each of them
+/// when there is none.
 fn bind_column(column: &ColumnRef, scope: &Scope) -> SqlResult<BoundExpr> {
     let line = line_of(&column.span);
     if column.qualifier.is_none()
@@ -477,15 +466,14 @@ fn bind_column(column: &ColumnRef, scope: &Scope) -> SqlResult<BoundExpr> {
         }
         None => SqlError::invalid_column_name(&column.name.value).with_line(line),
     };
-    let Some(source) = scope.source() else {
+    let Some(found) = lookup(
+        scope.sources(),
+        column.qualifier.as_ref(),
+        &column.name.value,
+    ) else {
         return Err(unbound());
     };
-    if let Some(qualifier) = &column.qualifier
-        && !source.matches(qualifier)
-    {
-        return Err(unbound());
-    }
-    match source.column(&column.name.value) {
+    match found {
         Lookup::One(binding) => Ok(BoundExpr {
             ty: binding.ty.clone(),
             kind: BoundExprKind::ColumnRef(binding.clone()),

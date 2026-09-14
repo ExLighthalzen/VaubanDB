@@ -150,31 +150,40 @@ fn bind_query_spec(
         return Err(not_implemented("SELECT … INTO, which creates a table"));
     }
 
-    let mut plan = match spec.from.as_slice() {
-        [] => LogicalPlan::OneRow,
-        [TableRef::Derived { .. }] => {
-            subquery::bind_derived(&spec.from[0], line_of(&stmt.span), ctx)?
-        }
+    let (mut plan, joined) = match spec.from.as_slice() {
+        [] => (LogicalPlan::OneRow, None),
+        [TableRef::Derived { .. }] => (
+            subquery::bind_derived(&spec.from[0], line_of(&stmt.span), ctx)?,
+            None,
+        ),
         [only] if !matches!(only, TableRef::Join { .. }) => {
-            bind_from(only, line_of(&stmt.span), ctx)?
+            (bind_from(only, line_of(&stmt.span), ctx)?, None)
         }
-        from => join::bind_from(from, line_of(&stmt.span), ctx)?,
+        // `join.rs` hands back the scope with the plan: the sources of a join are not
+        // read off its root.
+        from => {
+            let (plan, scope) = join::bind_from(from, line_of(&stmt.span), ctx)?;
+            (plan, Some(scope))
+        }
     };
     // The source is read off the `Scan` while it is still the root of the plan, so that a
     // `*` written after a `WHERE` still expands (`star.rs`).
-    let scope = match (&plan, spec.from.first()) {
-        (LogicalPlan::Scan { columns, alias, .. }, Some(reference)) => Scope::over(Source::new(
-            alias,
-            written_name(reference),
-            columns,
-            ctx.default_schema,
-            ctx.database,
-        )),
+    let scope = match (joined, &plan, spec.from.first()) {
+        (Some(scope), _, _) => scope,
+        (None, LogicalPlan::Scan { columns, alias, .. }, Some(reference)) => {
+            Scope::over(Source::new(
+                alias,
+                written_name(reference),
+                columns,
+                ctx.default_schema,
+                ctx.database,
+            ))
+        }
         // An expanded view: `bind_from` put the plan of the definition where a `Scan` would
         // have been, and the columns of the outer query index the **output** of that plan
         // (`view.rs`, `source_columns`). Its alias is read off the reference, the plan having
         // no node to carry it.
-        (expanded, Some(reference)) => match reference_alias(reference) {
+        (None, expanded, Some(reference)) => match reference_alias(reference) {
             Some(alias) => Scope::over(Source::new(
                 &alias,
                 written_name(reference),
@@ -184,7 +193,7 @@ fn bind_query_spec(
             )),
             None => Scope::empty(),
         },
-        (_, None) => Scope::empty(),
+        (None, _, None) => Scope::empty(),
     };
     if let Some(condition) = &spec.where_ {
         plan = LogicalPlan::Filter {
@@ -399,14 +408,11 @@ fn bind_select_item(
     ctx: &BindContext<'_>,
 ) -> SqlResult<Vec<BoundProjection>> {
     match item {
-        SelectItem::Wildcard(span) => match scope.source() {
-            Some(source) => Ok(star::expand(source, line_of(span))),
-            None => Err(SqlError::select_star_without_from().with_line(line_of(span))),
+        SelectItem::Wildcard(span) => match scope.sources() {
+            [] => Err(SqlError::select_star_without_from().with_line(line_of(span))),
+            sources => Ok(star::expand_all(sources, line_of(span))),
         },
-        SelectItem::QualifiedWildcard(name) => match scope.source() {
-            Some(source) => star::expand_qualified(source, name),
-            None => Err(qualified_wildcard(name)),
-        },
+        SelectItem::QualifiedWildcard(name) => star::expand_qualified(scope.sources(), name),
         SelectItem::Expr {
             expr: Expr::Assign { target, span, .. },
             ..

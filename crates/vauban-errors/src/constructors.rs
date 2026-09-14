@@ -545,6 +545,13 @@ const INVALID_OBJECT_NAME_208_OTHER_TYPE_STATE: u8 = 3;
 /// over a view name that does not exist either, send severity 16 state 12.
 const CANNOT_FIND_OBJECT_1088_SEVERITY: u8 = 16;
 
+/// The severity errors 1011 and 1012 travel with, where the catalogue holds 15.
+///
+/// `SELECT 1 FROM dbo.t AS x, dbo.t AS x;` and `SELECT 1 FROM dbo.t AS x JOIN dbo.u AS x
+/// ON 1 = 1;` send 1011 with severity 16 state 1; `SELECT 1 FROM dbo.t AS u JOIN dbo.u ON
+/// 1 = 1;` sends 1012 with severity 16 state 1.
+const DUPLICATE_CORRELATION_NAME_SEVERITY: u8 = 16;
+
 /// The severity error 1013 travels with, where the catalogue holds 15.
 ///
 /// `SELECT 1 FROM dbo.t, dbo.t;`, the same pair written as a `JOIN ... ON 1 = 1`, and
@@ -3156,6 +3163,46 @@ impl SqlError {
         from_catalog(7202, 2, &[Arg::Str(server)])
     }
 
+    /// Error 1011, severity 16, state 1: two sources of one `FROM` clause carry the same
+    /// alias. `name` is the alias as written on the source that came second
+    /// (`FROM dbo.t AS x JOIN dbo.u AS X ON 1 = 1` prints `'X'`).
+    ///
+    /// The catalogue holds severity 15 and the token sent carries 16
+    /// ([`DUPLICATE_CORRELATION_NAME_SEVERITY`]).
+    ///
+    /// ```text
+    /// Correlation name 'x' is used more than once in the FROM clause.
+    /// ```
+    pub fn duplicate_correlation_name(name: &str) -> Self {
+        from_catalog_with_severity(
+            1011,
+            DUPLICATE_CORRELATION_NAME_SEVERITY,
+            1,
+            &[Arg::Str(name)],
+        )
+    }
+
+    /// Error 1012, severity 16, state 1: the alias of one source of a `FROM` clause is the
+    /// exposed name of a table of the same clause, written without an alias. `alias` is
+    /// the alias as written and `table` the name of the table as written, whichever of
+    /// the two came first (`FROM dbo.t AS u JOIN dbo.u ON 1 = 1` prints `'u'` and
+    /// `'dbo.u'`).
+    ///
+    /// The catalogue holds severity 15 and the token sent carries 16
+    /// ([`DUPLICATE_CORRELATION_NAME_SEVERITY`]).
+    ///
+    /// ```text
+    /// Correlation name 'u' is also the exposed name of table 'dbo.u'; give one of them another alias.
+    /// ```
+    pub fn correlation_name_is_a_table_name(alias: &str, table: &str) -> Self {
+        from_catalog_with_severity(
+            1012,
+            DUPLICATE_CORRELATION_NAME_SEVERITY,
+            1,
+            &[Arg::Str(alias), Arg::Str(table)],
+        )
+    }
+
     /// Error 1013, severity 16, state 1: two sources of one `FROM` clause expose the same
     /// name. The two `%.*ls` are the sources in the order the server prints them.
     ///
@@ -3499,6 +3546,8 @@ mod tests {
             SqlError::collate_on_non_string_column("int"),
             SqlError::must_declare_table_variable("@tv"),
             SqlError::linked_server_not_found("nosuchserver"),
+            SqlError::duplicate_correlation_name("x"),
+            SqlError::correlation_name_is_a_table_name("u", "dbo.u"),
             SqlError::same_exposed_names("dbo.t", "dbo.t"),
             SqlError::table_is_ambiguous("t"),
             SqlError::no_column_name_in_derived_table(2, "d"),
@@ -3637,6 +3686,10 @@ mod tests {
         (1062, 15, 16),
         // SELECT 1 WHERE 1 = (SELECT a, b FROM dbo.t2);
         (116, 16, 15),
+        // SELECT 1 FROM dbo.t AS x, dbo.t AS x;
+        (1011, 16, 15),
+        // SELECT 1 FROM dbo.t AS u JOIN dbo.u ON 1 = 1;
+        (1012, 16, 15),
         // SELECT 1 FROM dbo.t, dbo.t;
         (1013, 16, 15),
         // CREATE INDEX ix_t ON dbo.nosuch (a);
@@ -6203,6 +6256,22 @@ mod tests {
                 "Server 'nosuchserver' is not registered in sys.servers; check the name or add it with sp_addlinkedserver.".to_owned(),
             ),
             (
+                // SELECT 1 FROM dbo.t AS x, dbo.t AS x;
+                SqlError::duplicate_correlation_name("x"),
+                1011,
+                16,
+                1,
+                "Correlation name 'x' is used more than once in the FROM clause.".to_owned(),
+            ),
+            (
+                // SELECT 1 FROM dbo.t AS u JOIN dbo.u ON 1 = 1;
+                SqlError::correlation_name_is_a_table_name("u", "dbo.u"),
+                1012,
+                16,
+                1,
+                "Correlation name 'u' is also the exposed name of table 'dbo.u'; give one of them another alias.".to_owned(),
+            ),
+            (
                 // SELECT 1 FROM dbo.t, dbo.t;
                 SqlError::same_exposed_names("dbo.t", "dbo.t"),
                 1013,
@@ -6294,11 +6363,11 @@ mod tests {
             );
             assert_eq!(err.line, 0, "line of error {number}");
         }
-        assert_eq!(expected.len(), 31);
+        assert_eq!(expected.len(), 33);
         let mut numbers: Vec<u32> = expected.iter().map(|row| row.1).collect();
         numbers.sort_unstable();
         numbers.dedup();
-        assert_eq!(numbers.len(), 26);
+        assert_eq!(numbers.len(), 28);
     }
 
     /// Error 1909 sends two states, so it carries two constructors rather than a state
@@ -6422,13 +6491,19 @@ mod tests {
         }
     }
 
-    /// Five numbers whose catalogued severity is not the one the server sends; the
+    /// Seven numbers whose catalogued severity is not the one the server sends; the
     /// catalogue keeps its value and the constructors override it, as
     /// `SEVERITY_OVERRIDES` records. 1750 is the widest gap: catalogued 10, the class of
     /// an informational message, and sent 16.
     #[test]
     fn ddl_and_name_resolution_severity_overrides() {
         let overridden: &[(SqlError, u32, u8)] = &[
+            (SqlError::duplicate_correlation_name("x"), 1011, 15),
+            (
+                SqlError::correlation_name_is_a_table_name("u", "dbo.u"),
+                1012,
+                15,
+            ),
             (SqlError::same_exposed_names("dbo.t", "dbo.t"), 1013, 15),
             (SqlError::cannot_find_object_to_index("dbo.t"), 1088, 15),
             (SqlError::could_not_create_constraint_or_index(), 1750, 10),

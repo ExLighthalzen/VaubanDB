@@ -419,6 +419,16 @@ const CATALOG: &[ErrorDef] = &[
         template: "The %S_MSG '%.*ls' exceeds the numeric range (precision is limited to 38).",
     },
     ErrorDef {
+        number: 1011,
+        severity: 15,
+        template: "Correlation name '%.*ls' is used more than once in the FROM clause.",
+    },
+    ErrorDef {
+        number: 1012,
+        severity: 15,
+        template: "Correlation name '%.*ls' is also the exposed name of table '%.*ls'; give one of them another alias.",
+    },
+    ErrorDef {
         number: 1013,
         severity: 15,
         template: "\"%.*ls\" and \"%.*ls\" expose the same name in the FROM clause; give them distinct aliases.",
@@ -926,6 +936,8 @@ mod tests {
         (1001, 16, &["%d", "%d"]),
         (1002, 16, &["%d", "%d"]),
         (1007, 15, &["%S_MSG", "%.*ls"]),
+        (1011, 15, &["%.*ls"]),
+        (1012, 15, &["%.*ls", "%.*ls"]),
         (1013, 15, &["%.*ls", "%.*ls"]),
         (1014, 15, &[]),
         (1023, 15, &["%d", "%ls"]),
