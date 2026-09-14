@@ -879,6 +879,7 @@ fn statement_line(stmt: &Statement) -> u32 {
         | Statement::DropTable { .. }
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
+        | Statement::AlterDatabase(_)
         | Statement::Use { .. } => statement_span(stmt).line,
         _ => 0,
     }

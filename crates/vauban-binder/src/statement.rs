@@ -20,7 +20,8 @@ use crate::control::{
     bind_block, bind_break, bind_continue, bind_if, bind_print, bind_return, bind_while,
 };
 use crate::ddl::{
-    bind_create_database, bind_create_table, bind_drop_database, bind_drop_table, bind_use,
+    bind_alter_database, bind_create_database, bind_create_table, bind_drop_database,
+    bind_drop_table, bind_use,
 };
 use crate::ddl_index::{bind_create_index, bind_drop_index};
 use crate::depth::at_statement;
@@ -77,6 +78,7 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
         } => bind_drop_table(names, *if_exists, ctx),
         Statement::CreateIndex(create) => bind_create_index(create, ctx),
         Statement::DropIndex(drop) => bind_drop_index(drop, ctx),
+        Statement::AlterDatabase(alter) => bind_alter_database(alter, ctx),
         Statement::AlterTable(alter) => bind_alter_table(alter, ctx),
         Statement::Truncate { table, span } => bind_truncate(table, *span, ctx),
         Statement::Insert(insert) => bind_insert(insert, ctx),
@@ -424,10 +426,11 @@ mod tests {
         );
     }
 
-    /// The two `ALTER` statements parse and are not bound, and each message names the
-    /// statement. `CREATE INDEX` and `DROP INDEX` do not come through here at all —
-    /// `ddl_index.rs` binds them, and the two assertions at the end of this test are the
-    /// counter-proof of the two above.
+    /// `ALTER TABLE` parses and is not bound, and the message names the statement;
+    /// `ALTER DATABASE … SET` is bound by `ddl.rs`, which refuses an option it does not
+    /// carry by naming the option, not the statement. `CREATE INDEX` and `DROP INDEX` do not
+    /// come through here at all — `ddl_index.rs` binds them, and the two assertions at the
+    /// end of this test are the counter-proof of the two above.
     #[test]
     fn the_alter_statements_name_themselves() {
         let message = |text: &str| {
@@ -444,8 +447,7 @@ mod tests {
             message("ALTER TABLE t ADD c int;")
         );
         assert!(
-            message("ALTER DATABASE d SET READ_ONLY;")
-                .ends_with("ALTER DATABASE is not implemented yet"),
+            message("ALTER DATABASE d SET READ_ONLY;").contains("SET READ_ONLY"),
             "{}",
             message("ALTER DATABASE d SET READ_ONLY;")
         );

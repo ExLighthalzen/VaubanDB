@@ -106,7 +106,18 @@ pub(crate) fn parse_alter_database(p: &mut Parser) -> SqlResult<Statement> {
     let start = p.mark();
     p.expect_keyword(Keyword::Alter)?;
     p.expect_keyword(Keyword::Database)?;
-    let name = p.parse_ident()?;
+    // `ALTER DATABASE CURRENT` names the current database; `CURRENT` is a reserved keyword
+    // that `parse_ident` would refuse, so it is read here as the unquoted name `CURRENT`.
+    // Which database that is, the binder decides. `[CURRENT]` stays a quoted name.
+    let name = if p.at_keyword(Keyword::Current) {
+        let token = p.advance();
+        Ident {
+            value: token.text,
+            quoted: false,
+        }
+    } else {
+        p.parse_ident()?
+    };
     p.eat_keyword(Keyword::Set);
     let options = swallow_options(p, OptionSplit::Commas);
     if options.is_empty() {

@@ -1,4 +1,5 @@
-//! Binding of `CREATE`/`DROP DATABASE`, `CREATE`/`DROP TABLE` and `USE`.
+//! Binding of `CREATE`/`DROP DATABASE`, `ALTER DATABASE … SET`, `CREATE`/`DROP TABLE` and
+//! `USE`.
 //!
 //! The binder turns the AST of a DDL statement into the `*Def` the catalogue takes
 //! ([`TableDef`]) and checks what it can check without writing anything. Calling
@@ -20,10 +21,14 @@
 //! | `SELECT 1; DROP TABLE dbo.nosuchtable;` | 3701 | **1** | at execution |
 //! | `SELECT 1; DROP DATABASE nosuchdatabase;` | 3701 | **1** | at execution |
 //! | `SELECT 1; USE nosuchdatabase;` | 911 | 0 | at compilation |
+//! | `SELECT 1; ALTER DATABASE nosuchdatabase SET READ_COMMITTED_SNAPSHOT ON;` | 5011 | **1** | at execution |
 //!
 //! So the type of a column is resolved here (2715), and the existence of a table or of a
-//! database is **not** looked at for a `DROP`: the executor and the catalogue answer 3701
-//! when they cannot find it, which is where SQL Server answers it too.
+//! database is **not** looked at for a `DROP` or an `ALTER DATABASE`: the executor and the
+//! catalogue answer 3701 or 5011 when they cannot find it, which is where SQL Server answers
+//! it too. The 5011 of an `ALTER DATABASE … SET` is severity 14, state 5, on the line of the
+//! statement, and the batch goes on after it (`SELECT 2;` written after the failing
+//! statement still answers its row): a run-time error scoped to its statement.
 //!
 //! 2714 is the one deliberate difference from SQL Server: the binder refuses a
 //! `CREATE TABLE` whose name the catalogue already resolves, **before** anything is
@@ -70,9 +75,9 @@ use vauban_catalog::{
 };
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{
-    Clustering, ColumnConstraintKind, ColumnDef as AstColumnDef, CreateDatabaseStatement,
-    CreateTableStatement, DatabaseOption, ForeignKeyRef, Ident, IndexColumn, ObjectName, RefAction,
-    SortDirection, Span, TableConstraint, TableConstraintKind,
+    AlterDatabaseStatement, Clustering, ColumnConstraintKind, ColumnDef as AstColumnDef,
+    CreateDatabaseStatement, CreateTableStatement, DatabaseOption, ForeignKeyRef, Ident,
+    IndexColumn, ObjectName, RefAction, SortDirection, Span, TableConstraint, TableConstraintKind,
 };
 use vauban_types::{Collation, TypeInfo};
 
@@ -144,6 +149,280 @@ pub(crate) fn bind_use(database: &Ident) -> SqlResult<BoundStatement> {
     Ok(BoundStatement::Use {
         database: database.value.clone(),
     })
+}
+
+// -------------------------------------------------------------------------------------------
+// ALTER DATABASE … SET
+// -------------------------------------------------------------------------------------------
+
+/// The two options of `ALTER DATABASE … SET` this file binds, spelled as the bound statement
+/// carries them.
+///
+/// `READ_COMMITTED_SNAPSHOT ON` asks that each statement under `READ COMMITTED` read a
+/// snapshot instead of taking shared locks; `ALLOW_SNAPSHOT_ISOLATION ON` asks that the
+/// database keep the versions a `SNAPSHOT` transaction reads. Binding them changes nothing:
+/// switching the option in the catalogue, and what the sessions already open see of it, is
+/// the executor's job.
+const VERSIONING_OPTIONS: [&str; 2] = ["READ_COMMITTED_SNAPSHOT", "ALLOW_SNAPSHOT_ISOLATION"];
+
+/// The first word of the `SET`-less forms of `ALTER DATABASE` — `ADD FILE`, `REMOVE FILE`,
+/// `MODIFY NAME`, `COLLATE` — which the parser hands over as an option named after that
+/// word, since it does not keep the `SET` itself.
+const CLAUSES_WITHOUT_SET: [&str; 4] = ["ADD", "REMOVE", "MODIFY", "COLLATE"];
+
+/// The name the bound statement gives the termination clause, `WITH …`, when the statement
+/// writes one.
+const TERMINATION_OPTION: &str = "WITH";
+
+/// Binds `ALTER DATABASE <name | CURRENT> SET <option> { ON | OFF } [WITH <termination>]`,
+/// where `<option>` is one of the two versioning options of [`VERSIONING_OPTIONS`].
+///
+/// # The shape of the bound statement
+///
+/// [`DdlStatement::AlterDatabase`] carries the database and a list of `(name, value)` pairs.
+/// This function fills the list in a fixed shape, so that the executor reads it without
+/// re-parsing text:
+///
+/// - `name` is the database name as written and unquoted, or the current database of the
+///   context when the statement writes the bare keyword `CURRENT` (in any case:
+///   `current` binds the same). A delimited `[CURRENT]` or `"CURRENT"` is a database named
+///   `CURRENT`, which the executor will not find (`bind_alter_database::current_*` tests).
+/// - `options[0]` is `(OPTION, Some("ON" | "OFF"))`, the option name and its value both
+///   upper-cased.
+/// - `options[1]`, present when the statement writes a termination clause, is
+///   `("WITH", Some(mode))` with `mode` one of `ROLLBACK IMMEDIATE`, `ROLLBACK AFTER <n>
+///   SECONDS` (the `SECONDS` written back when the statement left it out) and `NO_WAIT`.
+///   The clause is carried for both options and refused for neither: with
+///   `ALLOW_SNAPSHOT_ISOLATION`, SQL Server refuses it while the statement runs, by 5083
+///   (severity 16, state 1), in the five spellings above, `ON` and `OFF` alike, on a
+///   database whose state the value leaves as it is; with `READ_COMMITTED_SNAPSHOT`, the
+///   same five spellings are accepted and the option is switched. That refusal belongs to
+///   the executor, next to the switch itself.
+///
+/// Whether the database exists is **not** checked here: SQL Server answers 5011 while the
+/// statement runs, with the result sets of the statements before it already sent (module
+/// header), and [`CatalogView`](crate::CatalogView) answers about tables and views, not
+/// about databases.
+///
+/// # Errors
+///
+/// - 102, severity 15, when the value or the termination clause is malformed. The state
+///   and the quoted token follow the shapes below, on a statement written on one line;
+///   the line is the statement's, where SQL Server puts the line of the quoted token:
+///
+///   | written | near | state |
+///   |---|---|:-:|
+///   | `READ_COMMITTED_SNAPSHOT MAYBE` (a bare word other than `ON` / `OFF`) | `'MAYBE'` | 6 |
+///   | `READ_COMMITTED_SNAPSHOT` (no value) | `'READ_COMMITTED_SNAPSHOT'` | 6 |
+///   | `READ_COMMITTED_SNAPSHOT = ON` | `'READ_COMMITTED_SNAPSHOT'` | 6 |
+///   | `READ_COMMITTED_SNAPSHOT 1`, `'ON'`, `[ON]` | `'1'`, `'ON'`, `'ON'` | 1 |
+///   | `READ_COMMITTED_SNAPSHOT ON foo` | `'foo'` | 1 |
+///   | `… ON WITH FOO`, `… WITH ROLLBACK AFTER x` | `'FOO'`, `'x'` | 1 |
+///   | `… ON WITH ROLLBACK AFTER 5 MINUTES` | `'MINUTES'` | 1 |
+///   | `… ON WITH ROLLBACK AFTER;` (no count) | `'AFTER'` | 1 |
+///   | `… ON WITH;`, `… ON WITH ROLLBACK;` | `';'` | 1 |
+///   | `… ON WITH ROLLBACK IMMEDIATE, ALLOW_SNAPSHOT_ISOLATION ON` | `','` | 1 |
+///
+/// - 50000, the internal error, naming what it refuses, for an option of
+///   `ALTER DATABASE … SET` other than the two above (`MULTI_USER`, `RECOVERY SIMPLE`,
+///   `COMPATIBILITY_LEVEL = 150`, an option that does not exist:
+///   `bind_alter_database::other_set_option_names_itself_and_its_version`) and for the
+///   `SET`-less clauses (`ADD FILE`, `MODIFY NAME`, `COLLATE`:
+///   `bind_alter_database::alter_database_add_file_names_v2`): the message quotes the
+///   clause as written and names the version that takes it (V2). A statement that writes a versioning option **and** another
+///   option is refused the same way, naming the other option; one that writes the two
+///   versioning options, or one of them twice, is refused naming the list (SQL Server answers
+///   5082 on the two together, while the statement runs).
+pub(crate) fn bind_alter_database(
+    stmt: &AlterDatabaseStatement,
+    ctx: &BindContext<'_>,
+) -> SqlResult<BoundStatement> {
+    let name = if !stmt.name.quoted && stmt.name.value.eq_ignore_ascii_case("CURRENT") {
+        ctx.database.to_owned()
+    } else {
+        stmt.name.value.clone()
+    };
+    let [first, ..] = stmt.options.as_slice() else {
+        // The parser refuses an `ALTER DATABASE d` that says nothing about the database.
+        return Err(SqlError::from(InternalError::Bug(
+            "bind: ALTER DATABASE without an option".to_owned(),
+        )));
+    };
+    if CLAUSES_WITHOUT_SET
+        .iter()
+        .any(|clause| first.name.eq_ignore_ascii_case(clause))
+    {
+        return Err(SqlError::from(InternalError::Bug(format!(
+            "bind: ALTER DATABASE {} is not implemented yet (V2)",
+            written_option(first)
+        ))));
+    }
+    if let Some(other) = stmt
+        .options
+        .iter()
+        .find(|option| !is_versioning_option(option))
+    {
+        return Err(SqlError::from(InternalError::Bug(format!(
+            "bind: ALTER DATABASE … SET {} is not implemented yet (V2); READ_COMMITTED_SNAPSHOT \
+             and ALLOW_SNAPSHOT_ISOLATION are the options that bind",
+            written_option(other)
+        ))));
+    }
+    // A termination clause closes the statement: an option written after it is 102 near
+    // the comma, before the list is looked at.
+    if let Some((_, rest)) = stmt.options.split_last()
+        && rest
+            .iter()
+            .any(|option| matches!(versioning_value(option), Ok((_, Some(_)))))
+    {
+        return Err(on_statement(syntax_error_near(","), &stmt.span));
+    }
+    let [option] = stmt.options.as_slice() else {
+        let list = stmt
+            .options
+            .iter()
+            .map(written_option)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(SqlError::from(InternalError::Bug(format!(
+            "bind: ALTER DATABASE … SET {list} writes several versioning options in one \
+             statement, which is not implemented yet; SQL Server answers 5082 on the two \
+             together"
+        ))));
+    };
+    let (value, termination) =
+        versioning_value(option).map_err(|err| on_statement(err, &stmt.span))?;
+    let mut options = vec![(option.name.to_ascii_uppercase(), Some(value.to_owned()))];
+    if let Some(mode) = termination {
+        options.push((TERMINATION_OPTION.to_owned(), Some(mode)));
+    }
+    Ok(BoundStatement::Ddl(DdlStatement::AlterDatabase {
+        name,
+        options,
+    }))
+}
+
+/// Whether `option` names one of the two versioning options, in any case.
+fn is_versioning_option(option: &DatabaseOption) -> bool {
+    VERSIONING_OPTIONS
+        .iter()
+        .any(|name| option.name.eq_ignore_ascii_case(name))
+}
+
+/// The option as the statement wrote it: its name, then its value when it has one.
+fn written_option(option: &DatabaseOption) -> String {
+    match &option.value {
+        Some(value) => format!("{} {value}", option.name),
+        None => option.name.clone(),
+    }
+}
+
+/// The value of a versioning option, `ON` or `OFF`, and the termination clause written after
+/// it, as [`bind_alter_database`] carries it.
+///
+/// The parser hands the value over as the text of the tokens after the option name, joined
+/// with one space, delimiters kept: `ON WITH ROLLBACK IMMEDIATE`, `'ON'`, `= ON`, `ON foo`.
+/// This function reads that text word by word.
+///
+/// # Errors
+///
+/// 102, without a line (the caller puts the statement's): the table of
+/// [`bind_alter_database`] gives the token quoted and the state for each malformed shape.
+fn versioning_value(option: &DatabaseOption) -> SqlResult<(&'static str, Option<String>)> {
+    let Some(text) = option.value.as_deref() else {
+        return Err(syntax_error_in_option_position(&option.name));
+    };
+    let mut words = text.split(' ').filter(|word| !word.is_empty());
+    let value = match words.next() {
+        Some(word) if word.eq_ignore_ascii_case("ON") => "ON",
+        Some(word) if word.eq_ignore_ascii_case("OFF") => "OFF",
+        // `= ON`: the option name is quoted, as when the value is missing.
+        Some("=") | None => return Err(syntax_error_in_option_position(&option.name)),
+        Some(word) if is_bare_word(word) => return Err(syntax_error_in_option_position(word)),
+        Some(token) => return Err(syntax_error_near(token)),
+    };
+    let termination = match words.next() {
+        None => None,
+        Some(word) if word.eq_ignore_ascii_case(TERMINATION_OPTION) => {
+            Some(termination_mode(&mut words)?)
+        }
+        Some(token) => return Err(syntax_error_near(token)),
+    };
+    Ok((value, termination))
+}
+
+/// The termination mode written after `WITH`, normalised: `ROLLBACK IMMEDIATE`,
+/// `ROLLBACK AFTER <n> SECONDS` or `NO_WAIT`.
+///
+/// # Errors
+///
+/// 102 state 1 near the token that does not fit, near `AFTER` when the count is missing,
+/// near `;` when the clause stops after `WITH` or after `ROLLBACK`, near `,` when another
+/// option follows the clause.
+fn termination_mode<'a>(words: &mut impl Iterator<Item = &'a str>) -> SqlResult<String> {
+    let mode = match words.next() {
+        Some(word) if word.eq_ignore_ascii_case("NO_WAIT") => "NO_WAIT".to_owned(),
+        Some(word) if word.eq_ignore_ascii_case("ROLLBACK") => match words.next() {
+            Some(word) if word.eq_ignore_ascii_case("IMMEDIATE") => "ROLLBACK IMMEDIATE".to_owned(),
+            Some(after) if after.eq_ignore_ascii_case("AFTER") => {
+                let count = match words.next() {
+                    Some(count) if count.bytes().all(|byte| byte.is_ascii_digit()) => count,
+                    Some(token) => return Err(syntax_error_near(token)),
+                    None => return Err(syntax_error_near(after)),
+                };
+                let unit = words.next();
+                if let Some(word) = unit.filter(|word| !word.eq_ignore_ascii_case("SECONDS")) {
+                    return Err(syntax_error_near(word));
+                }
+                format!("ROLLBACK AFTER {count} SECONDS")
+            }
+            Some(token) => return Err(syntax_error_near(token)),
+            None => return Err(syntax_error_near(";")),
+        },
+        Some(token) => return Err(syntax_error_near(token)),
+        None => return Err(syntax_error_near(";")),
+    };
+    match words.next() {
+        None => Ok(mode),
+        Some(token) => Err(syntax_error_near(token)),
+    }
+}
+
+/// Whether `token` is a bare identifier or keyword, as opposed to a number, a string or a
+/// delimited identifier: the parser keeps the delimiters of the last two in the text.
+fn is_bare_word(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '@' || first == '#')
+}
+
+/// The 102 of a bare word met where an option name or its value was expected: state 6, the
+/// word quoted. `word` is quoted as written.
+fn syntax_error_in_option_position(word: &str) -> SqlError {
+    let mut err = SqlError::incorrect_syntax_near(word, 0);
+    err.state = 6;
+    err
+}
+
+/// The 102 of a token met after a complete option: state 1, the token quoted without its
+/// delimiters (`[ON]` and `'ON'` both quote `ON`).
+fn syntax_error_near(token: &str) -> SqlError {
+    let printed = token
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .or_else(|| {
+            token
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })
+        .or_else(|| {
+            token
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+        })
+        .unwrap_or(token);
+    SqlError::incorrect_syntax_near(printed, 0)
 }
 
 /// Binds `CREATE TABLE t (…)` into the [`TableDef`] the catalogue takes.
@@ -1215,13 +1494,14 @@ mod tests {
         assert!(!def.columns[0].ty.nullable);
     }
 
-    /// The dispatch of `statement.rs` sends the five statements of this file here, and not
+    /// The dispatch of `statement.rs` sends the six statements of this file here, and not
     /// one of them is a `SELECT`.
     #[test]
-    fn the_five_statements_of_this_file_bind() {
+    fn the_six_statements_of_this_file_bind() {
         for text in [
             "CREATE DATABASE d;",
             "DROP DATABASE d;",
+            "ALTER DATABASE d SET READ_COMMITTED_SNAPSHOT ON;",
             "USE d;",
             "CREATE TABLE t (a int);",
             "DROP TABLE t;",
