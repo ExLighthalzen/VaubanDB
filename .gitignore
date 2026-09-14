@@ -1,0 +1,10 @@
+/target/
+/dist/
+/data/
+*.wal
+*.vauban
+.DS_Store
+.idea/
+.vscode/
+*.swp
+__pycache__/

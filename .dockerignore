@@ -1,0 +1,6 @@
+*
+!LICENSE
+!docker/
+!docker/entrypoint.sh
+!dist/
+!dist/vauban

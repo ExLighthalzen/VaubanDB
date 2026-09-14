@@ -1,0 +1,91 @@
+name: wiki
+
+# Rust API documentation (`///` and `//!` comments) rendered as Markdown and pushed to the
+# wiki of this repository, as pages `API.md`, `API-<crate>.md` and `_Sidebar.md`. The wiki
+# repository must exist: GitHub creates it when the first page is saved from the Wiki tab.
+#
+# Pipeline: rustdoc JSON (pinned nightly) -> cargo doc-md (JSON -> Markdown, one file per
+# module) -> .github/scripts/wiki_api.py (one page per crate, home page, sidebar) -> git push.
+# The nightly is pinned to a rustdoc JSON format that cargo-doc-md 0.11 reads: bumping one
+# means checking the other.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/scripts/wiki_api.py"
+      - ".github/workflows/wiki.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  NIGHTLY: nightly-2026-09-10
+  DOC_MD_VERSION: 0.11.0
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wiki-api
+      - name: Install cargo-doc-md
+        run: |
+          set -euo pipefail
+          if ! cargo install --list | grep -q "^cargo-doc-md v${DOC_MD_VERSION}:"; then
+            cargo "+${NIGHTLY}" install --locked cargo-doc-md --version "${DOC_MD_VERSION}"
+          fi
+      - name: rustdoc JSON of each library crate
+        run: |
+          set -euo pipefail
+          cargo "+${NIGHTLY}" metadata --no-deps --format-version 1 \
+            | python3 -c 'import sys, json
+          for p in json.load(sys.stdin)["packages"]:
+              if any("lib" in t["kind"] for t in p["targets"]):
+                  print(p["name"])' \
+            | while read -r crate; do
+                cargo "+${NIGHTLY}" rustdoc --lib -p "${crate}" -- -Z unstable-options --output-format json
+              done
+          ls target/doc/*.json
+      - name: Markdown pages
+        run: |
+          set -euo pipefail
+          rm -rf doc-md wiki-pages
+          for json in target/doc/*.json; do
+            cargo doc-md --json "${json}" -o doc-md
+          done
+          python3 .github/scripts/wiki_api.py doc-md wiki-pages
+          ls wiki-pages
+      - name: Push to the wiki
+        env:
+          TOKEN: ${{ secrets.WIKI_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          url="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          if ! git clone --quiet "${url}" wiki 2>/dev/null; then
+            echo "::error::The wiki of ${GITHUB_REPOSITORY} does not exist yet: save its first page from the Wiki tab, then run this workflow again." >&2
+            exit 1
+          fi
+          rm -f wiki/API*.md wiki/_Sidebar.md
+          cp wiki-pages/*.md wiki/
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- 'API*.md' '_Sidebar.md'
+          if git diff --staged --quiet; then
+            echo "wiki already up to date"
+          else
+            git commit -q -m "docs: Rust API from ${GITHUB_SHA::7}"
+            git push --quiet
+          fi

@@ -1,0 +1,41 @@
+[package]
+name = "vauban-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rcgen.workspace = true
+vauban-session.workspace = true
+vauban-storage.workspace = true
+# The binary fills the process-wide `sysfn` registry before it listens.
+vauban-sysfn.workspace = true
+vauban-compat.workspace = true
+# `SaPasswordAuthenticator` and `NoAuth` return `SqlResult`.
+vauban-errors.workspace = true
+
+[dev-dependencies]
+# `tests/cli.rs` checks that every `--log-format json` line parses as a JSON object.
+serde_json.workspace = true
+# `tests/tls.rs` logs in through a real TDS client, without and with TLS.
+tiberius.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "vauban"
+path = "src/main.rs"

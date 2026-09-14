@@ -1,0 +1,21 @@
+[package]
+name = "vauban-planner"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# The logical plan this crate translates, and the expressions it carries unchanged.
+vauban-binder.workspace = true
+# `ColumnId` and the identifiers the bound plan names its tables and columns with.
+vauban-catalog.workspace = true
+vauban-errors.workspace = true
+# `IndexShape`, `IndexId`, `Direction` and the `Storage` trait `StorageIndexes` reads.
+vauban-storage.workspace = true
+vauban-types.workspace = true
+
+[lints]
+workspace = true

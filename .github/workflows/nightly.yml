@@ -1,0 +1,271 @@
+name: nightly
+
+# Nightly build of `main`: binaries for linux/amd64 and linux/arm64, one multi-arch image
+# tagged `nightly`, and a single rolling pre-release named `nightly` whose assets are replaced
+# in place.
+#
+# Why one rolling release rather than one per night: GitHub notifies watchers and shows
+# stargazers a feed entry when a release is *published*. Editing an existing release, replacing
+# its assets or moving its tag publishes nothing, so the `nightly` release is created once (the
+# first run) and only updated afterwards. It is always a pre-release and never "latest": the
+# version releases of release.yml (`v*.*.*`) keep both roles.
+#
+# Nothing is built when `main` has not moved since the last nightly.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if main has not changed since the last nightly
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: nightly
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.meta.outputs.build }}
+      version: ${{ steps.meta.outputs.version }}
+      date: ${{ steps.meta.outputs.date }}
+      image: ${{ steps.meta.outputs.image }}
+      previous: ${{ steps.meta.outputs.previous }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Compare main with the last nightly
+        id: meta
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" 2>/dev/null || true
+          previous=$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}" || echo none)
+          head=$(git rev-parse HEAD)
+          if [ "${previous}" = "${head}" ] && [ "${{ inputs.force }}" != "true" ]; then
+            build=false
+          else
+            build=true
+          fi
+          cargo_version=$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version'])")
+          date=$(date -u +%Y%m%d)
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          {
+            echo "build=${build}"
+            echo "version=${cargo_version}-nightly.${date}"
+            echo "date=${date}"
+            echo "image=ghcr.io/${owner}/vaubandb"
+            echo "previous=${previous}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "build=${build} previous=${previous} head=${head}"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            docker_arch: amd64
+            test: true
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            docker_arch: arm64
+            test: false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.rust_target }}
+      - name: Tests (amd64)
+        if: matrix.test
+        run: cargo test --workspace
+      # Same build as release.yml: inside rust:*-bookworm so the binary links against the
+      # glibc of debian:bookworm-slim, the runtime image.
+      - name: Release binary (Debian bookworm glibc)
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.cargo/registry"
+          docker run --rm -i \
+            -v "${PWD}:/src" -w /src \
+            -v "${HOME}/.cargo/registry:/usr/local/cargo/registry" \
+            -e CARGO_TERM_COLOR -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            rust:1.98.1-slim-bookworm sh -eu <<'EOF'
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends cmake binutils >/dev/null
+          cargo build --release -p vauban-cli
+          strip -s target/release/vauban
+          chown -R "${HOST_UID}:${HOST_GID}" target /usr/local/cargo/registry
+          EOF
+          ./target/release/vauban version
+      # Stable archive names: each night replaces the previous night's assets.
+      - name: Archive tar.gz
+        run: |
+          set -euo pipefail
+          name="vauban-${RELEASE_TAG}-${{ matrix.rust_target }}"
+          mkdir -p "dist/${name}"
+          cp target/release/vauban "dist/${name}/vauban"
+          cp LICENSE "dist/${name}/LICENSE"
+          tar -C dist -czf "${name}.tar.gz" "${name}"
+          mkdir -p artifacts
+          mv "${name}.tar.gz" artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vauban-${{ matrix.rust_target }}
+          path: artifacts/*.tar.gz
+          if-no-files-found: error
+      - name: Prepare the Docker context
+        run: |
+          mkdir -p dist
+          cp target/release/vauban dist/vauban
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+          DOCKER_BUILD_SUMMARY: "false"
+        with:
+          context: .
+          load: true
+          provenance: false
+          sbom: false
+          platforms: linux/${{ matrix.docker_arch }}
+          tags: vauban:ci
+          build-args: |
+            VAUBAN_VERSION=${{ needs.prepare.outputs.version }}
+            VAUBAN_REVISION=${{ github.sha }}
+      - name: Check the image
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint vauban vauban:ci version
+          set +e
+          docker run --rm vauban:ci
+          status=$?
+          set -e
+          if [ "${status}" -ne 2 ]; then
+            echo "without a password the container must exit with code 2 (got ${status})" >&2
+            exit 1
+          fi
+      - name: Push the per-architecture image
+        run: |
+          set -euo pipefail
+          dest="${{ needs.prepare.outputs.image }}:${RELEASE_TAG}-${{ matrix.docker_arch }}"
+          docker tag vauban:ci "${dest}"
+          docker push "${dest}"
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vauban-*
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum vauban-*.tar.gz | tee SHA256SUMS
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Only the rolling `nightly` tag is published, never `latest`: pin by digest to keep a
+      # given night.
+      - name: Multi-arch manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          image="${{ needs.prepare.outputs.image }}"
+          docker buildx imagetools create \
+            -t "${image}:${RELEASE_TAG}" \
+            "${image}:${RELEASE_TAG}-amd64" \
+            "${image}:${RELEASE_TAG}-arm64"
+          digest=$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          docker buildx imagetools inspect "${image}:${RELEASE_TAG}"
+      # A moved tag is a push, not a release: no notification, no feed entry.
+      - name: Move the nightly tag
+        run: |
+          set -euo pipefail
+          git tag -f "${RELEASE_TAG}" "${GITHUB_SHA}"
+          git push -f origin "refs/tags/${RELEASE_TAG}"
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          image="${{ needs.prepare.outputs.image }}"
+          {
+            echo "Nightly build of \`main\` at ${GITHUB_SHA:0:12} (${{ needs.prepare.outputs.date }}), version ${{ needs.prepare.outputs.version }}."
+            echo
+            echo "This pre-release is rewritten every night: its assets, tag and notes always describe the latest build. For a fixed version use a \`v*.*.*\` release."
+            echo
+            echo "Image (\`linux/amd64\`, \`linux/arm64\`):"
+            echo
+            echo '```'
+            echo "docker pull ${image}:${RELEASE_TAG}"
+            echo "docker pull ${image}@${{ steps.manifest.outputs.digest }}"
+            echo '```'
+            echo
+            if [ "${{ needs.prepare.outputs.previous }}" != "none" ]; then
+              echo "Changes since the previous nightly:"
+              echo
+              git log --no-merges --format='- %s' "${{ needs.prepare.outputs.previous }}..${GITHUB_SHA}" | head -100
+              echo
+            fi
+            echo "The engine only has in-memory storage for now: databases do not survive a container restart."
+          } > notes.md
+          cat notes.md
+      # Created once (the only run that publishes anything), then edited in place.
+      - name: Update the rolling pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --title "Nightly build" \
+              --notes-file notes.md \
+              --prerelease \
+              --latest=false
+          else
+            gh release create "${RELEASE_TAG}" \
+              --title "Nightly build" \
+              --notes-file notes.md \
+              --prerelease \
+              --latest=false
+          fi
+          gh release upload "${RELEASE_TAG}" --clobber artifacts/vauban-*.tar.gz artifacts/SHA256SUMS
+          gh release view "${RELEASE_TAG}"

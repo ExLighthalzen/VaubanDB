@@ -1,0 +1,25 @@
+[package]
+name = "vauban-tds"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+vauban-errors.workspace = true
+vauban-types.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tiberius.workspace = true
+tokio-util.workspace = true

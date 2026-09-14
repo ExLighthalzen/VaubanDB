@@ -1,0 +1,27 @@
+[package]
+name = "vauban-executor"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+vauban-binder.workspace = true
+# `ExecContext` carries the engine the statements read through: the catalogue, the rows
+# and the transaction manager that hands out their snapshot.
+vauban-catalog.workspace = true
+vauban-errors.workspace = true
+vauban-storage.workspace = true
+vauban-sysfn.workspace = true
+vauban-txn.workspace = true
+vauban-types.workspace = true
+
+[dev-dependencies]
+# The tests bind and run real SQL text; the engine itself does not see the parser, which
+# is why this is a dev-dependency and not a dependency.
+vauban-parser.workspace = true
+
+[lints]
+workspace = true

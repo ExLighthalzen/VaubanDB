@@ -1,0 +1,18 @@
+[package]
+name = "vauban-catalog"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+vauban-errors.workspace = true
+vauban-parser.workspace = true
+vauban-storage.workspace = true
+vauban-txn.workspace = true
+vauban-types.workspace = true
+
+[lints]
+workspace = true

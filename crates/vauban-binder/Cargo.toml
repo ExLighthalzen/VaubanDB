@@ -1,0 +1,18 @@
+[package]
+name = "vauban-binder"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+vauban-catalog.workspace = true
+vauban-errors.workspace = true
+vauban-parser.workspace = true
+vauban-sysfn.workspace = true
+vauban-types.workspace = true
+
+[lints]
+workspace = true

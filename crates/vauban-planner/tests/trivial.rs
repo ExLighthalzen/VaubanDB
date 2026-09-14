@@ -1,0 +1,540 @@
+//! The contract of the crate before its planning rules: the public types, the translation
+//! that holds no rule, and the internal error each unfilled form answers.
+//!
+//! The tests named `…_is_not_implemented_yet` pin the unfilled forms: the rule that fills
+//! one deletes or inverts its test, and the others keep answering until their turn.
+
+use vauban_planner::{KeyRangeExpr, PhysicalJoinKind, explain, testing::FakeCatalog};
+use vauban_planner::{NoIndexes, PhysicalPlan, PhysicalStatement, PlanCatalog, PlanContext, plan};
+
+use vauban_binder::{
+    BoundExpr, BoundExprKind, BoundProjection, BoundStatement, BoundTop, ColumnBinding, CompareOp,
+    DeletePlan, InsertPlan, JoinKind, LockHints, LogicalPlan, OutputColumn, OutputSchema,
+    SetOpKind, SortKey, UpdatePlan,
+};
+use vauban_catalog::ColumnId;
+use vauban_errors::SqlError;
+use vauban_storage::{IndexShape, KeyColumn, MemoryStorage, Storage, TableId, TableShape};
+use vauban_types::{SqlType, TypeInfo, Value};
+
+/// The context every test plans against, over the catalogue it is handed.
+fn context<'a>(catalog: &'a dyn PlanCatalog) -> PlanContext<'a> {
+    PlanContext { catalog }
+}
+
+fn int_type() -> TypeInfo {
+    TypeInfo::new(SqlType::Int, false)
+}
+
+fn literal(n: i32) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Literal(Value::I32(n)),
+        ty: int_type(),
+        line: 1,
+    }
+}
+
+fn id_binding() -> ColumnBinding {
+    ColumnBinding {
+        column: ColumnId(1),
+        index: 0,
+        name: "id".to_owned(),
+        ty: int_type(),
+    }
+}
+
+fn schema_of(names: &[&str]) -> OutputSchema {
+    OutputSchema {
+        columns: names
+            .iter()
+            .map(|name| OutputColumn {
+                name: (*name).to_owned(),
+                ty: int_type(),
+            })
+            .collect(),
+    }
+}
+
+/// `FROM dbo.t`, one `int` column named `id`.
+fn scan() -> LogicalPlan {
+    LogicalPlan::Scan {
+        table: TableId(7),
+        columns: vec![id_binding()],
+        alias: "t".to_owned(),
+        schema: schema_of(&["id"]),
+        hints: LockHints::default(),
+    }
+}
+
+/// `id = 1`, the predicate an index on `id` could serve.
+fn id_equals_one() -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(BoundExpr {
+                kind: BoundExprKind::ColumnRef(id_binding()),
+                ty: int_type(),
+                line: 1,
+            }),
+            right: Box::new(literal(1)),
+        },
+        ty: TypeInfo::new(SqlType::Bit, false),
+        line: 1,
+    }
+}
+
+/// `SELECT id FROM dbo.t WHERE id = 1`, as the binder would hand it over.
+fn project_filter_scan() -> LogicalPlan {
+    LogicalPlan::Project {
+        input: Box::new(LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate: id_equals_one(),
+        }),
+        exprs: vec![BoundProjection {
+            expr: BoundExpr {
+                kind: BoundExprKind::ColumnRef(id_binding()),
+                ty: int_type(),
+                line: 1,
+            },
+            name: "id".to_owned(),
+        }],
+        schema: schema_of(&["id"]),
+    }
+}
+
+fn plan_query(logical: LogicalPlan) -> PhysicalPlan {
+    let catalog = NoIndexes;
+    match plan(BoundStatement::Query(Box::new(logical)), &context(&catalog)) {
+        Ok(PhysicalStatement::Query(physical)) => physical,
+        Ok(other) => panic!("expected a query, got {other:?}"),
+        Err(err) => panic!("planning failed: {}", err.message),
+    }
+}
+
+/// The error a statement answers, or the shape it planned to.
+fn plan_error(stmt: BoundStatement) -> SqlError {
+    let catalog = NoIndexes;
+    match plan(stmt, &context(&catalog)) {
+        Ok(ok) => panic!("expected an error, got {ok:?}"),
+        Err(err) => err,
+    }
+}
+
+/// Checks that `err` is the internal error 50000 of a form not implemented yet.
+fn assert_not_implemented(err: &SqlError) {
+    assert_eq!(err.number, 50000, "error was {err:?}");
+    assert_eq!(err.state, 1, "error was {err:?}");
+    assert!(
+        err.message.contains("is not implemented yet"),
+        "message was {:?}",
+        err.message
+    );
+}
+
+#[test]
+fn one_row_plans_to_one_row() {
+    let catalog = NoIndexes;
+    let planned = plan(
+        BoundStatement::Query(Box::new(LogicalPlan::OneRow)),
+        &context(&catalog),
+    )
+    .expect("OneRow plans");
+    assert!(matches!(
+        planned,
+        PhysicalStatement::Query(PhysicalPlan::OneRow)
+    ));
+}
+
+#[test]
+fn filter_project_over_scan_keeps_its_shape() {
+    // A unique index on the filtered column, declared to the planner: no seek rule is
+    // written yet, so it changes nothing. That rule inverts this assertion.
+    let catalog = FakeCatalog::new().with_index(
+        TableId(7),
+        &[KeyColumn {
+            column: 0,
+            descending: false,
+        }],
+        true,
+    );
+    assert_eq!(catalog.indexes_of(TableId(7)).len(), 1);
+    let planned = match plan(
+        BoundStatement::Query(Box::new(project_filter_scan())),
+        &context(&catalog),
+    )
+    .expect("the query plans")
+    {
+        PhysicalStatement::Query(physical) => physical,
+        other => panic!("expected a query, got {other:?}"),
+    };
+
+    let PhysicalPlan::Project { input, exprs, .. } = &planned else {
+        panic!("expected a Project, got {planned:?}")
+    };
+    assert_eq!(exprs.len(), 1);
+    let PhysicalPlan::Filter { input, .. } = input.as_ref() else {
+        panic!("expected a Filter under the Project, got {input:?}")
+    };
+    assert!(
+        matches!(input.as_ref(), PhysicalPlan::TableScan { table, .. } if *table == TableId(7)),
+        "expected a TableScan, got {input:?}"
+    );
+    assert!(
+        !matches!(input.as_ref(), PhysicalPlan::IndexSeek { .. }),
+        "no rule chooses an index yet"
+    );
+}
+
+#[test]
+fn values_and_limit_are_translated() {
+    let values = LogicalPlan::Values {
+        rows: vec![vec![literal(1)], vec![literal(2)]],
+        schema: schema_of(&["n"]),
+    };
+    let limited = LogicalPlan::Limit {
+        input: Box::new(values),
+        top: BoundTop {
+            expr: literal(1),
+            percent: false,
+            with_ties: false,
+        },
+    };
+    let planned = plan_query(limited);
+    let PhysicalPlan::Top { input, top } = &planned else {
+        panic!("expected a Top, got {planned:?}")
+    };
+    assert!(!top.percent && !top.with_ties);
+    let PhysicalPlan::Values { rows, .. } = input.as_ref() else {
+        panic!("expected Values under the Top, got {input:?}")
+    };
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn join_is_not_implemented_yet() {
+    let join = LogicalPlan::Join {
+        left: Box::new(scan()),
+        right: Box::new(scan()),
+        kind: JoinKind::Inner,
+        on: Some(id_equals_one()),
+        schema: schema_of(&["id", "id"]),
+    };
+    assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(join))));
+}
+
+#[test]
+fn aggregate_sort_and_distinct_are_not_implemented_yet() {
+    let aggregate = LogicalPlan::Aggregate {
+        input: Box::new(scan()),
+        group_by: vec![literal(1)],
+        aggregates: Vec::new(),
+        schema: schema_of(&["n"]),
+    };
+    let sort = LogicalPlan::Sort {
+        input: Box::new(scan()),
+        keys: vec![SortKey {
+            expr: literal(1),
+            desc: false,
+            collation: None,
+        }],
+    };
+    let distinct = LogicalPlan::Distinct(Box::new(scan()));
+    for logical in [aggregate, sort, distinct] {
+        assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(logical))));
+    }
+}
+
+#[test]
+fn a_subquery_expression_is_not_implemented_yet() {
+    let exists = BoundExpr {
+        kind: BoundExprKind::Exists(Box::new(LogicalPlan::OneRow)),
+        ty: TypeInfo::new(SqlType::Bit, false),
+        line: 1,
+    };
+    let filtered = LogicalPlan::Filter {
+        input: Box::new(scan()),
+        predicate: exists,
+    };
+    assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(filtered))));
+
+    let derived = LogicalPlan::Subquery {
+        input: Box::new(scan()),
+        alias: "d".to_owned(),
+        schema: schema_of(&["id"]),
+    };
+    assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(derived))));
+}
+
+/// `EXISTS (SELECT …)`, the subquery expression the holders below carry.
+fn exists_expr() -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Exists(Box::new(LogicalPlan::OneRow)),
+        ty: TypeInfo::new(SqlType::Bit, false),
+        line: 1,
+    }
+}
+
+#[test]
+fn subquery_holders_outside_the_two_call_sites_go_through() {
+    // `plan.rs` hands `subquery::plan_expr_subqueries` two expressions: the predicate of a
+    // `Filter` and each expression of a `Project`. The seven holders below are copied
+    // across without being read, so the same `EXISTS` plans to `Ok` there. The rule that
+    // plans them inverts this test.
+    let catalog = NoIndexes;
+    let holders: Vec<(&str, BoundStatement)> = vec![
+        (
+            "BoundTop.expr",
+            BoundStatement::Query(Box::new(LogicalPlan::Limit {
+                input: Box::new(scan()),
+                top: BoundTop {
+                    expr: exists_expr(),
+                    percent: false,
+                    with_ties: false,
+                },
+            })),
+        ),
+        (
+            "a row of Values",
+            BoundStatement::Query(Box::new(LogicalPlan::Values {
+                rows: vec![vec![exists_expr()]],
+                schema: schema_of(&["b"]),
+            })),
+        ),
+        (
+            "the condition of If",
+            BoundStatement::If {
+                condition: exists_expr(),
+                then_: Box::new(BoundStatement::Break),
+                else_: None,
+            },
+        ),
+        (
+            "the condition of While",
+            BoundStatement::While {
+                condition: exists_expr(),
+                body: Box::new(BoundStatement::Break),
+            },
+        ),
+        ("Print", BoundStatement::Print(exists_expr())),
+        (
+            "SetVariable",
+            BoundStatement::SetVariable {
+                name: "@x".to_owned(),
+                value: exists_expr(),
+            },
+        ),
+        ("Return", BoundStatement::Return(Some(exists_expr()))),
+    ];
+    assert_eq!(holders.len(), 7);
+    for (holder, stmt) in holders {
+        assert!(
+            plan(stmt, &context(&catalog)).is_ok(),
+            "{holder} carried the EXISTS to an error; a rule changed this state"
+        );
+    }
+
+    // Counter-proof on the two sites `plan.rs` does hand over: the same `EXISTS` in the
+    // predicate of a `Filter` and in an expression of a `Project` is refused.
+    for logical in [
+        LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate: exists_expr(),
+        },
+        LogicalPlan::Project {
+            input: Box::new(scan()),
+            exprs: vec![BoundProjection {
+                expr: exists_expr(),
+                name: "b".to_owned(),
+            }],
+            schema: schema_of(&["b"]),
+        },
+    ] {
+        assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(logical))));
+    }
+}
+
+#[test]
+fn an_expression_without_a_subquery_goes_through() {
+    // Counter-proof of the test above: the same `Filter`, with a predicate that holds no
+    // subquery, plans without an error.
+    let planned = plan_query(LogicalPlan::Filter {
+        input: Box::new(scan()),
+        predicate: id_equals_one(),
+    });
+    assert!(matches!(planned, PhysicalPlan::Filter { .. }));
+}
+
+#[test]
+fn dml_is_not_implemented_yet() {
+    let insert = BoundStatement::Insert(InsertPlan {
+        table: TableId(7),
+        columns: vec![id_binding()],
+        source: Box::new(LogicalPlan::Values {
+            rows: vec![vec![literal(1)]],
+            schema: schema_of(&["id"]),
+        }),
+    });
+    let update = BoundStatement::Update(UpdatePlan {
+        table: TableId(7),
+        input: Box::new(scan()),
+        assignments: vec![(id_binding(), literal(2))],
+    });
+    let delete = BoundStatement::Delete(DeletePlan {
+        table: TableId(7),
+        input: Box::new(scan()),
+    });
+    for stmt in [insert, update, delete] {
+        assert_not_implemented(&plan_error(stmt));
+    }
+}
+
+#[test]
+fn a_set_operator_is_not_implemented_yet() {
+    let set_op = LogicalPlan::SetOp {
+        op: SetOpKind::Union,
+        all: true,
+        left: Box::new(scan()),
+        right: Box::new(scan()),
+        schema: schema_of(&["id"]),
+    };
+    assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(set_op))));
+}
+
+#[test]
+fn schema_follows_the_node() {
+    let planned = plan_query(project_filter_scan());
+    assert_eq!(planned.schema().columns.len(), 1);
+    assert_eq!(planned.schema().columns[0].name, "id");
+
+    let PhysicalPlan::Project { input, .. } = &planned else {
+        panic!("expected a Project, got {planned:?}")
+    };
+    // The `Filter` publishes the columns of its input, not its own.
+    assert_eq!(input.schema().columns.len(), 1);
+    assert_eq!(input.schema().columns[0].name, "id");
+    assert_eq!(PhysicalPlan::OneRow.schema().columns.len(), 0);
+
+    // A `Project` that drops a column publishes what it projects.
+    let widened = LogicalPlan::Project {
+        input: Box::new(scan()),
+        exprs: vec![
+            BoundProjection {
+                expr: literal(1),
+                name: "a".to_owned(),
+            },
+            BoundProjection {
+                expr: literal(2),
+                name: "b".to_owned(),
+            },
+        ],
+        schema: schema_of(&["a", "b"]),
+    };
+    let planned = plan_query(widened);
+    let names: Vec<&str> = planned
+        .schema()
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["a", "b"]);
+}
+
+#[test]
+fn explain_writes_one_line_per_node() {
+    let planned = plan_query(project_filter_scan());
+    let text = explain(&planned);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "explain wrote {text:?}");
+    assert_eq!(lines[0], "Project(columns=1)");
+    assert_eq!(lines[1], "  Filter");
+    assert_eq!(lines[2], "    TableScan(table=7, alias=t)");
+    for (level, line) in lines.iter().enumerate() {
+        let indent = line.len() - line.trim_start().len();
+        assert_eq!(indent, level * 2, "line {level} was {line:?}");
+    }
+}
+
+#[test]
+fn control_flow_is_planned_branch_by_branch() {
+    let block = BoundStatement::Block(vec![
+        BoundStatement::Break,
+        BoundStatement::If {
+            condition: id_equals_one(),
+            then_: Box::new(BoundStatement::Query(Box::new(LogicalPlan::OneRow))),
+            else_: Some(Box::new(BoundStatement::Continue)),
+        },
+    ]);
+    let catalog = NoIndexes;
+    let planned = plan(block, &context(&catalog)).expect("the block plans");
+    let PhysicalStatement::Block(statements) = &planned else {
+        panic!("expected a Block, got {planned:?}")
+    };
+    assert_eq!(statements.len(), 2);
+    let PhysicalStatement::If { then_, else_, .. } = &statements[1] else {
+        panic!("expected an If, got {:?}", statements[1])
+    };
+    assert!(matches!(
+        then_.as_ref(),
+        PhysicalStatement::Query(PhysicalPlan::OneRow)
+    ));
+    assert!(matches!(
+        else_.as_deref(),
+        Some(PhysicalStatement::Continue)
+    ));
+
+    // A branch that reaches an unfilled hook still fails the whole statement.
+    let err = plan_error(BoundStatement::While {
+        condition: id_equals_one(),
+        body: Box::new(BoundStatement::Query(Box::new(LogicalPlan::Distinct(
+            Box::new(scan()),
+        )))),
+    });
+    assert_not_implemented(&err);
+}
+
+#[test]
+fn storage_indexes_falls_back_to_a_scan_on_error() {
+    let storage = MemoryStorage::new();
+    let db = storage.create_database("db").expect("database");
+    let shape = TableShape {
+        columns: vec![int_type()],
+        clustered_key: None,
+    };
+    let table = storage.create_table(db, &shape).expect("table");
+    storage
+        .create_index(
+            table,
+            &IndexShape {
+                columns: vec![KeyColumn {
+                    column: 0,
+                    descending: false,
+                }],
+                unique: true,
+                included: Vec::new(),
+            },
+        )
+        .expect("index");
+
+    let indexes = vauban_planner::StorageIndexes(&storage);
+    // The counter-proof: the same call on a table that exists answers its index, so the
+    // empty vector below comes from the error and not from the implementation.
+    assert_eq!(indexes.indexes_of(table).len(), 1);
+    assert!(storage.indexes(TableId(4_242)).is_err());
+    assert!(indexes.indexes_of(TableId(4_242)).is_empty());
+}
+
+#[test]
+fn the_declared_types_are_reachable_from_outside() {
+    // Callers build on these names; the test fails to compile if one moves.
+    assert_eq!(
+        PhysicalJoinKind::from(JoinKind::Cross),
+        PhysicalJoinKind::Cross
+    );
+    assert_eq!(
+        PhysicalJoinKind::from(JoinKind::Left),
+        PhysicalJoinKind::Left
+    );
+    assert!(matches!(KeyRangeExpr::Full, KeyRangeExpr::Full));
+    let point = KeyRangeExpr::Point(vec![literal(1)]);
+    assert!(matches!(point, KeyRangeExpr::Point(ref keys) if keys.len() == 1));
+}

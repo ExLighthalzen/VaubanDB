@@ -1,0 +1,21 @@
+[package]
+name = "vauban-txn"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+vauban-errors.workspace = true
+vauban-storage.workspace = true
+
+[dev-dependencies]
+# Same crate as above, with the `testsuite` feature on: the integration tests build an `int`
+# table and its rows with the helpers of `vauban_storage::testsuite` instead of naming
+# `vauban_types` themselves. No crate is added to the dependency graph (`Cargo.lock` unchanged).
+vauban-storage = { workspace = true, features = ["testsuite"] }
+
+[lints]
+workspace = true
