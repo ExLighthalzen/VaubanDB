@@ -341,25 +341,15 @@ fn unsupported_clauses_are_internal_errors() {
     // `ORDER BY` is bound: `SELECT 1 ORDER BY 1` answers its row and the tests of the
     // clause are in `tests/bind_sort.rs`.
 
-    // GROUP BY and INTO, built by hand.
-    let mut spec = spec_of_select_one();
-    spec.group_by = vec![Expr::Literal(Literal::Integer("1".into()), Span::EMPTY)];
-    let error = err_of(&select_of(spec));
-    assert_eq!(error.number, 50000);
-    assert!(error.message.contains("GROUP BY"), "{}", error.message);
+    // `GROUP BY` and `HAVING` are bound: the tests of the two clauses are in
+    // `tests/bind_aggregate.rs`.
 
+    // INTO, built by hand.
     let mut spec = spec_of_select_one();
     spec.into = Some(object("t"));
     let error = err_of(&select_of(spec));
     assert_eq!(error.number, 50000);
     assert!(error.message.contains("INTO"), "{}", error.message);
-
-    let mut spec = spec_of_select_one();
-    spec.having = Some(Expr::Literal(Literal::Integer("1".into()), Span::EMPTY));
-    assert!(
-        err_of(&select_of(spec)).message.contains("HAVING"),
-        "the message names the clause"
-    );
 
     // UNION, built by hand: a set operation over two identical specifications.
     let union = Statement::Select(Box::new(SelectStatement {

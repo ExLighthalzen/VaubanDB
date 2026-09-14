@@ -139,6 +139,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "The row count of TOP or FETCH cannot be negative.",
     },
     ErrorDef {
+        number: 130,
+        severity: 15,
+        template: "An aggregate function cannot be applied to an expression that holds an aggregate or a subquery.",
+    },
+    ErrorDef {
         number: 131,
         severity: 15,
         template: "Size %d of the %S_MSG '%.*ls' is larger than any data type allows (%d).",
@@ -159,9 +164,19 @@ const CATALOG: &[ErrorDef] = &[
         template: "A SELECT that assigns variables cannot also return rows.",
     },
     ErrorDef {
+        number: 144,
+        severity: 15,
+        template: "A GROUP BY expression cannot hold an aggregate or a subquery.",
+    },
+    ErrorDef {
         number: 145,
         severity: 15,
         template: "With SELECT DISTINCT, each ORDER BY item has to be in the select list.",
+    },
+    ErrorDef {
+        number: 147,
+        severity: 15,
+        template: "An aggregate cannot appear in a WHERE clause, except inside a subquery of a HAVING clause or a select list, aggregating an outer reference.",
     },
     ErrorDef {
         number: 148,
@@ -914,11 +929,14 @@ mod tests {
         (120, 15, &[]),
         (121, 15, &[]),
         (127, 15, &[]),
+        (130, 15, &[]),
         (131, 15, &["%d", "%S_MSG", "%.*ls", "%d"]),
         (134, 15, &["%.*ls"]),
         (137, 15, &["%.*ls"]),
         (141, 15, &[]),
+        (144, 15, &[]),
         (145, 15, &[]),
+        (147, 15, &[]),
         (148, 15, &["%.*ls"]),
         (151, 15, &["%.*ls"]),
         (155, 15, &["%.*ls", "%ls"]),

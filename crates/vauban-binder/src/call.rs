@@ -41,20 +41,20 @@
 //!
 //! Each number above has its constructor in `vauban-errors`: **no number of the catalogue
 //! is spelled by hand in this file, and none of them leaves it as an internal 50000**. The
-//! last row of the table above, `SELECT SUM(1);` and `SELECT COUNT(*);`, still raises an
-//! internal error: a select list holding an aggregate is routed to `aggregate.rs` by
-//! `query.rs`, which does not bind it yet, and [`bind_function`] refuses an aggregate
-//! written anywhere else.
+//! last row of the table above, `SELECT SUM(1);` and `SELECT COUNT(*);`, is bound by
+//! `aggregate.rs`, which `query.rs` routes a select list holding an aggregate to, and
+//! which reaches [`bind_aggregate_call`] for the call itself; [`bind_function`] refuses an
+//! aggregate written anywhere else.
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{ColumnRef, DataType, Expr, Ident, Literal, ObjectName, Span};
 use vauban_sysfn::{FunctionDef, FunctionKind, check_call, lookup, parse_datepart};
 use vauban_types::{Len, SqlString, SqlType, TypeFamily, TypeInfo, Value, implicit_result_type};
 
-use crate::bound::{BoundExpr, BoundExprKind};
+use crate::bound::{AggregateCall, BoundExpr, BoundExprKind};
 use crate::context::BindContext;
 use crate::datatype::resolve_data_type;
-use crate::errors::line_of;
+use crate::errors::{line_at, line_of};
 use crate::expr::{Scope, implicit_conversion_may_be_null};
 
 /// Length a character or binary type gets in a `CAST`/`CONVERT` target written without
@@ -358,9 +358,14 @@ fn bind_style(style: &Expr, ctx: &BindContext<'_>, scope: &Scope) -> SqlResult<i
 /// - 8116 and 4151 for an untyped `NULL` argument the function refuses
 ///   ([`untyped_null_is_refused`]); an untyped `NULL` the function accepts is retyped from
 ///   its siblings first ([`retype_untyped_nulls`]);
+/// - **102** near `*` for a star under a name that is not `COUNT` or `COUNT_BIG`
+///   (`SELECT SUM(*) FROM dbo.t;`, `SELECT LEN(*) FROM dbo.t;`), see
+///   [`star_under_another_name`];
 /// - an internal error for `COUNT(*)`, for `DISTINCT` in a call and for a call whose
-///   definition is an aggregate — the select list that holds one is routed to
-///   `aggregate.rs` by `query.rs` before reaching here — and one for `OVER`.
+///   definition is an aggregate: a select list or a `HAVING` that holds one is bound by
+///   `aggregate.rs`, which reaches [`bind_aggregate_call`] and not this function, and an
+///   aggregate written anywhere else (`SET @x = COUNT(*)`, `ORDER BY COUNT(*)`) is not
+///   bound yet — and one for `OVER`.
 pub(crate) fn bind_function(
     e: &Expr,
     ctx: &BindContext<'_>,
@@ -378,16 +383,18 @@ pub(crate) fn bind_function(
         return Err(bug("bind_function: the node is not a function call"));
     };
     let line = line_of(span);
-    let def = lookup_function(name, line)?;
     if *star {
+        star_under_another_name(name, span, ctx)?;
         return Err(bug(
-            "COUNT(*): the aggregate calls of a select list are not implemented yet",
+            "COUNT(*): an aggregate call outside a select list or a HAVING clause is not \
+             implemented yet",
         ));
     }
+    let def = lookup_function(name, line)?;
     if *distinct {
         return Err(bug(
-            "DISTINCT in a function call: the aggregate calls of a select list are not \
-             implemented yet",
+            "DISTINCT in a function call: an aggregate call outside a select list or a \
+             HAVING clause is not implemented yet",
         ));
     }
     if over.is_some() {
@@ -395,7 +402,8 @@ pub(crate) fn bind_function(
     }
     if def.kind == FunctionKind::Aggregate {
         return Err(bug(format!(
-            "{}: the aggregate calls of a select list are not implemented yet",
+            "{}: an aggregate call outside a select list or a HAVING clause is not \
+             implemented yet",
             def.name
         )));
     }
@@ -411,6 +419,172 @@ pub(crate) fn bind_function(
         ty,
         line,
     })
+}
+
+/// Binds an aggregate call — `COUNT(*)`, `SUM(c)`, `COUNT(DISTINCT c)` — into the
+/// [`AggregateCall`] a [`LogicalPlan::Aggregate`](crate::bound::LogicalPlan::Aggregate)
+/// computes, and the type of its result.
+///
+/// The entry point of `aggregate.rs`, which decides **where** an aggregate may be written
+/// and reaches this function for the call itself; [`bind_function`] keeps refusing an
+/// aggregate met from any other place. The argument is bound against `scope`, the columns
+/// of the `FROM`: `SELECT k, SUM(c) FROM dbo.t GROUP BY k` aggregates a column that is not
+/// a key.
+///
+/// # What comes out
+///
+/// | written | `arg` | `distinct` | type of the result |
+/// |---|---|---|---|
+/// | `COUNT(*)`, `count(*)` | `None` | `false` | `int`, nullable |
+/// | `COUNT_BIG(*)` | `None` | `false` | `bigint`, nullable |
+/// | `COUNT(c)`, `COUNT(1)`, `COUNT(@v)` | the argument | `false` | `int`, nullable |
+/// | `COUNT(DISTINCT c)`, `COUNT(DISTINCT k + c)` | the argument | `true` | `int`, nullable |
+/// | `SUM(c)`, `AVG(c)`, `MIN(c)`, `MAX(c)` | the argument | `false` | what `check_call` answers, made nullable |
+///
+/// The result of the six aggregates is **nullable**, that of `COUNT(*)` included and
+/// whatever the argument: over `dbo.t (k int NOT NULL, …)`, `sp_describe_first_result_set`
+/// reports `COUNT(*)`, `COUNT_BIG(*)`, `MIN(k)`, `SUM(k)` and `COUNT(*) + 1` as nullable
+/// and `k` as not nullable, and `SELECT COUNT(*) AS n, MIN(k) AS m INTO #x FROM dbo.t`
+/// creates two nullable columns (`tests/bind_aggregate.rs`,
+/// `min_of_a_not_null_column_is_nullable`, `count_star_has_no_argument`). That `MIN(k)`
+/// differs from `k` on that point is what separates the rule from the one `sysfn`'s
+/// `extremum_return_type` alone would give a non-nullable argument.
+///
+/// # Errors
+///
+/// - **102** near `*` for a star under a name that is not `COUNT` or `COUNT_BIG`
+///   ([`star_under_another_name`]);
+/// - **195**, severity 15, state 10, naming an `aggregate function` — not a built-in
+///   function — for a `DISTINCT` under a name that is not an aggregate
+///   (`SELECT LEN(DISTINCT s) FROM dbo.t;`), and for an unknown name under `DISTINCT`;
+///   the 195 of [`lookup_function`] otherwise;
+/// - **8117** with the word `NULL` for the bare `NULL` constant as the argument
+///   (`SELECT SUM(NULL) FROM dbo.t;`, `SELECT COUNT(NULL) FROM dbo.t;`), the operator
+///   being the lower-case name of the aggregate;
+/// - **174** from `check_call` for the wrong number of arguments (`COUNT(k, c)`,
+///   `SUM()`), and 8117 from the `return_type` of `sysfn` for an argument type the
+///   aggregate refuses (`SUM(s)` over a `varchar`);
+/// - an internal error for `OVER`, as [`bind_function`] answers it;
+/// - an internal error for a node that is not a function call, or for a definition that
+///   is not an aggregate reached with neither star nor `DISTINCT` (`aggregate.rs` sends
+///   the aggregate calls only).
+pub(crate) fn bind_aggregate_call(
+    e: &Expr,
+    ctx: &BindContext<'_>,
+    scope: &Scope,
+) -> SqlResult<(AggregateCall, TypeInfo)> {
+    let Expr::Function {
+        name,
+        args,
+        star,
+        distinct,
+        over,
+        span,
+    } = e
+    else {
+        return Err(bug("bind_aggregate_call: the node is not a function call"));
+    };
+    let line = line_of(span);
+    if over.is_some() {
+        return Err(bug("OVER: the window functions are not implemented yet"));
+    }
+    if *star {
+        star_under_another_name(name, span, ctx)?;
+        let def = lookup_function(name, line)?;
+        let ty = if def.name == "COUNT_BIG" {
+            SqlType::BigInt
+        } else {
+            SqlType::Int
+        };
+        return Ok((
+            AggregateCall {
+                def,
+                arg: None,
+                distinct: false,
+            },
+            TypeInfo::new(ty, true),
+        ));
+    }
+    let def = if *distinct {
+        lookup_function(name, line)
+            .ok()
+            .filter(|def| def.kind == FunctionKind::Aggregate)
+            .ok_or_else(|| {
+                SqlError::not_a_recognized_name(&name.name.value, "aggregate function")
+                    .with_line(line)
+            })?
+    } else {
+        lookup_function(name, line)?
+    };
+    if def.kind != FunctionKind::Aggregate {
+        return Err(bug(format!(
+            "bind_aggregate_call: {} is not an aggregate",
+            def.name
+        )));
+    }
+    if def.arity.accepts(args.len())
+        && let Some(written) = args.first()
+        && is_untyped_null(written)
+    {
+        return Err(
+            SqlError::invalid_operand_type("NULL", &def.name.to_ascii_lowercase()).with_line(line),
+        );
+    }
+    let mut bound = bind_arguments(def, args, line, ctx, scope)?;
+    let types: Vec<TypeInfo> = bound.iter().map(|arg| arg.ty.clone()).collect();
+    let ty = check_call(def, &types).map_err(|err| err.with_line(line))?;
+    let ty = TypeInfo {
+        nullable: true,
+        ..ty
+    };
+    let arg = if bound.len() == 1 {
+        bound.pop()
+    } else {
+        return Err(bug(format!(
+            "bind_aggregate_call: {} bound {} arguments, one expected",
+            def.name,
+            bound.len()
+        )));
+    };
+    Ok((
+        AggregateCall {
+            def,
+            arg,
+            distinct: *distinct,
+        },
+        ty,
+    ))
+}
+
+/// Error 102 near `*` for a star under a name that is not `COUNT` or `COUNT_BIG`.
+///
+/// The parser reads `f(*)` for any `f`; SQL Server reads it for the two counting
+/// aggregates alone and answers a syntax error for the others, on the line of the `*`:
+/// `SELECT SUM(*) FROM dbo.t;`, `SELECT MAX(*) FROM dbo.t;` and `SELECT LEN(*) FROM
+/// dbo.t;` answer 102 near `*`, and the star of a `SUM(` opened on the line before is
+/// reported on its own line. The two names are matched without regard to case
+/// (`count(*)` counts) and with no qualifier: `dbo.COUNT(*)` and `NOSUCH(*)` answer 102
+/// near `*` as well.
+pub(crate) fn star_under_another_name(
+    name: &ObjectName,
+    span: &Span,
+    ctx: &BindContext<'_>,
+) -> SqlResult<()> {
+    let counting = name.server.is_none()
+        && name.database.is_none()
+        && name.schema.is_none()
+        && (name.name.value.eq_ignore_ascii_case("COUNT")
+            || name.name.value.eq_ignore_ascii_case("COUNT_BIG"));
+    if counting {
+        return Ok(());
+    }
+    let start = span.offset as usize;
+    let line = ctx
+        .text
+        .get(start..)
+        .and_then(|rest| rest.find('*'))
+        .map_or(line_of(span), |at| line_at(ctx.text, span, start + at));
+    Err(SqlError::incorrect_syntax_near("*", line))
 }
 
 /// Narrows the result type of `NULLIF` over an integer literal, as SQL Server does.

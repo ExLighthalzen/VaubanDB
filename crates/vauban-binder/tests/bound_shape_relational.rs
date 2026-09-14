@@ -395,11 +395,9 @@ fn error_of(text: &str) -> vauban_errors::SqlError {
 fn an_unimplemented_form_names_itself() {
     let shapes: &[(&str, &str)] = &[
         // `SELECT 1 FROM a, b` and `SELECT 1 FROM a JOIN b ON 1 = 1` are bound
-        // (`tests/bind_join.rs`).
-        ("SELECT 1 FROM a GROUP BY c", "GROUP BY and HAVING"),
-        ("SELECT 1 FROM a HAVING 1 = 1", "GROUP BY and HAVING"),
-        ("SELECT COUNT(*) FROM a", "GROUP BY and HAVING"),
-        ("SELECT SUM(c) FROM a", "GROUP BY and HAVING"),
+        // (`tests/bind_join.rs`); so are `SELECT 1 FROM a GROUP BY c`, `SELECT 1 FROM a
+        // HAVING 1 = 1`, `SELECT COUNT(*) FROM a` and `SELECT SUM(c) FROM a`
+        // (`tests/bind_aggregate.rs`).
         // `SELECT 1 FROM a ORDER BY 1` and `SELECT DISTINCT c FROM a` are bound
         // (`tests/bind_sort.rs`).
         ("SELECT 1 WHERE EXISTS (SELECT 1)", "EXISTS"),
@@ -457,12 +455,15 @@ fn an_unimplemented_form_names_itself() {
 /// The first half is the routing: the group of `SELECT COUNT(*) FROM a` is the whole
 /// table, so the clause cannot be what sends the query there. The four spellings below
 /// are the star, a named aggregate, an aggregate under an operator and one under a `CASE`
-/// — the walk of `query::holds_an_aggregate` goes through both.
+/// — the walk of `query::holds_an_aggregate` goes through both — and each binds to a
+/// plan whose root is a `Project` over an `Aggregate` without a key.
 ///
 /// The second half is the counter-proof: without it the test would pass on a routing that
-/// sent each function call to `aggregate.rs`. `ABS(c)` and `ISNULL(c, 1)` bind, and
-/// `SUM(c)` written in a `WHERE` rather than in the select list stays with `call.rs`,
-/// whose refusal names the aggregate calls from another site.
+/// sent each function call to `aggregate.rs`. `ABS(c)` and `ISNULL(c, 1)` bind to a
+/// `Project` over the `Scan`, with no `Aggregate` in between; and `SUM(c)` written in a
+/// `WHERE` rather than in the select list is error 147, which `aggregate.rs` raises before
+/// the clause is bound, while `ORDER BY SUM(c)` stays with `call.rs`, whose refusal names
+/// the site.
 #[test]
 fn an_aggregate_in_a_select_list_reaches_aggregate_rs() {
     let aggregated = [
@@ -472,47 +473,59 @@ fn an_aggregate_in_a_select_list_reaches_aggregate_rs() {
         "SELECT CASE WHEN 1 = 1 THEN MAX(c) ELSE 0 END FROM a",
     ];
     for text in aggregated {
-        let error = error_of(text);
-        assert_eq!(error.number, 50000, "{text}: {}", error.message);
-        assert!(
-            error.message.contains("GROUP BY and HAVING"),
-            "{text} should reach aggregate.rs: {}",
-            error.message
-        );
+        let plan = plan_of(text);
+        let LogicalPlan::Project { input, .. } = &plan else {
+            panic!("{text}: the root is not a Project: {plan:?}");
+        };
+        let LogicalPlan::Aggregate { group_by, .. } = input.as_ref() else {
+            panic!("{text} should reach aggregate.rs: {input:?}");
+        };
+        assert!(group_by.is_empty(), "{text}");
     }
 
     let scalar = ["SELECT ABS(c) FROM a", "SELECT ISNULL(c, 1) FROM a"];
     for text in scalar {
-        register_builtins();
-        let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
-        let catalog = TwoTables;
-        let variables = NoVariables;
-        let ctx = BindContext {
-            text,
-            catalog: Some(&catalog),
-            database: "master",
-            default_schema: "dbo",
-            variables: &variables,
-            options: SessionOptions::default(),
+        let plan = plan_of(text);
+        let LogicalPlan::Project { input, .. } = &plan else {
+            panic!("{text}: the root is not a Project: {plan:?}");
         };
         assert!(
-            bind(&batch.statements[0], &ctx).is_ok(),
-            "{text} binds: a scalar call is not routed to aggregate.rs"
+            matches!(input.as_ref(), LogicalPlan::Scan { .. }),
+            "{text} binds without an Aggregate: a scalar call is not routed to aggregate.rs"
         );
     }
 
     let elsewhere = error_of("SELECT c FROM a WHERE SUM(c) = 1");
+    assert_eq!(elsewhere.number, 147, "{}", elsewhere.message);
+
+    let elsewhere = error_of("SELECT c FROM a ORDER BY SUM(c)");
     assert_eq!(elsewhere.number, 50000, "{}", elsewhere.message);
-    assert!(
-        !elsewhere.message.contains("GROUP BY and HAVING"),
-        "an aggregate in a WHERE stays with call.rs: {}",
-        elsewhere.message
-    );
     assert!(
         elsewhere
             .message
-            .contains("aggregate calls of a select list"),
-        "call.rs names the aggregate calls too: {}",
+            .contains("outside a select list or a HAVING clause"),
+        "call.rs names the site: {}",
         elsewhere.message
     );
+}
+
+/// The plan of `text`, bound against the two tables above.
+fn plan_of(text: &str) -> LogicalPlan {
+    register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default())
+        .unwrap_or_else(|e| unreachable!("{text} parses, got {e:?}"));
+    let catalog = TwoTables;
+    let variables = NoVariables;
+    let ctx = BindContext {
+        text,
+        catalog: Some(&catalog),
+        database: "master",
+        default_schema: "dbo",
+        variables: &variables,
+        options: SessionOptions::default(),
+    };
+    match bind(&batch.statements[0], &ctx) {
+        Ok(BoundStatement::Query(plan)) => *plan,
+        other => panic!("{text} should bind to a query: {other:?}"),
+    }
 }

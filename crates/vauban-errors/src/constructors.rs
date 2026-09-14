@@ -2490,6 +2490,46 @@ impl SqlError {
         from_catalog(141, 1, &[])
     }
 
+    /// Error 130, severity 15, state 1 (`SELECT SUM(COUNT(*)) FROM dbo.t2;`): an
+    /// aggregate is applied to an expression that itself holds an aggregate, whichever
+    /// operator sits between the two (`SELECT SUM(1 + MIN(a)) FROM dbo.t2;` raises it as
+    /// well). SQL Server reports it on the line of the inner call.
+    ///
+    /// No argument.
+    ///
+    /// ```text
+    /// An aggregate function cannot be applied to an expression that holds an aggregate or a subquery.
+    /// ```
+    pub fn nested_aggregate() -> Self {
+        from_catalog(130, 1, &[])
+    }
+
+    /// Error 144, severity 15, state 1 (`SELECT a FROM dbo.t2 GROUP BY SUM(b);`): a
+    /// `GROUP BY` key holds an aggregate. SQL Server reports it on the line of the call.
+    ///
+    /// No argument.
+    ///
+    /// ```text
+    /// A GROUP BY expression cannot hold an aggregate or a subquery.
+    /// ```
+    pub fn aggregate_in_group_by() -> Self {
+        from_catalog(144, 1, &[])
+    }
+
+    /// Error 147, severity 15, state 1 (`SELECT a FROM dbo.t2 WHERE COUNT(*) > 1;`): a
+    /// `WHERE` holds an aggregate, with or without a `GROUP BY` after it, and with or
+    /// without a `FROM` (`SELECT 1 WHERE COUNT(*) > 0;`). SQL Server reports it on the
+    /// line of the statement, not on the line of the call.
+    ///
+    /// No argument.
+    ///
+    /// ```text
+    /// An aggregate cannot appear in a WHERE clause, except inside a subquery of a HAVING clause or a select list, aggregating an outer reference.
+    /// ```
+    pub fn aggregate_in_where() -> Self {
+        from_catalog(147, 1, &[])
+    }
+
     /// Error 145, severity 15, state 1 (`SELECT DISTINCT a FROM dbo.t2 ORDER BY b;`): an
     /// `ORDER BY` item is absent from the select list of a `SELECT DISTINCT`.
     ///
@@ -6026,6 +6066,30 @@ mod tests {
                 "Column 'dbo.t2.b' of the HAVING clause is neither aggregated nor part of GROUP BY.",
             ),
             (
+                // SELECT SUM(COUNT(*)) FROM dbo.t2;
+                SqlError::nested_aggregate(),
+                130,
+                15,
+                1,
+                "An aggregate function cannot be applied to an expression that holds an aggregate or a subquery.",
+            ),
+            (
+                // SELECT a FROM dbo.t2 GROUP BY SUM(b);
+                SqlError::aggregate_in_group_by(),
+                144,
+                15,
+                1,
+                "A GROUP BY expression cannot hold an aggregate or a subquery.",
+            ),
+            (
+                // SELECT a FROM dbo.t2 WHERE COUNT(*) > 1;
+                SqlError::aggregate_in_where(),
+                147,
+                15,
+                1,
+                "An aggregate cannot appear in a WHERE clause, except inside a subquery of a HAVING clause or a select list, aggregating an outer reference.",
+            ),
+            (
                 // INSERT INTO dbo.t2 VALUES (1); on a two-column table
                 SqlError::column_count_does_not_match_table(),
                 213,
@@ -6109,11 +6173,11 @@ mod tests {
             );
             assert_eq!(err.line, 0, "line of error {number}");
         }
-        assert_eq!(expected.len(), 26);
+        assert_eq!(expected.len(), 29);
         let mut numbers: Vec<u32> = expected.iter().map(|row| row.1).collect();
         numbers.sort_unstable();
         numbers.dedup();
-        assert_eq!(numbers.len(), 25);
+        assert_eq!(numbers.len(), 28);
     }
 
     /// Fifteen DML numbers and their sixteen constructors, 1222 counting twice, each

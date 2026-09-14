@@ -196,6 +196,9 @@ fn bind_query_spec(
         (None, _, None) => Scope::empty(),
     };
     if let Some(condition) = &spec.where_ {
+        // An aggregate in a `WHERE` is error 147, before the clause is bound: `aggregate.rs`
+        // owns the rule and the line it is reported on.
+        aggregate::refuse_in_where(condition, line_of(&stmt.span), ctx)?;
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate: bind_condition(condition, ctx, &scope)?,
@@ -210,7 +213,7 @@ fn bind_query_spec(
         // A select list holding an aggregate comes here with no `GROUP BY` written
         // ([`aggregated_select_list`]): the group is then the whole input, and the
         // `group_by` of the variant is empty.
-        let grouped = aggregate::bind_aggregate(spec, plan, ctx)?;
+        let grouped = aggregate::bind_aggregate(spec, plan, &scope, ctx)?;
         return finish(grouped, spec, stmt, ctx);
     }
 
@@ -289,11 +292,13 @@ fn aggregated_select_list(spec: &QuerySpec) -> bool {
 
 /// Whether `expr` holds an aggregate call, the sub-expressions below included.
 ///
-/// Two spellings count: a call the `sysfn` registry answers for with
-/// [`FunctionKind::Aggregate`], and a call written with a star — `COUNT(*)` and
+/// Three spellings count: a call the `sysfn` registry answers for with
+/// [`FunctionKind::Aggregate`], a call written with a star — `COUNT(*)` and
 /// `COUNT_BIG(*)`, which take no argument and are therefore not entries of that registry
-/// (`vauban-sysfn`, `builtins/aggregates.rs`). A name written with a qualifier is left
-/// alone, as [`call.rs`](crate::call) leaves it: `dbo.SUM(1)` is error 4121 there.
+/// (`vauban-sysfn`, `builtins/aggregates.rs`) — and a call written with `DISTINCT`, which
+/// `aggregate.rs` refuses by 195 when the name is no aggregate (`LEN(DISTINCT s)`). A
+/// name written with a qualifier is left alone, as [`call.rs`](crate::call) leaves it:
+/// `dbo.SUM(1)` is error 4121 there.
 ///
 /// A subquery is not walked into: the aggregate of `SELECT (SELECT SUM(c) FROM dbo.u)`
 /// groups the inner query, not the outer one. The walk is a worklist rather than a
@@ -304,9 +309,13 @@ fn holds_an_aggregate(expr: &Expr) -> bool {
     while let Some(expr) = pending.pop() {
         match expr {
             Expr::Function {
-                name, args, star, ..
+                name,
+                args,
+                star,
+                distinct,
+                ..
             } => {
-                if *star || is_aggregate_name(name) {
+                if *star || *distinct || is_aggregate_name(name) {
                     return true;
                 }
                 pending.extend(args);
@@ -376,7 +385,7 @@ fn holds_an_aggregate(expr: &Expr) -> bool {
 }
 
 /// Whether an unqualified function name is that of an aggregate of the registry.
-fn is_aggregate_name(name: &ObjectName) -> bool {
+pub(crate) fn is_aggregate_name(name: &ObjectName) -> bool {
     if name.server.is_some() || name.database.is_some() || name.schema.is_some() {
         return false;
     }
@@ -483,7 +492,11 @@ fn reference_alias(reference: &TableRef) -> Option<String> {
 ///
 /// The last two lines are why the **bound** node decides and not the written one: `USER`
 /// is written as a column reference and binds to a niladic call, which has no name.
-fn column_name(expr: &Expr, bound: &BoundExpr, alias: Option<&Ident>) -> String {
+/// `aggregate.rs` applies the same rule to the select list of a grouped query, whose
+/// bound nodes point at the columns of an `Aggregate`: `SELECT k, COUNT(*) FROM dbo.t
+/// GROUP BY k` is headed `k` and `""`, and `SELECT c + 1 FROM dbo.t GROUP BY c + 1` is
+/// headed `""`.
+pub(crate) fn column_name(expr: &Expr, bound: &BoundExpr, alias: Option<&Ident>) -> String {
     if let Some(alias) = alias {
         return alias.value.clone();
     }
