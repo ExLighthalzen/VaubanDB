@@ -838,7 +838,8 @@ fn column_metadata(schema: &OutputSchema) -> Vec<ColumnMeta> {
 /// # Which variants have a case, and why
 ///
 /// A `SELECT` ([`PhysicalStatement::Query`]), the DDL of databases, tables and indexes
-/// ([`PhysicalStatement::Ddl`]) and `USE` ([`PhysicalStatement::Use`]). These are the statements
+/// ([`PhysicalStatement::Ddl`]), `USE` ([`PhysicalStatement::Use`]) and `INSERT`
+/// ([`PhysicalStatement::Insert`]). These are the statements
 /// whose run-time errors reach [`at_statement`], and whose fragment
 /// [`Session::bind_batch`] pads with `line - 1` newlines before rebinding it, so that a
 /// binding error lands on its line of the batch instead of line 1. A variant without a
@@ -880,7 +881,8 @@ fn statement_line(stmt: &Statement) -> u32 {
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::AlterDatabase(_)
-        | Statement::Use { .. } => statement_span(stmt).line,
+        | Statement::Use { .. }
+        | Statement::Insert(_) => statement_span(stmt).line,
         _ => 0,
     }
 }
@@ -1247,7 +1249,8 @@ mod tests {
         assert_eq!(statement_line(&parse("SET nocount on")[0]), 0);
     }
 
-    /// The DDL variants and `USE` answer the line of their first token, like a `SELECT`.
+    /// The DDL variants, `USE` and `INSERT` answer the line of their first token, like a
+    /// `SELECT`.
     ///
     /// Each statement below starts on line 2 and spreads over line 3: a case that read the
     /// last line of the statement would answer 3, and a missing case 0, which is what the
@@ -1262,6 +1265,7 @@ mod tests {
             "SELECT 1;\nCREATE INDEX ix ON dbo.t\n  (a);",
             "SELECT 1;\nDROP INDEX ix ON\n  dbo.t;",
             "SELECT 1;\nUSE\n  d;",
+            "SELECT 1;\nINSERT INTO dbo.t\n  (a) VALUES (1);",
         ] {
             assert_eq!(statement_line(&parse(text)[1]), 2, "{text}");
         }

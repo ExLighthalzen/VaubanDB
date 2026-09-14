@@ -12,7 +12,7 @@
 //! [`CatalogSnapshot::view_definition`]) and converts the result into the types of the
 //! binder.
 
-use vauban_catalog::{CatalogSnapshot, ColumnMeta, ObjectId, ObjectKind};
+use vauban_catalog::{CatalogSnapshot, ColumnId, ColumnMeta, ObjectId, ObjectKind};
 use vauban_parser::ObjectName;
 
 use crate::bound::ColumnBinding;
@@ -65,6 +65,29 @@ impl CatalogView for CatalogSnapshot {
     fn view_definition(&self, object: ObjectId) -> Option<&str> {
         CatalogSnapshot::view_definition(self, object)
     }
+
+    /// The column of `object` whose [`ColumnMeta::identity`] is set, read from
+    /// [`CatalogSnapshot::table`]; `None` on a snapshot that holds no such table (unit test
+    /// `an_empty_snapshot_has_no_identity_nor_computed_column`).
+    fn identity_column(&self, object: ObjectId) -> Option<ColumnId> {
+        self.table(object)?
+            .columns
+            .iter()
+            .find(|column| column.identity.is_some())
+            .map(|column| column.id)
+    }
+
+    /// The columns of `object` whose [`ColumnMeta::computed`] is set, read from
+    /// [`CatalogSnapshot::table`].
+    fn computed_columns(&self, object: ObjectId) -> Vec<ColumnId> {
+        self.table(object).map_or_else(Vec::new, |meta| {
+            meta.columns
+                .iter()
+                .filter(|column| column.computed.is_some())
+                .map(|column| column.id)
+                .collect()
+        })
+    }
 }
 
 /// The columns of a table as the binder names them, in the order of the row of `storage`.
@@ -88,7 +111,6 @@ fn columns_of(columns: &[ColumnMeta]) -> Vec<ColumnBinding> {
 mod tests {
     use super::*;
     use crate::context::TableReferenceKind;
-    use vauban_catalog::ColumnId;
     use vauban_parser::{Ident, Span};
     use vauban_types::{SqlType, TypeInfo};
 
@@ -143,6 +165,17 @@ mod tests {
             TableReferenceKind::Unknown
         );
         assert!(CatalogView::view_definition(&snapshot, ObjectId(1)).is_none());
+    }
+
+    #[test]
+    fn an_empty_snapshot_has_no_identity_nor_computed_column() {
+        let snapshot = CatalogSnapshot::default();
+        assert!(CatalogView::identity_column(&snapshot, ObjectId(1)).is_none());
+        assert!(CatalogView::computed_columns(&snapshot, ObjectId(1)).is_empty());
+        assert!(
+            snapshot.table(ObjectId(1)).is_none(),
+            "the forwarded method answers the same thing"
+        );
     }
 
     #[test]

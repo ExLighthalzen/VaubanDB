@@ -1,7 +1,7 @@
 //! What the binder needs to know besides the AST: the batch text, the catalogue, the
 //! current database and schema, the variables in scope and the `SET` options.
 
-use vauban_catalog::ObjectId;
+use vauban_catalog::{ColumnId, ObjectId};
 use vauban_types::TypeInfo;
 
 use crate::bound::ColumnBinding;
@@ -78,6 +78,23 @@ pub trait CatalogView {
     fn view_definition(&self, object: ObjectId) -> Option<&str> {
         let _ = object;
         None
+    }
+
+    /// The `IDENTITY` column of the table of identifier `object`, `None` for a table
+    /// declared without one and when `object` is not a table.
+    ///
+    /// An `INSERT` leaves that column out of the list it builds when none was written, and
+    /// refuses a value written for it (`insert.rs`).
+    fn identity_column(&self, object: ObjectId) -> Option<ColumnId> {
+        let _ = object;
+        None
+    }
+
+    /// The computed columns of the table of identifier `object`, empty when it declares
+    /// none or when `object` is not a table. An `INSERT` cannot fill them (`insert.rs`).
+    fn computed_columns(&self, object: ObjectId) -> Vec<ColumnId> {
+        let _ = object;
+        Vec::new()
     }
 
     /// Classifies the written name in the current database and default schema.

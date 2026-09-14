@@ -2742,6 +2742,96 @@ impl SqlError {
         from_catalog(544, 1, &[Arg::Str(table)])
     }
 
+    /// Error 109, severity 15, state 1 (`INSERT INTO dbo.t2 (a, b) VALUES (1);`): the
+    /// column list of an `INSERT` names more columns than a `VALUES` row supplies.
+    ///
+    /// No argument. The opposite count is 110 ([`SqlError::more_values_than_columns`]);
+    /// the same `INSERT` written without a column list answers 213
+    /// ([`SqlError::column_count_does_not_match_table`]).
+    ///
+    /// ```text
+    /// The INSERT column list names more columns than the VALUES row supplies; the two counts have to match.
+    /// ```
+    pub fn more_columns_than_values() -> Self {
+        from_catalog(109, 1, &[])
+    }
+
+    /// Error 110, severity 15, state 1 (`INSERT INTO dbo.t2 (a) VALUES (1, 2);`): the
+    /// column list of an `INSERT` names fewer columns than a `VALUES` row supplies.
+    ///
+    /// No argument.
+    ///
+    /// ```text
+    /// The INSERT column list names fewer columns than the VALUES row supplies; the two counts have to match.
+    /// ```
+    pub fn more_values_than_columns() -> Self {
+        from_catalog(110, 1, &[])
+    }
+
+    /// Error 120, severity 15, state 1 (`INSERT INTO dbo.t2 (a, b) SELECT 1;`): the
+    /// select list of an `INSERT … SELECT` supplies fewer items than the column list names.
+    ///
+    /// No argument. The opposite count is 121 ([`SqlError::select_list_longer_than_insert_list`]).
+    ///
+    /// ```text
+    /// The select list of the INSERT supplies fewer items than its column list; the two counts have to match.
+    /// ```
+    pub fn select_list_shorter_than_insert_list() -> Self {
+        from_catalog(120, 1, &[])
+    }
+
+    /// Error 121, severity 15, state 1 (`INSERT INTO dbo.t2 (a) SELECT 1, 2;`): the select
+    /// list of an `INSERT … SELECT` supplies more items than the column list names.
+    ///
+    /// No argument.
+    ///
+    /// ```text
+    /// The select list of the INSERT supplies more items than its column list; the two counts have to match.
+    /// ```
+    pub fn select_list_longer_than_insert_list() -> Self {
+        from_catalog(121, 1, &[])
+    }
+
+    /// Error 264, severity 16, state 1 (`INSERT INTO dbo.t2 (a, a) VALUES (1, 2);`): a
+    /// column is named twice in the column list of an `INSERT` or the `SET` clause of an
+    /// `UPDATE`.
+    ///
+    /// `column` is the name as the catalogue spells it, unqualified (`'a'`): the list
+    /// `(A, a)` over a column `a` prints `'a'`.
+    ///
+    /// ```text
+    /// Column 'a' is named more than once in the column list of the INSERT or the SET clause of the UPDATE; a column takes one value per statement.
+    /// ```
+    pub fn column_specified_more_than_once(column: &str) -> Self {
+        from_catalog(264, 1, &[Arg::Str(column)])
+    }
+
+    /// Error 339, severity 16, state 1 (`INSERT INTO dbo.ident (id, v) VALUES (NULL, 1);`
+    /// and the same row with `DEFAULT`): a `NULL` or a `DEFAULT` is written for an identity
+    /// column named in the column list.
+    ///
+    /// No argument.
+    ///
+    /// ```text
+    /// DEFAULT and NULL cannot be given as explicit identity values.
+    /// ```
+    pub fn default_or_null_as_identity_value() -> Self {
+        from_catalog(339, 1, &[])
+    }
+
+    /// Error 10709, severity 16, state 1 (`INSERT INTO dbo.t2 (a, b) VALUES (1, 2), (3);`):
+    /// two rows of one `VALUES` constructor do not supply the same number of columns.
+    ///
+    /// No argument. Raised whether or not a column list was written, and before the count
+    /// of a row is compared with that list (109, 110) or with the table (213).
+    ///
+    /// ```text
+    /// The rows of a table value constructor have to supply the same number of columns.
+    /// ```
+    pub fn table_value_constructor_rows_differ() -> Self {
+        from_catalog(10709, 1, &[])
+    }
+
     /// Error 1205, severity 13, state 51: this session was picked as the victim of a
     /// deadlock.
     ///
@@ -5993,8 +6083,8 @@ mod tests {
         assert_eq!(numbers.len(), 25);
     }
 
-    /// Eight numbers catalogued before their constructor: nine constructors, 1222
-    /// counting twice, each sending the catalogue's severity.
+    /// Fifteen DML numbers and their sixteen constructors, 1222 counting twice, each
+    /// sending the catalogue's severity.
     #[test]
     fn dml_constructors_exist_for_the_catalogued_numbers() {
         let calls: &[(SqlError, u32, u8)] = &[
@@ -6011,18 +6101,29 @@ mod tests {
                 8120,
                 16,
             ),
+            (SqlError::more_columns_than_values(), 109, 15),
+            (SqlError::more_values_than_columns(), 110, 15),
+            (SqlError::select_list_shorter_than_insert_list(), 120, 15),
+            (SqlError::select_list_longer_than_insert_list(), 121, 15),
+            (SqlError::column_specified_more_than_once("a"), 264, 16),
+            (SqlError::default_or_null_as_identity_value(), 339, 16),
+            (SqlError::table_value_constructor_rows_differ(), 10709, 16),
         ];
         for (err, number, severity) in calls {
             assert_eq!(err.number, *number);
             assert_eq!(err.severity, *severity, "severity of error {number}");
+            assert!(
+                !err.message.contains('%'),
+                "error {number} still carries a specifier"
+            );
             let def = message_template(*number).expect("catalogued");
             assert_eq!(def.severity, *severity, "published severity of {number}");
         }
-        assert_eq!(calls.len(), 9);
+        assert_eq!(calls.len(), 16);
         let mut numbers: Vec<u32> = calls.iter().map(|row| row.1).collect();
         numbers.sort_unstable();
         numbers.dedup();
-        assert_eq!(numbers.len(), 8);
+        assert_eq!(numbers.len(), 15);
     }
 
     /// Error 1222 sends two states, so it carries two constructors rather than a state

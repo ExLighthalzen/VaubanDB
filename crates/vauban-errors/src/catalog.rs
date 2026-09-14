@@ -99,6 +99,16 @@ const CATALOG: &[ErrorDef] = &[
         template: "The column prefix '%.*ls' matches no table or alias of the query.",
     },
     ErrorDef {
+        number: 109,
+        severity: 15,
+        template: "The INSERT column list names more columns than the VALUES row supplies; the two counts have to match.",
+    },
+    ErrorDef {
+        number: 110,
+        severity: 15,
+        template: "The INSERT column list names fewer columns than the VALUES row supplies; the two counts have to match.",
+    },
+    ErrorDef {
         number: 113,
         severity: 15,
         template: "Comment is not closed: '*/' expected.",
@@ -112,6 +122,16 @@ const CATALOG: &[ErrorDef] = &[
         number: 117,
         severity: 15,
         template: "The %S_MSG name '%.*ls' has too many prefixes; at most %d are allowed.",
+    },
+    ErrorDef {
+        number: 120,
+        severity: 15,
+        template: "The select list of the INSERT supplies fewer items than its column list; the two counts have to match.",
+    },
+    ErrorDef {
+        number: 121,
+        severity: 15,
+        template: "The select list of the INSERT supplies more items than its column list; the two counts have to match.",
     },
     ErrorDef {
         number: 127,
@@ -304,6 +324,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "No table to select from.",
     },
     ErrorDef {
+        number: 264,
+        severity: 16,
+        template: "Column '%.*ls' is named more than once in the column list of the INSERT or the SET clause of the UPDATE; a column takes one value per statement.",
+    },
+    ErrorDef {
         number: 266,
         severity: 16,
         template: "The transaction count changed across EXECUTE: BEGIN and COMMIT are unbalanced (before %ld, after %ld).",
@@ -327,6 +352,11 @@ const CATALOG: &[ErrorDef] = &[
         number: 295,
         severity: 16,
         template: "The character string could not be converted to smalldatetime.",
+    },
+    ErrorDef {
+        number: 339,
+        severity: 16,
+        template: "DEFAULT and NULL cannot be given as explicit identity values.",
     },
     ErrorDef {
         number: 402,
@@ -829,6 +859,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "Datepart %.*ls cannot be used with the date function %.*ls on data type %s.",
     },
     ErrorDef {
+        number: 10709,
+        severity: 16,
+        template: "The rows of a table value constructor have to supply the same number of columns.",
+    },
+    ErrorDef {
         number: 18452,
         severity: 14,
         template: "Login refused: integrated authentication does not accept a login from an untrusted domain.%.*ls",
@@ -866,9 +901,13 @@ mod tests {
         (103, 15, &["%S_MSG", "%.*ls", "%d"]),
         (105, 15, &["%.*ls"]),
         (107, 15, &["%.*ls"]),
+        (109, 15, &[]),
+        (110, 15, &[]),
         (113, 15, &[]),
         (116, 15, &[]),
         (117, 15, &["%S_MSG", "%.*ls", "%d"]),
+        (120, 15, &[]),
+        (121, 15, &[]),
         (127, 15, &[]),
         (131, 15, &["%d", "%S_MSG", "%.*ls", "%d"]),
         (134, 15, &["%.*ls"]),
@@ -907,11 +946,13 @@ mod tests {
         (248, 16, &["%ls", "%.*ls"]),
         (257, 16, &["%ls", "%ls"]),
         (263, 16, &[]),
+        (264, 16, &["%.*ls"]),
         (266, 16, &["%ld", "%ld"]),
         (281, 16, &["%d", "%ls"]),
         (289, 16, &["%ls"]),
         (292, 16, &["%ls"]),
         (295, 16, &[]),
+        (339, 16, &[]),
         (402, 16, &["%s", "%s", "%s"]),
         (447, 16, &["%ls"]),
         (448, 16, &["%.*ls"]),
@@ -1018,6 +1059,7 @@ mod tests {
         (9807, 16, &["%d"]),
         (9809, 16, &["%d", "%s", "%s"]),
         (9810, 16, &["%.*ls", "%.*ls", "%s"]),
+        (10709, 16, &[]),
         (18452, 14, &["%.*ls"]),
         (18456, 14, &["%.*ls", "%.*ls", "%.*ls"]),
     ];
