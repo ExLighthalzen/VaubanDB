@@ -65,6 +65,10 @@
 //!   yields every row once.
 //! - `scan_and_seek_isolated_from_later_writes_of_other_txns`: an iterator created before
 //!   another transaction writes and commits does not see those writes.
+//! - `scan_isolated_from_later_commits_with_large_xmax`: an iterator created before another
+//!   transaction commits with a reader snapshot whose `xmax` does not hide that transaction
+//!   still does not see the new rows: the trait asks for the isolation, and a scan that
+//!   materialises its rows before it returns is what gives it.
 //! - `vacuum_removes_dead_versions_keeps_visible_ones`: versions deleted or replaced by a
 //!   transaction below the horizon go, those a held snapshot can still see stay, aborted
 //!   versions go, `RowId`s are not reused, vacuuming twice is harmless.
@@ -245,6 +249,8 @@ macro_rules! storage_contract_suite {
             clustered_key_orders_scan => case_clustered_key_orders_scan,
             scan_and_seek_isolated_from_later_writes_of_other_txns
                 => case_scan_and_seek_isolated_from_later_writes_of_other_txns,
+            scan_isolated_from_later_commits_with_large_xmax
+                => case_scan_isolated_from_later_commits_with_large_xmax,
             vacuum_removes_dead_versions_keeps_visible_ones
                 => case_vacuum_removes_dead_versions_keeps_visible_ones,
             checkpoint_is_ok => case_checkpoint_is_ok,

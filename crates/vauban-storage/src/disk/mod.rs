@@ -850,9 +850,20 @@ impl DiskStorage {
         // leaves them out of the redo.
         self.wal
             .append_durable(WalRecordKind::RollbackTo, txn, &sp.0.to_le_bytes())?;
-        // Rollback per table.
-        for (table, mark) in &marks {
-            self.with_rows(*table, |store| Ok(store.rollback_to_savepoint(txn, *mark)?))?;
+        // Rollback per table. Each table the transaction wrote in — including those that
+        // appeared after the savepoint — undoes its writes back to the position the savepoint
+        // named when it was taken. A table the savepoint did not name yet has its whole undo
+        // log to replay, so its position is `0`
+        // (`savepoint_invalidated_after_rollback_to`). The undo of a write pushes an [`IndexChange::Removed`] into the store's
+        // maintenance log; that log is drained here and applied to the trees, as `commit`
+        // and `rollback` do at the end of a transaction.
+        for table in self.txn_tables(txn) {
+            let mark = marks.get(&table).copied().unwrap_or(0);
+            let changes = self.with_rows(table, |store| {
+                store.rollback_to_savepoint(txn, mark)?;
+                Ok(store.take_index_changes())
+            })?;
+            self.maintain_indexes(table, &changes)?;
         }
         // Truncate savepoints after this one.
         let mut register = write_lock(&self.txns);

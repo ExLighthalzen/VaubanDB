@@ -1069,6 +1069,40 @@ pub fn case_scan_and_seek_isolated_from_later_writes_of_other_txns(
     assert_eq!(collect(seek_iter), vec![(a, row(&[1]))]);
 }
 
+/// See [`crate::testsuite`]: `scan_isolated_from_later_commits_with_large_xmax`.
+pub fn case_scan_isolated_from_later_commits_with_large_xmax(make: &dyn Fn() -> Box<dyn Storage>) {
+    let (s, _, t) = one_table(make, 1);
+    let a = s.insert(TxnId(1), t, &row(&[1])).expect("insert a");
+    s.commit(TxnId(1)).expect("commit 1");
+    // A snapshot whose `xmax` is past the transaction that will commit next: `xmax` alone
+    // does not hide T2 — the `active` list is what would. An iterator that reads the heap
+    // page again at each `next` still hands back T2's row on a lazy implementation, so the
+    // isolation the trait asks for fails here while
+    // [`case_scan_and_seek_isolated_from_later_writes_of_other_txns`] stays green.
+    let reader = Snapshot {
+        xmin: TxnId(1),
+        xmax: TxnId(1000),
+        active: Vec::new(),
+        own: TxnId(1),
+    };
+    let scan_iter = s.scan(&reader, t).expect("scan");
+    let b = s.insert(TxnId(2), t, &row(&[2])).expect("insert b");
+    s.commit(TxnId(2)).expect("commit 2");
+    // A later reader with the same shape does see the new row.
+    let later = Snapshot {
+        xmin: TxnId(1),
+        xmax: TxnId(1000),
+        active: Vec::new(),
+        own: TxnId(3),
+    };
+    assert_eq!(
+        collect(s.scan(&later, t).expect("scan 2")),
+        vec![(a, row(&[1])), (b, row(&[2]))]
+    );
+    // The iterator created before the commit does not.
+    assert_eq!(collect(scan_iter), vec![(a, row(&[1]))]);
+}
+
 // -------------------------------------------------------------------- vacuum
 
 /// See [`crate::testsuite`]: `vacuum_removes_dead_versions_keeps_visible_ones`.

@@ -149,7 +149,7 @@ impl Store<'_> {
     }
 
     /// Takes the maintenance log of the writes made since the previous call.
-    fn take_index_changes(&mut self) -> Vec<IndexChange> {
+    pub(crate) fn take_index_changes(&mut self) -> Vec<IndexChange> {
         match self {
             Self::Heap(table) => table.take_index_changes(),
             Self::Clustered(table) => table.take_index_changes(),
@@ -543,6 +543,13 @@ impl DiskStorage {
         let lsn = self.end_txn(txn, kind)?;
         let mut changed: Vec<(TableId, Vec<IndexChange>)> = Vec::new();
         for table in self.txn_tables(txn) {
+            // A table the transaction wrote in and that was dropped since is left alone:
+            // `drop_table` frees its pages and takes it out of the catalogue, and its
+            // in-flight writes have nothing to finish in — the same answer
+            // [`crate::MemoryStorage`] gives (`table_create_drop_and_ids_not_reused`).
+            if self.lock_catalogue()?.table(table).is_none() {
+                continue;
+            }
             let changes = self.with_rows(table, |store| {
                 store.finish(txn, status)?;
                 Ok(store.take_index_changes())
