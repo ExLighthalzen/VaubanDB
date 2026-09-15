@@ -29,7 +29,7 @@ use vauban_session::{
     Authenticator, Engine, NoAuth, REQUEST_THREAD_STACK_SIZE, SaPasswordAuthenticator, Server,
     ServerConfig,
 };
-use vauban_storage::MemoryStorage;
+use vauban_storage::{DiskOptions, DiskStorage, MemoryStorage, Storage};
 
 use crate::config::{
     Config, ConfigError, ConfigLayer, DEFAULT_CONFIG_FILE, EDITION_ENV, LogFormat,
@@ -185,7 +185,23 @@ async fn run_server(cfg: Config, tls: Option<Arc<rustls::ServerConfig>>) -> anyh
     vauban_sysfn::register_builtins();
     vauban_compat::register_functions();
 
-    let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+    // `Config::validate` refuses a configuration where both flags or neither is set, so
+    // the `else` branch has the directory the caller asked for (`StorageBoth` and
+    // `StorageUnset`).
+    let storage: Arc<dyn Storage> = if cfg.in_memory {
+        Arc::new(MemoryStorage::new())
+    } else {
+        let dir = cfg
+            .data
+            .as_ref()
+            .expect("validate refused the empty --data branch");
+        Arc::new(
+            DiskStorage::open(dir, DiskOptions::default())
+                .map_err(|err| anyhow::anyhow!("cannot open instance {}: {err}", dir.display()))?,
+        )
+    };
+    let on_disk = !cfg.in_memory;
+    let engine = Arc::new(Engine::new(Arc::clone(&storage)));
     let authenticator: Arc<dyn Authenticator> = match (cfg.no_auth, &cfg.sa_password) {
         (true, _) => Arc::new(NoAuth),
         (false, Some(password)) => Arc::new(SaPasswordAuthenticator(password.clone())),
@@ -220,7 +236,7 @@ async fn run_server(cfg: Config, tls: Option<Arc<rustls::ServerConfig>>) -> anyh
         port = local.port(),
         encrypt = ?cfg.encrypt,
         auth = cfg.auth_mode(),
-        storage = "in-memory",
+        storage = if on_disk { "disk" } else { "in-memory" },
         server_name = %server_cfg.server_name,
         "vauban listening"
     );
@@ -229,6 +245,15 @@ async fn run_server(cfg: Config, tls: Option<Arc<rustls::ServerConfig>>) -> anyh
         .serve(listener, shutdown)
         .await
         .context("server failed")?;
+    // A disk instance gets its last checkpoint before the process returns, so what the
+    // server committed while running reaches `data` and the next `open` finds it without
+    // replaying a journal. An in-memory instance answers `Ok(())` on `checkpoint` and has
+    // nothing to flush; the call is made on the trait, which both implementations answer.
+    if on_disk {
+        storage
+            .checkpoint()
+            .context("cannot checkpoint the instance before exit")?;
+    }
     info!("shutdown complete");
     Ok(())
 }

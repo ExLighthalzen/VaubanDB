@@ -21,8 +21,8 @@ vauban version            # print the version and the build target
 |---|---|---|
 | `--bind <ADDR>` | `0.0.0.0` | Address to listen on |
 | `--port <N>` | `1433` | TCP port |
-| `--data <DIR>` | none | Data directory. Holds the generated TLS certificate (`tls/`); the databases follow when disk storage lands |
-| `--in-memory` | off | Keep every database in memory. **Required** in this version |
+| `--data <DIR>` | unset | Instance directory: `vauban.ctl`, `data`, `wal`. Also holds the generated TLS certificate (`tls/`). Mutually exclusive with `--in-memory` |
+| `--in-memory` | off | Keep the databases in memory. Mutually exclusive with `--data`. Exactly one of the two is required |
 | `--sa-password <PASSWORD>` | none | Password of the `sa` login. Prefer `VAUBAN_SA_PASSWORD` |
 | `--no-auth` | off | Accept any login and password (development only) |
 | `--encrypt <off\|optional\|required>` | `optional` | Encryption policy announced at PRELOGIN (see [TLS](#tls)) |

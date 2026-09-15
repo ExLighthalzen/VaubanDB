@@ -8,7 +8,27 @@
 //! startup log. `VAUBAN_TEST_PORT` retains explicit base-plus-offset allocation (20..=24).
 
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A unique directory under `CARGO_TARGET_TMPDIR`, created on disk: where a `--data`
+/// server writes its instance files.
+fn tmp_dir(label: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "cli-{label}-{pid}-{nanos}-{seq}",
+        pid = std::process::id(),
+        seq = SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&path).expect("create the tmp dir");
+    path
+}
 
 /// The binary with a clean environment and a working directory without `vauban.toml`.
 fn vauban() -> Command {
@@ -99,11 +119,30 @@ fn serve_without_password_or_no_auth_exits_2() {
 }
 
 #[test]
-fn serve_without_in_memory_exits_2() {
+fn serve_without_storage_choice_exits_2() {
     let output = run(&["serve", "--no-auth", "--encrypt", "off"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(
-        stderr(&output).contains("error: disk storage is not implemented yet; pass --in-memory"),
+        stderr(&output).contains("error: disk storage requires --data <dir>, or pass --in-memory"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn serve_with_both_storage_choices_exits_2() {
+    let output = run(&[
+        "serve",
+        "--no-auth",
+        "--encrypt",
+        "off",
+        "--in-memory",
+        "--data",
+        "d",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("error: --data and --in-memory are mutually exclusive"),
         "{}",
         stderr(&output)
     );
@@ -302,6 +341,24 @@ mod unix {
                 .args([
                     "serve",
                     "--in-memory",
+                    "--encrypt",
+                    "off",
+                    "--port",
+                    &port.to_string(),
+                ])
+                .args(extra);
+            Self::spawn(command, port)
+        }
+
+        /// [`Self::start`] with `--data <dir>` rather than `--in-memory`.
+        fn start_on_data(offset: u16, dir: &Path, extra: &[&str]) -> Self {
+            let port = port(offset);
+            let mut command = vauban();
+            command
+                .args([
+                    "serve",
+                    "--data",
+                    &dir.to_string_lossy(),
                     "--encrypt",
                     "off",
                     "--port",
@@ -552,6 +609,40 @@ mod unix {
         let out = stdout(&output);
         assert!(out.contains("vauban listening"), "{out}");
         assert!(out.contains("shutdown complete"), "{out}");
+    }
+
+    /// A server on `--data <dir>` listens, checkpoints on the SIGINT shutdown, and its
+    /// directory holds the three files of an instance afterwards. A second server on the
+    /// same directory opens it — no corruption, no journal replay failure — and listens
+    /// too.
+    #[test]
+    fn serve_on_data_restarts_on_the_same_directory() {
+        let dir = tmp_dir("data-restart");
+        let server = Running::start_on_data(30, &dir, &["--no-auth"]);
+        assert!(TcpStream::connect(("127.0.0.1", server.port)).is_ok());
+        let (output, elapsed) = server.interrupt();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stdout:\n{}\nstderr:\n{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(elapsed < timeout(), "shutdown took {elapsed:?}");
+        // The three files of an instance are there: `vauban.ctl`, `data`, `wal`.
+        for name in ["vauban.ctl", "data", "wal"] {
+            assert!(
+                dir.join(name).is_file(),
+                "the shutdown left no {name} in {}",
+                dir.display()
+            );
+        }
+        // A second `serve` on the same directory opens and listens.
+        let server = Running::start_on_data(31, &dir, &["--no-auth"]);
+        assert!(TcpStream::connect(("127.0.0.1", server.port)).is_ok());
+        let (output, _) = server.interrupt();
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        drop(std::fs::remove_dir_all(&dir));
     }
 
     #[test]

@@ -52,10 +52,11 @@ pub(crate) struct ServeArgs {
     pub(crate) port: Option<u16>,
 
     /// Data directory (holds tls/server.crt and tls/server.key; databases come with disk storage)
+    /// Instance directory on disk (vauban.ctl, data, wal); mutually exclusive with --in-memory
     #[arg(long, value_name = "DIR")]
     pub(crate) data: Option<PathBuf>,
 
-    /// Keep every database in memory (required in this version)
+    /// Keep the databases in memory; mutually exclusive with --data
     #[arg(long)]
     pub(crate) in_memory: bool,
 
@@ -335,8 +336,11 @@ pub(crate) enum ConfigError {
     MissingPassword,
     /// `--cert` without `--key` or the reverse.
     CertWithoutKey,
-    /// `--in-memory` not given: disk storage does not exist yet.
-    DiskStorage,
+    /// Neither `--in-memory` nor `--data <dir>` given: the server has to be told which of
+    /// the two storage implementations to open.
+    StorageUnset,
+    /// Both `--in-memory` and `--data <dir>` given: the two are exclusive.
+    StorageBoth,
     /// `program_name` longer than [`PROGRAM_NAME_MAX_UNITS`]; holds its length in UTF-16
     /// code units.
     ProgramNameTooLong(usize),
@@ -353,8 +357,11 @@ impl fmt::Display for ConfigError {
             ConfigError::CertWithoutKey => {
                 write!(f, "--cert and --key must be given together")
             }
-            ConfigError::DiskStorage => {
-                write!(f, "disk storage is not implemented yet; pass --in-memory")
+            ConfigError::StorageUnset => {
+                write!(f, "disk storage requires --data <dir>, or pass --in-memory")
+            }
+            ConfigError::StorageBoth => {
+                write!(f, "--data and --in-memory are mutually exclusive")
             }
             ConfigError::ProgramNameTooLong(units) => write!(
                 f,
@@ -434,8 +441,11 @@ impl Config {
         if self.cert.is_some() != self.key.is_some() {
             return Err(ConfigError::CertWithoutKey);
         }
-        if !self.in_memory {
-            return Err(ConfigError::DiskStorage);
+        if self.in_memory && self.data.is_some() {
+            return Err(ConfigError::StorageBoth);
+        }
+        if !self.in_memory && self.data.is_none() {
+            return Err(ConfigError::StorageUnset);
         }
         if let Some(name) = &self.program_name {
             // UTF-16 code units, not bytes and not characters: the length byte of a
@@ -669,14 +679,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_requires_in_memory() {
+    fn validate_requires_exactly_one_of_in_memory_and_data() {
         let cfg = Config::assemble(&args(&["--no-auth"]), None, None);
-        assert_eq!(cfg.validate(), Err(ConfigError::DiskStorage));
+        assert_eq!(cfg.validate(), Err(ConfigError::StorageUnset));
         let cfg = Config::assemble(
             &args(&["--no-auth", "--in-memory", "--data", "d"]),
             None,
             None,
         );
+        assert_eq!(cfg.validate(), Err(ConfigError::StorageBoth));
+        let cfg = Config::assemble(&args(&["--no-auth", "--in-memory"]), None, None);
+        assert_eq!(cfg.validate(), Ok(()));
+        let cfg = Config::assemble(&args(&["--no-auth", "--data", "d"]), None, None);
         assert_eq!(cfg.validate(), Ok(()));
     }
 

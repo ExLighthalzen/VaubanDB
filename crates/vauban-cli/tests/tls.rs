@@ -102,10 +102,14 @@ struct Running {
 impl Running {
     /// Starts `serve --in-memory --no-auth --bind 127.0.0.1 --port <port(offset)>
     /// --log-format json` plus `extra`, and waits for the port to accept a connection.
+    /// When `extra` names `--data`, the `--in-memory` flag is left out: the two are
+    /// mutually exclusive and the caller asked for the disk branch.
     fn start(offset: u16, extra: &[&str]) -> Self {
+        let on_data = extra.contains(&"--data");
         let port = port(offset);
         let port_text = port.to_string();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_vauban"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vauban"));
+        command
             .env_remove("VAUBAN_SA_PASSWORD")
             .env_remove("VAUBAN_PROGRAM_NAME")
             .env_remove("VAUBAN_VERSION_BANNER")
@@ -115,9 +119,12 @@ impl Running {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .args(["serve"]);
+        if !on_data {
+            command.arg("--in-memory");
+        }
+        let mut child = command
             .args([
-                "serve",
-                "--in-memory",
                 "--no-auth",
                 "--bind",
                 "127.0.0.1",
