@@ -52,8 +52,8 @@ pub use catalog::Catalog;
 pub use def::{ColumnDef, ConstraintDef, IndexDef, SortedColumn, TableDef};
 pub use ids::{ColumnId, ObjectId};
 pub use meta::{
-    AlterTable, ColumnMeta, ConstraintMeta, DatabaseMeta, IdentitySpec, IndexMeta, ObjectKind,
-    ObjectMeta, QualifiedName, TableMeta,
+    AlterTable, ColumnMeta, ConstraintMeta, DatabaseMeta, DatabaseOption, IdentitySpec, IndexMeta,
+    ObjectKind, ObjectMeta, QualifiedName, SnapshotIsolationState, TableMeta,
 };
 pub use snapshot::CatalogSnapshot;
 // Re-exported so that a crate which names a table of `storage` through the catalogue —

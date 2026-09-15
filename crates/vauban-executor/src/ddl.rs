@@ -70,6 +70,7 @@ use vauban_types::Collation;
 
 use crate::context::ExecContext;
 use crate::ddl_index::execute_index_ddl;
+use crate::ddl_options::execute_set_options;
 use crate::row::ExecOutcome;
 
 /// Error 3701, the number a `DROP` of something that is not there answers.
@@ -102,11 +103,11 @@ pub(crate) fn execute_ddl(stmt: &DdlStatement, ctx: &ExecContext<'_>) -> SqlResu
         DdlStatement::DropTable { names, if_exists } => {
             drop_tables(catalog, handle, names, *if_exists)?;
         }
-        // The two `ALTER` statements are bound but not executed yet.
+        // `ALTER DATABASE … SET` of the two versioning options is routed to
+        // `ddl_options.rs`, which answers [`ExecOutcome::NoRows`] like the DDL of
+        // databases and tables.
         DdlStatement::AlterDatabase { .. } => {
-            return Err(SqlError::from(InternalError::Bug(
-                "execute_ddl: ALTER DATABASE … SET is not implemented yet".to_owned(),
-            )));
+            return execute_set_options(stmt, ctx);
         }
         DdlStatement::AlterTable { .. } => {
             return Err(SqlError::from(InternalError::Bug(
