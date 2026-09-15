@@ -89,7 +89,7 @@ mod pattern;
 mod plan;
 mod row;
 mod statement;
-mod txn_exec;
+pub mod txn_exec;
 
 pub use compile::compile;
 pub use context::{CancelToken, CollectSink, ExecContext, ExecSession, RowSink};

@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use vauban_binder::{OutputSchema, SessionOptions};
 use vauban_catalog::Catalog;
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
-use vauban_storage::{Snapshot, Storage};
+use vauban_storage::{SavepointId, Snapshot, Storage};
 use vauban_sysfn::EvalContext;
-use vauban_txn::{TransactionManager, TxnHandle};
+use vauban_txn::{IsolationLevel, LockTimeout, TransactionManager, TxnHandle};
 use vauban_types::Value;
 
 use crate::row::Row;
@@ -79,7 +79,11 @@ impl CancelToken {
 /// and lends it to each statement through [`ExecContext::with_session`]. The fields are
 /// what the statements of a batch share: the variables, `@@ROWCOUNT`, `@@TRANCOUNT`, the
 /// transaction the session keeps open across statements, `XACT_ABORT` and `@@ERROR`.
-#[derive(Debug, Clone, Default)]
+///
+/// Isolation level and lock timeout are the session-wide defaults set by
+/// `SET TRANSACTION ISOLATION LEVEL` and `SET LOCK_TIMEOUT`; the level is applied when
+/// `BEGIN TRANSACTION` opens a new transaction, the timeout when a lock is taken.
+#[derive(Debug, Clone)]
 pub struct ExecSession {
     /// The declared variables, keyed by name with the `@`.
     pub variables: HashMap<String, Value>,
@@ -93,6 +97,34 @@ pub struct ExecSession {
     pub xact_abort: bool,
     /// `@@ERROR`: the number of the last error, `0` after a statement that raised no error.
     pub last_error: u32,
+    /// Named savepoints created by `SAVE TRANSACTION`, keyed by name as written.
+    pub savepoints: HashMap<String, SavepointId>,
+    /// The savepoint of the currently running statement, taken by [`begin_statement`] and
+    /// rolled back to by [`end_statement`](crate::txn_exec::end_statement) on error.
+    pub stmt_savepoint: Option<SavepointId>,
+    /// The isolation level of the session, applied when `BEGIN TRANSACTION` opens a new
+    /// transaction. Set by `SET TRANSACTION ISOLATION LEVEL`.
+    pub isolation: IsolationLevel,
+    /// The lock timeout of the session, applied when a lock is taken.
+    /// Set by `SET LOCK_TIMEOUT`.
+    pub lock_timeout: LockTimeout,
+}
+
+impl Default for ExecSession {
+    fn default() -> Self {
+        Self {
+            variables: HashMap::new(),
+            rowcount: 0,
+            trancount: 0,
+            txn: None,
+            xact_abort: false,
+            last_error: 0,
+            savepoints: HashMap::new(),
+            stmt_savepoint: None,
+            isolation: IsolationLevel::ReadCommitted,
+            lock_timeout: LockTimeout::Infinite,
+        }
+    }
 }
 
 /// Where the rows of a statement go, one call per row.
