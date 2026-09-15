@@ -204,8 +204,11 @@ fn values_and_limit_are_translated() {
     assert_eq!(rows.len(), 2);
 }
 
+/// A self-join on `id = 1` produces a HashJoin: the equality triggers the hash
+/// algorithm when no index is available. With the join rule written, the old
+/// `join_is_not_implemented_yet` would fail; this test verifies it now plans.
 #[test]
-fn join_is_not_implemented_yet() {
+fn a_join_with_an_equality_on_a_literal_produces_a_hash_join() {
     let join = LogicalPlan::Join {
         left: Box::new(scan()),
         right: Box::new(scan()),
@@ -213,7 +216,17 @@ fn join_is_not_implemented_yet() {
         on: Some(id_equals_one()),
         schema: schema_of(&["id", "id"]),
     };
-    assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(join))));
+    let catalog = NoIndexes;
+    let ctx = PlanContext { catalog: &catalog };
+    let planned = plan(BoundStatement::Query(Box::new(join)), &ctx)
+        .expect("a join with an equality plans to a HashJoin");
+    assert!(
+        matches!(
+            &planned,
+            PhysicalStatement::Query(PhysicalPlan::HashJoin { .. })
+        ),
+        "expected a HashJoin, got {planned:?}"
+    );
 }
 
 #[test]
