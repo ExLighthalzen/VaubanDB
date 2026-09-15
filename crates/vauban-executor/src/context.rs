@@ -276,6 +276,11 @@ pub struct ExecContext<'a> {
     /// The informational messages queued by [`ExecContext::emit_info`], drained by the
     /// driving loop into the sink after the last row.
     infos: Vec<InfoMessage>,
+    /// The stack of outer rows a correlated join pushes before opening the inner input:
+    /// an [`IndexSeek`](crate::ops::seek::IndexSeek) evaluates its bounds with the outer
+    /// row through [`eval_expr`](crate::expr::eval_expr), which consults this stack when
+    /// the current row is `None`.
+    outer_rows: Vec<Row>,
 }
 
 impl<'a> ExecContext<'a> {
@@ -297,6 +302,7 @@ impl<'a> ExecContext<'a> {
             cancel: &NEVER,
             session: None,
             infos: Vec::new(),
+            outer_rows: Vec::new(),
         }
     }
 
@@ -356,6 +362,30 @@ impl<'a> ExecContext<'a> {
     #[must_use]
     pub fn cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// Pushes a row onto the outer-row stack for correlated joins: the row is visible
+    /// through [`eval_expr`](crate::expr::eval_expr) for any `ColumnRef` whose index is
+    /// within it.
+    ///
+    /// Popped by [`ExecContext::pop_outer`].
+    pub fn push_outer(&mut self, row: Row) {
+        self.outer_rows.push(row);
+    }
+
+    /// Pops the outer row that [`ExecContext::push_outer`] pushed. The caller must match
+    /// each push with one pop; the row is returned so that the caller does not need to
+    /// clone it to keep it.
+    #[must_use]
+    pub fn pop_outer(&mut self) -> Option<Row> {
+        self.outer_rows.pop()
+    }
+
+    /// The outer row stack, for [`eval_expr`](crate::expr::eval_expr) to resolve a
+    /// `ColumnRef` whose row is `None`.
+    #[must_use]
+    pub(crate) fn outer_rows(&self) -> &[Row] {
+        &self.outer_rows
     }
 
     /// Queues an informational message for the sink. An operator has no sink of its own;

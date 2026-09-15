@@ -460,7 +460,7 @@ fn limit_stops_early() {
 
 #[test]
 fn unserved_variant_is_a_bug() {
-    let input = || Box::new(values(&[1]));
+    let _input = || Box::new(values(&[1]));
     let unserved: [(&str, PhysicalPlan); 0] = [];
     for (name, plan) in &unserved {
         let error = build_operator(plan)

@@ -25,7 +25,7 @@ pub(crate) mod aggregate;
 pub(crate) mod filter;
 pub(crate) mod hash_join;
 pub mod limit;
-pub(crate) mod nl_join;
+pub mod nl_join;
 pub(crate) mod project;
 pub(crate) mod scan;
 pub(crate) mod seek;

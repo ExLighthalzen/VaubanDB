@@ -182,14 +182,20 @@ pub fn eval_expr(
         // sits in the row the node below produced, and the binder put the name and the
         // type in the binding while it resolved the column. A `row` of `None` means the
         // binder let a column reference through where there is no source to read — 50000
-        // (`column_ref_without_row_is_a_bug`), no client input causing it.
+        // (`column_ref_without_row_is_a_bug`), no client input causing it — unless the
+        // reference is to an outer row pushed by a correlated join, in which case the
+        // outer rows of the context are consulted instead.
         BoundExprKind::ColumnRef(binding) => {
-            let row = row.ok_or_else(|| {
-                bug(&format!(
-                    "eval_expr: column `{}` is evaluated without a row",
-                    binding.name
-                ))
-            })?;
+            let row = if let Some(row) = row {
+                row
+            } else {
+                ctx.outer_rows().last().ok_or_else(|| {
+                    bug(&format!(
+                        "eval_expr: column `{}` is evaluated without a row",
+                        binding.name
+                    ))
+                })?
+            };
             row.get(binding.index).cloned().ok_or_else(|| {
                 bug(&format!(
                     "eval_expr: column `{}` is at index {} of a row of {} value(s)",
