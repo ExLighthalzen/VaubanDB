@@ -154,6 +154,16 @@ const CATALOG: &[ErrorDef] = &[
         template: "The variable '%.*ls' is already declared; a batch or a procedure declares each name once.",
     },
     ErrorDef {
+        number: 135,
+        severity: 15,
+        template: "Cannot use a BREAK statement outside the scope of a WHILE statement.",
+    },
+    ErrorDef {
+        number: 136,
+        severity: 15,
+        template: "Cannot use a CONTINUE statement outside the scope of a WHILE statement.",
+    },
+    ErrorDef {
         number: 137,
         severity: 15,
         template: "The scalar variable \"%.*ls\" is not declared.",
@@ -207,6 +217,11 @@ const CATALOG: &[ErrorDef] = &[
         number: 174,
         severity: 15,
         template: "The function %.*ls takes exactly %d argument(s).",
+    },
+    ErrorDef {
+        number: 178,
+        severity: 15,
+        template: "A RETURN statement with a return value cannot be used in this context.",
     },
     ErrorDef {
         number: 189,
@@ -942,6 +957,8 @@ mod tests {
         (130, 15, &[]),
         (131, 15, &["%d", "%S_MSG", "%.*ls", "%d"]),
         (134, 15, &["%.*ls"]),
+        (135, 15, &[]),
+        (136, 15, &[]),
         (137, 15, &["%.*ls"]),
         (141, 15, &[]),
         (144, 15, &[]),
@@ -953,6 +970,7 @@ mod tests {
         (156, 15, &["%.*ls"]),
         (168, 15, &["%.*ls", "%d"]),
         (174, 15, &["%.*ls", "%d"]),
+        (178, 15, &[]),
         (189, 15, &["%ls", "%d", "%d"]),
         (191, 15, &[]),
         (192, 16, &[]),

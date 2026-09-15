@@ -407,9 +407,8 @@ fn an_unimplemented_form_names_itself() {
         ("SELECT 1 EXCEPT SELECT 2", "UNION, EXCEPT and INTERSECT"),
         // `INSERT INTO a (c) VALUES (1)` is bound (`tests/bind_insert.rs`).
         // `UPDATE a SET c = 1` and `DELETE FROM a` are bound (`tests/bind_update_delete.rs`).
-        ("IF 1 = 1 SELECT 1", "IF"),
-        ("WHILE 1 = 1 BREAK", "WHILE"),
-        ("PRINT 'a'", "PRINT"),
+        // `IF 1 = 1 SELECT 1 ELSE SELECT 2`, `WHILE 1 = 1 BEGIN … END`, `PRINT 'a'` and
+        // `BEGIN … END` are bound (`tests/bind_control_flow.rs`).
         ("ALTER TABLE a ADD d int", "ALTER TABLE"),
         ("ALTER DATABASE d SET READ_ONLY", "ALTER DATABASE"),
         ("SELECT 1 INTO b FROM a", "SELECT … INTO"),

@@ -19,7 +19,8 @@ use vauban_binder::{
 use vauban_errors::SqlError;
 use vauban_parser::{
     AliasStyle, Expr, Ident, Literal, ObjectName, ParseOptions, QueryBody, QuerySpec, SelectItem,
-    SelectStatement, SetOp, Span, Statement, TableHint, TableRef, parse_batch,
+    SelectStatement, SetOp, Span, Statement, TableHint, TableRef, WaitforKind, WaitforStatement,
+    parse_batch,
 };
 use vauban_sysfn::register_builtins;
 use vauban_types::SqlType;
@@ -421,13 +422,21 @@ fn a_qualified_wildcard_names_its_number() {
 
 #[test]
 fn bind_dispatches_only_select() {
-    let print = Statement::Print {
-        expr: Expr::Literal(Literal::Integer("1".into()), Span::EMPTY),
+    // `WAITFOR` is not bound yet (V2), so the binder reports an internal error.
+    let waitfor = Statement::Waitfor(Box::new(WaitforStatement {
+        kind: WaitforKind::Delay,
+        value: Expr::Literal(
+            Literal::Str {
+                value: "00:00:00".into(),
+                unicode: false,
+            },
+            Span::EMPTY,
+        ),
         span: Span::EMPTY,
-    };
-    let error = err_of(&print);
+    }));
+    let error = err_of(&waitfor);
     assert_eq!(error.number, 50000);
-    assert!(error.message.contains("PRINT"), "{}", error.message);
+    assert!(error.message.contains("WAITFOR"), "{}", error.message);
 }
 
 #[test]

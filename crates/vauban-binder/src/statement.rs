@@ -98,7 +98,7 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
         Statement::Block { statements, .. } => bind_block(statements, ctx),
         Statement::Break(_) => bind_break(ctx),
         Statement::Continue(_) => bind_continue(ctx),
-        Statement::Return { value, .. } => bind_return(value.as_ref(), ctx),
+        Statement::Return { value, span } => bind_return(value.as_ref(), span.line, ctx),
         Statement::Print { expr, .. } => bind_print(expr, ctx),
         Statement::BeginTransaction { name, mark, .. } => {
             bind_begin(name.as_ref(), mark.as_deref(), ctx)

@@ -1323,6 +1323,26 @@ impl SqlError {
         from_catalog(8117, 1, &[Arg::Str(ty), Arg::Str(operator)])
     }
 
+    /// Error 135, severity 15, state 1 (`BREAK;` outside a `WHILE`): a BREAK statement
+    /// written where no WHILE encloses it.
+    ///
+    /// ```text
+    /// Cannot use a BREAK statement outside the scope of a WHILE statement.
+    /// ```
+    pub fn break_without_while() -> Self {
+        from_catalog(135, 1, &[])
+    }
+
+    /// Error 136, severity 15, state 1 (`CONTINUE;` outside a `WHILE`): a CONTINUE
+    /// statement written where no WHILE encloses it.
+    ///
+    /// ```text
+    /// Cannot use a CONTINUE statement outside the scope of a WHILE statement.
+    /// ```
+    pub fn continue_without_while() -> Self {
+        from_catalog(136, 1, &[])
+    }
+
     /// Error 4145, severity 15, state 1 (`IF 1 SELECT 1;`): a place that requires a
     /// predicate (`IF`, `WHERE`, `WHEN`) got an expression that is not one. `near` is the
     /// token that follows the expression, as SQL Server echoes it.
@@ -1332,6 +1352,16 @@ impl SqlError {
     /// ```
     pub fn non_boolean_expression(near: &str) -> Self {
         from_catalog(4145, 1, &[Arg::Str(near)])
+    }
+
+    /// Error 178, severity 15, state 1 (`RETURN 1;` outside a procedure): a RETURN
+    /// statement written with a value where the context does not accept one.
+    ///
+    /// ```text
+    /// A RETURN statement with a return value cannot be used in this context.
+    /// ```
+    pub fn return_with_value_outside_procedure() -> Self {
+        from_catalog(178, 1, &[])
     }
 
     /// Error 2715, severity 16, state 3 (`DECLARE @x foo;`): a declaration names a type
