@@ -359,26 +359,49 @@ fn an_expression_without_a_subquery_goes_through() {
 }
 
 #[test]
-fn dml_is_not_implemented_yet() {
-    let insert = BoundStatement::Insert(InsertPlan {
+fn dml_plans_to_physical_insert() {
+    let insert = InsertPlan {
         table: TableId(7),
         columns: vec![id_binding()],
         source: Box::new(LogicalPlan::Values {
             rows: vec![vec![literal(1)]],
             schema: schema_of(&["id"]),
         }),
-    });
-    let update = BoundStatement::Update(UpdatePlan {
+    };
+    let catalog = NoIndexes;
+    match plan(BoundStatement::Insert(insert), &context(&catalog)) {
+        Ok(PhysicalStatement::Insert(_)) => {}
+        Ok(other) => panic!("expected Insert, got {other:?}"),
+        Err(err) => panic!("planning failed: {}", err.message),
+    }
+}
+
+#[test]
+fn dml_plans_to_physical_update() {
+    let update = UpdatePlan {
         table: TableId(7),
         input: Box::new(scan()),
         assignments: vec![(id_binding(), literal(2))],
-    });
-    let delete = BoundStatement::Delete(DeletePlan {
+    };
+    let catalog = NoIndexes;
+    match plan(BoundStatement::Update(update), &context(&catalog)) {
+        Ok(PhysicalStatement::Update(_)) => {}
+        Ok(other) => panic!("expected Update, got {other:?}"),
+        Err(err) => panic!("planning failed: {}", err.message),
+    }
+}
+
+#[test]
+fn dml_plans_to_physical_delete() {
+    let delete = DeletePlan {
         table: TableId(7),
         input: Box::new(scan()),
-    });
-    for stmt in [insert, update, delete] {
-        assert_not_implemented(&plan_error(stmt));
+    };
+    let catalog = NoIndexes;
+    match plan(BoundStatement::Delete(delete), &context(&catalog)) {
+        Ok(PhysicalStatement::Delete(_)) => {}
+        Ok(other) => panic!("expected Delete, got {other:?}"),
+        Err(err) => panic!("planning failed: {}", err.message),
     }
 }
 
