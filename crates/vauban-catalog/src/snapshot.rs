@@ -289,6 +289,11 @@ impl CatalogSnapshot {
             .find(|database| same_name(Collation::DEFAULT, &database.name, name))
     }
 
+    /// The database of identifier `id`, `None` when this snapshot holds no such database.
+    pub fn database_by_id(&self, id: vauban_storage::DbId) -> Option<&DatabaseMeta> {
+        self.databases.iter().find(|database| database.id == id)
+    }
+
     /// The object named by one to three parts, `None` when the name resolves to nothing.
     ///
     /// `schema` is the schema the client wrote, `default_schema` the one of its session,
@@ -363,6 +368,14 @@ impl CatalogSnapshot {
     /// `sys_tables_resolves_to_a_view_with_its_definition`).
     pub fn table(&self, id: ObjectId) -> Option<&crate::meta::TableMeta> {
         self.tables.get(&id)
+    }
+
+    /// The table whose storage identifier is `storage_id`, `None` when no table of this
+    /// snapshot carries that identifier.
+    pub fn table_by_storage(&self, storage_id: vauban_storage::TableId) -> Option<&TableMeta> {
+        self.tables
+            .values()
+            .find(|meta| meta.storage_id == storage_id)
     }
 
     /// The T-SQL text of the view of identifier `id`, `None` when `id` is not a view.

@@ -19,6 +19,8 @@ vauban-storage.workspace = true
 vauban-sysfn.workspace = true
 vauban-txn.workspace = true
 vauban-types.workspace = true
+# AST expressions from the catalogue: `ColumnMeta::default` and `ColumnMeta::computed`.
+vauban-parser.workspace = true
 
 [dev-dependencies]
 # The tests bind and run real SQL text; the engine itself does not see the parser, which
