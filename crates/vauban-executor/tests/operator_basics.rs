@@ -20,7 +20,7 @@ use vauban_executor::{
     CancelToken, CollectSink, ExecContext, ExecOutcome, Operator, Row, RowSink, build_operator,
     execute, ops::limit::Limit,
 };
-use vauban_planner::{PhysicalJoinKind, PhysicalPlan, PhysicalStatement};
+use vauban_planner::{PhysicalPlan, PhysicalStatement};
 use vauban_storage::{MemoryStorage, Row as StorageRow, Snapshot, Storage, TableId, TableShape};
 use vauban_sysfn::StaticContext;
 use vauban_txn::{IsolationLevel, TransactionManager};
@@ -461,28 +461,15 @@ fn limit_stops_early() {
 #[test]
 fn unserved_variant_is_a_bug() {
     let input = || Box::new(values(&[1]));
-    let unserved: [(&str, PhysicalPlan); 2] = [
-        (
-            "HashJoin",
-            PhysicalPlan::HashJoin {
-                build: input(),
-                probe: input(),
-                kind: PhysicalJoinKind::Inner,
-                keys: vec![(col(0), col(0))],
-                residual: None,
-                schema: schema_of(&["v", "v"]),
-            },
-        ),
-        (
-            "HashAggregate",
-            PhysicalPlan::HashAggregate {
-                input: input(),
-                group_by: Vec::new(),
-                aggregates: Vec::new(),
-                schema: schema_of(&[]),
-            },
-        ),
-    ];
+    let unserved: [(&str, PhysicalPlan); 1] = [(
+        "HashAggregate",
+        PhysicalPlan::HashAggregate {
+            input: input(),
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
+            schema: schema_of(&[]),
+        },
+    )];
     for (name, plan) in &unserved {
         let error = build_operator(plan)
             .err()
