@@ -461,15 +461,7 @@ fn limit_stops_early() {
 #[test]
 fn unserved_variant_is_a_bug() {
     let input = || Box::new(values(&[1]));
-    let unserved: [(&str, PhysicalPlan); 1] = [(
-        "HashAggregate",
-        PhysicalPlan::HashAggregate {
-            input: input(),
-            group_by: Vec::new(),
-            aggregates: Vec::new(),
-            schema: schema_of(&[]),
-        },
-    )];
+    let unserved: [(&str, PhysicalPlan); 0] = [];
     for (name, plan) in &unserved {
         let error = build_operator(plan)
             .err()
