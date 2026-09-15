@@ -461,7 +461,7 @@ fn limit_stops_early() {
 #[test]
 fn unserved_variant_is_a_bug() {
     let input = || Box::new(values(&[1]));
-    let unserved: [(&str, PhysicalPlan); 3] = [
+    let unserved: [(&str, PhysicalPlan); 2] = [
         (
             "HashJoin",
             PhysicalPlan::HashJoin {
@@ -471,13 +471,6 @@ fn unserved_variant_is_a_bug() {
                 keys: vec![(col(0), col(0))],
                 residual: None,
                 schema: schema_of(&["v", "v"]),
-            },
-        ),
-        (
-            "Sort",
-            PhysicalPlan::Sort {
-                input: input(),
-                keys: Vec::new(),
             },
         ),
         (

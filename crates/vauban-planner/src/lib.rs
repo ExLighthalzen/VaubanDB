@@ -19,11 +19,12 @@
 //! of the scanned table (`seek.rs`; `tests/trivial.rs`,
 //! `filter_project_over_scan_becomes_a_seek_under_the_project`). The six other nodes of
 //! [`LogicalPlan`](vauban_binder::LogicalPlan) — `Join`,
-//! `Aggregate`, `Sort`, `Distinct`, `SetOp`, `Subquery` — answer an internal error saying
+//! `Aggregate`, `SetOp`, `Subquery` — answer an internal error saying
 //! they are not implemented yet (`tests/trivial.rs`, `join_is_not_implemented_yet`,
-//! `aggregate_sort_and_distinct_are_not_implemented_yet`,
+//! `aggregate_is_not_implemented_yet`,
 //! `a_subquery_expression_is_not_implemented_yet`,
-//! `a_set_operator_is_not_implemented_yet`).
+//! `a_set_operator_is_not_implemented_yet`). `Sort` and `Distinct` are translated to
+//! their physical node.
 //!
 //! # File plan
 //!

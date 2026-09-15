@@ -10,7 +10,7 @@ use vauban_planner::{NoIndexes, PhysicalPlan, PhysicalStatement, PlanCatalog, Pl
 use vauban_binder::{
     BoundExpr, BoundExprKind, BoundProjection, BoundStatement, BoundTop, ColumnBinding, CompareOp,
     DeletePlan, InsertPlan, JoinKind, LockHints, LogicalPlan, OutputColumn, OutputSchema,
-    SetOpKind, SortKey, UpdatePlan,
+    SetOpKind, UpdatePlan,
 };
 use vauban_catalog::ColumnId;
 use vauban_errors::SqlError;
@@ -230,25 +230,14 @@ fn a_join_with_an_equality_on_a_literal_produces_a_hash_join() {
 }
 
 #[test]
-fn aggregate_sort_and_distinct_are_not_implemented_yet() {
+fn aggregate_is_not_implemented_yet() {
     let aggregate = LogicalPlan::Aggregate {
         input: Box::new(scan()),
         group_by: vec![literal(1)],
         aggregates: Vec::new(),
         schema: schema_of(&["n"]),
     };
-    let sort = LogicalPlan::Sort {
-        input: Box::new(scan()),
-        keys: vec![SortKey {
-            expr: literal(1),
-            desc: false,
-            collation: None,
-        }],
-    };
-    let distinct = LogicalPlan::Distinct(Box::new(scan()));
-    for logical in [aggregate, sort, distinct] {
-        assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(logical))));
-    }
+    assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(aggregate))));
 }
 
 #[test]
@@ -512,12 +501,15 @@ fn control_flow_is_planned_branch_by_branch() {
         Some(PhysicalStatement::Continue)
     ));
 
-    // A branch that reaches an unfilled hook still fails the whole statement.
+    // A branch that reaches an unfilled node still fails the whole statement.
     let err = plan_error(BoundStatement::While {
         condition: id_equals_one(),
-        body: Box::new(BoundStatement::Query(Box::new(LogicalPlan::Distinct(
-            Box::new(scan()),
-        )))),
+        body: Box::new(BoundStatement::Query(Box::new(LogicalPlan::Aggregate {
+            input: Box::new(scan()),
+            group_by: vec![literal(1)],
+            aggregates: Vec::new(),
+            schema: schema_of(&["n"]),
+        }))),
     });
     assert_not_implemented(&err);
 }
