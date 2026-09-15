@@ -64,5 +64,5 @@ pub use ast::stmt::{
     SetOptionStatement, SetOptionValue, SetStatement, SetValue, Statement, UpdateStatement,
     WaitforKind, WaitforStatement,
 };
-pub use parser::{ParseOptions, parse_batch};
+pub use parser::{ParameterDeclaration, ParseOptions, parse_batch, parse_parameter_declarations};
 pub use span::Span;
