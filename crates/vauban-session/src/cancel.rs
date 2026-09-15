@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
+use vauban_executor::CancelToken;
 
 /// A shared flag that asks the running request to stop. Cloning gives another handle on
 /// the same flag.
@@ -29,6 +30,11 @@ impl CancelHandle {
     /// `true` once [`cancel`](Self::cancel) was called on any clone of this handle.
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// A [`CancelToken`] backed by the same flag as this handle.
+    pub(crate) fn token(&self) -> CancelToken {
+        CancelToken::from_shared(self.cancelled.clone())
     }
 
     /// Lowers the flag. The connection task calls it before each request: a handle lives
@@ -93,5 +99,16 @@ mod tests {
         clone.cancel();
         handle.reset();
         assert!(!clone.is_cancelled());
+    }
+
+    #[test]
+    fn token_shares_the_flag() {
+        let handle = CancelHandle::new();
+        let token = handle.token();
+        assert!(!token.is_cancelled());
+        handle.cancel();
+        assert!(token.is_cancelled());
+        token.clone().cancel();
+        assert!(handle.is_cancelled());
     }
 }

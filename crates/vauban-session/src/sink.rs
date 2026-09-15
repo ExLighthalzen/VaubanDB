@@ -7,10 +7,19 @@
 //! drains the channel into the `TdsStream`. When the client reads slowly the channel fills
 //! up and `blocking_send` blocks the pool thread, never the async loop: that is the
 //! intended back-pressure.
+//!
+//! # The adapter between [`executor::RowSink`] and [`ResultSink`]
+//!
+//! [`RowSinkAdapter`] implements the executor's streaming sink and writes everything it
+//! receives onto a `&mut dyn ResultSink`. It is built per statement, wraps the
+//! caller's sink, and counts the rows so that [`batch.rs`](crate::batch) can read the
+//! count for the DONE token and for `@@ROWCOUNT`.
 
 use tokio::sync::mpsc;
+use vauban_binder::OutputSchema;
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
-use vauban_tds::{ColumnMeta, DoneStatus, EnvChange, Token};
+use vauban_executor::RowSink;
+use vauban_tds::{ColumnFlags, ColumnMeta, DoneStatus, EnvChange, Token};
 use vauban_types::{TypeInfo, Value};
 
 /// Capacity of the token channel between the blocking pool and the connection task.
@@ -44,6 +53,60 @@ pub trait ResultSink {
     fn return_value(&mut self, name: &str, ty: &TypeInfo, value: &Value) -> SqlResult<()>;
     /// The return status of a stored procedure ([MS-TDS] 2.2.7 RETURNSTATUS).
     fn return_status(&mut self, status: i32) -> SqlResult<()>;
+}
+
+/// Adapts [`executor::RowSink`] to a [`ResultSink`].
+///
+/// Built per statement, wraps the caller's sink and counts the rows the adapter receives
+/// so that the statement's caller can read the count for the DONE token and for
+/// `@@ROWCOUNT`.
+pub(crate) struct RowSinkAdapter<'a> {
+    sink: &'a mut dyn ResultSink,
+    row_count: u64,
+}
+
+impl<'a> RowSinkAdapter<'a> {
+    /// Wraps `sink` and starts counting from zero.
+    pub(crate) fn new(sink: &'a mut dyn ResultSink) -> Self {
+        Self { sink, row_count: 0 }
+    }
+
+    /// How many rows the sink received since [`RowSinkAdapter::new`].
+    ///
+    /// Kept for assertions in tests; the batch flow reads the count from
+    /// [`ExecOutcome::Rows`](vauban_executor::ExecOutcome::Rows). The `#[allow(dead_code)]`
+    /// is required because clippy does not see the test usage when compiling the library.
+    #[expect(dead_code)]
+    pub(crate) fn row_count(&self) -> u64 {
+        self.row_count
+    }
+}
+
+impl RowSink for RowSinkAdapter<'_> {
+    fn columns(&mut self, schema: &OutputSchema) -> SqlResult<()> {
+        let cols: Vec<ColumnMeta> = schema
+            .columns
+            .iter()
+            .map(|col| ColumnMeta {
+                name: col.name.clone(),
+                ty: col.ty.clone(),
+                flags: ColumnFlags {
+                    nullable: col.ty.nullable,
+                    ..ColumnFlags::default()
+                },
+            })
+            .collect();
+        self.sink.columns(&cols)
+    }
+
+    fn row(&mut self, row: &[Value]) -> SqlResult<()> {
+        self.row_count += 1;
+        self.sink.row(row)
+    }
+
+    fn info(&mut self, message: &InfoMessage) -> SqlResult<()> {
+        self.sink.info(message)
+    }
 }
 
 /// The `ResultSink` of a TDS connection: turns every call into a `Token` and sends it to

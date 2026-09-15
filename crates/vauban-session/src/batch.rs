@@ -126,7 +126,7 @@ use std::sync::{Arc, OnceLock};
 use vauban_binder::{BindContext, OutputSchema};
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
-use vauban_executor::{CancelToken, ExecContext, ExecOutcome, RowSet};
+use vauban_executor::{ExecContext, ExecOutcome, RowSink};
 use vauban_parser::{Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange, Rpc, RpcProc};
@@ -139,7 +139,7 @@ use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
 use crate::server::Engine;
 use crate::set_options::apply_set_statement;
-use crate::sink::ResultSink;
+use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
 
 /// Number of the generic internal error (`errors`, `InternalError` → `SqlError`): the
@@ -513,47 +513,15 @@ impl Session {
             }
         };
 
-        // COLMETADATA goes out **before** the transaction of the statement is opened: this
-        // call can fail (closed channel, cancelled request), and a `?` between the `begin`
-        // and the `commit`/`rollback` of `execute_in_a_transaction` would leave that
-        // transaction open.
-        match bound {
-            PhysicalStatement::Query(plan) => {
-                sink.columns(&column_metadata(plan.schema()))?;
-            }
-            // A DDL statement sends no column metadata, and its DONE carries neither
-            // `DONE_COUNT` nor a row count (status `0x0001` before another statement,
-            // `row_count` 0), where the DONE of a `SELECT 1` in the same batch is `0x0011`
-            // with `row_count` 1. The DONE of `USE master;` and of `DROP TABLE` is `0x0001`
-            // too. Hence `NoRows` -> `done(None, more)` below. What a `USE` sends instead of
-            // metadata, before that DONE, is [`Session::switch_database`] (unit test
-            // `a_ddl_statement_sends_no_metadata_and_a_done_without_a_count`).
-            PhysicalStatement::Ddl(_) | PhysicalStatement::Use { .. } => {}
-            // The other statements send no column metadata of their own before they run.
-            PhysicalStatement::Insert(_)
-            | PhysicalStatement::Update(_)
-            | PhysicalStatement::Delete(_)
-            | PhysicalStatement::SetVariable { .. }
-            | PhysicalStatement::Declare(_)
-            | PhysicalStatement::If { .. }
-            | PhysicalStatement::While { .. }
-            | PhysicalStatement::Block(_)
-            | PhysicalStatement::Break
-            | PhysicalStatement::Continue
-            | PhysicalStatement::Return(_)
-            | PhysicalStatement::Print(_)
-            | PhysicalStatement::Transaction(_) => {}
-        }
-        let outcome = self.execute_in_a_transaction(bound);
+        // The adapter wraps the caller's sink and counts rows for the DONE. The
+        // executor calls `RowSink::columns` during execution, which the adapter
+        // converts to `ResultSink::columns` — COLMETADATA therefore goes out when
+        // the statement starts to run, not while it is prepared.
+        let mut adapter = RowSinkAdapter::new(sink);
+        let outcome = self.execute_in_a_transaction(bound, &mut adapter);
         match outcome {
-            Ok((ExecOutcome::Rows(_), rows)) => {
-                // The metadata is already out; `rows.schema` is the schema the executor
-                // announced to its collecting sink, so there is nothing more to send
-                // about it.
-                for row in &rows.rows {
-                    sink.row(row)?;
-                }
-                let count = rows.rows.len() as u64;
+            Ok(ExecOutcome::Rows(count)) => {
+                // The metadata was already sent through the adapter during execution.
                 // `SET NOCOUNT ON` clears `DONE_COUNT` on the DONE of a `SELECT`
                 // ([MS-TDS] 2.2.7.6): `SET NOCOUNT ON; SELECT 1;` answers a DONE with
                 // status `0x0000` where `SET NOCOUNT OFF; SELECT 1;` answers `0x0010`, and
@@ -578,12 +546,12 @@ impl Session {
                 Ok(Flow::Continue)
             }
             // The DDL and `USE` answer `NoRows` (`executor`, `ddl.rs`); a `SELECT`
-            // answers `Rows`. A `NoRows` sent no COLMETADATA in the match above, so the
-            // DONE closes a statement with no result set, and it carries no row count,
-            // the shape of `CREATE TABLE`, `DROP TABLE` and `USE` (comment on that match).
-            // `NOCOUNT` is not read here: those DONEs carry no count under `SET NOCOUNT
-            // OFF` either.
-            Ok((ExecOutcome::NoRows, _)) => {
+            // answers `Rows`. A `NoRows` sent no COLMETADATA (the executor does not call
+            // `RowSink::columns` for these), so the DONE closes a statement with no result
+            // set, and it carries no row count, the shape of `CREATE TABLE`, `DROP TABLE`
+            // and `USE`. `NOCOUNT` is not read here: those DONEs carry no count under `SET
+            // NOCOUNT OFF` either.
+            Ok(ExecOutcome::NoRows) => {
                 if let Some(database) = target {
                     self.switch_database(database, line, sink)?;
                 }
@@ -594,13 +562,12 @@ impl Session {
             // The token handed to the executor cannot be raised, and the outcomes of the
             // control of flow have no statement to produce them yet: each is reported as
             // an internal error rather than mapped to a DONE this layer cannot justify.
-            Ok((
+            Ok(
                 outcome @ (ExecOutcome::Cancelled
                 | ExecOutcome::Return(_)
                 | ExecOutcome::Break
                 | ExecOutcome::Continue),
-                _,
-            )) => {
+            ) => {
                 let err = SqlError::from(InternalError::Bug(format!(
                     "run_prepared: the executor answered {outcome:?}, which this layer does \
                      not handle"
@@ -608,7 +575,7 @@ impl Session {
                 self.fail(&err, sink).map(|()| Flow::Stop)
             }
             // A batch-scoped error: sent like a run-time error, and the batch stops.
-            Ok((ExecOutcome::BatchAbort(err), _)) => {
+            Ok(ExecOutcome::BatchAbort(err)) => {
                 let err = at_statement(err, line);
                 self.state.last_error = err.number;
                 sink.error(&err)?;
@@ -698,30 +665,19 @@ impl Session {
     fn execute_in_a_transaction(
         &self,
         bound: &PhysicalStatement,
-    ) -> SqlResult<(ExecOutcome, RowSet)> {
+        sink: &mut dyn RowSink,
+    ) -> SqlResult<ExecOutcome> {
         let handle = self.engine.txn.begin(IsolationLevel::ReadCommitted);
         let snap = self.engine.txn.statement_snapshot(&handle);
-        // The context borrows the state and the handle; the block ends both borrows so
-        // that the handle can be moved into `commit` or `rollback` below, and the row
-        // count written by the caller. The clock of `SessionEvalContext` is read here,
-        // once for the whole statement.
         let outcome = {
-            // `OBJECT_ID` and its neighbours read the catalogue through the transaction of
-            // this statement, and only when the statement calls one of them: the snapshot
-            // is taken on the first call (`CatalogSource` of `eval_context.rs`).
-            // Taken from the handle of the statement, it holds what the statements before it
-            // committed, where the snapshot of the binding predates the whole batch (header
-            // of `prepare_batch`).
             let eval = SessionEvalContext::deferred(&self.state, &self.engine.catalog, &handle);
-            // The ATTENTION of this layer (`cancel.rs`) is not wired to the executor's
-            // token yet: the statement runs to its end and the rows are collected here.
-            let never = CancelToken::never();
+            let token = self.cancel.token();
             let mut exec = ExecContext::scalar(&eval, self.state.options.to_binder())
                 .with_engine(self.engine.storage.as_ref(), &self.engine.txn, &snap)
                 .with_catalog(&self.engine.catalog)
                 .with_handle(&handle)
-                .with_cancel(&never);
-            vauban_executor::execute_collect(bound, &mut exec)
+                .with_cancel(&token);
+            vauban_executor::execute(bound, &mut exec, sink)
         };
         match outcome {
             Ok(outcome) => self.engine.txn.commit(handle).map(|()| outcome),
@@ -817,6 +773,10 @@ impl Session {
 /// what a driver accepts for a computed column (`column_metadata_follows_the_schema`):
 /// `usUpdateable` is 0 (read-only) because an expression is not a column of a table,
 /// `fCaseSen`, `fIdentity` and `fComputed` have no meaning outside one.
+///
+/// Used by the tests and kept for its documentation; the live path goes through
+/// [`RowSinkAdapter::columns`].
+#[cfg_attr(not(test), allow(dead_code))]
 fn column_metadata(schema: &OutputSchema) -> Vec<ColumnMeta> {
     schema
         .columns

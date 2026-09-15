@@ -57,6 +57,13 @@ impl CancelToken {
         Self { flag: None }
     }
 
+    /// A token backed by a caller-provided flag, so that [`CancelHandle`] and
+    /// [`ExecContext`] share the same `AtomicBool`.
+    #[must_use]
+    pub fn from_shared(flag: Arc<AtomicBool>) -> Self {
+        Self { flag: Some(flag) }
+    }
+
     /// Raises the flag: the running statement stops at its next read of the token.
     pub fn cancel(&self) {
         if let Some(flag) = &self.flag {
