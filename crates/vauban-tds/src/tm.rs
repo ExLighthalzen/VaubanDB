@@ -225,6 +225,7 @@ mod tests {
     use bytes::BytesMut;
 
     use super::*;
+    use crate::ResetConnection;
     use crate::message::{ClientMessage, decode_client_message};
     use crate::packet::PacketType;
     use crate::tokens::{DoneStatus, EncodeContext, EnvChange, Token, encode_tokens};
@@ -462,7 +463,11 @@ mod tests {
     #[test]
     fn dispatch_reaches_tm_decoder() {
         let bytes = payload(0, &[0x05, 0x00, 0x00, 0x00]);
-        match decode_client_message(PacketType::TransactionManager, &bytes) {
+        match decode_client_message(
+            PacketType::TransactionManager,
+            &bytes,
+            ResetConnection::None,
+        ) {
             Ok(ClientMessage::TransactionManager(TmRequest::Begin { isolation: 0, .. })) => {}
             other => panic!("expected TransactionManager(Begin), got {other:?}"),
         }

@@ -161,7 +161,7 @@ impl WriteState {
 /// Reads one complete message and decodes it.
 async fn read_message_on<R: AsyncRead + Unpin>(r: &mut R) -> Result<ClientMessage, TdsError> {
     let raw = packet::read_message(r, MAX_MESSAGE_SIZE).await?;
-    decode_client_message(raw.kind, &raw.payload)
+    decode_client_message(raw.kind, &raw.payload, raw.reset)
 }
 
 /// Writes `payload` as one complete message (EOM on its last packet) with the current

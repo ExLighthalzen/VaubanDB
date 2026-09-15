@@ -46,6 +46,19 @@ pub use stream::{TdsReader, TdsStream, TdsWriter};
 pub use tm::TmRequest;
 pub use tokens::{ColumnFlags, ColumnMeta, DoneStatus, EnvChange, FeatureAck, Token};
 
+/// Whether the client asks the server to reset the connection state
+/// ([MS-TDS] 2.2.3.1.2 Status: RESETCONNECTION and RESETCONNECTIONSKIPTRAN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResetConnection {
+    /// No reset requested.
+    #[default]
+    None,
+    /// RESETCONNECTION (0x08): full reset.
+    Full,
+    /// RESETCONNECTIONSKIPTRAN (0x10): reset, skipping transaction rollback.
+    SkipTransaction,
+}
+
 #[cfg(test)]
 mod api_surface {
     /// The names of the public interface resolve at the crate root (the `use` below is
@@ -54,8 +67,8 @@ mod api_surface {
     fn interface_names_resolve_at_root() {
         use crate::{
             ClientMessage, ColumnFlags, ColumnMeta, DoneStatus, EncryptPolicy, EnvChange,
-            FeatureAck, FeatureExt, Login7, PacketType, Rpc, RpcParam, RpcProc, SqlBatch, TdsError,
-            TdsReader, TdsStream, TdsWriter, TmRequest, Token,
+            FeatureAck, FeatureExt, Login7, PacketType, ResetConnection, Rpc, RpcParam, RpcProc,
+            SqlBatch, TdsError, TdsReader, TdsStream, TdsWriter, TmRequest, Token,
         };
 
         fn exists<T>() {}
@@ -79,5 +92,6 @@ mod api_surface {
         exists::<TdsReader>();
         exists::<TdsWriter>();
         exists::<PacketType>();
+        exists::<ResetConnection>();
     }
 }

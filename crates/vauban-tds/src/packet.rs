@@ -5,6 +5,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::ResetConnection;
 use crate::error::TdsError;
 
 /// Size of the packet header ([MS-TDS] 2.2.3.1).
@@ -165,8 +166,9 @@ pub struct RawMessage {
     pub kind: PacketType,
     /// Payload, header bytes removed.
     pub payload: Bytes,
-    /// `true` when the first packet carried RESETCONNECTION or RESETCONNECTIONSKIPTRAN.
-    pub reset_connection: bool,
+    /// RESETCONNECTION or RESETCONNECTIONSKIPTRAN from the status of the first packet
+    /// ([MS-TDS] 2.2.3.1.2); bits on later packets are ignored.
+    pub reset: ResetConnection,
 }
 
 /// Clamps a negotiated packet size into `MIN_PACKET_SIZE..=MAX_PACKET_SIZE`.
@@ -268,20 +270,26 @@ pub async fn read_message<R: AsyncRead + Unpin>(
     let mut header_buf = [0u8; HEADER_LEN];
     let mut payload = BytesMut::new();
     // `None` until the first packet of the current message has been read.
-    let mut first: Option<(PacketType, bool)> = None;
+    let mut first: Option<(PacketType, ResetConnection)> = None;
     loop {
         read_exact_or_closed(r, &mut header_buf).await?;
         let header = PacketHeader::decode(&header_buf)?;
-        let (kind, reset_connection) = match first {
+        let (kind, reset) = match first {
             None => {
-                let reset = header.status.contains(PacketStatus::RESET_CONNECTION)
-                    || header
-                        .status
-                        .contains(PacketStatus::RESET_CONNECTION_SKIP_TRAN);
+                let reset = if header
+                    .status
+                    .contains(PacketStatus::RESET_CONNECTION_SKIP_TRAN)
+                {
+                    ResetConnection::SkipTransaction
+                } else if header.status.contains(PacketStatus::RESET_CONNECTION) {
+                    ResetConnection::Full
+                } else {
+                    ResetConnection::None
+                };
                 first = Some((header.kind, reset));
                 (header.kind, reset)
             }
-            Some((kind, _)) if kind != header.kind => {
+            Some((kind, _reset)) if kind != header.kind => {
                 return Err(TdsError::Malformed("packet type changed inside a message"));
             }
             Some(state) => state,
@@ -305,7 +313,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(
         return Ok(RawMessage {
             kind,
             payload: payload.freeze(),
-            reset_connection,
+            reset,
         });
     }
 }
@@ -456,20 +464,65 @@ mod tests {
         let message = read_message(&mut server, 1 << 20).await.unwrap();
         assert_eq!(message.kind, PacketType::SqlBatch);
         assert_eq!(&message.payload[..], b"abcdefgh");
-        assert!(!message.reset_connection);
+        assert_eq!(message.reset, ResetConnection::None);
     }
 
     #[tokio::test]
-    async fn read_message_single_packet_and_reset_flag() {
+    async fn reset_bit_on_first_packet_is_reported() {
         let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        // 0x08 → Full
         client
-            .write_all(&packet(PacketType::Rpc, 0x09, b"xyz"))
+            .write_all(&packet(PacketType::Rpc, 0x09, b"full"))
             .await
             .unwrap();
         let message = read_message(&mut server, 1 << 20).await.unwrap();
-        assert_eq!(message.kind, PacketType::Rpc);
-        assert_eq!(&message.payload[..], b"xyz");
-        assert!(message.reset_connection);
+        assert_eq!(message.reset, ResetConnection::Full);
+
+        // 0x10 → SkipTransaction
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        client
+            .write_all(&packet(PacketType::Rpc, 0x11, b"skip"))
+            .await
+            .unwrap();
+        let message = read_message(&mut server, 1 << 20).await.unwrap();
+        assert_eq!(message.reset, ResetConnection::SkipTransaction);
+
+        // `ResetConnection::None` when neither bit is set
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        client
+            .write_all(&packet(PacketType::Rpc, 0x01, b"none"))
+            .await
+            .unwrap();
+        let message = read_message(&mut server, 1 << 20).await.unwrap();
+        assert_eq!(message.reset, ResetConnection::None);
+
+        // both bits → SkipTransaction (RESETCONNECTIONSKIPTRAN implies RESETCONNECTION)
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        client
+            .write_all(&packet(PacketType::Rpc, 0x19, b"both"))
+            .await
+            .unwrap();
+        let message = read_message(&mut server, 1 << 20).await.unwrap();
+        assert_eq!(message.reset, ResetConnection::SkipTransaction);
+    }
+
+    #[tokio::test]
+    async fn reset_bit_on_a_later_packet_is_ignored() {
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        // First packet: no reset bit. Second packet: RESETCONNECTION (0x08) + EOM (0x01).
+        // The first packet's status decides the reset value.
+        client
+            .write_all(&packet(PacketType::SqlBatch, 0x00, b"first"))
+            .await
+            .unwrap();
+        client
+            .write_all(&packet(PacketType::SqlBatch, 0x09, b"second"))
+            .await
+            .unwrap();
+        let message = read_message(&mut server, 1 << 20).await.unwrap();
+        assert_eq!(message.kind, PacketType::SqlBatch);
+        assert_eq!(&message.payload[..], b"firstsecond");
+        assert_eq!(message.reset, ResetConnection::None);
     }
 
     #[tokio::test]

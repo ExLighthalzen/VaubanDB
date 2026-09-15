@@ -53,6 +53,7 @@
 
 use vauban_types::{SqlType, TypeInfo, Value};
 
+use crate::ResetConnection;
 use crate::error::TdsError;
 use crate::headers::decode_all_headers;
 use crate::types::{NULLTYPE, decode_type_info, decode_value};
@@ -81,6 +82,9 @@ pub struct Rpc {
     pub params: Vec<RpcParam>,
     /// `TransactionDescriptor` of the ALL_HEADERS block ([MS-TDS] 2.2.5.3.1); 0 when absent.
     pub transaction_descriptor: u64,
+    /// RESETCONNECTION or RESETCONNECTIONSKIPTRAN from the first packet's status
+    /// ([MS-TDS] 2.2.3.1.2).
+    pub reset: ResetConnection,
 }
 
 /// Target of an RPC: a procedure name or a well-known `ProcID`
@@ -201,6 +205,7 @@ pub(crate) fn decode(payload: &[u8]) -> Result<Rpc, TdsError> {
         options,
         params,
         transaction_descriptor: headers.transaction_descriptor,
+        reset: ResetConnection::None,
     })
 }
 

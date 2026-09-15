@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use crate::ResetConnection;
 use crate::batch::SqlBatch;
 use crate::error::TdsError;
 use crate::login7::Login7;
@@ -43,11 +44,23 @@ impl fmt::Debug for ClientMessage {
 
 /// Decodes the payload of a reassembled message according to its packet type. ATTENTION
 /// carries no payload; a packet type not listed in `ClientMessage` gives `Unsupported`.
-pub fn decode_client_message(kind: PacketType, payload: &[u8]) -> Result<ClientMessage, TdsError> {
+/// `reset` is the RESETCONNECTION or RESETCONNECTIONSKIPTRAN status from the first packet
+/// of the message ([MS-TDS] 2.2.3.1.2), applied to `SqlBatch` and `Rpc`.
+pub fn decode_client_message(
+    kind: PacketType,
+    payload: &[u8],
+    reset: ResetConnection,
+) -> Result<ClientMessage, TdsError> {
     match kind {
         PacketType::Login7 => crate::login7::decode(payload).map(ClientMessage::Login7),
-        PacketType::SqlBatch => crate::batch::decode(payload).map(ClientMessage::SqlBatch),
-        PacketType::Rpc => crate::rpc::decode(payload).map(ClientMessage::Rpc),
+        PacketType::SqlBatch => crate::batch::decode(payload).map(|mut b| {
+            b.reset = reset;
+            ClientMessage::SqlBatch(b)
+        }),
+        PacketType::Rpc => crate::rpc::decode(payload).map(|mut r| {
+            r.reset = reset;
+            ClientMessage::Rpc(r)
+        }),
         PacketType::TransactionManager => {
             crate::tm::decode(payload).map(ClientMessage::TransactionManager)
         }
@@ -69,23 +82,23 @@ mod tests {
     #[test]
     fn dispatch_attention_and_unsupported() {
         assert!(matches!(
-            decode_client_message(PacketType::Attention, &[]),
+            decode_client_message(PacketType::Attention, &[], ResetConnection::None),
             Ok(ClientMessage::Attention)
         ));
         assert!(matches!(
-            decode_client_message(PacketType::Attention, &[0]),
+            decode_client_message(PacketType::Attention, &[0], ResetConnection::None),
             Err(TdsError::Malformed(_))
         ));
         assert!(matches!(
-            decode_client_message(PacketType::from_u8(0x07), &[]),
+            decode_client_message(PacketType::from_u8(0x07), &[], ResetConnection::None),
             Ok(ClientMessage::Unsupported(0x07))
         ));
         assert!(matches!(
-            decode_client_message(PacketType::PreLogin, &[]),
+            decode_client_message(PacketType::PreLogin, &[], ResetConnection::None),
             Ok(ClientMessage::Unsupported(0x12))
         ));
         assert!(matches!(
-            decode_client_message(PacketType::Unknown(0x55), &[]),
+            decode_client_message(PacketType::Unknown(0x55), &[], ResetConnection::None),
             Ok(ClientMessage::Unsupported(0x55))
         ));
         // LOGIN7, SQL_BATCH, RPC and TM are dispatched to their own decoders; a three-byte
@@ -98,7 +111,7 @@ mod tests {
             PacketType::TransactionManager,
         ] {
             assert!(
-                decode_client_message(kind, &[1, 2, 3]).is_err(),
+                decode_client_message(kind, &[1, 2, 3], ResetConnection::None).is_err(),
                 "{kind:?} must reject a 3-byte payload"
             );
         }
@@ -113,5 +126,24 @@ mod tests {
             "Unsupported(0x07)"
         );
         assert_eq!(format!("{:?}", ClientMessage::Attention), "Attention");
+    }
+
+    #[test]
+    fn reset_is_relayed_to_sql_batch_and_rpc() {
+        // Minimal ALL_HEADERS (22 bytes) followed by UCS-2 "SELECT 1".
+        let headers: [u8; 22] = [
+            0x16, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let utf16le =
+            |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect() };
+
+        let mut payload = headers.to_vec();
+        payload.extend_from_slice(&utf16le("SELECT 1"));
+        match decode_client_message(PacketType::SqlBatch, &payload, ResetConnection::Full).unwrap()
+        {
+            ClientMessage::SqlBatch(b) => assert_eq!(b.reset, ResetConnection::Full),
+            other => panic!("expected SqlBatch, got {other:?}"),
+        }
     }
 }

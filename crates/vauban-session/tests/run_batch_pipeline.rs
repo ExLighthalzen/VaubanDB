@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_session::{Engine, ResultSink, Session, SessionState};
 use vauban_storage::MemoryStorage;
-use vauban_tds::{ColumnMeta, EnvChange, Rpc, RpcProc};
+use vauban_tds::{ColumnMeta, EnvChange, ResetConnection, Rpc, RpcProc};
 use vauban_types::{SqlString, SqlType, TypeInfo, Value};
 
 /// SPID of every session built here.
@@ -709,6 +709,7 @@ fn a_cancelled_batch_sends_nothing_and_fails() {
 #[test]
 fn rpc_by_id_gets_2812_under_the_name_of_the_special_procedure() {
     let rpc = Rpc {
+        reset: ResetConnection::None,
         proc: RpcProc::SP_EXECUTESQL,
         options: 0,
         params: Vec::new(),
@@ -729,6 +730,7 @@ fn rpc_by_id_gets_2812_under_the_name_of_the_special_procedure() {
 #[test]
 fn rpc_by_name_gets_2812_with_the_name_as_sent() {
     let rpc = Rpc {
+        reset: ResetConnection::None,
         proc: RpcProc::Name("dbo.p".into()),
         options: 0,
         params: Vec::new(),

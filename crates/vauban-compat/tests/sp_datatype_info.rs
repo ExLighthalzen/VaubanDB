@@ -6,7 +6,7 @@ use vauban_compat::{call_system_procedure, register_functions, sp_datatype_info_
 use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_session::{Engine, ResultSink, Session, SessionState};
 use vauban_storage::MemoryStorage;
-use vauban_tds::{ColumnMeta, EnvChange, Rpc, RpcParam, RpcProc};
+use vauban_tds::{ColumnMeta, EnvChange, ResetConnection, Rpc, RpcParam, RpcProc};
 use vauban_types::{SqlType, TypeInfo, Value};
 
 const COLUMN_NAMES: [&str; 20] = [
@@ -345,6 +345,7 @@ fn session() -> Session {
 
 fn rpc(name: &str, data_type: i32) -> Rpc {
     Rpc {
+        reset: ResetConnection::None,
         proc: RpcProc::Name(name.to_owned()),
         options: 0,
         params: vec![

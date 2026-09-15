@@ -22,6 +22,7 @@
 //! receives until that DONE. An ATTENTION that arrives while the server is still
 //! writing a response is handled by `session`, not here.
 
+use crate::ResetConnection;
 use crate::error::TdsError;
 use crate::headers::decode_all_headers;
 
@@ -33,6 +34,9 @@ pub struct SqlBatch {
     /// `TransactionDescriptor` of the Transaction Descriptor header ([MS-TDS] 2.2.5.3.1);
     /// 0 when absent.
     pub transaction_descriptor: u64,
+    /// RESETCONNECTION or RESETCONNECTIONSKIPTRAN from the first packet's status
+    /// ([MS-TDS] 2.2.3.1.2).
+    pub reset: ResetConnection,
 }
 
 /// Decodes the payload of a SQL_BATCH packet ([MS-TDS] 2.2.6.7): ALL_HEADERS, then
@@ -54,6 +58,7 @@ pub(crate) fn decode(payload: &[u8]) -> Result<SqlBatch, TdsError> {
     Ok(SqlBatch {
         text: String::from_utf16_lossy(&units),
         transaction_descriptor: headers.transaction_descriptor,
+        reset: ResetConnection::None,
     })
 }
 
@@ -146,7 +151,7 @@ mod tests {
     fn dispatch_reaches_batch_decoder() {
         let mut payload = HEADERS.to_vec();
         payload.extend_from_slice(&utf16le("SELECT 1"));
-        match decode_client_message(PacketType::SqlBatch, &payload) {
+        match decode_client_message(PacketType::SqlBatch, &payload, ResetConnection::None) {
             Ok(ClientMessage::SqlBatch(batch)) => assert_eq!(batch.text, "SELECT 1"),
             other => panic!("expected SqlBatch, got {other:?}"),
         }
@@ -155,7 +160,7 @@ mod tests {
     #[test]
     fn attention_is_dispatched() {
         assert!(matches!(
-            decode_client_message(PacketType::Attention, &[]),
+            decode_client_message(PacketType::Attention, &[], ResetConnection::None),
             Ok(ClientMessage::Attention)
         ));
     }
