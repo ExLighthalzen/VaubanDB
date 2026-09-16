@@ -144,7 +144,7 @@ fn bug(what: &str) -> SqlError {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use vauban_binder::{OutputColumn, SessionOptions};
+    use vauban_binder::{LockHints, OutputColumn, SessionOptions};
     use vauban_catalog::ColumnId;
     use vauban_planner::{PhysicalPlan, PhysicalStatement};
     use vauban_storage::{MemoryStorage, Row, Snapshot, Storage, TableShape};
@@ -224,6 +224,7 @@ mod tests {
             columns,
             alias: "t".to_owned(),
             schema,
+            hints: LockHints::default(),
         }
     }
 
@@ -332,6 +333,7 @@ mod tests {
             columns,
             alias,
             mut schema,
+            hints: _,
         } = scan_node(fixture.table, &[0, 1])
         else {
             unreachable!("scan_node builds a TableScan")
@@ -342,6 +344,7 @@ mod tests {
             columns,
             alias,
             schema,
+            hints: LockHints::default(),
         };
         let error = run(&fixture, &plan).expect_err("the arities disagree");
         assert_eq!(error.number, 50000);

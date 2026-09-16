@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, OutputColumn, OutputSchema, SessionOptions,
+    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LockHints, OutputColumn, OutputSchema,
+    SessionOptions,
 };
 use vauban_catalog::ColumnId;
 use vauban_executor::{
@@ -164,6 +165,7 @@ impl DualFixture {
             columns,
             alias: "b".to_owned(),
             schema: schema_of(&names.iter().map(String::as_str).collect::<Vec<_>>()),
+            hints: LockHints::default(),
         }
     }
 
@@ -175,6 +177,7 @@ impl DualFixture {
             columns,
             alias: "p".to_owned(),
             schema: schema_of(&names.iter().map(String::as_str).collect::<Vec<_>>()),
+            hints: LockHints::default(),
         }
     }
 
@@ -588,12 +591,14 @@ fn case_insensitive_key_matches_under_the_default_collation() {
         columns: vec![str_binding(0), str_binding(1)],
         alias: "b".to_owned(),
         schema: str_schema(&["k", "v"]),
+        hints: LockHints::default(),
     };
     let probe_scan = PhysicalPlan::TableScan {
         table: p_table,
         columns: vec![str_binding(0), str_binding(1)],
         alias: "p".to_owned(),
         schema: str_schema(&["k", "v"]),
+        hints: LockHints::default(),
     };
 
     let plan = hash_join_plan(

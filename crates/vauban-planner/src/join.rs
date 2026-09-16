@@ -130,6 +130,7 @@ fn try_inner_seek(
         table,
         columns,
         schema: scan_schema,
+        hints,
         ..
     } = scan
     else {
@@ -182,6 +183,7 @@ fn try_inner_seek(
                 columns: columns.clone(),
                 direction: vauban_storage::Direction::Forward,
                 schema: scan_schema.clone(),
+                hints: *hints,
             };
 
             // Replace the scan with the seek in the inner plan tree.

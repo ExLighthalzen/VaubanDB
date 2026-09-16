@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, OutputColumn, OutputSchema, SessionOptions,
+    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LockHints, OutputColumn, OutputSchema,
+    SessionOptions,
 };
 use vauban_catalog::ColumnId;
 use vauban_executor::{ExecContext, ExecOutcome, Row, execute_collect};
@@ -81,6 +82,7 @@ fn scan(table: TableId) -> PhysicalPlan {
         columns: vec![binding(0)],
         alias: "t".to_owned(),
         schema: schema_of(&["c0"]),
+        hints: LockHints::default(),
     }
 }
 
@@ -419,6 +421,7 @@ fn inner_seek_uses_the_outer_row() {
         columns: vec![binding(0)],
         direction: Direction::Forward,
         schema: schema_of(&["c0"]),
+        hints: LockHints::default(),
     };
 
     let on = eq(col_ref(0), col_ref(1));

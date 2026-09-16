@@ -89,6 +89,7 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         columns,
         direction,
         schema,
+        hints: _,
     } = plan
     else {
         return Err(bug("IndexSeek: the node is not an IndexSeek"));

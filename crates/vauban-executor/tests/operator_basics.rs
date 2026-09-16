@@ -11,8 +11,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding, CompareOp, OutputColumn,
-    OutputSchema, SessionOptions,
+    BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding, CompareOp, LockHints,
+    OutputColumn, OutputSchema, SessionOptions,
 };
 use vauban_catalog::ColumnId;
 use vauban_errors::{InfoMessage, SqlResult};
@@ -252,6 +252,7 @@ fn scan(table: TableId, width: usize) -> PhysicalPlan {
         columns,
         alias: "t".to_owned(),
         schema: schema_of(&names.iter().map(String::as_str).collect::<Vec<_>>()),
+        hints: LockHints::default(),
     }
 }
 

@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, OutputColumn, OutputSchema, SessionOptions,
+    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LockHints, OutputColumn, OutputSchema,
+    SessionOptions,
 };
 use vauban_catalog::{Catalog, ColumnDef, IdentitySpec, QualifiedName, TableDef};
 use vauban_executor::{ExecContext, ExecSession, execute_collect};
@@ -167,6 +168,7 @@ fn insert_values_then_scan_returns_the_rows() {
             columns: vec![out_col("a", int(false)), out_col("b", int(true))],
         },
         alias: "".to_owned(),
+        hints: LockHints::default(),
     };
     let scan_stmt = PhysicalStatement::Query(scan_plan);
     let (_, set) = execute_collect(&scan_stmt, &mut ctx).expect("scan succeeds");
@@ -245,6 +247,7 @@ fn missing_column_takes_its_default() {
             columns: vec![out_col("a", int(false)), out_col("b", int(false))],
         },
         alias: "".to_owned(),
+        hints: LockHints::default(),
     };
     let read_stmt = PhysicalStatement::Query(read_plan);
     let (_, set) = execute_collect(&read_stmt, &mut ctx).expect("scan succeeds");
@@ -393,6 +396,7 @@ fn identity_increments_per_row() {
             columns: vec![out_col("id", int(false)), out_col("v", int(true))],
         },
         alias: "".to_owned(),
+        hints: LockHints::default(),
     };
     let read_stmt = PhysicalStatement::Query(read_plan);
     let (_, set) = execute_collect(&read_stmt, &mut ctx).expect("scan succeeds");
@@ -461,6 +465,7 @@ fn string_too_long_truncates_silently() {
             columns: vec![out_col("a", varchar(3, false))],
         },
         alias: "".to_owned(),
+        hints: LockHints::default(),
     };
     let read_stmt = PhysicalStatement::Query(read_plan);
     let (_, set) = execute_collect(&read_stmt, &mut ctx).expect("readback works");
@@ -615,6 +620,7 @@ fn insert_reading_its_own_target_is_materialized() {
             columns: vec![out_col("a", int(true))],
         },
         alias: "".to_owned(),
+        hints: LockHints::default(),
     };
     let copy_stmt = PhysicalStatement::Insert(PhysicalInsert {
         table: meta.storage_id,
@@ -633,6 +639,7 @@ fn insert_reading_its_own_target_is_materialized() {
             columns: vec![out_col("a", int(true))],
         },
         alias: "".to_owned(),
+        hints: LockHints::default(),
     };
     let read_stmt = PhysicalStatement::Query(read_plan);
     let (_, set) = execute_collect(&read_stmt, &mut ctx).expect("scan succeeds");

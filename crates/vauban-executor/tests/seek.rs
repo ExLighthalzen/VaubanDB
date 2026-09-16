@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, ColumnBinding, OutputColumn, OutputSchema, SessionOptions,
+    BoundExpr, BoundExprKind, ColumnBinding, LockHints, OutputColumn, OutputSchema, SessionOptions,
 };
 use vauban_catalog::ColumnId;
 use vauban_errors::SqlResult;
@@ -240,6 +240,7 @@ impl Fixture {
             columns: columns.clone(),
             direction,
             schema: schema_of(&columns),
+            hints: LockHints::default(),
         }
     }
 
@@ -251,6 +252,7 @@ impl Fixture {
             columns: columns.clone(),
             alias: "t".to_owned(),
             schema: schema_of(&columns),
+            hints: LockHints::default(),
         }
     }
 

@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundTop, ColumnBinding, OutputColumn, OutputSchema, SessionOptions,
-    SortKey,
+    BoundExpr, BoundExprKind, BoundTop, ColumnBinding, LockHints, OutputColumn, OutputSchema,
+    SessionOptions, SortKey,
 };
 use vauban_catalog::ColumnId;
 use vauban_executor::{CancelToken, CollectSink, ExecContext, ExecOutcome, Row, RowSink, execute};
@@ -271,6 +271,7 @@ fn sort_on_two_keys() {
             columns: columns.clone(),
             alias: "t".to_owned(),
             schema: schema_of(&["c0", "c1"], &[int_t(), int_t()]),
+            hints: LockHints::default(),
         }),
         keys: vec![sort_key(0, false), sort_key(1, false)],
     };

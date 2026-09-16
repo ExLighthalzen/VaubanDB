@@ -347,7 +347,7 @@ mod tests {
     /// the statement, so the test does not guess how `MemoryStorage` numbers its tables.
     #[test]
     fn create_table_then_scan_is_empty() {
-        use vauban_binder::{ColumnBinding, OutputColumn, OutputSchema};
+        use vauban_binder::{ColumnBinding, LockHints, OutputColumn, OutputSchema};
 
         let fixture = Fixture::new();
         let before = fixture.tables();
@@ -380,6 +380,7 @@ mod tests {
                     ty,
                 }],
             },
+            hints: LockHints::default(),
         };
         let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);
         let snap = fixture.txn.statement_snapshot(&handle);

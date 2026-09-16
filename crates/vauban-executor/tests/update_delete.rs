@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, OutputColumn, OutputSchema, SessionOptions,
+    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LockHints, OutputColumn, OutputSchema,
+    SessionOptions,
 };
 use vauban_catalog::{Catalog, ColumnDef, IndexDef, QualifiedName, SortedColumn, TableDef};
 use vauban_executor::{ExecContext, ExecSession, execute_collect};
@@ -67,6 +68,7 @@ fn scan_plan(
         columns,
         schema,
         alias: "t".to_owned(),
+        hints: LockHints::default(),
     }
 }
 
@@ -405,6 +407,7 @@ fn update_via_seek_touches_one_row() {
             schema: OutputSchema {
                 columns: vec![out_col("a", int(false))],
             },
+            hints: LockHints::default(),
         },
         assignments: vec![(
             col_binding(0, "a", int(false)),
@@ -748,6 +751,7 @@ fn halloween_spool_updates_each_row_once() {
             schema: OutputSchema {
                 columns: vec![out_col("a", int(false))],
             },
+            hints: LockHints::default(),
         },
         assignments: vec![(
             col_a.clone(),

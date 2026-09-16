@@ -97,12 +97,13 @@ pub(crate) fn plan_node(plan: &LogicalPlan, ctx: &PlanContext<'_>) -> SqlResult<
             columns,
             alias,
             schema,
-            hints: _,
+            hints,
         } => Ok(PhysicalPlan::TableScan {
             table: *table,
             columns: columns.clone(),
             alias: alias.clone(),
             schema: schema.clone(),
+            hints: *hints,
         }),
         LogicalPlan::Filter { input, predicate } => {
             let input = plan_node(input, ctx)?;

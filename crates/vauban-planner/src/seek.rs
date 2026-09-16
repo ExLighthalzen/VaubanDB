@@ -83,6 +83,7 @@ pub(crate) fn try_index_seek(
         columns,
         alias: _,
         schema,
+        hints,
     } = input
     else {
         return Ok(None);
@@ -106,6 +107,7 @@ pub(crate) fn try_index_seek(
             columns: columns.clone(),
             direction: Direction::Forward,
             schema: schema.clone(),
+            hints: *hints,
         };
         let residual = conjuncts
             .iter()

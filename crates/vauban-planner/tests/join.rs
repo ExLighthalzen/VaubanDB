@@ -132,14 +132,20 @@ fn scan_a() -> LogicalPlan {
     }
 }
 
-fn scan_b() -> LogicalPlan {
+/// `FROM dbo.b`, with `hints` on the reference.
+fn scan_b_with(hints: LockHints) -> LogicalPlan {
     LogicalPlan::Scan {
         table: TABLE_B,
         columns: vec![binding_b("k", 0), binding_b("c", 1)],
         alias: "b".to_owned(),
         schema: schema_b(),
-        hints: LockHints::default(),
+        hints,
     }
+}
+
+/// `FROM dbo.b` written without a hint.
+fn scan_b() -> LogicalPlan {
+    scan_b_with(LockHints::default())
 }
 
 /// The join schema of a then b: columns of left then right.
@@ -269,6 +275,39 @@ fn equality_on_an_inner_index_becomes_a_loop_with_a_seek() {
         "expected a ColumnRef to a.k, got {:?}",
         keys[0]
     );
+}
+
+/// A join whose inner table carries `READPAST` and has a usable index: the `IndexSeek` that
+/// replaces the inner scan keeps the hints.
+#[test]
+fn the_inner_seek_of_a_join_keeps_the_hints() {
+    let catalog = FakeCatalog::new().with_index(
+        TABLE_B,
+        &[KeyColumn {
+            column: 0,
+            descending: false,
+        }],
+        true,
+    );
+    let hints = LockHints {
+        readpast: true,
+        ..LockHints::default()
+    };
+    let logical = LogicalPlan::Join {
+        left: Box::new(scan_a()),
+        right: Box::new(scan_b_with(hints)),
+        kind: JoinKind::Inner,
+        on: Some(compare(CompareOp::Eq, column_a("k", 0), column_b("k", 0))),
+        schema: join_schema(),
+    };
+    let planned = plan_with(&catalog, logical);
+    let PhysicalPlan::NestedLoopJoin { inner, .. } = &planned else {
+        panic!("expected a NestedLoopJoin, got {planned:?}")
+    };
+    let PhysicalPlan::IndexSeek { hints: carried, .. } = inner.as_ref() else {
+        panic!("expected an IndexSeek as inner, got {inner:?}")
+    };
+    assert_eq!(*carried, hints);
 }
 
 #[test]

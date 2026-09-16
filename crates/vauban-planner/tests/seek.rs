@@ -100,8 +100,8 @@ fn and(left: BoundExpr, right: BoundExpr) -> BoundExpr {
     logical(LogicalOp::And, left, right)
 }
 
-/// `FROM dbo.t`, the three columns read.
-fn scan() -> LogicalPlan {
+/// `FROM dbo.t`, the three columns read, with `hints` on the reference.
+fn scan_with(hints: LockHints) -> LogicalPlan {
     LogicalPlan::Scan {
         table: TABLE,
         columns: COLUMNS.iter().map(|name| binding(name)).collect(),
@@ -115,8 +115,13 @@ fn scan() -> LogicalPlan {
                 })
                 .collect(),
         },
-        hints: LockHints::default(),
+        hints,
     }
+}
+
+/// `FROM dbo.t` written without a hint.
+fn scan() -> LogicalPlan {
+    scan_with(LockHints::default())
 }
 
 fn filter(predicate: BoundExpr) -> LogicalPlan {
@@ -197,6 +202,26 @@ fn equality_on_a_unique_index_becomes_a_point_seek() {
         panic!("expected a Point, got {range:?}")
     };
     assert_eq!(literal_values(keys), vec![3]);
+}
+
+/// A `Filter` above a `Scan` whose reference carries `UPDLOCK`: the seek that replaces the
+/// scan keeps the hints.
+#[test]
+fn a_seek_keeps_the_hints_of_the_scan_it_replaces() {
+    let catalog = FakeCatalog::new().with_index(TABLE, &ascending(&["a"]), true);
+    let hints = LockHints {
+        updlock: true,
+        ..LockHints::default()
+    };
+    let logical = LogicalPlan::Filter {
+        input: Box::new(scan_with(hints)),
+        predicate: compare(CompareOp::Eq, column("a"), literal(3)),
+    };
+    let planned = plan_with(&catalog, logical);
+    let PhysicalPlan::IndexSeek { hints: carried, .. } = &planned else {
+        panic!("expected an IndexSeek, got {planned:?}")
+    };
+    assert_eq!(*carried, hints);
 }
 
 #[test]

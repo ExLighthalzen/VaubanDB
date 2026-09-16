@@ -150,6 +150,7 @@ fn collect_input_rows(
             columns: _,
             alias: _,
             schema: _,
+            hints: _,
         } => {
             if *t != table {
                 return Err(bug("UPDATE/DELETE: TableScan reads a different table"));
@@ -186,6 +187,7 @@ fn collect_input_rows(
             columns: _,
             direction,
             schema: _,
+            hints: _,
         } => {
             let storage = ctx.storage()?;
             let snap = ctx.snapshot()?;

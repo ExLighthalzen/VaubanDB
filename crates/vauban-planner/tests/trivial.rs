@@ -145,6 +145,40 @@ fn one_row_plans_to_one_row() {
     ));
 }
 
+/// A `Scan` whose `LockHints` carry `nolock` plans into a `TableScan` that carries those
+/// hints: the whole struct is compared, so a translation that dropped them for
+/// `LockHints::default()` fails here.
+#[test]
+fn hints_of_a_scan_reach_the_physical_scan() {
+    let hints = LockHints {
+        nolock: true,
+        ..LockHints::default()
+    };
+    let logical = LogicalPlan::Scan {
+        table: TableId(7),
+        columns: vec![id_binding()],
+        alias: "t".to_owned(),
+        schema: schema_of(&["id"]),
+        hints,
+    };
+    let planned = plan_query(logical);
+    let PhysicalPlan::TableScan { hints: carried, .. } = &planned else {
+        panic!("expected a TableScan, got {planned:?}")
+    };
+    assert_eq!(*carried, hints);
+}
+
+/// A reference written without a hint carries `LockHints::default()`; the default does not
+/// turn into an indicator on the way.
+#[test]
+fn a_reference_without_a_hint_carries_the_default() {
+    let planned = plan_query(scan());
+    let PhysicalPlan::TableScan { hints, .. } = &planned else {
+        panic!("expected a TableScan, got {planned:?}")
+    };
+    assert_eq!(*hints, LockHints::default());
+}
+
 #[test]
 fn filter_project_over_scan_becomes_a_seek_under_the_project() {
     // A unique index on the filtered column, declared to the planner: the seek rule

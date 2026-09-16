@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, ColumnBinding, OutputColumn, OutputSchema, SessionOptions,
+    BoundExpr, BoundExprKind, ColumnBinding, LockHints, OutputColumn, OutputSchema, SessionOptions,
 };
 use vauban_catalog::ColumnId;
 use vauban_executor::{CancelToken, CollectSink, ExecContext, ExecOutcome, Row, RowSink, execute};
@@ -141,6 +141,7 @@ fn scan(table: TableId, types: &[TypeInfo]) -> PhysicalPlan {
         columns,
         alias: "t".to_owned(),
         schema: schema_of(&names.iter().map(String::as_str).collect::<Vec<_>>(), types),
+        hints: LockHints::default(),
     }
 }
 

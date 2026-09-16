@@ -17,7 +17,7 @@ use std::ops::Bound;
 use vauban_binder::BoundDeclaration;
 use vauban_binder::{
     AggregateCall, BoundExpr, BoundProjection, BoundTop, ColumnBinding, DdlStatement, JoinKind,
-    OutputSchema, SortKey, TxnStatement,
+    LockHints, OutputSchema, SortKey, TxnStatement,
 };
 use vauban_catalog::TableId;
 use vauban_storage::{Direction, IndexId};
@@ -107,9 +107,10 @@ pub enum PhysicalPlan {
     },
     /// Reads the rows of one table, in the order `storage` hands them out.
     ///
-    /// The lock hints of [`LogicalPlan::Scan`](vauban_binder::LogicalPlan::Scan) are not
-    /// carried: what a hint changes at run time is not decided by this node, but by
-    /// whoever reads [`LockHints`](vauban_binder::LockHints).
+    /// `hints` are the lock hints the reference carried
+    /// ([`LogicalPlan::Scan`](vauban_binder::LogicalPlan::Scan)), copied unchanged: this
+    /// node decides nothing about them, and whoever takes a lock reads them
+    /// ([`LockHints`](vauban_binder::LockHints)).
     TableScan {
         /// The table in `storage`.
         table: TableId,
@@ -120,6 +121,9 @@ pub enum PhysicalPlan {
         alias: String,
         /// The columns this node produces, in the same order as `columns`.
         schema: OutputSchema,
+        /// The lock hints written on the reference this scan comes from,
+        /// [`LockHints::default`] for a reference written without a hint.
+        hints: LockHints,
     },
     /// Reads the rows an index serves for a range of keys.
     ///
@@ -136,6 +140,8 @@ pub enum PhysicalPlan {
         direction: Direction,
         /// The columns this node produces, in the same order as `columns`.
         schema: OutputSchema,
+        /// The lock hints of the scan this seek replaces, copied unchanged.
+        hints: LockHints,
     },
     /// Keeps the rows of `input` for which `predicate` is true.
     Filter {
