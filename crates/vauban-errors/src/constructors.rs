@@ -1443,7 +1443,7 @@ impl SqlError {
     /// written where no WHILE encloses it.
     ///
     /// ```text
-    /// Cannot use a BREAK statement outside the scope of a WHILE statement.
+    /// BREAK is written where no WHILE loop encloses it.
     /// ```
     pub fn break_without_while() -> Self {
         from_catalog(135, 1, &[])
@@ -1453,7 +1453,7 @@ impl SqlError {
     /// statement written where no WHILE encloses it.
     ///
     /// ```text
-    /// Cannot use a CONTINUE statement outside the scope of a WHILE statement.
+    /// CONTINUE is written where no WHILE loop encloses it.
     /// ```
     pub fn continue_without_while() -> Self {
         from_catalog(136, 1, &[])
@@ -1474,7 +1474,7 @@ impl SqlError {
     /// statement written with a value where the context does not accept one.
     ///
     /// ```text
-    /// A RETURN statement with a return value cannot be used in this context.
+    /// A return value needs a procedure to return from; this statement is not inside one.
     /// ```
     pub fn return_with_value_outside_procedure() -> Self {
         from_catalog(178, 1, &[])
@@ -3668,7 +3668,7 @@ impl SqlError {
     /// a derived table has more columns than its column list names.
     ///
     /// ```text
-    /// '%.*ls' has more columns than were specified in the column list.
+    /// The alias list of the derived table '%.*ls' names fewer columns than the query inside it produces.
     /// ```
     pub fn derived_table_more_columns_than_column_list(alias: &str) -> Self {
         from_catalog(8158, 1, &[Arg::Str(alias)])
@@ -3678,7 +3678,7 @@ impl SqlError {
     /// a derived table has fewer columns than its column list names.
     ///
     /// ```text
-    /// '%.*ls' has fewer columns than were specified in the column list.
+    /// The alias list of the derived table '%.*ls' names more columns than the query inside it produces.
     /// ```
     pub fn derived_table_fewer_columns_than_column_list(alias: &str) -> Self {
         from_catalog(8159, 1, &[Arg::Str(alias)])

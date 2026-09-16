@@ -285,7 +285,7 @@ fn derived_column_list_longer_than_columns_is_8159() {
     let error = error_of("SELECT 1 FROM (SELECT c, k FROM a) AS d(x, y, z)");
     assert_eq!(error.number, 8159, "{}", error.message);
     assert!(
-        error.message.contains("has fewer columns"),
+        error.message.contains("names more columns"),
         "{}",
         error.message
     );
@@ -297,7 +297,7 @@ fn derived_column_list_shorter_than_columns_is_8158() {
     let error = error_of("SELECT 1 FROM (SELECT c, k FROM a) AS d(x)");
     assert_eq!(error.number, 8158, "{}", error.message);
     assert!(
-        error.message.contains("has more columns"),
+        error.message.contains("names fewer columns"),
         "{}",
         error.message
     );

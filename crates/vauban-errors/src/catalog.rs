@@ -161,12 +161,12 @@ const CATALOG: &[ErrorDef] = &[
     ErrorDef {
         number: 135,
         severity: 15,
-        template: "Cannot use a BREAK statement outside the scope of a WHILE statement.",
+        template: "BREAK is written where no WHILE loop encloses it.",
     },
     ErrorDef {
         number: 136,
         severity: 15,
-        template: "Cannot use a CONTINUE statement outside the scope of a WHILE statement.",
+        template: "CONTINUE is written where no WHILE loop encloses it.",
     },
     ErrorDef {
         number: 137,
@@ -226,7 +226,7 @@ const CATALOG: &[ErrorDef] = &[
     ErrorDef {
         number: 178,
         severity: 15,
-        template: "A RETURN statement with a return value cannot be used in this context.",
+        template: "A return value needs a procedure to return from; this statement is not inside one.",
     },
     ErrorDef {
         number: 179,
@@ -891,12 +891,12 @@ const CATALOG: &[ErrorDef] = &[
     ErrorDef {
         number: 8158,
         severity: 16,
-        template: "'%.*ls' has more columns than were specified in the column list.",
+        template: "The alias list of the derived table '%.*ls' names fewer columns than the query inside it produces.",
     },
     ErrorDef {
         number: 8159,
         severity: 16,
-        template: "'%.*ls' has fewer columns than were specified in the column list.",
+        template: "The alias list of the derived table '%.*ls' names more columns than the query inside it produces.",
     },
     ErrorDef {
         number: 8168,
