@@ -311,6 +311,7 @@ fn every_statement_variant_exists() {
             }
             BoundStatement::Transaction(_) => 0,
             BoundStatement::Query(_) | BoundStatement::Ddl(_) | BoundStatement::Use { .. } => 0,
+            BoundStatement::Execute(_) => 0,
         };
     }
     assert_eq!(matched, values.len(), "each value matched its own variant");

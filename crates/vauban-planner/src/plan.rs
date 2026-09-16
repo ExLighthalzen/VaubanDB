@@ -40,6 +40,9 @@ pub fn plan(stmt: BoundStatement, ctx: &PlanContext<'_>) -> SqlResult<PhysicalSt
             "plan",
             "a SELECT that assigns variables from a FROM",
         )),
+        // `EXECUTE` is bound and not planned here yet: carrying it to a physical statement
+        // belongs to the executor task that runs it.
+        BoundStatement::Execute(_) => Err(not_implemented("plan", "EXECUTE")),
         BoundStatement::Declare(declarations) => Ok(PhysicalStatement::Declare(declarations)),
         BoundStatement::If {
             condition,

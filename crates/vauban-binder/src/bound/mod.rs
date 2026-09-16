@@ -14,6 +14,8 @@ use vauban_catalog::{AlterTable, ColumnId, IndexDef, QualifiedName, TableDef, Ta
 use vauban_sysfn::FunctionDef;
 use vauban_types::{BinaryOp, Collation, TypeInfo, Value};
 
+use crate::execute::BoundExecute;
+
 /// A statement, bound.
 ///
 /// This enum is deliberately **not** `#[non_exhaustive]`: a new variant must break the
@@ -110,6 +112,8 @@ pub enum BoundStatement {
     Return(Option<BoundExpr>),
     /// `PRINT e`..
     Print(BoundExpr),
+    /// `EXECUTE`: a procedure call or a text, with its arguments.
+    Execute(BoundExecute),
     /// `BEGIN`, `COMMIT`, `ROLLBACK` and `SAVE TRANSACTION`..
     Transaction(TxnStatement),
 }

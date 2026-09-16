@@ -67,6 +67,7 @@ mod ddl;
 mod ddl_index;
 mod depth;
 mod errors;
+mod execute;
 mod expr;
 mod hints;
 mod insert;
@@ -94,5 +95,6 @@ pub use context::{
     BindContext, CatalogView, NoVariables, ResolvedTable, ResolvedTableKind, SessionOptions,
     TableReferenceKind, VariableScope,
 };
+pub use execute::{BoundExecArg, BoundExecTarget, BoundExecute};
 pub use statement::bind;
 pub use variables::BatchVariables;

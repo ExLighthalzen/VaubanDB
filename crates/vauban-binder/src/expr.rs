@@ -1908,6 +1908,46 @@ fn near_token_at<'a>(text: &'a str, span: &Span) -> (&'a str, u32) {
     }
 }
 
+/// The span of `expr`'s first token, which a `near` quotes for a syntax error.
+///
+/// A `near` names one token, not the whole expression's text: this is the span that
+/// token starts on, and [`token_at`] reads it out of the batch.
+pub(crate) fn syntax_span(expr: &Expr) -> Span {
+    match expr {
+        Expr::Literal(_, span)
+        | Expr::Nested(_, span)
+        | Expr::Exists(_, span)
+        | Expr::Subquery(_, span)
+        | Expr::Placeholder(span) => *span,
+        Expr::Column(column) => column.span,
+        Expr::Variable { span, .. }
+        | Expr::Binary { span, .. }
+        | Expr::Unary { span, .. }
+        | Expr::Function { span, .. }
+        | Expr::Case { span, .. }
+        | Expr::Cast { span, .. }
+        | Expr::Convert { span, .. }
+        | Expr::IsNull { span, .. }
+        | Expr::In { span, .. }
+        | Expr::Like { span, .. }
+        | Expr::Between { span, .. }
+        | Expr::Quantified { span, .. }
+        | Expr::Collate { span, .. }
+        | Expr::Assign { span, .. }
+        | Expr::NextValueFor { span, .. }
+        | Expr::InvalidNiladic { span, .. } => *span,
+    }
+}
+
+/// The token `span` starts on, and its line. See [`syntax_span`].
+pub(crate) fn token_at<'a>(text: &'a str, span: &Span) -> (&'a str, u32) {
+    let start = span.offset as usize;
+    match text.get(start..).and_then(first_token) {
+        Some(token) => (token, line_at(text, span, start)),
+        None => ("", span.line),
+    }
+}
+
 /// The first token of `text`, which must already have its trivia skipped
 /// ([`crate::errors::skip_trivia`]), or `None` when there is none.
 fn first_token(rest: &str) -> Option<&str> {

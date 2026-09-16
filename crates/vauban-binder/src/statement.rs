@@ -26,6 +26,7 @@ use crate::ddl::{
 use crate::ddl_index::{bind_create_index, bind_drop_index};
 use crate::depth::at_statement;
 use crate::errors::on_the_statement;
+use crate::execute::bind_execute;
 use crate::insert::{bind_insert, bind_truncate};
 use crate::query::bind_select;
 use crate::txn_stmt::{bind_begin, bind_commit, bind_rollback, bind_save};
@@ -106,6 +107,7 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
         Statement::Commit { name, .. } => bind_commit(name.as_ref(), ctx),
         Statement::Rollback { name, .. } => bind_rollback(name.as_ref(), ctx),
         Statement::Save { name, .. } => bind_save(name, ctx),
+        Statement::Execute(execute) => bind_execute(execute, ctx),
         other => Err(unsupported(other)),
     }
 }
