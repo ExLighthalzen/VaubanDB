@@ -386,6 +386,13 @@ impl EvalContext for SessionEvalContext<'_> {
         self.state.rowcount
     }
 
+    /// `@@TRANCOUNT`: how many `BEGIN TRANSACTION` are open. `txn_session.rs` keeps the
+    /// count on the state; `@@TRANCOUNT` is read through this method and not through
+    /// [`EvalContext::variable`].
+    fn trancount(&self) -> i32 {
+        self.state.trancount
+    }
+
     fn last_identity(&self) -> Option<Decimal> {
         // The session does not track the identity values `INSERT` generates.
         None

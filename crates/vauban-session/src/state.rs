@@ -3,11 +3,12 @@
 
 use crate::login::{EDITION, VERSION_BANNER};
 use crate::set_options::{IsolationLevel, SetOptions};
+use crate::txn_session::SessionTxn;
 
 /// Per-connection state, built by `server.rs` once the login is accepted:
 /// `SessionState::new(spid)` then the fields of the LOGIN7.
 ///
-/// Not held here yet: the current storage transaction and the batch variables.
+/// Not held here yet: the batch variables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionState {
     /// `@@SPID`, also written in every packet header ([MS-TDS] 2.2.3.1.4).
@@ -37,9 +38,15 @@ pub struct SessionState {
     /// `batch.rs` sets it on the error that stops a batch; putting it back to `0` after a
     /// statement that succeeds is not implemented (it comes with `TRY ... CATCH`).
     pub last_error: u32,
-    /// `@@TRANCOUNT`: number of transactions accepted through TRANSACTION_MANAGER. It
-    /// tracks the driver's request; storage remains autocommit.
+    /// `@@TRANCOUNT`: how many `BEGIN TRANSACTION` are open. Kept in step with
+    /// [`SessionState::txn`] by `txn_session.rs`; a driver TRANSACTION_MANAGER request still
+    /// writes it directly (`txn_request.rs`).
     pub trancount: i32,
+    /// The storage transaction a `BEGIN TRANSACTION` opened, held across the statements of a
+    /// batch and the batches that follow, `None` outside one. The session's authoritative
+    /// transaction; [`SessionState::trancount`] and the wire are read from it by
+    /// `txn_session.rs`.
+    pub(crate) txn: Option<SessionTxn>,
     /// Opaque descriptor handed to the client for its current transaction, or `0` when
     /// no TRANSACTION_MANAGER transaction is open ([MS-TDS] 2.2.5.3.1).
     pub transaction_descriptor: u64,
@@ -82,6 +89,7 @@ impl SessionState {
             rowcount: 0,
             last_error: 0,
             trancount: 0,
+            txn: None,
             transaction_descriptor: 0,
             version_banner: VERSION_BANNER.into(),
             edition: EDITION.into(),

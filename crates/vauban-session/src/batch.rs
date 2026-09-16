@@ -126,7 +126,7 @@ use std::sync::{Arc, OnceLock};
 use vauban_binder::{BindContext, OutputSchema};
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
-use vauban_executor::{ExecContext, ExecOutcome, RowSink};
+use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSink};
 use vauban_parser::{Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange, Rpc, RpcProc};
@@ -141,6 +141,7 @@ use crate::server::Engine;
 use crate::set_options::apply_set_statement;
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
+use crate::txn_session::{self, StatementTxn};
 
 /// Number of the generic internal error (`errors`, `InternalError` → `SqlError`): the
 /// binder answers it for each statement that is not implemented yet.
@@ -199,9 +200,22 @@ pub struct Session {
     /// Storage, transaction manager and catalogue, shared by the connections of one
     /// server. Read by
     /// [`Session::prepare_batch`], which snapshots the catalogue for the binder, and by
-    /// [`Session::execute_in_a_transaction`], which opens one transaction per statement.
+    /// [`Session::execute_in_a_transaction`], which opens the transaction of one statement.
     engine: Arc<Engine>,
     cancel: CancelHandle,
+    /// The executor's session state: the open transaction, its savepoints, the variables and
+    /// `@@ROWCOUNT`. Held here so the transaction a `BEGIN TRANSACTION` opened outlives the
+    /// statement that opened it and the batch that contained it (`txn_session.rs`).
+    exec: ExecSession,
+}
+
+impl Drop for Session {
+    /// Rolls back a transaction the connection left open. The full release (locks given
+    /// back, a waiting request cut) is the connection-teardown work; this one cancels the
+    /// open transaction and clears its descriptor.
+    fn drop(&mut self) {
+        let _ = txn_session::rollback_all(&mut self.state, &self.engine);
+    }
 }
 
 /// What one statement of a batch decided about the rest of it.
@@ -244,6 +258,7 @@ impl Session {
             state,
             engine,
             cancel: CancelHandle::new(),
+            exec: ExecSession::default(),
         }
     }
 
@@ -291,6 +306,9 @@ impl Session {
                 break;
             }
         }
+        // A batch may end with a transaction still open; what the end of a batch does with
+        // it is `txn_session::end_of_batch`'s decision.
+        txn_session::end_of_batch(&self.state, sink)?;
         Ok(())
     }
 
@@ -518,8 +536,20 @@ impl Session {
         // converts to `ResultSink::columns` — COLMETADATA therefore goes out when
         // the statement starts to run, not while it is prepared.
         let mut adapter = RowSinkAdapter::new(sink);
-        let outcome = self.execute_in_a_transaction(bound, &mut adapter);
-        match outcome {
+        let (result, txn) = self.execute_in_a_transaction(bound, &mut adapter);
+        let succeeded = result.is_ok();
+        // The ENVCHANGE of an opening or a closing transaction goes out before the DONE of
+        // the statement that caused it.
+        txn_session::finish_statement(
+            &mut self.state,
+            &self.engine,
+            &mut self.exec,
+            txn,
+            txn_session::kind_of(bound),
+            succeeded,
+            sink,
+        )?;
+        match result {
             Ok(ExecOutcome::Rows(count)) => {
                 // The metadata was already sent through the adapter during execution.
                 // `SET NOCOUNT ON` clears `DONE_COUNT` on the DONE of a `SELECT`
@@ -662,30 +692,43 @@ impl Session {
     /// to commit, the internal error of the transaction manager. A `rollback` that fails
     /// after a statement error keeps that error: the client is owed the number of what it
     /// asked for, and the manager's own failure is a bug of this engine.
+    ///
+    /// The transaction is the session one when a `BEGIN TRANSACTION` opened it, and a
+    /// one-statement transaction otherwise; what to do with it is
+    /// [`txn_session::finish_statement`]'s decision, which is why the [`StatementTxn`] is
+    /// handed back with the outcome.
     fn execute_in_a_transaction(
-        &self,
+        &mut self,
         bound: &PhysicalStatement,
         sink: &mut dyn RowSink,
-    ) -> SqlResult<ExecOutcome> {
-        let handle = self.engine.txn.begin(IsolationLevel::ReadCommitted);
-        let snap = self.engine.txn.statement_snapshot(&handle);
-        let outcome = {
-            let eval = SessionEvalContext::deferred(&self.state, &self.engine.catalog, &handle);
-            let token = self.cancel.token();
-            let mut exec = ExecContext::scalar(&eval, self.state.options.to_binder())
-                .with_engine(self.engine.storage.as_ref(), &self.engine.txn, &snap)
-                .with_catalog(&self.engine.catalog)
-                .with_handle(&handle)
-                .with_cancel(&token);
-            vauban_executor::execute(bound, &mut exec, sink)
+    ) -> (SqlResult<ExecOutcome>, StatementTxn) {
+        let txn = txn_session::statement_txn(&self.state, &self.engine, &mut self.exec);
+        let handle = match &txn {
+            StatementTxn::Explicit => self
+                .state
+                .txn
+                .as_ref()
+                .map(|session_txn| session_txn.handle.clone()),
+            StatementTxn::Autocommit(handle) => Some(handle.clone()),
         };
-        match outcome {
-            Ok(outcome) => self.engine.txn.commit(handle).map(|()| outcome),
-            Err(err) => {
-                let _ = self.engine.txn.rollback(handle);
-                Err(err)
-            }
-        }
+        let Some(handle) = handle else {
+            return (
+                Err(SqlError::from(InternalError::Bug(
+                    "execute_in_a_transaction: the session transaction has no handle".to_owned(),
+                ))),
+                txn,
+            );
+        };
+        let snap = self.engine.txn.statement_snapshot(&handle);
+        let eval = SessionEvalContext::deferred(&self.state, &self.engine.catalog, &handle);
+        let token = self.cancel.token();
+        let mut exec = ExecContext::scalar(&eval, self.state.options.to_binder())
+            .with_engine(self.engine.storage.as_ref(), &self.engine.txn, &snap)
+            .with_catalog(&self.engine.catalog)
+            .with_handle(&handle)
+            .with_cancel(&token)
+            .with_session(&mut self.exec);
+        (vauban_executor::execute(bound, &mut exec, sink), txn)
     }
 
     /// Sends `err` and the DONE that closes the batch, and records `@@ERROR`.
@@ -844,7 +887,11 @@ fn statement_line(stmt: &Statement) -> u32 {
         | Statement::Use { .. }
         | Statement::Insert(_)
         | Statement::Update(_)
-        | Statement::Delete(_) => statement_span(stmt).line,
+        | Statement::Delete(_)
+        | Statement::BeginTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. }
+        | Statement::Save { .. } => statement_span(stmt).line,
         _ => 0,
     }
 }

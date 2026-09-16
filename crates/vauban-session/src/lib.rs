@@ -16,6 +16,7 @@
 //! | `cancel.rs` | ATTENTION handling |
 //! | `eval_context.rs` | `EvalContext` of the session for `sysfn` |
 //! | `txn_request.rs` | TRANSACTION_MANAGER requests |
+//! | `txn_session.rs` | the session transaction: opening, holding across batches, closing, descriptor |
 
 mod auth;
 mod batch;
@@ -28,6 +29,7 @@ mod set_options;
 mod sink;
 mod state;
 mod txn_request;
+mod txn_session;
 
 pub use auth::*;
 pub use server::*;
