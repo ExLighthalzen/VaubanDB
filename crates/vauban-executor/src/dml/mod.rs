@@ -14,18 +14,9 @@
 //! `update_delete.rs` answer the internal error 50000, and the other files hold their
 //! documentation alone.
 
-use vauban_errors::{InternalError, SqlError};
-
 pub(crate) mod assign;
 pub(crate) mod constraints;
 pub(crate) mod fk_check;
 pub(crate) mod insert;
 pub(crate) mod truncate;
 pub(crate) mod update_delete;
-
-/// The internal error 50000 a statement answers until it is written.
-pub(crate) fn not_implemented(statement: &str) -> SqlError {
-    SqlError::from(InternalError::Bug(format!(
-        "execute: {statement} is not implemented yet"
-    )))
-}
