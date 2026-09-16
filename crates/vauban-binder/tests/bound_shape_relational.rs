@@ -403,8 +403,8 @@ fn an_unimplemented_form_names_itself() {
         // `SELECT 1 WHERE EXISTS (SELECT 1)` is bound (`tests/bind_subquery.rs`).
         // `SELECT 1 WHERE 1 IN (SELECT 1)` is bound (`tests/bind_subquery.rs`).
         // `SELECT 1 FROM (SELECT 1 AS c) AS d` is bound (`tests/bind_subquery.rs`).
-        ("SELECT 1 UNION SELECT 2", "UNION, EXCEPT and INTERSECT"),
-        ("SELECT 1 EXCEPT SELECT 2", "UNION, EXCEPT and INTERSECT"),
+        // `SELECT 1 UNION SELECT 2` and `SELECT 1 EXCEPT SELECT 2` are supported by the setop binder.
+        // (`tests/bind_setop.rs`).
         // `INSERT INTO a (c) VALUES (1)` is bound (`tests/bind_insert.rs`).
         // `UPDATE a SET c = 1` and `DELETE FROM a` are bound (`tests/bind_update_delete.rs`).
         // `IF 1 = 1 SELECT 1 ELSE SELECT 2`, `WHILE 1 = 1 BEGIN … END`, `PRINT 'a'` and

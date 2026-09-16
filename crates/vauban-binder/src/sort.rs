@@ -95,7 +95,8 @@ use vauban_parser::{
 use vauban_types::{Collation, TypeInfo};
 
 use crate::bound::{
-    BoundExpr, BoundExprKind, BoundProjection, BoundTop, LogicalPlan, OutputSchema, SortKey,
+    BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding, LogicalPlan, OutputSchema,
+    SortKey,
 };
 use crate::context::BindContext;
 use crate::errors::line_of;
@@ -125,9 +126,19 @@ pub(crate) fn bind_order_by(
     input: LogicalPlan,
     ctx: &BindContext<'_>,
 ) -> SqlResult<LogicalPlan> {
-    let QueryBody::Select(spec) = &stmt.body else {
-        return Err(not_implemented("the ORDER BY of a set operator"));
-    };
+    match &stmt.body {
+        QueryBody::Select(spec) => bind_order_by_select(stmt, input, ctx, spec),
+        QueryBody::SetOp { .. } | QueryBody::Nested(..) => bind_order_by_set_op(stmt, input, ctx),
+    }
+}
+
+/// Binds the ORDER BY of a plain `SELECT`.
+fn bind_order_by_select(
+    stmt: &SelectStatement,
+    input: LogicalPlan,
+    ctx: &BindContext<'_>,
+    spec: &QuerySpec,
+) -> SqlResult<LogicalPlan> {
     let (body, top) = strip_limit(input);
     let (deduplicated, projected) = match body {
         LogicalPlan::Distinct(inner) => (true, *inner),
@@ -180,6 +191,63 @@ pub(crate) fn bind_order_by(
         }
     };
     Ok(put_the_limit_back(plan, top))
+}
+
+/// Binds the ORDER BY of a set operator: `UNION … ORDER BY a`.
+///
+/// The Sort goes directly above the `SetOp`: the keys resolve against the output
+/// schema of the set operation, by ordinal or by name, with no `FROM` scope.
+/// The ORDER BY items are resolved the same way as for a plain SELECT: an integer
+/// literal is a position (108 out of range), a bare name matches an output column,
+/// and anything else is an expression that is refused by 408 if it is constant.
+fn bind_order_by_set_op(
+    stmt: &SelectStatement,
+    input: LogicalPlan,
+    ctx: &BindContext<'_>,
+) -> SqlResult<LogicalPlan> {
+    let LogicalPlan::SetOp { schema, .. } = &input else {
+        return Err(bug(format!(
+            "sort::bind_order_by_set_op: the input is not a SetOp: {input:?}"
+        )));
+    };
+    // The projections match the output columns one-to-one.
+    let exprs: Vec<BoundProjection> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| BoundProjection {
+            expr: BoundExpr {
+                kind: BoundExprKind::ColumnRef(ColumnBinding {
+                    column: vauban_catalog::ColumnId(i as i32),
+                    index: i,
+                    name: col.name.clone(),
+                    ty: col.ty.clone(),
+                }),
+                ty: col.ty.clone(),
+                line: 1,
+            },
+            name: col.name.clone(),
+        })
+        .collect();
+
+    let mut keys = Vec::with_capacity(stmt.order_by.len());
+    for (position, item) in stmt.order_by.iter().enumerate() {
+        keys.push(resolve_key(
+            item,
+            position,
+            &exprs,
+            schema,
+            &Scope::empty(),
+            ctx,
+        )?);
+    }
+    refuse_a_repeated_key(&keys)?;
+
+    let keys = keys.into_iter().map(ResolvedKey::into_sort_key).collect();
+    Ok(LogicalPlan::Sort {
+        input: Box::new(input),
+        keys,
+    })
 }
 
 /// Binds a `SELECT DISTINCT` over a `FROM` into a [`LogicalPlan::Distinct`] over `input`.

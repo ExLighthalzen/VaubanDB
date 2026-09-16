@@ -19,7 +19,7 @@ use vauban_binder::{
 use vauban_errors::SqlError;
 use vauban_parser::{
     AliasStyle, Expr, Ident, Literal, ObjectName, ParseOptions, QueryBody, QuerySpec, SelectItem,
-    SelectStatement, SetOp, Span, Statement, TableHint, TableRef, WaitforKind, WaitforStatement,
+    SelectStatement, Span, Statement, TableHint, TableRef, WaitforKind, WaitforStatement,
     parse_batch,
 };
 use vauban_sysfn::register_builtins;
@@ -345,31 +345,14 @@ fn unsupported_clauses_are_internal_errors() {
     // `GROUP BY` and `HAVING` are bound: the tests of the two clauses are in
     // `tests/bind_aggregate.rs`.
 
+    // UNION, EXCEPT and INTERSECT are supported: the tests are in tests/bind_setop.rs.
+
     // INTO, built by hand.
     let mut spec = spec_of_select_one();
     spec.into = Some(object("t"));
     let error = err_of(&select_of(spec));
     assert_eq!(error.number, 50000);
     assert!(error.message.contains("INTO"), "{}", error.message);
-
-    // UNION, built by hand: a set operation over two identical specifications.
-    let union = Statement::Select(Box::new(SelectStatement {
-        with: None,
-        body: QueryBody::SetOp {
-            op: SetOp::Union,
-            all: false,
-            left: Box::new(QueryBody::Select(Box::new(spec_of_select_one()))),
-            right: Box::new(QueryBody::Select(Box::new(spec_of_select_one()))),
-            span: Span::EMPTY,
-        },
-        order_by: Vec::new(),
-        offset_fetch: None,
-        for_clause: None,
-        span: Span::EMPTY,
-    }));
-    let error = err_of(&union);
-    assert_eq!(error.number, 50000);
-    assert!(error.message.contains("UNION"), "{}", error.message);
 }
 
 #[test]
