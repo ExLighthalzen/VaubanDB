@@ -775,6 +775,122 @@ impl SqlError {
         from_catalog(2812, 62, &[Arg::Str(name)])
     }
 
+    /// Error 201, severity 16, state 10: `EXEC` or an RPC calls `procedure` without the
+    /// `parameter` it requires.
+    ///
+    /// ```text
+    /// Procedure 'sp_executesql' was called without the parameter '@statement' it requires.
+    /// ```
+    pub fn procedure_expects_parameter(procedure: &str, parameter: &str) -> Self {
+        from_catalog(201, 10, &[Arg::Str(procedure), Arg::Str(parameter)])
+    }
+
+    /// Error 8144, severity 16, state 2: the call gives more arguments than the procedure
+    /// declares. The name is empty when the call goes through `sp_executesql`.
+    ///
+    /// ```text
+    /// Procedure sp_who was called with more arguments than it declares.
+    /// ```
+    pub fn too_many_arguments(procedure: &str) -> Self {
+        from_catalog(8144, 2, &[Arg::Str(procedure)])
+    }
+
+    /// Error 8145, severity 16, state 1: `parameter` is not a parameter of `procedure`.
+    ///
+    /// ```text
+    /// @x is not a parameter declared by procedure sp_who.
+    /// ```
+    pub fn not_a_parameter(parameter: &str, procedure: &str) -> Self {
+        from_catalog(8145, 1, &[Arg::Str(parameter), Arg::Str(procedure)])
+    }
+
+    /// Error 8146, severity 16, state 1: a procedure that declares no parameter was called
+    /// with arguments.
+    ///
+    /// ```text
+    /// Procedure  declares no parameter and was called with arguments.
+    /// ```
+    pub fn no_parameter_but_arguments(procedure: &str) -> Self {
+        from_catalog(8146, 1, &[Arg::Str(procedure)])
+    }
+
+    /// Error 119, severity 15, state 1: a positional argument follows a named one, at
+    /// `position` in the argument list, which is 1-based.
+    ///
+    /// ```text
+    /// Parameter number 2 and the ones after it have to use the '@name = value' form; once that form has been used, a positional argument may not follow it.
+    /// ```
+    pub fn positional_after_named(position: i64) -> Self {
+        from_catalog(119, 1, &[Arg::Int(position)])
+    }
+
+    /// Error 179, severity 15, state 1: `OUTPUT` was written on a constant.
+    ///
+    /// ```text
+    /// The OUTPUT option cannot be used on a constant argument of a procedure.
+    /// ```
+    pub fn output_on_a_constant() -> Self {
+        from_catalog(179, 1, &[])
+    }
+
+    /// Error 214, severity 16, state 2: `procedure` was passed `parameter`, whose type is not
+    /// `ty`.
+    ///
+    /// ```text
+    /// The parameter '@statement' has to be of type 'ntext/nchar/nvarchar' for this procedure.
+    /// ```
+    pub fn procedure_expects_type(parameter: &str, ty: &str) -> Self {
+        from_catalog(214, 2, &[Arg::Str(parameter), Arg::Str(ty)])
+    }
+
+    /// Error 8178, severity 16, state 1: the parameter list of `sp_executesql` declares
+    /// `parameter` and the call does not supply it. `query` is the parameterised text.
+    ///
+    /// ```text
+    /// The parameterized query '(@x int)SELECT @x' was called without its parameter '@x'.
+    /// ```
+    pub fn parameter_not_supplied(query: &str, parameter: &str) -> Self {
+        from_catalog(8178, 1, &[Arg::Str(query), Arg::Str(parameter)])
+    }
+
+    /// Error 8179, severity 16, state 4: `handle` names no prepared statement of this session.
+    ///
+    /// ```text
+    /// No prepared statement of this session has the handle 123456.
+    /// ```
+    pub fn prepared_statement_not_found(handle: i64) -> Self {
+        from_catalog(8179, 4, &[Arg::Int(handle)])
+    }
+
+    /// Error 8180, severity 16, state 1: the statement given to `sp_prepare` or
+    /// `sp_executesql` could not be prepared. It comes after the compile error that caused
+    /// it, as a second message of the batch.
+    ///
+    /// ```text
+    /// The statement could not be prepared.
+    /// ```
+    pub fn statement_could_not_be_prepared() -> Self {
+        from_catalog(8180, 1, &[])
+    }
+
+    /// Error 15009, severity 16, state 1: `object` does not exist in `database`.
+    ///
+    /// ```text
+    /// The object 'nosuchobj' is not in database 'master', or this operation does not accept it.
+    /// ```
+    pub fn object_missing_in_database(object: &str, database: &str) -> Self {
+        from_catalog(15009, 1, &[Arg::Str(object), Arg::Str(database)])
+    }
+
+    /// Error 15010, severity 16, state 1: `sp_helpdb` names a database that does not exist.
+    ///
+    /// ```text
+    /// No database named 'nosuchdb' exists; give a valid database name.
+    /// ```
+    pub fn help_database_not_found(database: &str) -> Self {
+        from_catalog(15010, 1, &[Arg::Str(database)])
+    }
+
     /// Error 245, severity 16, state 1: an implicit or
     /// explicit conversion of `value` (of type `from`) to type `to` failed.
     ///
@@ -3589,6 +3705,18 @@ mod tests {
             SqlError::database_not_found("nope"),
             SqlError::cannot_open_database("nope"),
             SqlError::procedure_not_found("dbo.p"),
+            SqlError::procedure_expects_parameter("sp_executesql", "@statement"),
+            SqlError::too_many_arguments("sp_who"),
+            SqlError::not_a_parameter("@x", "sp_who"),
+            SqlError::no_parameter_but_arguments(""),
+            SqlError::positional_after_named(2),
+            SqlError::output_on_a_constant(),
+            SqlError::procedure_expects_type("@statement", "ntext/nchar/nvarchar"),
+            SqlError::parameter_not_supplied("(@x int)SELECT @x", "@x"),
+            SqlError::prepared_statement_not_found(123456),
+            SqlError::statement_could_not_be_prepared(),
+            SqlError::object_missing_in_database("nosuchobj", "master"),
+            SqlError::help_database_not_found("nosuchdb"),
             SqlError::conversion_failed("varchar", "abc", "int"),
             SqlError::error_converting_data_type("varchar", "numeric"),
             SqlError::conversion_failed_datetime(),
@@ -4060,6 +4188,117 @@ mod tests {
                 16,
                 1,
                 "The escape character \"\" of the LIKE predicate must be a single character.",
+            ),
+        ];
+        for (err, number, severity, state, message) in expected {
+            assert_eq!(err.number, *number, "number of {message}");
+            assert_eq!(err.severity, *severity, "severity of {number}");
+            assert_eq!(err.state, *state, "state of {number}");
+            assert_eq!(&err.message, message, "message of {number}");
+            assert_eq!(err.line, 0);
+        }
+    }
+
+    /// The message, severity and state of each procedure-call constructor, with the form
+    /// that raises it quoted next to it.
+    #[test]
+    fn procedure_call_messages_are_rendered() {
+        let expected: &[(SqlError, u32, u8, u8, &str)] = &[
+            (
+                // EXEC sp_executesql;
+                SqlError::procedure_expects_parameter("sp_executesql", "@statement"),
+                201,
+                16,
+                10,
+                "Procedure 'sp_executesql' was called without the parameter '@statement' it requires.",
+            ),
+            (
+                // EXEC sp_who 'sa', 'x';
+                SqlError::too_many_arguments("sp_who"),
+                8144,
+                16,
+                2,
+                "Procedure sp_who was called with more arguments than it declares.",
+            ),
+            (
+                // EXEC sp_who @x = 1;
+                SqlError::not_a_parameter("@x", "sp_who"),
+                8145,
+                16,
+                1,
+                "@x is not a parameter declared by procedure sp_who.",
+            ),
+            (
+                // EXEC sp_executesql N'SELECT 1', N'', N'', N'';
+                SqlError::no_parameter_but_arguments(""),
+                8146,
+                16,
+                1,
+                "Procedure  declares no parameter and was called with arguments.",
+            ),
+            (
+                // EXEC sp_executesql @stmt = N'SELECT 1', 1;
+                SqlError::positional_after_named(2),
+                119,
+                15,
+                1,
+                "Parameter number 2 and the ones after it have to use the '@name = value' form; once that form has been used, a positional argument may not follow it.",
+            ),
+            (
+                // EXEC sp_executesql N'SELECT @x OUTPUT', N'@x int', 1 OUTPUT;
+                SqlError::output_on_a_constant(),
+                179,
+                15,
+                1,
+                "The OUTPUT option cannot be used on a constant argument of a procedure.",
+            ),
+            (
+                // EXEC sp_executesql 123;
+                SqlError::procedure_expects_type("@statement", "ntext/nchar/nvarchar"),
+                214,
+                16,
+                2,
+                "The parameter '@statement' has to be of type 'ntext/nchar/nvarchar' for this procedure.",
+            ),
+            (
+                // EXEC sp_executesql N'SELECT @x', N'@x int';
+                SqlError::parameter_not_supplied("(@x int)SELECT @x", "@x"),
+                8178,
+                16,
+                1,
+                "The parameterized query '(@x int)SELECT @x' was called without its parameter '@x'.",
+            ),
+            (
+                // EXEC sp_execute 123456;
+                SqlError::prepared_statement_not_found(123456),
+                8179,
+                16,
+                4,
+                "No prepared statement of this session has the handle 123456.",
+            ),
+            (
+                // DECLARE @p int; EXEC sp_prepare @p OUTPUT, N'@x int, @x int', N'SELECT @x';
+                SqlError::statement_could_not_be_prepared(),
+                8180,
+                16,
+                1,
+                "The statement could not be prepared.",
+            ),
+            (
+                // EXEC sp_help 'nosuchobj';
+                SqlError::object_missing_in_database("nosuchobj", "master"),
+                15009,
+                16,
+                1,
+                "The object 'nosuchobj' is not in database 'master', or this operation does not accept it.",
+            ),
+            (
+                // EXEC sp_helpdb N'nosuchdb';
+                SqlError::help_database_not_found("nosuchdb"),
+                15010,
+                16,
+                1,
+                "No database named 'nosuchdb' exists; give a valid database name.",
             ),
         ];
         for (err, number, severity, state, message) in expected {
