@@ -12,7 +12,7 @@ use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
 use vauban_storage::{SavepointId, Snapshot, Storage};
 use vauban_sysfn::EvalContext;
 use vauban_txn::{IsolationLevel, LockTimeout, TransactionManager, TxnHandle};
-use vauban_types::Value;
+use vauban_types::{TypeInfo, Value};
 
 use crate::row::Row;
 
@@ -94,6 +94,10 @@ impl CancelToken {
 pub struct ExecSession {
     /// The declared variables, keyed by name with the `@`.
     pub variables: HashMap<String, Value>,
+    /// The declared type of each variable, keyed by name with the `@`. `DECLARE` writes
+    /// it and the `SET` of a value the binder did not convert reads it: the value is
+    /// converted to this type before it is stored.
+    pub variable_types: HashMap<String, TypeInfo>,
     /// `@@ROWCOUNT`: what the previous statement produced or changed.
     pub rowcount: i64,
     /// `@@TRANCOUNT`: how many `BEGIN TRANSACTION` are open.
@@ -121,6 +125,7 @@ impl Default for ExecSession {
     fn default() -> Self {
         Self {
             variables: HashMap::new(),
+            variable_types: HashMap::new(),
             rowcount: 0,
             trancount: 0,
             txn: None,

@@ -175,8 +175,14 @@ pub fn eval_expr(
             // `compare` and `LIKE` read it.
             eval_expr(inner, row, ctx)
         }
-        BoundExprKind::Variable { .. } => {
-            Err(bug("eval_expr: a local variable is not implemented yet"))
+        // A local variable is read from the session state `DECLARE` entered it in. A name
+        // the binder did not declare is a bug of the binder, reported as such.
+        BoundExprKind::Variable { name } => {
+            ctx.session()?.variables.get(name).cloned().ok_or_else(|| {
+                bug(&format!(
+                    "eval_expr: the variable `{name}` was not declared"
+                ))
+            })
         }
         // A column is read by position and consults nothing: `index` is where the value
         // sits in the row the node below produced, and the binder put the name and the
