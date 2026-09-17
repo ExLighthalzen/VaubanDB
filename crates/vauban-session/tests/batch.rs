@@ -716,3 +716,158 @@ async fn two_bare_defaults_are_8148_over_the_wire() {
     drop(client);
     running.stop().await;
 }
+
+// ---------------------------------------------------------------------------------------
+// Batch variables over the wire
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn declare_set_select_returns_three_over_the_wire() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let response = batch(&mut client, "DECLARE @i int; SET @i = 3; SELECT @i").await;
+    assert!(
+        !tokens(&response.payload)
+            .iter()
+            .any(|token| matches!(token, Tok::Error { .. })),
+        "{:?}",
+        tokens(&response.payload)
+    );
+    let toks = tokens(&response.payload);
+    assert_eq!(
+        toks.iter()
+            .filter(|token| matches!(token, Tok::Row(_)))
+            .count(),
+        1,
+        "{toks:?}"
+    );
+    assert!(
+        toks.contains(&Tok::Row(vec![3])),
+        "SELECT @i answers 3: {toks:?}"
+    );
+    assert_eq!(
+        toks.last(),
+        Some(&Tok::Done {
+            status: DONE_COUNT,
+            cur_cmd: CUR_CMD_SELECT,
+            row_count: 1,
+        }),
+        "{toks:?}"
+    );
+    assert_eq!(
+        toks.iter()
+            .filter(|token| matches!(token, Tok::Done { .. }))
+            .count(),
+        3,
+        "DECLARE, SET and SELECT each close with a DONE: {toks:?}"
+    );
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn return_in_the_middle_stops_the_batch_over_the_wire() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let response = batch(&mut client, "SELECT 1; RETURN; SELECT 2").await;
+    let toks = tokens(&response.payload);
+    assert!(
+        !toks.iter().any(|token| matches!(token, Tok::Error { .. })),
+        "{toks:?}"
+    );
+    assert_eq!(
+        toks,
+        vec![
+            Tok::ColMetaData(vec![(0, INT4TYPE, String::new())]),
+            Tok::Row(vec![1]),
+            Tok::Done {
+                status: DONE_MORE | DONE_COUNT,
+                cur_cmd: CUR_CMD_SELECT,
+                row_count: 1,
+            },
+            Tok::Done {
+                status: 0,
+                cur_cmd: 0,
+                row_count: 0,
+            },
+        ]
+    );
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn a_variable_from_an_earlier_batch_is_137_over_the_wire() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let setup = batch(&mut client, "DECLARE @i int; SET @i = 3;").await;
+    assert!(
+        !tokens(&setup.payload)
+            .iter()
+            .any(|token| matches!(token, Tok::Error { .. })),
+        "{:?}",
+        tokens(&setup.payload)
+    );
+
+    let response = batch(&mut client, "SELECT @i").await;
+    let err = tokens(&response.payload)
+        .iter()
+        .find_map(|token| match token {
+            Tok::Error { number, state, .. } => Some((*number, *state)),
+            _ => None,
+        })
+        .expect("137 over the wire");
+    let expected = SqlError::must_declare_scalar_variable("@i");
+    assert_eq!(err, (expected.number, expected.state));
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn if_while_read_variables_set_earlier_over_the_wire() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let if_batch = batch(
+        &mut client,
+        "DECLARE @n int; SET @n = 1; IF @n = 1 SELECT 10 ELSE SELECT 20",
+    )
+    .await;
+    let if_toks = tokens(&if_batch.payload);
+    assert!(
+        !if_toks
+            .iter()
+            .any(|token| matches!(token, Tok::Error { .. })),
+        "{if_toks:?}"
+    );
+    assert!(
+        if_toks.contains(&Tok::Row(vec![10])),
+        "IF took the THEN branch: {if_toks:?}"
+    );
+
+    let while_batch = batch(
+        &mut client,
+        "DECLARE @i int = 0; WHILE @i < 2 BEGIN SET @i = @i + 1; END; SELECT @i",
+    )
+    .await;
+    let while_toks = tokens(&while_batch.payload);
+    assert!(
+        !while_toks
+            .iter()
+            .any(|token| matches!(token, Tok::Error { .. })),
+        "{while_toks:?}"
+    );
+    assert!(
+        while_toks.contains(&Tok::Row(vec![2])),
+        "WHILE ran twice: {while_toks:?}"
+    );
+
+    drop(client);
+    running.stop().await;
+}

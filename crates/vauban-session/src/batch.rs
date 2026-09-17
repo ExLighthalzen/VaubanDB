@@ -123,7 +123,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use vauban_binder::{BindContext, OutputSchema};
+use vauban_binder::{BatchVariables, BindContext, BoundStatement, OutputSchema};
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
 use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSink};
@@ -285,6 +285,9 @@ impl Session {
     /// cancelled request) and means the response is incomplete; the connection task
     /// (`server.rs`) is what turns it into a DONE `ATTN` or drops the connection.
     pub fn run_batch(&mut self, text: &str, sink: &mut dyn ResultSink) -> SqlResult<()> {
+        // Batch variables do not survive the batch: each text starts with an empty scope.
+        self.exec.variables.clear();
+        self.exec.variable_types.clear();
         let batch = match parse_batch(text, &self.state.options.parse_options()) {
             Ok(batch) => batch,
             // A syntax error is a compilation error: SQL Server compiles no batch partly,
@@ -409,6 +412,7 @@ impl Session {
         snapshot: &CatalogSnapshot,
     ) -> SqlResult<Vec<PreparedStatement>> {
         let mut state = self.state.clone();
+        let mut batch_variables = BatchVariables::new();
         let mut prepared = Vec::with_capacity(statements.len());
 
         for (index, original) in statements.iter().enumerate() {
@@ -444,7 +448,7 @@ impl Session {
                 catalog: Some(snapshot),
                 database: &state.database,
                 default_schema: DEFAULT_SCHEMA,
-                variables: &vauban_binder::NoVariables,
+                variables: &batch_variables,
                 options,
             };
             let bound = match vauban_binder::bind(statement, &ctx) {
@@ -458,6 +462,11 @@ impl Session {
                 }
                 Err(error) => return Err(error),
             };
+            if let BoundStatement::Declare(declarations) = &bound {
+                for declaration in declarations {
+                    batch_variables.declare(&declaration.name, declaration.ty.clone())?;
+                }
+            }
 
             // The planner reads the indexes of the storage; the rules that would choose
             // one are not written, so a read is planned as a scan.
@@ -606,12 +615,12 @@ impl Session {
             // The token handed to the executor cannot be raised, and the outcomes of the
             // control of flow have no statement to produce them yet: each is reported as
             // an internal error rather than mapped to a DONE this layer cannot justify.
-            Ok(
-                outcome @ (ExecOutcome::Cancelled
-                | ExecOutcome::Return(_)
-                | ExecOutcome::Break
-                | ExecOutcome::Continue),
-            ) => {
+            Ok(ExecOutcome::Return(_)) => {
+                sink.done(None, false)?;
+                self.state.rowcount = 0;
+                Ok(Flow::Stop)
+            }
+            Ok(outcome @ (ExecOutcome::Cancelled | ExecOutcome::Break | ExecOutcome::Continue)) => {
                 let err = SqlError::from(InternalError::Bug(format!(
                     "run_prepared: the executor answered {outcome:?}, which this layer does \
                      not handle"

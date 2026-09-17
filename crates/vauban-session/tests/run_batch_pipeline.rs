@@ -757,3 +757,81 @@ fn getdate_is_frozen_within_a_statement() {
     let row = rows(&events).into_iter().next().expect("one row");
     assert_eq!(row[0], row[1], "one clock read per statement: {row:?}");
 }
+
+// ---------------------------------------------------------------------------------------
+// Batch variables: DECLARE, SET, SELECT @x, IF, WHILE, RETURN
+// ---------------------------------------------------------------------------------------
+
+/// `bind_batch` must accumulate [`BatchVariables`]: with [`NoVariables`], `SET @i` fails
+/// at binding time with 137 and the batch stops before `SELECT @i`.
+#[test]
+fn declare_set_select_reads_the_value_from_an_earlier_statement() {
+    let events = run("DECLARE @i int; SET @i = 3; SELECT @i");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(3)]]);
+}
+
+#[test]
+fn return_stops_the_batch_without_an_internal_error() {
+    let events = run("SELECT 1; RETURN; SELECT 2");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]]);
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Info(_))),
+        "the statement after RETURN must not run: {events:#?}"
+    );
+}
+
+#[test]
+fn a_variable_declared_in_one_batch_is_not_visible_in_the_next() {
+    let mut session = session();
+    let (first, _) = run_on(&mut session, "DECLARE @i int; SET @i = 3;");
+    assert!(
+        !first.iter().any(|event| matches!(event, Event::Error(_))),
+        "{first:#?}"
+    );
+    let (second, _) = run_on(&mut session, "SELECT @i");
+    let err = only_error(&second);
+    assert_eq!(err.number, 137);
+    assert_eq!(err.state, 2);
+}
+
+#[test]
+fn if_reads_a_variable_set_earlier_in_the_batch() {
+    let events = run("DECLARE @n int; SET @n = 1; IF @n = 1 SELECT 10 ELSE SELECT 20");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(10)]]);
+}
+
+#[test]
+fn while_reads_a_variable_set_earlier_in_the_batch() {
+    let events = run("DECLARE @i int = 0; WHILE @i < 2 BEGIN SET @i = @i + 1; END; SELECT @i");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(2)]]);
+}
+
+#[test]
+fn rowcount_still_tracks_select_after_variable_statements() {
+    let events = run("DECLARE @i int; SET @i = 3; SELECT 1; SELECT @@ROWCOUNT");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(1)], vec![Value::I32(1)]],
+        "{events:#?}"
+    );
+}
