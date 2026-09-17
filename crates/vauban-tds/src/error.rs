@@ -58,3 +58,124 @@ pub enum TdsError {
         got: usize,
     },
 }
+
+impl TdsError {
+    /// Whether the failure is the codec refusing to turn a token into bytes, rather than
+    /// the connection under it going away.
+    ///
+    /// `true` for the four failures the encoder raises while looking at a value: a value
+    /// that does not match the TYPE_INFO it is announced under, a `NULL` under a TYPE_INFO
+    /// that is not nullable, a row against no COLMETADATA, a row of another width than the
+    /// COLMETADATA before it. `write_tokens` encodes into a scratch buffer, so these leave
+    /// the response buffer and the socket as they were (`stream.rs`, unit test
+    /// `write_tokens_error_leaves_buffer_and_wire_untouched`): the peer is still there and
+    /// still waiting for an answer, which its caller can send.
+    ///
+    /// `false` for the rest: I/O and TLS failures, a byte stream that violates [MS-TDS],
+    /// an oversized message, an unexpected packet type, a feature this version refuses, a
+    /// path not implemented, a refused encryption negotiation, a peer that left. A caller
+    /// that meets one of those has no working channel to answer through. `Malformed`
+    /// carries both a client stream the decoder rejects and a token too large to frame, and
+    /// stays on this side: the framing, not the value, is what failed.
+    ///
+    /// Both arms are written out, so a variant added to the enum stops the build instead of
+    /// taking a side by default (unit test `each_variant_has_one_sample_and_its_side`).
+    pub fn is_encoding_failure(&self) -> bool {
+        match self {
+            Self::ValueTypeMismatch { .. }
+            | Self::NullInNotNullable
+            | Self::RowWithoutMetadata
+            | Self::ColumnCountMismatch { .. } => true,
+            Self::Io(_)
+            | Self::Tls(_)
+            | Self::Malformed(_)
+            | Self::MessageTooLarge(_)
+            | Self::UnexpectedPacketType(_)
+            | Self::Unsupported(_)
+            | Self::NotImplemented(_)
+            | Self::EncryptionRefused
+            | Self::ConnectionClosed => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How many variants [`TdsError`] declares, recounted on the list above.
+    const VARIANTS: usize = 13;
+
+    /// How many of them [`TdsError::is_encoding_failure`] puts on the codec side,
+    /// recounted on its first arm.
+    const ENCODING_VARIANTS: usize = 4;
+
+    /// Rank of the variant of `err` in the declaration order of [`TdsError`].
+    ///
+    /// Written out rather than derived, so that a variant added to the enum stops the build
+    /// here and has to be given a sample below.
+    fn rank(err: &TdsError) -> usize {
+        match err {
+            TdsError::Io(_) => 0,
+            TdsError::Tls(_) => 1,
+            TdsError::Malformed(_) => 2,
+            TdsError::MessageTooLarge(_) => 3,
+            TdsError::UnexpectedPacketType(_) => 4,
+            TdsError::Unsupported(_) => 5,
+            TdsError::NotImplemented(_) => 6,
+            TdsError::EncryptionRefused => 7,
+            TdsError::ConnectionClosed => 8,
+            TdsError::ValueTypeMismatch { .. } => 9,
+            TdsError::NullInNotNullable => 10,
+            TdsError::RowWithoutMetadata => 11,
+            TdsError::ColumnCountMismatch { .. } => 12,
+        }
+    }
+
+    /// One value per variant, each with the side the classification owes it.
+    fn samples() -> Vec<(TdsError, bool)> {
+        vec![
+            (TdsError::Io(std::io::Error::other("socket")), false),
+            (
+                TdsError::Tls(rustls::Error::General("handshake".into())),
+                false,
+            ),
+            (TdsError::Malformed("PRELOGIN option past the end"), false),
+            (TdsError::MessageTooLarge(1 << 20), false),
+            (TdsError::UnexpectedPacketType(0x01), false),
+            (TdsError::Unsupported("MARS"), false),
+            (TdsError::NotImplemented("BULK_LOAD"), false),
+            (TdsError::EncryptionRefused, false),
+            (TdsError::ConnectionClosed, false),
+            (TdsError::ValueTypeMismatch { expected: "int" }, true),
+            (TdsError::NullInNotNullable, true),
+            (TdsError::RowWithoutMetadata, true),
+            (
+                TdsError::ColumnCountMismatch {
+                    expected: 2,
+                    got: 1,
+                },
+                true,
+            ),
+        ]
+    }
+
+    /// The samples cover the enum once each, and each takes the side it is given: the two
+    /// counts below hold the classification still.
+    #[test]
+    fn each_variant_has_one_sample_and_its_side() {
+        let mut sides: [Option<bool>; VARIANTS] = [None; VARIANTS];
+        for (err, encoding) in samples() {
+            assert_eq!(err.is_encoding_failure(), encoding, "{err:?}");
+            let slot = &mut sides[rank(&err)];
+            assert!(slot.is_none(), "two samples for the variant of {err:?}");
+            *slot = Some(encoding);
+        }
+        assert_eq!(sides.iter().flatten().count(), VARIANTS, "{sides:?}");
+        assert_eq!(
+            sides.iter().flatten().filter(|side| **side).count(),
+            ENCODING_VARIANTS,
+            "{sides:?}"
+        );
+    }
+}

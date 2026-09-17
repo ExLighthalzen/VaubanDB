@@ -47,6 +47,17 @@
 //! - the cancelled request is never reported to the client: its result, `Ok` or the
 //!   internal "cancelled" error, is dropped with the DONE `ATTN` sent in its place.
 //!
+//! # A token that cannot be encoded is not a broken socket
+//!
+//! `write_tokens` fails for two unrelated reasons, told apart by
+//! [`TdsError::is_encoding_failure`]. When the transport is gone there is nobody left to
+//! talk to: the request is cancelled, the tokens it still had are dropped unread and the
+//! connection closes. When the codec refuses a value, the socket is untouched and the
+//! client is still waiting for an answer: the response then ends with an ERROR and a DONE
+//! carrying `DoneStatus::ERROR` ([`report_unencodable`]), and the connection serves the
+//! next request. The COLMETADATA and the rows already written stay where they are, the
+//! error coming after them ([MS-TDS] 2.2.7.9).
+//!
 //! No client error reaches `serve`: a `TdsError` is logged at `warn` and closes its own
 //! connection only. The password of a LOGIN7 is never logged: only named fields of the
 //! login appear in the journal, never the whole message.
@@ -517,6 +528,10 @@ enum Relayed {
     /// An ATTENTION arrived: the request is cancelled, the remaining tokens are dropped
     /// and the DONE `ATTN` is owed to the client.
     Attention,
+    /// The codec refused a token of the response: the socket is intact, so the client is
+    /// owed an ERROR and a DONE carrying `ERROR` and the connection stays open. Carries the
+    /// refusal for the log and for the message.
+    Unencodable(TdsError),
     /// The connection must close, with the error to report if there is one (a write
     /// failure, a failed read); `None` for a protocol violation, already logged.
     Aborted(Option<TdsError>),
@@ -530,7 +545,9 @@ enum Relayed {
 /// ends the response with a `flush`; an `Err` (internal error, response incomplete) is
 /// sent as an ERROR token and a DONE `ERROR` before the `flush`. An ATTENTION replaces
 /// the whole answer with a lone DONE `ATTN`, once the blocking task has handed the
-/// session back — a pool thread cannot be killed, it is asked to stop and awaited.
+/// session back — a pool thread cannot be killed, it is asked to stop and awaited. A token
+/// the codec refused ends the response the same way as an internal error, by
+/// [`report_unencodable`], and the connection is kept.
 async fn run_request<F>(
     writer: &mut TdsWriter,
     client_rx: &mut mpsc::Receiver<Result<ClientMessage, TdsError>>,
@@ -574,6 +591,13 @@ where
         // "cancelled" error, the client only sees the acknowledgement.
         Relayed::Attention => {
             acknowledge_attention(writer).await?;
+            return Ok(RequestOutcome::Served(session));
+        }
+        // The result of the request is dropped here as well: the relay cancelled it to let
+        // the pool thread go, and what the client is owed is the refusal, not the
+        // "cancelled" error that unwound the blocking task.
+        Relayed::Unencodable(err) => {
+            report_unencodable(writer, &err).await?;
             return Ok(RequestOutcome::Served(session));
         }
         Relayed::Aborted(Some(err)) => return Err(err),
@@ -635,7 +659,7 @@ async fn relay(
                     if let Err(err) = writer.write_tokens(&[token]).await {
                         cancel.cancel();
                         drain(rx).await;
-                        return Relayed::Aborted(Some(err));
+                        return after_write_failure(err);
                     }
                 }
                 None => return Relayed::Complete,
@@ -666,6 +690,52 @@ async fn relay(
             }
         }
     }
+}
+
+/// What a failed `write_tokens` means for the connection, from the error alone
+/// ([`TdsError::is_encoding_failure`]): a token the codec refused leaves a working socket
+/// and a client waiting for an answer, while the rest is the transport going away.
+///
+/// The request has already been cancelled and its channel drained by the caller; what is
+/// left to pick here is the ending (unit test
+/// `a_refused_token_is_reported_while_a_broken_socket_closes`).
+fn after_write_failure(err: TdsError) -> Relayed {
+    if err.is_encoding_failure() {
+        Relayed::Unencodable(err)
+    } else {
+        Relayed::Aborted(Some(err))
+    }
+}
+
+/// Head of the message sent when a token of the response cannot be encoded.
+///
+/// The column is not named: the refusal of the codec does not say which value it looked at.
+const UNENCODABLE: &str = "a value of the response cannot be sent to the client";
+
+/// Ends a response whose next token the codec refused: an ERROR then a DONE carrying
+/// `ERROR`, followed by the `flush` that closes the message.
+///
+/// Nothing of the refused token reached the buffer or the wire, so this lands right after
+/// the COLMETADATA and the rows that did, which [MS-TDS] 2.2.7.9 allows. The number is the
+/// one of any internal failure of the engine, 50000, since the client asked for a state the
+/// engine cannot serve.
+async fn report_unencodable(writer: &mut TdsWriter, err: &TdsError) -> Result<(), TdsError> {
+    warn!(
+        error = %err,
+        "a token of the response cannot be encoded, answering an error instead of closing"
+    );
+    let reported = SqlError::from(InternalError::Bug(format!("{UNENCODABLE}: {err}")));
+    writer
+        .write_tokens(&[
+            Token::Error(reported),
+            Token::Done {
+                status: DoneStatus::ERROR,
+                cur_cmd: 0,
+                row_count: None,
+            },
+        ])
+        .await?;
+    writer.flush().await
 }
 
 /// Drops every token the cancelled request still had to send, until it lets go of the
@@ -1186,6 +1256,61 @@ mod tests {
             SqlError::cannot_open_database("nosuchdb").message
         );
         assert!(engine.txn.active_sessions().is_empty());
+    }
+
+    /// The branch that decides what a failed write means: a token the codec refused is
+    /// reported to the client, anything else closes the connection.
+    ///
+    /// Counter-proof of the fix: were the transport failures routed to
+    /// [`Relayed::Unencodable`] too, the two socket failures below would answer instead of
+    /// closing, and a genuine breakage would be swallowed.
+    #[test]
+    fn a_refused_token_is_reported_while_a_broken_socket_closes() {
+        for err in [
+            TdsError::NullInNotNullable,
+            TdsError::ValueTypeMismatch { expected: "int" },
+            TdsError::RowWithoutMetadata,
+            TdsError::ColumnCountMismatch {
+                expected: 2,
+                got: 1,
+            },
+        ] {
+            let text = err.to_string();
+            assert!(
+                matches!(after_write_failure(err), Relayed::Unencodable(_)),
+                "{text}"
+            );
+        }
+        for err in [
+            TdsError::Io(std::io::Error::other("broken pipe")),
+            TdsError::ConnectionClosed,
+            TdsError::Malformed("token longer than 65535 bytes"),
+        ] {
+            let text = err.to_string();
+            assert!(
+                matches!(after_write_failure(err), Relayed::Aborted(Some(_))),
+                "{text}"
+            );
+        }
+    }
+
+    /// The message the client gets for a refused token: number 50000, severity 16, state 1,
+    /// and a text that says a value could not be sent without naming a column.
+    #[test]
+    fn the_reported_refusal_is_the_internal_error_number() {
+        let reported = SqlError::from(InternalError::Bug(format!(
+            "{UNENCODABLE}: {}",
+            TdsError::NullInNotNullable
+        )));
+        assert_eq!(
+            (reported.number, reported.severity, reported.state),
+            (50000, 16, 1)
+        );
+        assert_eq!(
+            reported.message,
+            "Internal error: internal bug: a value of the response cannot be sent to the \
+             client: NULL value in a non-nullable column"
+        );
     }
 
     #[test]
