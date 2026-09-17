@@ -145,6 +145,28 @@ fn try_bind(text: &str) -> Result<BoundStatement, SqlError> {
     bind(&batch.statements[0], &ctx)
 }
 
+/// Binds with `SET IDENTITY_INSERT` open for `schema.name` in `master`.
+fn try_bind_with_identity(
+    text: &str,
+    schema: &str,
+    name: &str,
+) -> Result<BoundStatement, SqlError> {
+    register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default())
+        .unwrap_or_else(|e| unreachable!("{text} parses, got {e:?}"));
+    assert_eq!(batch.statements.len(), 1, "{text}: one statement");
+    let catalog = Tables;
+    let ctx = BindContext {
+        text,
+        catalog: Some(&catalog),
+        database: "master",
+        default_schema: "dbo",
+        variables: &NoVariables,
+        options: SessionOptions::default().with_identity_insert("master", schema, name),
+    };
+    bind(&batch.statements[0], &ctx)
+}
+
 fn insert(text: &str) -> InsertPlan {
     match try_bind(text) {
         Ok(BoundStatement::Insert(plan)) => plan,
@@ -424,6 +446,38 @@ fn insert_into_identity_column_is_544_or_8101() {
         &SqlError::identity_insert_requires_column_list("DBO.TI"),
         1,
     );
+}
+
+#[test]
+fn identity_insert_on_for_the_target_accepts_an_explicit_value() {
+    let plan =
+        match try_bind_with_identity("INSERT INTO dbo.ti (id, v) VALUES (1, 2);", "dbo", "ti") {
+            Ok(BoundStatement::Insert(plan)) => plan,
+            other => panic!("expected an INSERT, got {other:?}"),
+        };
+    assert_eq!(names(&plan.columns), vec!["id", "v"]);
+    assert_eq!(rows(&plan.source).len(), 1);
+
+    // Another table still answers 544.
+    assert_error(
+        &try_bind_with_identity("INSERT INTO dbo.ti (id, v) VALUES (1, 2);", "dbo", "t")
+            .expect_err("another table keeps 544"),
+        &SqlError::identity_insert_is_off("ti"),
+        1,
+    );
+    // Without a column list, 8101 is unchanged even when the option is open.
+    assert_error(
+        &try_bind_with_identity("INSERT INTO dbo.ti VALUES (1, 1);", "dbo", "ti")
+            .expect_err("8101 does not consult IDENTITY_INSERT"),
+        &SqlError::identity_insert_requires_column_list("dbo.ti"),
+        1,
+    );
+    // Unqualified INSERT matches SET IDENTITY_INSERT dbo.ti.
+    let plan = match try_bind_with_identity("INSERT INTO ti (id, v) VALUES (1, 2);", "dbo", "ti") {
+        Ok(BoundStatement::Insert(plan)) => plan,
+        other => panic!("expected an INSERT, got {other:?}"),
+    };
+    assert_eq!(names(&plan.columns), vec!["id", "v"]);
 }
 
 #[test]

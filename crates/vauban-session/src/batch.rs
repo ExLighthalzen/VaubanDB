@@ -138,7 +138,7 @@ use crate::eval_context::SessionEvalContext;
 use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
 use crate::server::Engine;
-use crate::set_options::apply_set_statement;
+use crate::set_options::{SetOutcome, apply_set_statement};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
 use crate::txn_session::{self, StatementTxn};
@@ -229,7 +229,12 @@ enum Flow {
 /// One statement after every compilation-stage check has succeeded for the whole batch.
 enum PreparedStatement {
     /// A `SET` is replayed only during execution; preparation applies it to a cloned state.
-    Set(String),
+    Set {
+        text: String,
+        /// Line the `SET` starts on, which a `SET` that is refused carries
+        /// (`tests/set_options_effects.rs`, `identity_insert_8107_carries_the_line_of_its_statement`).
+        line: u32,
+    },
     /// A statement the binder does not bind, still served by the deliberately narrow fallback.
     Fallback { text: String, error: SqlError },
     /// A bound, planned and compile-checked statement, ready to execute without another
@@ -413,7 +418,10 @@ impl Session {
                 // SET options affect compilation of following statements but are not committed
                 // to the connection unless the whole batch compiles and execution reaches them.
                 apply_set_statement(&mut state, &raw);
-                prepared.push(PreparedStatement::Set(raw));
+                prepared.push(PreparedStatement::Set {
+                    text: raw,
+                    line: statement_span(original).line,
+                });
                 continue;
             }
 
@@ -430,7 +438,7 @@ impl Session {
                 )));
             };
 
-            let options = state.options.to_binder();
+            let options = state.binder_options();
             let ctx = BindContext {
                 text: &padded,
                 catalog: Some(snapshot),
@@ -499,8 +507,14 @@ impl Session {
         more: bool,
         sink: &mut dyn ResultSink,
     ) -> SqlResult<Flow> {
-        if let PreparedStatement::Set(text) = prepared {
-            apply_set_statement(&mut self.state, text);
+        if let PreparedStatement::Set { text, line } = prepared {
+            match apply_set_statement(&mut self.state, text) {
+                SetOutcome::Applied | SetOutcome::Ignored(_) => {}
+                SetOutcome::Failed(err) => {
+                    let err = at_statement(err, *line);
+                    return self.fail(&err, sink).map(|()| Flow::Stop);
+                }
+            }
             // A `SET` carries no row count, under both values of `NOCOUNT`: its DONE is
             // `0x0001` (MORE) before a statement and `0x0000` last, without `DONE_COUNT`.
             sink.done(None, more)?;
@@ -526,7 +540,7 @@ impl Session {
                 database,
                 line,
             } => (statement, *line, Some(database.as_str())),
-            PreparedStatement::Set(_) | PreparedStatement::Fallback { .. } => {
+            PreparedStatement::Set { .. } | PreparedStatement::Fallback { .. } => {
                 unreachable!("SET and fallback were handled above")
             }
         };

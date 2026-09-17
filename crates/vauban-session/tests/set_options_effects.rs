@@ -494,3 +494,262 @@ fn the_honoured_options_are_the_five_with_a_test() {
     .collect();
     assert_eq!(honoured, expected);
 }
+
+// ---------------------------------------------------------------------------------------
+// IDENTITY_INSERT
+// ---------------------------------------------------------------------------------------
+
+/// Two sessions on one in-memory engine.
+fn shared_sessions() -> (Session, Session) {
+    vauban_sysfn::register_builtins();
+    let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+    let a = Session::new(Arc::clone(&engine), SessionState::new(SPID));
+    let b = Session::new(engine, SessionState::new(SPID + 1));
+    (a, b)
+}
+
+fn no_error(events: &[Event], text: &str) {
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "`{text}` raised an error: {events:#?}"
+    );
+}
+
+#[test]
+fn identity_insert_on_then_off_accepts_then_refuses_an_explicit_value() {
+    let mut session = session();
+    no_error(
+        &run_on(
+            &mut session,
+            "CREATE TABLE dbo.t1 (id int IDENTITY NOT NULL, v int NOT NULL)",
+        ),
+        "CREATE TABLE",
+    );
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.t1 ON"),
+        "SET ON",
+    );
+    no_error(
+        &run_on(&mut session, "INSERT INTO dbo.t1 (id, v) VALUES (50, 1)"),
+        "INSERT with IDENTITY_INSERT ON",
+    );
+    let events = run_on(&mut session, "SELECT id, v FROM dbo.t1");
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(50), Value::I32(1)]],
+        "{events:#?}"
+    );
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.t1 OFF"),
+        "SET OFF",
+    );
+    let events = run_on(&mut session, "INSERT INTO dbo.t1 (id, v) VALUES (51, 1)");
+    let err = only_error(&events);
+    assert_eq!(err.number, 544);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 1);
+}
+
+#[test]
+fn identity_insert_without_a_column_list_is_8101() {
+    let mut session = session();
+    no_error(
+        &run_on(
+            &mut session,
+            "CREATE TABLE dbo.t1 (id int IDENTITY NOT NULL, v int NOT NULL)",
+        ),
+        "CREATE TABLE",
+    );
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.t1 ON"),
+        "SET ON",
+    );
+    let events = run_on(&mut session, "INSERT INTO dbo.t1 VALUES (50, 1)");
+    let err = only_error(&events);
+    assert_eq!(err.number, 8101);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 1);
+    let events = run_on(&mut session, "INSERT INTO dbo.t1 (id, v) VALUES (50, 1)");
+    no_error(&events, "INSERT with a column list");
+}
+
+#[test]
+fn a_second_table_on_is_8107_and_the_first_stays_open() {
+    let mut session = session();
+    no_error(
+        &run_on(
+            &mut session,
+            "CREATE TABLE dbo.t1 (id int IDENTITY NOT NULL, v int NOT NULL)",
+        ),
+        "CREATE TABLE t1",
+    );
+    no_error(
+        &run_on(
+            &mut session,
+            "CREATE TABLE dbo.t2 (id int IDENTITY NOT NULL, v int NOT NULL)",
+        ),
+        "CREATE TABLE t2",
+    );
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.t1 ON"),
+        "SET t1 ON",
+    );
+    let events = run_on(&mut session, "SET IDENTITY_INSERT dbo.t2 ON");
+    let err = only_error(&events);
+    assert_eq!(err.number, 8107);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 1);
+    assert_eq!(
+        err.message,
+        SqlError::identity_insert_already_on("master", "dbo", "t1", "dbo.t2").message
+    );
+    let open = session
+        .state()
+        .identity_insert
+        .as_ref()
+        .expect("t1 stays open");
+    assert_eq!(open.name, "t1");
+    no_error(
+        &run_on(&mut session, "INSERT INTO dbo.t1 (id, v) VALUES (52, 1)"),
+        "INSERT t1 after 8107",
+    );
+    let events = run_on(&mut session, "INSERT INTO dbo.t2 (id, v) VALUES (52, 1)");
+    assert_eq!(only_error(&events).number, 544);
+}
+
+/// A table with an identity column and one ordinary column, on `session`.
+fn create_identity_table(session: &mut Session, name: &str) {
+    no_error(
+        &run_on(
+            session,
+            &format!("CREATE TABLE dbo.{name} (id int IDENTITY NOT NULL, v int NOT NULL)"),
+        ),
+        "CREATE TABLE",
+    );
+}
+
+#[test]
+fn identity_insert_opened_on_a_delimited_name_is_closed_by_a_canonical_off() {
+    for opened_as in ["[dbo].[ra]", "\"dbo\".\"ra\"", "[DBO].[RA]", "[ra]"] {
+        let mut session = session();
+        create_identity_table(&mut session, "ra");
+        no_error(
+            &run_on(&mut session, &format!("SET IDENTITY_INSERT {opened_as} ON")),
+            opened_as,
+        );
+        // The explicit value goes in, so the option was read.
+        no_error(
+            &run_on(&mut session, "INSERT INTO dbo.ra (id, v) VALUES (5, 1)"),
+            "INSERT with the option open",
+        );
+        // The canonical form of the same table is not a second table.
+        no_error(
+            &run_on(&mut session, "SET IDENTITY_INSERT dbo.ra ON"),
+            "the same table again",
+        );
+        // And the canonical `OFF` closes what the delimited `ON` opened: without this the
+        // session would hold an option no statement can close.
+        no_error(
+            &run_on(&mut session, "SET IDENTITY_INSERT dbo.ra OFF"),
+            "SET OFF",
+        );
+        assert_eq!(session.state().identity_insert, None, "{opened_as}");
+        let events = run_on(&mut session, "INSERT INTO dbo.ra (id, v) VALUES (6, 1)");
+        assert_eq!(only_error(&events).number, 544, "{opened_as}");
+    }
+}
+
+#[test]
+fn identity_insert_names_the_refused_table_without_its_delimiters() {
+    let mut session = session();
+    create_identity_table(&mut session, "ra");
+    create_identity_table(&mut session, "rb");
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.ra ON"),
+        "SET ra ON",
+    );
+    let events = run_on(&mut session, "SET IDENTITY_INSERT [dbo].[rb] ON");
+    let err = only_error(&events);
+    assert_eq!(err.number, 8107);
+    assert_eq!(
+        err.message,
+        SqlError::identity_insert_already_on("master", "dbo", "ra", "dbo.rb").message
+    );
+    // One written part stays one written part.
+    let events = run_on(&mut session, "SET IDENTITY_INSERT [rb] ON");
+    assert_eq!(
+        only_error(&events).message,
+        SqlError::identity_insert_already_on("master", "dbo", "ra", "rb").message
+    );
+}
+
+#[test]
+fn identity_insert_8107_carries_the_line_of_its_statement() {
+    let mut session = session();
+    create_identity_table(&mut session, "ra");
+    create_identity_table(&mut session, "rb");
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.ra ON"),
+        "SET ra ON",
+    );
+    // The refused `SET` is the third statement and starts on line 4: the two hypotheses
+    // "line of the statement" and "line of the batch" answer differently.
+    let events = run_on(
+        &mut session,
+        "SELECT 1;\nSELECT 2;\n\nSET IDENTITY_INSERT dbo.rb ON;",
+    );
+    let err = only_error(&events);
+    assert_eq!(err.number, 8107);
+    assert_eq!(err.line, 4, "{events:#?}");
+}
+
+#[test]
+fn identity_insert_on_a_double_quoted_name_needs_quoted_identifier_on() {
+    let mut session = session();
+    create_identity_table(&mut session, "ra");
+    no_error(
+        &run_on(&mut session, "SET QUOTED_IDENTIFIER OFF"),
+        "QUOTED_IDENTIFIER OFF",
+    );
+    // With the option off the name is a string, so the statement does not parse and
+    // nothing is opened; with it on the same text opens the option.
+    let events = run_on(&mut session, "SET IDENTITY_INSERT \"dbo\".\"ra\" ON");
+    assert_eq!(only_error(&events).number, 102);
+    assert_eq!(session.state().identity_insert, None);
+    let events = run_on(&mut session, "INSERT INTO dbo.ra (id, v) VALUES (5, 1)");
+    assert_eq!(only_error(&events).number, 544);
+
+    no_error(
+        &run_on(&mut session, "SET QUOTED_IDENTIFIER ON"),
+        "QUOTED_IDENTIFIER ON",
+    );
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT \"dbo\".\"ra\" ON"),
+        "a double quoted name under QUOTED_IDENTIFIER ON",
+    );
+    no_error(
+        &run_on(&mut session, "INSERT INTO dbo.ra (id, v) VALUES (5, 1)"),
+        "INSERT with the option open",
+    );
+}
+
+#[test]
+fn identity_insert_survives_the_next_batch_and_is_not_shared() {
+    let (mut a, mut b) = shared_sessions();
+    no_error(
+        &run_on(
+            &mut a,
+            "CREATE TABLE dbo.t1 (id int IDENTITY NOT NULL, v int NOT NULL)",
+        ),
+        "CREATE TABLE",
+    );
+    no_error(&run_on(&mut a, "SET IDENTITY_INSERT dbo.t1 ON"), "SET ON");
+    no_error(
+        &run_on(&mut a, "INSERT INTO dbo.t1 (id, v) VALUES (7, 1)"),
+        "INSERT on a after a later batch",
+    );
+    let events = run_on(&mut b, "INSERT INTO dbo.t1 (id, v) VALUES (8, 1)");
+    assert_eq!(only_error(&events).number, 544);
+    let events = run_on(&mut a, "SELECT id FROM dbo.t1 WHERE id = 7");
+    assert_eq!(rows(&events), vec![vec![Value::I32(7)]], "{events:#?}");
+}

@@ -74,11 +74,15 @@
 //!
 //! # 544 and `IDENTITY_INSERT`
 //!
-//! The session option `SET IDENTITY_INSERT` does not exist yet, so the identity column
-//! named with a value is refused here without consulting one. A batch that writes
-//! `SELECT 1/0;` before such an `INSERT` therefore answers 544 where SQL Server, which
-//! raises 544 while the statement runs, answers 8134: the check moves behind the option
-//! when the option exists.
+//! When [`crate::SessionOptions::with_identity_insert`] names this table, an explicit
+//! value for the identity column binds (`tests/bind_insert.rs`,
+//! `identity_insert_on_for_the_target_accepts_an_explicit_value`). For another table, or
+//! when no table is named, the same `INSERT` with a column list answers 544 and without
+//! one answers 8101 (`insert_into_identity_column_is_544_or_8101`).
+//!
+//! 544 is raised here, while the statement is bound. A batch that writes `SELECT 1/0;`
+//! before such an `INSERT` therefore answers 544, where SQL Server, which raises 544
+//! while the statement runs, answers 8134.
 //!
 //! # The names in 544 and 8101
 //!
@@ -138,7 +142,7 @@ pub(crate) fn bind_insert(
         InsertSource::Execute(_) => return Err(not_implemented("INSERT … EXECUTE")),
     };
     check_repeated(&columns, line)?;
-    target.check_identity_written(&source.columns, line)?;
+    target.check_identity_written(&source.columns, line, ctx)?;
     Ok(BoundStatement::Insert(InsertPlan {
         table: target.table,
         columns: source.columns,
@@ -310,13 +314,37 @@ impl Target {
         Err(err.with_line(line))
     }
 
-    /// 544 when the `IDENTITY` column is among the columns a value is written for.
-    fn check_identity_written(&self, columns: &[ColumnBinding], line: u32) -> SqlResult<()> {
-        if columns.iter().any(|column| self.is_identity(column)) {
+    /// 544 when the `IDENTITY` column is among the columns a value is written for and
+    /// `SET IDENTITY_INSERT` is not open for this table.
+    fn check_identity_written(
+        &self,
+        columns: &[ColumnBinding],
+        line: u32,
+        ctx: &BindContext<'_>,
+    ) -> SqlResult<()> {
+        if columns.iter().any(|column| self.is_identity(column))
+            && !identity_insert_covers(ctx, &self.name)
+        {
             return Err(SqlError::identity_insert_is_off(&self.name.name.value).with_line(line));
         }
         Ok(())
     }
+}
+
+/// Whether `SET IDENTITY_INSERT` is open for `name`, filling missing database and schema
+/// from the bind context (`tests/bind_insert.rs`,
+/// `identity_insert_on_for_the_target_accepts_an_explicit_value`).
+fn identity_insert_covers(ctx: &BindContext<'_>, name: &ObjectName) -> bool {
+    let database = name
+        .database
+        .as_ref()
+        .map_or(ctx.database, |ident| ident.value.as_str());
+    let schema = name
+        .schema
+        .as_ref()
+        .map_or(ctx.default_schema, |ident| ident.value.as_str());
+    ctx.options
+        .identity_insert_covers(database, schema, &name.name.value)
 }
 
 /// 264 when a column appears twice in the resolved list, named as the catalogue spells it.

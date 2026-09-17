@@ -84,7 +84,8 @@ pub trait CatalogView {
     /// declared without one and when `object` is not a table.
     ///
     /// An `INSERT` leaves that column out of the list it builds when none was written, and
-    /// refuses a value written for it (`insert.rs`).
+    /// refuses a value written for it unless `SET IDENTITY_INSERT` is open for the table
+    /// (`insert.rs`).
     fn identity_column(&self, object: ObjectId) -> Option<ColumnId> {
         let _ = object;
         None
@@ -182,8 +183,9 @@ impl VariableScope for NoVariables {
 /// The subset of the `SET` options that typing and evaluation depend on.
 ///
 /// `session::SetOptions` (the whole state of a connection) derives a value of this type;
-/// `binder` and `executor` know nothing of the session crate, which depends on them. Five
-/// booleans, hence `Copy` and a field of [`BindContext`] by value.
+/// `binder` and `executor` know nothing of the session crate, which depends on them. The
+/// five booleans plus the table of `SET IDENTITY_INSERT`, a field of [`BindContext`] by
+/// value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionOptions {
     /// `SET ANSI_NULLS`: `= NULL` compares as unknown instead of as `IS NULL`.
@@ -197,6 +199,13 @@ pub struct SessionOptions {
     pub concat_null_yields_null: bool,
     /// `SET NUMERIC_ROUNDABORT`: losing precision in a numeric operation raises.
     pub numeric_roundabort: bool,
+    /// Database, schema and object of the table `SET IDENTITY_INSERT` opened, or absent.
+    ///
+    /// Filled by [`SessionOptions::with_identity_insert`]. `insert.rs` consults it
+    /// (`tests/bind_insert.rs`, `identity_insert_on_for_the_target_accepts_an_explicit_value`).
+    /// Packed so [`SessionOptions`] stays `Copy`.
+    #[allow(clippy::type_complexity)]
+    pub identity_insert: Option<([u8; 128], u8, [u8; 128], u8, [u8; 128], u8)>,
 }
 
 /// The options a client driver posts when it connects: everything `ON` except
@@ -212,8 +221,55 @@ impl Default for SessionOptions {
             arithabort: true,
             concat_null_yields_null: true,
             numeric_roundabort: false,
+            identity_insert: None,
         }
     }
+}
+
+impl SessionOptions {
+    /// Names the table whose identity column may take an explicit value.
+    ///
+    /// `database`, `schema` and `name` are the three parts `insert.rs` compares with the
+    /// `INSERT` target, filling missing parts of the target from the bind context
+    /// (`tests/bind_insert.rs`, `identity_insert_on_for_the_target_accepts_an_explicit_value`).
+    #[must_use]
+    pub fn with_identity_insert(mut self, database: &str, schema: &str, name: &str) -> Self {
+        if let (Some(database), Some(schema), Some(name)) =
+            (pack_ident(database), pack_ident(schema), pack_ident(name))
+        {
+            self.identity_insert =
+                Some((database.0, database.1, schema.0, schema.1, name.0, name.1));
+        }
+        self
+    }
+
+    /// Whether `database.schema.name` is the table `SET IDENTITY_INSERT` opened.
+    pub(crate) fn identity_insert_covers(&self, database: &str, schema: &str, name: &str) -> bool {
+        self.identity_insert.is_some_and(
+            |(open_db, db_len, open_schema, schema_len, open_name, name_len)| {
+                unpack_ident(&open_db, db_len).eq_ignore_ascii_case(database)
+                    && unpack_ident(&open_schema, schema_len).eq_ignore_ascii_case(schema)
+                    && unpack_ident(&open_name, name_len).eq_ignore_ascii_case(name)
+            },
+        )
+    }
+}
+
+/// Packs an identifier into 128 bytes; `None` when it does not fit.
+fn pack_ident(part: &str) -> Option<([u8; 128], u8)> {
+    let bytes = part.as_bytes();
+    if bytes.len() > 128 {
+        return None;
+    }
+    let len = u8::try_from(bytes.len()).ok()?;
+    let mut buf = [0u8; 128];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    Some((buf, len))
+}
+
+/// The identifier packed by [`pack_ident`]. Empty when the bytes are not UTF-8.
+fn unpack_ident(buf: &[u8; 128], len: u8) -> &str {
+    str::from_utf8(&buf[..usize::from(len)]).unwrap_or("")
 }
 
 #[cfg(test)]

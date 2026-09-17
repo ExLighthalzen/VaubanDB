@@ -2884,6 +2884,37 @@ impl SqlError {
         from_catalog(8102, 1, &[Arg::Str(column)])
     }
 
+    /// Error 8107, severity 16, state 1
+    /// (`SET IDENTITY_INSERT dbo.t1 ON; SET IDENTITY_INSERT dbo.t2 ON;`): a second table
+    /// is asked to accept explicit identity values while another already does.
+    ///
+    /// The first three `%.*ls` are the open table as `database.schema.object`
+    /// (`'master.dbo.t1'`). The fourth is the refused table as written (`'dbo.t2'`, or
+    /// `'t2'` when the statement was unqualified). After the error, the first table stays
+    /// open (`SET IDENTITY_INSERT dbo.t1 ON; SET IDENTITY_INSERT dbo.t2 ON;` then
+    /// `INSERT INTO dbo.t1 (id, v) VALUES (52, 1);` writes the row).
+    ///
+    /// ```text
+    /// A session holds IDENTITY_INSERT for one table at a time; 'master.dbo.t1' already has it, and 'dbo.t2' is refused.
+    /// ```
+    pub fn identity_insert_already_on(
+        database: &str,
+        schema: &str,
+        table: &str,
+        refused: &str,
+    ) -> Self {
+        from_catalog(
+            8107,
+            1,
+            &[
+                Arg::Str(database),
+                Arg::Str(schema),
+                Arg::Str(table),
+                Arg::Str(refused),
+            ],
+        )
+    }
+
     /// Error 271, severity 16, state 1 (`UPDATE dbo.tc SET c = 1;` where `c` is a computed
     /// column): an `UPDATE` writes a computed column.
     ///
@@ -3836,6 +3867,7 @@ mod tests {
             SqlError::cannot_add_column_to_non_empty_table("b", "notempty"),
             SqlError::identity_insert_requires_column_list("dbo.ident"),
             SqlError::cannot_update_identity_column("id"),
+            SqlError::identity_insert_already_on("master", "dbo", "t1", "dbo.t2"),
             SqlError::cannot_update_computed_column("c"),
             SqlError::column_invalid_in_having("dbo.t2", "b"),
             SqlError::column_count_does_not_match_table(),
@@ -6213,7 +6245,7 @@ mod tests {
     /// The DML, flow control, transaction and concurrency constructors, on four fields:
     /// number, severity on the wire, state, and the substituted message compared as a
     /// whole string. Each row is built with the arguments of the query quoted next to it,
-    /// so the comparison leaves no specifier behind. Twenty-six rows for twenty-five
+    /// so the comparison leaves no specifier behind. Thirty rows for twenty-nine
     /// numbers: 1222 has one constructor per lock granularity.
     #[test]
     fn dml_and_transaction_messages_are_rendered() {
@@ -6395,6 +6427,14 @@ mod tests {
                 "An explicit value for the identity column of table 'ident' requires IDENTITY_INSERT ON.",
             ),
             (
+                // SET IDENTITY_INSERT dbo.t1 ON; SET IDENTITY_INSERT dbo.t2 ON;
+                SqlError::identity_insert_already_on("master", "dbo", "t1", "dbo.t2"),
+                8107,
+                16,
+                1,
+                "A session holds IDENTITY_INSERT for one table at a time; 'master.dbo.t1' already has it, and 'dbo.t2' is refused.",
+            ),
+            (
                 // two sessions updating the same two rows in opposite order
                 SqlError::deadlock_victim(60, "lock"),
                 1205,
@@ -6462,11 +6502,11 @@ mod tests {
             );
             assert_eq!(err.line, 0, "line of error {number}");
         }
-        assert_eq!(expected.len(), 29);
+        assert_eq!(expected.len(), 30);
         let mut numbers: Vec<u32> = expected.iter().map(|row| row.1).collect();
         numbers.sort_unstable();
         numbers.dedup();
-        assert_eq!(numbers.len(), 28);
+        assert_eq!(numbers.len(), 29);
     }
 
     /// Fifteen DML numbers and their sixteen constructors, 1222 counting twice, each

@@ -8,9 +8,10 @@
 
 use tracing::debug;
 use vauban_binder::SessionOptions as BinderOptions;
+use vauban_errors::SqlError;
 use vauban_parser::ParseOptions;
 
-use crate::state::SessionState;
+use crate::state::{IdentityInsertTable, SessionState};
 
 /// Options of a session settable with `SET`.
 ///
@@ -233,6 +234,24 @@ impl SetOptions {
             arithabort: self.arithabort,
             concat_null_yields_null: self.concat_null_yields_null,
             numeric_roundabort: self.numeric_roundabort,
+            identity_insert: None,
+        }
+    }
+}
+
+impl SessionState {
+    /// The binder options of this session, including the table `SET IDENTITY_INSERT` opened.
+    ///
+    /// `to_binder` carries the five booleans; this adds the identity table so `INSERT`
+    /// can accept an explicit value (`tests/set_options_effects.rs`).
+    pub(crate) fn binder_options(&self) -> BinderOptions {
+        match &self.identity_insert {
+            Some(table) => self.options.to_binder().with_identity_insert(
+                &table.database,
+                &table.schema,
+                &table.name,
+            ),
+            None => self.options.to_binder(),
         }
     }
 }
@@ -304,6 +323,8 @@ pub(crate) enum SetOutcome {
     /// The statement is not a recognised `SET`; the state is unchanged. The payload is the
     /// statement as received, for the log.
     Ignored(String),
+    /// The statement was recognised and refused; the state is unchanged.
+    Failed(SqlError),
 }
 
 /// Keywords that start a statement: a line beginning with one of them starts a new
@@ -360,32 +381,195 @@ fn is_keyword(word: &str) -> bool {
 ///
 /// Recognised: `SET <opt> [, <opt>...] ON|OFF` for the boolean options of `SetOptions`,
 /// `SET ANSI_DEFAULTS ON|OFF`, `SET TEXTSIZE n`, `SET LOCK_TIMEOUT n`, `SET DATEFORMAT f`,
-/// `SET DATEFIRST n`, `SET LANGUAGE name`, `SET DEADLOCK_PRIORITY LOW|NORMAL|HIGH|n` and
-/// `SET TRANSACTION ISOLATION LEVEL ...`. Anything else (`SET NOEXEC`, `SET ROWCOUNT`,
-/// `SET SHOWPLAN_*`, unknown option, malformed value) is `Ignored` with a `debug` log and
-/// leaves the state untouched: no error here.
+/// `SET DATEFIRST n`, `SET LANGUAGE name`, `SET DEADLOCK_PRIORITY LOW|NORMAL|HIGH|n`,
+/// `SET TRANSACTION ISOLATION LEVEL ...` and `SET IDENTITY_INSERT <table> ON|OFF`.
+/// Anything else (`SET NOEXEC`, `SET ROWCOUNT`, `SET SHOWPLAN_*`, unknown option,
+/// malformed value) is `Ignored` with a `debug` log and leaves the state untouched: no
+/// error here. A second `IDENTITY_INSERT ON` while another table is open is `Failed`
+/// with 8107 (`tests/set_options_effects.rs`).
 pub(crate) fn apply_set_statement(state: &mut SessionState, stmt: &str) -> SetOutcome {
     let tokens: Vec<Token<'_>> = tokenize(stmt).into_iter().map(|s| s.token).collect();
     match apply_tokens(state, &tokens) {
-        Some(()) => SetOutcome::Applied,
-        None => {
+        Ok(Some(())) => SetOutcome::Applied,
+        Ok(None) => {
             debug!(statement = stmt, "SET statement ignored");
             SetOutcome::Ignored(stmt.to_owned())
+        }
+        Err(err) => SetOutcome::Failed(err),
+    }
+}
+
+/// `Ok(Some(()))` once the state is updated; `Ok(None)` leaves it untouched; `Err` is a
+/// recognised `SET` that was refused (8107).
+fn apply_tokens(state: &mut SessionState, tokens: &[Token<'_>]) -> Result<Option<()>, SqlError> {
+    let (first, rest) = match tokens.split_first() {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
+    if !first.is_word("SET") {
+        return Ok(None);
+    }
+    let (option, args) = match rest.split_first() {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
+    let Token::Word(option) = option else {
+        return Ok(None);
+    };
+    if option.eq_ignore_ascii_case("IDENTITY_INSERT") {
+        return apply_identity_insert(state, args);
+    }
+    Ok(apply_known_option(state, option, args))
+}
+
+/// Default schema of a login, `dbo` until the catalogue knows better.
+const DEFAULT_SCHEMA: &str = "dbo";
+
+/// `SET IDENTITY_INSERT <table> {ON|OFF}`. A second `ON` while another table is open
+/// answers 8107 and leaves the first table open.
+fn apply_identity_insert(
+    state: &mut SessionState,
+    args: &[Token<'_>],
+) -> Result<Option<()>, SqlError> {
+    let [Token::Word(table), Token::Word(on_off)] = args else {
+        return Ok(None);
+    };
+    let on = match on_off {
+        word if word.eq_ignore_ascii_case("ON") => true,
+        word if word.eq_ignore_ascii_case("OFF") => false,
+        _ => return Ok(None),
+    };
+    let target = match parse_identity_table(table, &state.database, state.options.quoted_identifier)
+    {
+        Some(target) => target,
+        None => return Ok(None),
+    };
+    if on {
+        if let Some(open) = &state.identity_insert {
+            if open.same_as(&target.table) {
+                return Ok(Some(()));
+            }
+            return Err(SqlError::identity_insert_already_on(
+                &open.database,
+                &open.schema,
+                &open.name,
+                &target.written,
+            ));
+        }
+        state.identity_insert = Some(target.table);
+    } else if state
+        .identity_insert
+        .as_ref()
+        .is_some_and(|open| open.same_as(&target.table))
+    {
+        state.identity_insert = None;
+    }
+    Ok(Some(()))
+}
+
+/// A table named by `SET IDENTITY_INSERT`, read two ways.
+struct IdentityTarget {
+    /// The three parts the state keeps and compares, delimiters removed.
+    table: IdentityInsertTable,
+    /// The same name with as many parts as the statement wrote, delimiters removed: what
+    /// 8107 puts in its fourth specifier (`tests/set_options_effects.rs`,
+    /// `identity_insert_names_the_refused_table_without_its_delimiters`).
+    written: String,
+}
+
+/// One, two or three dotted parts: `t`, `dbo.t`, `db.dbo.t`. Missing schema is `dbo`;
+/// missing database is `current_db`.
+///
+/// What the state keeps is the name without its delimiters, so that a later `OFF` written
+/// another way closes the option that `[dbo].[t] ON` opened
+/// (`tests/set_options_effects.rs`, `identity_insert_opened_on_a_delimited_name_is_closed_by_a_canonical_off`).
+/// `"..."` is a name while `QUOTED_IDENTIFIER` is on; off, this answers `None` and
+/// nothing is opened (`a_dot_or_a_bracket_inside_a_delimited_part_does_not_split_it`).
+fn parse_identity_table(
+    written: &str,
+    current_db: &str,
+    quoted_identifier: bool,
+) -> Option<IdentityTarget> {
+    let parts = split_identifier(written, quoted_identifier)?;
+    let (database, schema, name) = match parts.as_slice() {
+        [name] => (
+            current_db.to_owned(),
+            DEFAULT_SCHEMA.to_owned(),
+            name.clone(),
+        ),
+        [schema, name] => (current_db.to_owned(), schema.clone(), name.clone()),
+        [database, schema, name] => (database.clone(), schema.clone(), name.clone()),
+        _ => return None,
+    };
+    Some(IdentityTarget {
+        table: IdentityInsertTable {
+            database,
+            schema,
+            name,
+        },
+        written: parts.join("."),
+    })
+}
+
+/// Splits a table name into its parts on the dots that separate them, delimiters honoured
+/// before anything is stripped.
+///
+/// A delimited part keeps what it holds: `[dbo.x]` is one part named `dbo.x`, and `[a]]b]`
+/// one part named `a]b`, a doubled closing delimiter standing for itself. Splitting on the
+/// dots first would read those two as two parts and as `a]]b`
+/// (`a_dot_or_a_bracket_inside_a_delimited_part_does_not_split_it`).
+///
+/// `None` when the name is not one, two or three non-empty parts, when a delimiter is left
+/// open, or when anything follows a closing delimiter other than a dot.
+fn split_identifier(written: &str, quoted_identifier: bool) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut rest = written;
+    loop {
+        let (part, tail) = match rest.chars().next()? {
+            '[' => delimited(rest, ']')?,
+            '"' if quoted_identifier => delimited(rest, '"')?,
+            _ => {
+                let end = rest.find(['.', '[', ']', '"']).unwrap_or(rest.len());
+                (rest[..end].to_owned(), &rest[end..])
+            }
+        };
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part);
+        match tail.strip_prefix('.') {
+            Some(next) => rest = next,
+            None if tail.is_empty() => break,
+            None => return None,
+        }
+    }
+    (1..=3).contains(&parts.len()).then_some(parts)
+}
+
+/// What a `[...]` or `"..."` part holds, and the text that follows it. The closing
+/// delimiter written twice stands for itself. `None` for a part left unclosed
+/// (`a_dot_or_a_bracket_inside_a_delimited_part_does_not_split_it`).
+fn delimited(src: &str, close: char) -> Option<(String, &str)> {
+    let mut value = String::new();
+    // Past the opening delimiter, which is one byte (`[` or `"`).
+    let mut rest = &src[1..];
+    loop {
+        let end = rest.find(close)?;
+        value.push_str(&rest[..end]);
+        let after = &rest[end + close.len_utf8()..];
+        match after.strip_prefix(close) {
+            Some(tail) => {
+                value.push(close);
+                rest = tail;
+            }
+            None => return Some((value, after)),
         }
     }
 }
 
 /// `Some(())` once the state is updated; `None` leaves it untouched (nothing is applied
 /// before the whole statement is validated).
-fn apply_tokens(state: &mut SessionState, tokens: &[Token<'_>]) -> Option<()> {
-    let (first, rest) = tokens.split_first()?;
-    if !first.is_word("SET") {
-        return None;
-    }
-    let (option, args) = rest.split_first()?;
-    let Token::Word(option) = option else {
-        return None;
-    };
+fn apply_known_option(state: &mut SessionState, option: &str, args: &[Token<'_>]) -> Option<()> {
     let options = &mut state.options;
     match option.to_ascii_uppercase().as_str() {
         "TRANSACTION" => state.isolation = parse_isolation(args)?,
@@ -1026,7 +1210,6 @@ mod tests {
             "SET DEADLOCK_PRIORITY 11",
             "SET TRANSACTION ISOLATION LEVEL 'READ COMMITTED'",
             "SET @x = 1",
-            "SET IDENTITY_INSERT t ON",
             "SELECT 1",
             "",
             "''",
@@ -1038,6 +1221,165 @@ mod tests {
             );
         }
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn identity_insert_opens_one_table_and_refuses_a_second() {
+        let mut state = state();
+        assert_eq!(
+            apply(&mut state, "SET IDENTITY_INSERT dbo.t1 ON"),
+            SetOutcome::Applied
+        );
+        assert_eq!(
+            state
+                .identity_insert
+                .as_ref()
+                .map(|t| { (t.database.as_str(), t.schema.as_str(), t.name.as_str(),) }),
+            Some(("master", "dbo", "t1"))
+        );
+        assert_eq!(
+            apply(&mut state, "SET IDENTITY_INSERT dbo.t1 ON"),
+            SetOutcome::Applied
+        );
+        let failed = apply(&mut state, "SET IDENTITY_INSERT dbo.t2 ON");
+        match failed {
+            SetOutcome::Failed(err) => {
+                assert_eq!(
+                    err,
+                    SqlError::identity_insert_already_on("master", "dbo", "t1", "dbo.t2")
+                );
+            }
+            other => panic!("expected 8107, got {other:?}"),
+        }
+        assert_eq!(
+            state.identity_insert.as_ref().map(|t| t.name.as_str()),
+            Some("t1")
+        );
+        assert_eq!(
+            apply(&mut state, "SET IDENTITY_INSERT dbo.t2 OFF"),
+            SetOutcome::Applied
+        );
+        assert_eq!(
+            state.identity_insert.as_ref().map(|t| t.name.as_str()),
+            Some("t1")
+        );
+        assert_eq!(
+            apply(&mut state, "SET IDENTITY_INSERT t1 OFF"),
+            SetOutcome::Applied
+        );
+        assert_eq!(state.identity_insert, None);
+    }
+
+    /// The three parts a name is read as, and the name as written with its delimiters
+    /// removed.
+    fn parts(written: &str) -> Option<(String, String, String, String)> {
+        parse_identity_table(written, "master", true).map(|target| {
+            (
+                target.table.database,
+                target.table.schema,
+                target.table.name,
+                target.written,
+            )
+        })
+    }
+
+    #[test]
+    fn a_dot_or_a_bracket_inside_a_delimited_part_does_not_split_it() {
+        // One part holding a dot, not two parts: splitting on the dots before honouring
+        // the delimiters would answer `dbo` and `x`.
+        assert_eq!(
+            parts("[dbo.x]"),
+            Some((
+                "master".to_owned(),
+                "dbo".to_owned(),
+                "dbo.x".to_owned(),
+                "dbo.x".to_owned()
+            ))
+        );
+        // The same name written in two parts is the same table.
+        assert_eq!(
+            parts("[dbo].[dbo.x]").map(|p| p.2),
+            Some("dbo.x".to_owned())
+        );
+        // A doubled closing delimiter stands for itself: `a]b`, not `a]]b`.
+        assert_eq!(parts("[a]]b]").map(|p| p.2), Some("a]b".to_owned()));
+        assert_eq!(parts("\"a\"\"b\"").map(|p| p.2), Some("a\"b".to_owned()));
+        // Delimiters removed, part count kept.
+        assert_eq!(parts("[dbo].[ra]").map(|p| p.3), Some("dbo.ra".to_owned()));
+        assert_eq!(parts("[ra]").map(|p| p.3), Some("ra".to_owned()));
+        assert_eq!(
+            parts("[db].[dbo].[ra]").map(|p| p.3),
+            Some("db.dbo.ra".to_owned())
+        );
+        // Undelimited names are unchanged.
+        assert_eq!(
+            parts("dbo.ra"),
+            Some((
+                "master".to_owned(),
+                "dbo".to_owned(),
+                "ra".to_owned(),
+                "dbo.ra".to_owned()
+            ))
+        );
+        assert_eq!(parts("db.dbo.ra").map(|p| p.0), Some("db".to_owned()));
+        // Shapes with no name to read.
+        for written in [
+            "", ".", "dbo.", ".ra", "a.b.c.d", "[ra", "[ra]]", "[dbo]x", "ra]", "[]",
+        ] {
+            assert_eq!(parts(written), None, "{written}");
+        }
+        // `"..."` is a name while QUOTED_IDENTIFIER is on, and not while it is off.
+        assert_eq!(
+            parse_identity_table("\"dbo\".\"ra\"", "master", false).map(|t| t.written),
+            None
+        );
+    }
+
+    #[test]
+    fn identity_insert_on_a_delimited_name_keeps_the_canonical_form() {
+        let mut state = state();
+        assert_eq!(
+            apply(&mut state, "SET IDENTITY_INSERT [dbo].[ra] ON"),
+            SetOutcome::Applied
+        );
+        assert_eq!(
+            state.identity_insert.as_ref().map(|t| (
+                t.database.as_str(),
+                t.schema.as_str(),
+                t.name.as_str()
+            )),
+            Some(("master", "dbo", "ra"))
+        );
+        assert_eq!(
+            apply(&mut state, "SET IDENTITY_INSERT dbo.ra OFF"),
+            SetOutcome::Applied
+        );
+        assert_eq!(state.identity_insert, None);
+    }
+
+    #[test]
+    fn identity_insert_on_a_name_the_tokenizer_splits_is_ignored() {
+        // A delimited part holding white space reaches this module as several words, so
+        // the statement is not recognised and the state is untouched: nothing is opened,
+        // and a table already open stays open.
+        let mut state = state();
+        assert!(matches!(
+            apply(&mut state, "SET IDENTITY_INSERT [my table] ON"),
+            SetOutcome::Ignored(_)
+        ));
+        assert_eq!(state.identity_insert, None);
+        assert_eq!(
+            apply(&mut state, "SET IDENTITY_INSERT dbo.ra ON"),
+            SetOutcome::Applied
+        );
+        assert!(matches!(
+            apply(&mut state, "SET IDENTITY_INSERT [my table] OFF"),
+            SetOutcome::Ignored(_)
+        ));
+        assert_eq!(
+            state.identity_insert.as_ref().map(|t| t.name.as_str()),
+            Some("ra")
+        );
     }
 
     #[test]

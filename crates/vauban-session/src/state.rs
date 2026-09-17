@@ -59,6 +59,34 @@ pub struct SessionState {
     pub server_name: String,
     /// Next descriptor to allocate. `0` means the `u64` space was exhausted.
     next_transaction_descriptor: u64,
+    /// Table whose identity column currently accepts an explicit value, or no table.
+    ///
+    /// One table at a time: a second `SET IDENTITY_INSERT … ON` answers 8107 and leaves
+    /// this field as it was (`tests/set_options_effects.rs`).
+    pub identity_insert: Option<IdentityInsertTable>,
+}
+
+/// The table `SET IDENTITY_INSERT` opened on this session, in three parts stripped of the
+/// `[...]` and `"..."` that the statement may have written around them, so that an `OFF`
+/// spelled another way closes what an `ON` opened (`set_options.rs`,
+/// `parse_identity_table`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityInsertTable {
+    /// Current database when the option was opened, or the database part of the name.
+    pub database: String,
+    /// Schema part of the name, or `dbo` when the statement omitted it.
+    pub schema: String,
+    /// Object part of the name.
+    pub name: String,
+}
+
+impl IdentityInsertTable {
+    /// Same database, schema and object, without regard to case.
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.database.eq_ignore_ascii_case(&other.database)
+            && self.schema.eq_ignore_ascii_case(&other.schema)
+            && self.name.eq_ignore_ascii_case(&other.name)
+    }
 }
 
 impl SessionState {
@@ -95,6 +123,7 @@ impl SessionState {
             edition: EDITION.into(),
             server_name: Self::DEFAULT_SERVER_NAME.into(),
             next_transaction_descriptor: 1,
+            identity_insert: None,
         }
     }
 
@@ -132,6 +161,7 @@ mod tests {
         assert_eq!(state.version_banner, VERSION_BANNER);
         assert_eq!(state.edition, EDITION);
         assert_eq!(state.server_name, "vauban");
+        assert_eq!(state.identity_insert, None);
     }
 
     #[test]
