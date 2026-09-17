@@ -3814,8 +3814,8 @@ mod tests {
             SqlError::cannot_drop("drop", "index", "t3.ix_nope"),
             SqlError::statement_not_allowed_in_transaction("CREATE DATABASE"),
             SqlError::ambiguous_column_name("a"),
-            SqlError::cannot_drop("drop", "sequence", "nope_seq_err019"),
-            SqlError::cannot_drop("drop", "synonym", "nope_syn_err019"),
+            SqlError::cannot_drop("drop", "sequence", "nope_sequence"),
+            SqlError::cannot_drop("drop", "synonym", "nope_synonym"),
             SqlError::cannot_drop_system_database("master"),
             SqlError::drop_database_in_transaction(),
             SqlError::duplicate_column_name("a", "t_dup"),
@@ -5846,12 +5846,12 @@ mod tests {
                 "nope",
                 "Unable to drop the table 'nope': it does not exist or is not accessible.",
             ),
-            // DROP DATABASE nope_vauban_err018;
+            // DROP DATABASE nope_db;
             (
                 "database",
                 1,
-                "nope_vauban_err018",
-                "Unable to drop the database 'nope_vauban_err018': it does not exist or is not accessible.",
+                "nope_db",
+                "Unable to drop the database 'nope_db': it does not exist or is not accessible.",
             ),
             // DROP INDEX ix_nope ON t3; — the name joins the table and the index.
             (
@@ -5888,33 +5888,33 @@ mod tests {
                 "nope_tr",
                 "Unable to drop the trigger 'nope_tr': it does not exist or is not accessible.",
             ),
-            // DROP SEQUENCE nope_seq_err019;
+            // DROP SEQUENCE nope_sequence;
             (
                 "sequence",
                 5,
-                "nope_seq_err019",
-                "Unable to drop the sequence 'nope_seq_err019': it does not exist or is not accessible.",
+                "nope_sequence",
+                "Unable to drop the sequence 'nope_sequence': it does not exist or is not accessible.",
             ),
-            // DROP SEQUENCE dbo.nope_seq_err019; — the qualifier stays in the name.
+            // DROP SEQUENCE dbo.nope_sequence; — the qualifier stays in the name.
             (
                 "sequence",
                 5,
-                "dbo.nope_seq_err019",
-                "Unable to drop the sequence 'dbo.nope_seq_err019': it does not exist or is not accessible.",
+                "dbo.nope_sequence",
+                "Unable to drop the sequence 'dbo.nope_sequence': it does not exist or is not accessible.",
             ),
-            // DROP SYNONYM nope_syn_err019;
+            // DROP SYNONYM nope_synonym;
             (
                 "synonym",
                 5,
-                "nope_syn_err019",
-                "Unable to drop the synonym 'nope_syn_err019': it does not exist or is not accessible.",
+                "nope_synonym",
+                "Unable to drop the synonym 'nope_synonym': it does not exist or is not accessible.",
             ),
-            // DROP SYNONYM dbo.nope_syn_err019;
+            // DROP SYNONYM dbo.nope_synonym;
             (
                 "synonym",
                 5,
-                "dbo.nope_syn_err019",
-                "Unable to drop the synonym 'dbo.nope_syn_err019': it does not exist or is not accessible.",
+                "dbo.nope_synonym",
+                "Unable to drop the synonym 'dbo.nope_synonym': it does not exist or is not accessible.",
             ),
         ];
         for (kind, state, name, message) in expected {
@@ -5937,7 +5937,7 @@ mod tests {
             super::UNKNOWN_DDL_STATE
         );
         assert_ne!(
-            SqlError::cannot_drop("drop", "sequence", "nope_seq_err019").state,
+            SqlError::cannot_drop("drop", "sequence", "nope_sequence").state,
             super::UNKNOWN_DDL_STATE
         );
     }
@@ -5957,7 +5957,7 @@ mod tests {
         assert_eq!(err.line, 0);
         assert_eq!(err.procedure, None);
 
-        // BEGIN TRANSACTION; ALTER DATABASE vauban_err018_tmp SET RECOVERY SIMPLE;
+        // BEGIN TRANSACTION; ALTER DATABASE scratch_db SET RECOVERY SIMPLE;
         let alter = SqlError::statement_not_allowed_in_transaction("ALTER DATABASE");
         assert_eq!(alter.state, 6);
         assert_eq!(
@@ -6031,7 +6031,7 @@ mod tests {
 
         // The sentence is not the one 3701 prints for a missing database, and neither is
         // the number.
-        let missing = SqlError::cannot_drop("drop", "database", "nope_vauban_err019");
+        let missing = SqlError::cannot_drop("drop", "database", "nope_db");
         assert_eq!(missing.number, 3701);
         assert!(err.message.ends_with(": it is a system database."));
         assert!(
@@ -6163,21 +6163,21 @@ mod tests {
             SqlError::object_already_exists("t").state,
             // DROP TABLE nope;
             SqlError::cannot_drop("drop", "table", "nope").state,
-            // DROP DATABASE nope_vauban_err018;
+            // DROP DATABASE nope_db;
             SqlError::cannot_drop("drop", "database", "nope").state,
             // DROP INDEX ix_nope ON t3;
             SqlError::cannot_drop("drop", "index", "t3.ix_nope").state,
-            // BEGIN TRANSACTION; CREATE DATABASE vauban_err018_tx;
+            // BEGIN TRANSACTION; CREATE DATABASE scratch_db;
             SqlError::statement_not_allowed_in_transaction("CREATE DATABASE").state,
             // SELECT c FROM (SELECT 1 AS c) AS x CROSS JOIN (SELECT 2 AS c) AS y; and
             // the five other shapes tried, which sent state 1 too.
             SqlError::ambiguous_column_name("c").state,
-            // DROP SEQUENCE nope_seq_err019; and DROP SYNONYM nope_syn_err019;
-            SqlError::cannot_drop("drop", "sequence", "nope_seq_err019").state,
-            SqlError::cannot_drop("drop", "synonym", "nope_syn_err019").state,
+            // DROP SEQUENCE nope_sequence; and DROP SYNONYM nope_synonym;
+            SqlError::cannot_drop("drop", "sequence", "nope_sequence").state,
+            SqlError::cannot_drop("drop", "synonym", "nope_synonym").state,
             // DROP DATABASE master; tempdb; model; msdb; and the five other spellings.
             SqlError::cannot_drop_system_database("master").state,
-            // BEGIN TRANSACTION; DROP DATABASE vauban_err019_b; and the five other shapes.
+            // BEGIN TRANSACTION; DROP DATABASE scratch_db; and the five other shapes.
             SqlError::drop_database_in_transaction().state,
             // CREATE TABLE t_dup (a int, a int); and the eight other shapes.
             SqlError::duplicate_column_name("a", "t_dup").state,

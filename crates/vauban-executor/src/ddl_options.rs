@@ -332,7 +332,7 @@ mod tests {
     /// written against a newly created database, and the fixture creates it rather than
     /// repeating the default values.
     #[test]
-    fn defaults_match_the_capture() {
+    fn a_new_database_carries_the_default_options() {
         let fixture = Fixture::new();
         fixture.created_database("vdb");
         let meta = fixture.meta_of("vdb");
