@@ -2,11 +2,13 @@ use std::collections::HashSet;
 
 use vauban_catalog::{Catalog, ColumnMeta, ObjectId};
 use vauban_errors::{SqlError, SqlResult};
-use vauban_parser::{Expr, Literal};
+use vauban_parser::{Expr, Literal, UnaryOp};
 use vauban_planner::PhysicalInsert;
 use vauban_storage::{Storage, TableId, TxnId};
 use vauban_txn::TxnHandle;
-use vauban_types::{Decimal, Len, SqlType, TypeInfo, Value};
+use vauban_types::{
+    BinaryOp, Decimal, LiteralKind, SqlType, TypeInfo, Value, eval_binary, parse_literal,
+};
 
 use crate::context::ExecContext;
 use crate::dml::assign::assign_value;
@@ -19,7 +21,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
     let storage: &dyn Storage = ctx.storage()?;
     let txn_id = ctx.handle()?.id;
 
-    let (col_metas, db_name, table_obj_id, table_id, tbl_schema, tbl_name) = {
+    let (col_metas, table_name, table_obj_id, table_id) = {
         let catalog: &Catalog = ctx.catalog()?;
         let handle: &TxnHandle = ctx.handle()?;
         let snap = catalog.snapshot(handle);
@@ -30,14 +32,10 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
             .database_by_id(meta.database)
             .map_or_else(|| "?".to_owned(), |db| db.name.clone());
         let col_metas: Vec<ColumnMeta> = meta.columns.clone();
-        (
-            col_metas,
-            db_name,
-            meta.id,
-            stmt.table,
-            meta.schema.clone(),
-            meta.name.clone(),
-        )
+        // The three-part name 515 prints, built once for the whole statement rather than
+        // per row: both loops of `write_one` need it.
+        let table_name = format!("{}.{}.{}", db_name, meta.schema, meta.name);
+        (col_metas, table_name, meta.id, stmt.table)
     };
 
     let mut root = build_operator(&stmt.source)?;
@@ -69,9 +67,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 row,
                 stmt,
                 &col_metas,
-                &db_name,
-                &tbl_schema,
-                &tbl_name,
+                &table_name,
                 txn_id,
                 table_id,
                 table_obj_id,
@@ -92,9 +88,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 &row,
                 stmt,
                 &col_metas,
-                &db_name,
-                &tbl_schema,
-                &tbl_name,
+                &table_name,
                 txn_id,
                 table_id,
                 table_obj_id,
@@ -118,9 +112,7 @@ fn write_one(
     row: &[Value],
     stmt: &PhysicalInsert,
     col_metas: &[ColumnMeta],
-    db_name: &str,
-    tbl_schema: &str,
-    tbl_name: &str,
+    table_name: &str,
     txn_id: TxnId,
     table_id: TableId,
     table_obj_id: ObjectId,
@@ -135,6 +127,7 @@ fn write_one(
         let src = &row[i];
         let col_meta = &col_metas[ordinal];
         let converted = assign_value(src.clone(), &binding.ty, col_meta).map_err(|e| at(e, 0))?;
+        refuse_null(&converted, col_meta, table_name)?;
         output[ordinal] = converted;
         covered.insert(ordinal);
     }
@@ -151,16 +144,17 @@ fn write_one(
             // The literal of the constraint follows the conversion an explicit value goes
             // through: `eval_default` gives its own type, `assign_value` writes the column's.
             let (value, from) = eval_default(default)?;
-            output[ordinal] = assign_value(value, &from, col_meta).map_err(|e| at(e, 0))?;
+            let converted = assign_value(value, &from, col_meta).map_err(|e| at(e, 0))?;
+            refuse_null(&converted, col_meta, table_name)?;
+            output[ordinal] = converted;
             continue;
         }
         if col_meta.ty.nullable {
             output[ordinal] = Value::Null;
             continue;
         }
-        let table_name = format!("{}.{}.{}", db_name, tbl_schema, tbl_name);
         return Err(at(
-            SqlError::cannot_insert_null(&col_meta.name, &table_name, "INSERT"),
+            SqlError::cannot_insert_null(&col_meta.name, table_name, "INSERT"),
             0,
         ));
     }
@@ -168,36 +162,127 @@ fn write_one(
     Ok(())
 }
 
+/// 515 for a `NULL` landing in a column that refuses it, whichever way the value reached
+/// the row: written in the `VALUES` row, produced by a source query or a variable, or
+/// taken from a `DEFAULT` constraint whose literal is `NULL`.
+///
+/// The column carrying a `DEFAULT` constraint changes nothing: a written `NULL` is
+/// refused instead of the default being applied
+/// (`tests/insert.rs::a_written_null_does_not_fall_back_to_the_default`), and a default
+/// that is itself `NULL` is refused on the column that omitted it
+/// (`tests/insert.rs::a_null_default_on_a_not_null_column_is_refused`). A column that
+/// accepts `NULL` takes it either way.
+///
+/// # Why the check is here rather than just before the write
+///
+/// Both call sites run before `storage.insert`, so the row a refusal concerns is never
+/// handed to the storage and no refusal the storage raises — a duplicate key among them —
+/// can be the answer instead. `tests/insert.rs::a_refused_null_leaves_nothing_to_read`
+/// reads the table after the refusal and finds it empty, which is also what keeps a later
+/// read from meeting a value its column metadata says cannot be `NULL`.
+fn refuse_null(value: &Value, col_meta: &ColumnMeta, table_name: &str) -> SqlResult<()> {
+    if matches!(value, Value::Null) && !col_meta.ty.nullable {
+        return Err(at(
+            SqlError::cannot_insert_null(&col_meta.name, table_name, "INSERT"),
+            0,
+        ));
+    }
+    Ok(())
+}
+
 /// Evaluates the literal of a `DEFAULT` constraint, with the type it is written with.
 ///
-/// The type is what [`assign_value`] converts from, so that an `int` column receives an
-/// `I32` and not the `I64` an integer literal is parsed into.
+/// The type is what [`assign_value`] converts from, and it is the type the same literal
+/// would carry in a `VALUES` row: `types::parse_literal` is the one place that decides it,
+/// so `DEFAULT 5` on an `int` column arrives as an `I32` typed `int` and `DEFAULT 1.25` as
+/// a `numeric(3,2)`, exactly as `VALUES (5)` and `VALUES (1.25)` do.
+///
+/// # What counts as a literal here
+///
+/// A leading `+` or `-` and a pair of parentheses belong to the literal: `DEFAULT -5`,
+/// `DEFAULT (-5)` and `DEFAULT 0x01` are constraints a column carries, and each writes and
+/// reads back at the type of the column (`tests/insert.rs::signed_and_binary_defaults`).
+/// The sign is computed as `0 - literal` through `types::eval_binary`, which keeps the
+/// range rules and the 8115 they raise in `types` rather than restating them here.
+///
+/// Anything else is refused with the internal error: `DEFAULT (1 + 1)` and
+/// `DEFAULT GETDATE()` are expressions, not literals, and this function does not evaluate
+/// expressions (`tests/insert.rs::an_arithmetic_default_is_not_a_literal`).
 fn eval_default(expr: &Expr) -> SqlResult<(Value, TypeInfo)> {
     match expr {
         Expr::Literal(Literal::Null, _) => Ok((Value::Null, TypeInfo::new(SqlType::Int, true))),
         Expr::Literal(Literal::Default, _) => Err(bug(
             "INSERT: DEFAULT keyword in a DEFAULT constraint is a self-reference",
         )),
-        Expr::Literal(Literal::Integer(text), _) => {
-            let n: i64 = text
-                .parse()
-                .map_err(|_| bug("INSERT: default integer literal does not parse"))?;
-            Ok((Value::I64(n), TypeInfo::new(SqlType::BigInt, false)))
+        // `DEFAULT (5)`: a pair of parentheses around the literal does not make it an
+        // expression (`tests/insert.rs::signed_and_binary_defaults`).
+        Expr::Nested(inner, _) => eval_default(inner),
+        Expr::Unary {
+            op: UnaryOp::Plus,
+            expr: inner,
+            ..
+        } => eval_default(inner),
+        Expr::Unary {
+            op: UnaryOp::Minus,
+            expr: inner,
+            ..
+        } => {
+            let (value, ty) = eval_default(inner)?;
+            let zero = zero_of(&value)?;
+            let negated = eval_binary(BinaryOp::Sub, &zero, &value, &ty)?;
+            Ok((negated, ty))
         }
-        Expr::Literal(Literal::Str { value, unicode }, _) => {
-            let ty = if *unicode {
-                SqlType::NVarChar(Len::Max)
-            } else {
-                SqlType::VarChar(Len::Max)
-            };
-            Ok((
-                Value::String(vauban_types::SqlString {
-                    text: value.clone(),
-                }),
-                TypeInfo::new(ty, false),
-            ))
+        Expr::Literal(literal, _) => {
+            let (kind, text) = literal_payload(literal)?;
+            parse_literal(kind, text)
         }
         _ => Err(bug("INSERT: default expression is not a literal")),
+    }
+}
+
+/// The [`LiteralKind`] and the payload `types::parse_literal` reads for `literal`.
+///
+/// `NULL` and `DEFAULT` carry no payload and are answered by [`eval_default`] before this
+/// function is reached.
+fn literal_payload(literal: &Literal) -> SqlResult<(LiteralKind, &str)> {
+    Ok(match literal {
+        Literal::Integer(text) => (LiteralKind::Integer, text.as_str()),
+        Literal::Decimal(text) => (LiteralKind::Decimal, text.as_str()),
+        Literal::Float(text) => (LiteralKind::Float, text.as_str()),
+        Literal::Money(text) => (LiteralKind::Money, text.as_str()),
+        Literal::Binary(text) => (LiteralKind::Hex, text.as_str()),
+        Literal::Str {
+            value,
+            unicode: false,
+        } => (LiteralKind::Str, value.as_str()),
+        Literal::Str {
+            value,
+            unicode: true,
+        } => (LiteralKind::NStr, value.as_str()),
+        Literal::Null | Literal::Default => {
+            return Err(bug("INSERT: NULL and DEFAULT carry no literal payload"));
+        }
+    })
+}
+
+/// The zero a signed default subtracts its literal from, in the family of that literal.
+///
+/// `eval_binary` widens an integer to `i64` before it computes and rebuilds the result in
+/// the type it is given, so the integral variants share one zero. A character or binary
+/// literal takes no sign: `DEFAULT -0x01` and `DEFAULT -'a'` are refused here rather than
+/// given a meaning the write path would have to invent.
+fn zero_of(value: &Value) -> SqlResult<Value> {
+    match value {
+        Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_) => Ok(Value::I64(0)),
+        Value::Decimal(d) => Ok(Value::Decimal(Decimal {
+            mantissa: 0,
+            precision: d.precision,
+            scale: d.scale,
+        })),
+        Value::Money(_) => Ok(Value::Money(0)),
+        Value::F32(_) => Ok(Value::F32(0.0)),
+        Value::F64(_) => Ok(Value::F64(0.0)),
+        _ => Err(bug("INSERT: a signed default needs a numeric literal")),
     }
 }
 
