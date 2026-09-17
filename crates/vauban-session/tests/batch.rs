@@ -684,3 +684,35 @@ async fn a_named_default_is_written_and_read_over_the_wire() {
     drop(client);
     running.stop().await;
 }
+
+/// Two bare `DEFAULT` clauses on one column are 8148 over the wire
+/// (`CREATE TABLE t (a int DEFAULT 1 DEFAULT 2)`).
+#[tokio::test]
+async fn two_bare_defaults_are_8148_over_the_wire() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let response = batch(&mut client, "CREATE TABLE t (a int DEFAULT 1 DEFAULT 2)").await;
+    assert_eq!(
+        tokens(&response.payload),
+        vec![
+            Tok::Error {
+                number: 8148,
+                state: 0,
+                class: 16,
+                message: SqlError::multiple_column_defaults("a", "dbo.t").message,
+            },
+            Tok::Done {
+                status: DONE_ERROR,
+                cur_cmd: 0,
+                row_count: 0,
+            },
+        ]
+    );
+
+    let next = batch(&mut client, "SELECT 1").await;
+    assert_eq!(tokens(&next.payload), select_1_tokens(false));
+
+    drop(client);
+    running.stop().await;
+}

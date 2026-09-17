@@ -635,10 +635,13 @@ pub(crate) fn written(name: &ObjectName) -> String {
 /// `CREATE TABLE dbo.p1 (a int, b int NULL, c int NOT NULL, …)`, `sys.columns.is_nullable`
 /// answers 1, 1 and 0.
 ///
-/// An unnamed `DEFAULT` fills [`ColumnDef::default`], which is the field the catalogue
-/// reads; a `CONSTRAINT df DEFAULT 0` becomes a [`ConstraintDef::Default`] instead, so that
-/// the name the client chose survives to `sys.default_constraints`. Neither is evaluated
-/// here: the catalogue holds the `parser::Expr`.
+/// The first unnamed `DEFAULT` fills [`ColumnDef::default`], which is the field the
+/// catalogue reads. A later unnamed `DEFAULT` on the same column is pushed as
+/// [`ConstraintDef::Default`] without a name so the catalogue can refuse the pair
+/// (`tests/bind_ddl.rs`). A `CONSTRAINT df DEFAULT 0` becomes a
+/// [`ConstraintDef::Default`] so that the name the client chose survives to
+/// `sys.default_constraints`. Neither is evaluated here: the catalogue holds the
+/// `parser::Expr`.
 ///
 /// # Errors
 ///
@@ -673,14 +676,17 @@ fn column_of(
         match &constraint.kind {
             ColumnConstraintKind::Null => nullable = true,
             ColumnConstraintKind::NotNull => nullable = false,
-            ColumnConstraintKind::Default(expr) => match name {
-                Some(name) => constraints.push(ConstraintDef::Default {
-                    name: Some(name),
-                    column: column.name.value.clone(),
-                    expr: expr.clone(),
-                }),
-                None => default = Some(expr.clone()),
-            },
+            ColumnConstraintKind::Default(expr) => {
+                if name.is_none() && default.is_none() {
+                    default = Some(expr.clone());
+                } else {
+                    constraints.push(ConstraintDef::Default {
+                        name,
+                        column: column.name.value.clone(),
+                        expr: expr.clone(),
+                    });
+                }
+            }
             ColumnConstraintKind::PrimaryKey { clustering, order } => {
                 constraints.push(ConstraintDef::PrimaryKey {
                     name,

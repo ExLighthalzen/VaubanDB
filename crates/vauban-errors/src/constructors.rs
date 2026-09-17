@@ -3307,6 +3307,24 @@ impl SqlError {
         from_catalog_with_severity(1750, COULD_NOT_CREATE_CONSTRAINT_1750_SEVERITY, 0, &[])
     }
 
+    /// Error 1754, severity 16, state 0 (`CREATE TABLE dbo.t (a int IDENTITY DEFAULT 1);`):
+    /// a `DEFAULT` is written on an `IDENTITY` column.
+    ///
+    /// `table` is the table name without its schema (`CREATE TABLE dbo.t …` prints `'t'`),
+    /// `column` the column name as written (`CREATE TABLE dbo.t ([Ab] int IDENTITY DEFAULT 1);`
+    /// prints `'Ab'`). A named `DEFAULT` on the same column answers 1754 as well
+    /// (`CREATE TABLE dbo.t (a int IDENTITY CONSTRAINT d DEFAULT 1);`).
+    ///
+    /// A column that also carries two `DEFAULT` clauses answers 8148
+    /// ([`SqlError::multiple_column_defaults`]) instead of 1754.
+    ///
+    /// ```text
+    /// A DEFAULT cannot sit on an IDENTITY column. Table 't', column 'a'.
+    /// ```
+    pub fn default_on_identity_column(table: &str, column: &str) -> Self {
+        from_catalog(1754, 0, &[Arg::Str(table), Arg::Str(column)])
+    }
+
     /// Error 8168, severity 16, state 0: one statement creates two constraints of the
     /// name `name` ([`DUPLICATE_NAME_8168_CONSTRAINT_STATE`]): a `CREATE TABLE` holding
     /// two `CONSTRAINT c1` clauses, one `PRIMARY KEY` and one `UNIQUE`, a `CREATE TABLE`
@@ -3425,6 +3443,39 @@ impl SqlError {
     /// ```
     pub fn identity_on_nullable_column(column: &str, table: &str) -> Self {
         from_catalog(8147, 1, &[Arg::Str(column), Arg::Str(table)])
+    }
+
+    /// Error 8148, severity 16, state 0
+    /// (`CREATE TABLE dbo.t (a int DEFAULT 1 CONSTRAINT c DEFAULT 2);`): a column is given
+    /// two `DEFAULT` clauses.
+    ///
+    /// The `%ls` and `%S_MSG` are filled `DEFAULT` and `constraint`. `column` is the column
+    /// name as written (`CREATE TABLE dbo.t ([A col] int DEFAULT 1 CONSTRAINT c DEFAULT 2);`
+    /// prints `'A col'`). `table` is the table as written, schema included when it was
+    /// written (`CREATE TABLE dbo.t …` prints `'dbo.t'`, `CREATE TABLE t …` prints `'t'`).
+    ///
+    /// `CREATE TABLE dbo.t (a int DEFAULT 1 DEFAULT 2)`,
+    /// `CREATE TABLE dbo.t (a int DEFAULT 1 CONSTRAINT c DEFAULT 2)`,
+    /// `CREATE TABLE dbo.t (a int CONSTRAINT c DEFAULT 2 DEFAULT 1)` and
+    /// `CREATE TABLE dbo.t (a int CONSTRAINT c1 DEFAULT 1 CONSTRAINT c2 DEFAULT 2)` each
+    /// answer 8148. `CREATE TABLE dbo.t (a int CONSTRAINT da DEFAULT 1, b int CONSTRAINT db
+    /// DEFAULT 2)` does not: each column has one default
+    /// (`crates/vauban-catalog/tests/sys_constraints.rs`).
+    ///
+    /// ```text
+    /// A second DEFAULT constraint is refused for column 'a' of table 'dbo.t'.
+    /// ```
+    pub fn multiple_column_defaults(column: &str, table: &str) -> Self {
+        from_catalog(
+            8148,
+            0,
+            &[
+                Arg::Str("DEFAULT"),
+                Arg::Str("constraint"),
+                Arg::Str(column),
+                Arg::Str(table),
+            ],
+        )
     }
 
     // ---------------------------------------------------------------------------------
@@ -3888,6 +3939,7 @@ mod tests {
             SqlError::duplicate_column_in_index("a"),
             SqlError::duplicate_column_in_included_columns("a"),
             SqlError::could_not_create_constraint_or_index(),
+            SqlError::default_on_identity_column("t", "a"),
             SqlError::duplicate_name_in_this_context("c1"),
             SqlError::duplicate_index_name_in_this_context("ix_t"),
             SqlError::cannot_drop_constraint_index("dbo.t.pk_t", "PRIMARY KEY"),
@@ -3896,6 +3948,7 @@ mod tests {
             SqlError::cannot_find_object_to_index("dbo.nosuch"),
             SqlError::invalid_identity_column_type("a"),
             SqlError::identity_on_nullable_column("a", "dbo.t"),
+            SqlError::multiple_column_defaults("a", "dbo.t"),
             SqlError::invalid_object_name_of_another_type("sys.sp_executesql"),
             SqlError::collate_on_non_string_column("int"),
             SqlError::must_declare_table_variable("@tv"),
@@ -6146,6 +6199,55 @@ mod tests {
         );
     }
 
+    /// Error 8148 for `CREATE TABLE dbo.t (a int DEFAULT 1 CONSTRAINT c DEFAULT 2);`:
+    /// severity 16, state 0, the column then the table as written.
+    #[test]
+    fn multiple_column_defaults_8148() {
+        let err = SqlError::multiple_column_defaults("a", "dbo.t");
+        assert_eq!(err.number, 8148);
+        assert_eq!(err.severity, 16);
+        assert_eq!(err.state, 0);
+        assert_eq!(
+            err.message,
+            "A second DEFAULT constraint is refused for column 'a' of table 'dbo.t'."
+        );
+        assert_eq!(err.line, 0);
+        assert_eq!(err.procedure, None);
+
+        let quoted = SqlError::multiple_column_defaults("A col", "dbo.T Q");
+        assert_eq!(
+            quoted.message,
+            "A second DEFAULT constraint is refused for column 'A col' of table 'dbo.T Q'."
+        );
+        let unqualified = SqlError::multiple_column_defaults("a", "t");
+        assert_eq!(
+            unqualified.message,
+            "A second DEFAULT constraint is refused for column 'a' of table 't'."
+        );
+    }
+
+    /// Error 1754 for `CREATE TABLE dbo.t (a int IDENTITY DEFAULT 1);`: severity 16,
+    /// state 0, the table without its schema then the column.
+    #[test]
+    fn default_on_identity_column_1754() {
+        let err = SqlError::default_on_identity_column("t", "a");
+        assert_eq!(err.number, 1754);
+        assert_eq!(err.severity, 16);
+        assert_eq!(err.state, 0);
+        assert_eq!(
+            err.message,
+            "A DEFAULT cannot sit on an IDENTITY column. Table 't', column 'a'."
+        );
+        assert_eq!(err.line, 0);
+        assert_eq!(err.procedure, None);
+
+        let quoted = SqlError::default_on_identity_column("T I", "A col");
+        assert_eq!(
+            quoted.message,
+            "A DEFAULT cannot sit on an IDENTITY column. Table 'T I', column 'A col'."
+        );
+    }
+
     /// Error 2715 has two states for one sentence: 3 for a scalar declaration and a
     /// routine parameter, 6 for the column list of a table.
     #[test]
@@ -6685,6 +6787,14 @@ mod tests {
                 "The constraint or index was not created; the previous errors say why.".to_owned(),
             ),
             (
+                // CREATE TABLE dbo.t (a int IDENTITY DEFAULT 1);
+                SqlError::default_on_identity_column("t", "a"),
+                1754,
+                16,
+                0,
+                "A DEFAULT cannot sit on an IDENTITY column. Table 't', column 'a'.".to_owned(),
+            ),
+            (
                 // CREATE TABLE dbo.t (a int NOT NULL CONSTRAINT c1 PRIMARY KEY, b int NOT NULL CONSTRAINT c1 UNIQUE);
                 SqlError::duplicate_name_in_this_context("c1"),
                 8168,
@@ -6748,6 +6858,15 @@ mod tests {
                 16,
                 1,
                 "Column 'a' of table 'dbo.t' is nullable and cannot be an IDENTITY column."
+                    .to_owned(),
+            ),
+            (
+                // CREATE TABLE dbo.t (a int DEFAULT 1 CONSTRAINT c DEFAULT 2);
+                SqlError::multiple_column_defaults("a", "dbo.t"),
+                8148,
+                16,
+                0,
+                "A second DEFAULT constraint is refused for column 'a' of table 'dbo.t'."
                     .to_owned(),
             ),
             (
@@ -6890,11 +7009,11 @@ mod tests {
             );
             assert_eq!(err.line, 0, "line of error {number}");
         }
-        assert_eq!(expected.len(), 33);
+        assert_eq!(expected.len(), 35);
         let mut numbers: Vec<u32> = expected.iter().map(|row| row.1).collect();
         numbers.sort_unstable();
         numbers.dedup();
-        assert_eq!(numbers.len(), 28);
+        assert_eq!(numbers.len(), 30);
     }
 
     /// Error 1909 sends two states, so it carries two constructors rather than a state

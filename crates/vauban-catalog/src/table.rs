@@ -216,6 +216,14 @@ struct TableEntry {
 ///
 /// - 2714 when the database already holds a table of that schema and name (`tests/table.rs`,
 ///   `a_second_table_of_the_same_name_is_2714`);
+/// - 8148 when a column of `def` carries two `DEFAULT` clauses — an unnamed default on the
+///   column plus a `ConstraintDef::Default`, two named `DEFAULT` constraints, or two unnamed
+///   `DEFAULT` constraints — (`tests/sys_constraints.rs`,
+///   `two_defaults_on_one_column_are_8148`);
+/// - 1754 when a column of `def` is `IDENTITY` and also carries a `DEFAULT`, unnamed or
+///   named (`tests/sys_constraints.rs`, `identity_and_default_are_1754`); 8148 is raised
+///   before 1754 when the same column has two defaults and is `IDENTITY`
+///   (`tests/sys_constraints.rs`, `two_defaults_on_identity_are_8148_not_1754`);
 /// - [`InternalError::Bug`] when `def` carries no column, more than one `IDENTITY` column —
 ///   2744 is raised before the catalogue, by the binder (`tests/table.rs`,
 ///   `two_identity_columns_are_a_bug`) — or a database name that resolves to nothing, name
@@ -253,6 +261,7 @@ pub(crate) fn create_table(
         ))
         .into());
     }
+    refuse_invalid_defaults(def)?;
     let columns = column_metas(def)?;
     // Before `storage.create_table`: the clustered key is a field of the shape, and a
     // definition the catalogue refuses must leave nothing behind. `table_keys` owns the
@@ -325,6 +334,59 @@ pub(crate) fn create_table(
         },
     );
     Ok(meta)
+}
+
+/// Refuses a `CREATE TABLE` whose column list would give a column two `DEFAULT` values
+/// (8148) or a `DEFAULT` on an `IDENTITY` column (1754).
+///
+/// 8148 is raised before 1754 when a column has both faults, and both are raised before
+/// 2714 so a second `CREATE TABLE` of an existing name that also has two defaults answers
+/// 8148 (`tests/sys_constraints.rs`, `two_defaults_on_one_column_are_8148`,
+/// `identity_and_default_are_1754`, `two_defaults_on_identity_are_8148_not_1754`,
+/// `two_defaults_on_an_existing_name_are_8148`).
+fn refuse_invalid_defaults(def: &TableDef) -> SqlResult<()> {
+    let table_8148 = table_name_for_8148(def);
+    for column in &def.columns {
+        let extras = default_constraints_on(def, &column.name);
+        let unnamed = usize::from(column.default.is_some());
+        if unnamed + extras >= 2 {
+            return Err(SqlError::multiple_column_defaults(
+                &column.name,
+                &table_8148,
+            ));
+        }
+        if column.identity.is_some() && (column.default.is_some() || extras >= 1) {
+            return Err(SqlError::default_on_identity_column(
+                &def.name.name,
+                &column.name,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How many `ConstraintDef::Default` of `def` name `column`, compared without ASCII case.
+fn default_constraints_on(def: &TableDef, column: &str) -> usize {
+    def.constraints
+        .iter()
+        .filter(|constraint| {
+            matches!(
+                constraint,
+                ConstraintDef::Default { column: target, .. }
+                    if target.eq_ignore_ascii_case(column)
+            )
+        })
+        .count()
+}
+
+/// The table name 8148 prints: `schema.name` when the schema is filled, the object name
+/// alone when it is empty (`tests/sys_constraints.rs`, `two_defaults_on_one_column_are_8148`).
+fn table_name_for_8148(def: &TableDef) -> String {
+    if def.name.schema.is_empty() {
+        def.name.name.clone()
+    } else {
+        format!("{}.{}", def.name.schema, def.name.name)
+    }
 }
 
 /// Changes the shape of a table. See [`Catalog::alter_table`].

@@ -584,6 +584,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "The constraint or index was not created; the previous errors say why.",
     },
     ErrorDef {
+        number: 1754,
+        severity: 16,
+        template: "A DEFAULT cannot sit on an IDENTITY column. Table '%.*ls', column '%.*ls'.",
+    },
+    ErrorDef {
         number: 1769,
         severity: 16,
         template: "Foreign key '%.*ls' names the column '%.*ls', which the referencing table '%.*ls' does not have.",
@@ -874,6 +879,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "Column '%.*ls' of table '%.*ls' is nullable and cannot be an IDENTITY column.",
     },
     ErrorDef {
+        number: 8148,
+        severity: 16,
+        template: "A second %ls %S_MSG is refused for column '%.*ls' of table '%.*ls'.",
+    },
+    ErrorDef {
         number: 8152,
         severity: 16,
         template: "Data too long: the string or binary value would be cut.",
@@ -1114,6 +1124,7 @@ mod tests {
         (1205, 13, &["%d", "%.*ls"]),
         (1222, 16, &[]),
         (1750, 10, &[]),
+        (1754, 16, &["%.*ls", "%.*ls"]),
         (1769, 16, &["%.*ls", "%.*ls", "%.*ls"]),
         (1776, 16, &["%.*ls", "%.*ls"]),
         (1801, 16, &["%.*ls"]),
@@ -1172,6 +1183,7 @@ mod tests {
         (8145, 16, &["%.*ls", "%.*ls"]),
         (8146, 16, &["%.*ls"]),
         (8147, 16, &["%.*ls", "%.*ls"]),
+        (8148, 16, &["%ls", "%S_MSG", "%.*ls", "%.*ls"]),
         (8152, 16, &[]),
         (8153, 10, &[]),
         (8154, 15, &["%.*ls"]),
