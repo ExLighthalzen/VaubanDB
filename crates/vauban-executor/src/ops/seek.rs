@@ -39,19 +39,26 @@
 //! As for a `TableScan`, the `index` of each [`ColumnBinding`] is the position of the
 //! value in the row the storage hands out, and the answer keeps the columns of the node
 //! in the order of the node (`tests/seek.rs`, `seek_projects_the_plan_columns`).
+//!
+//! # One lock per row handed over
+//!
+//! A row a seek reaches is locked, read and released exactly as a row a scan reaches
+//! (`ops/scan.rs`). A lock names a table and a row, never an index, so the table the index
+//! belongs to is part of what the first `open` looks up and keeps, next to the key columns.
 
 use std::cmp::Ordering;
 use std::ops::Bound;
 
-use vauban_binder::{BoundExpr, ColumnBinding, OutputSchema};
+use vauban_binder::{BoundExpr, ColumnBinding, LockHints, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{KeyRangeExpr, PhysicalPlan};
-use vauban_storage::{Direction, IndexId, KeyColumn, KeyRange, RowIter, Storage};
+use vauban_storage::{Direction, IndexId, KeyColumn, KeyRange, RowIter, Storage, TableId};
 use vauban_types::{Collation, TypeInfo, Value, compare, convert};
 
 use crate::context::ExecContext;
 use crate::errors::at;
 use crate::expr::eval_expr;
+use crate::locking::{self, RowVisibility};
 use crate::operator::Operator;
 use crate::row::Row;
 
@@ -63,9 +70,11 @@ struct IndexSeek<'a> {
     columns: Vec<ColumnBinding>,
     direction: Direction,
     schema: OutputSchema,
-    /// The key columns of the index, read from the storage by the first `open` and kept
-    /// for the next ones.
-    key: Option<Vec<KeyColumnType>>,
+    /// The locking words written on the table reference, read once per row.
+    hints: LockHints,
+    /// The table the index belongs to and the key columns of the index, read from the
+    /// storage by the first `open` and kept for the next ones.
+    key: Option<(TableId, Vec<KeyColumnType>)>,
     /// The iterator of `storage.seek`, `Some` between `open` and the end of the rows.
     iter: Option<Box<dyn RowIter + 'a>>,
 }
@@ -89,7 +98,7 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         columns,
         direction,
         schema,
-        hints: _,
+        hints,
     } = plan
     else {
         return Err(bug("IndexSeek: the node is not an IndexSeek"));
@@ -107,6 +116,7 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         columns: columns.clone(),
         direction: *direction,
         schema: schema.clone(),
+        hints: *hints,
         key: None,
         iter: None,
     }))
@@ -126,16 +136,16 @@ impl<'a> Operator<'a> for IndexSeek<'a> {
     fn open(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<()> {
         self.iter = None;
         let storage = ctx.storage()?;
-        let snap = ctx.snapshot()?;
+        let snap = locking::snapshot_for_scan(ctx, &self.hints)?;
         if self.key.is_none() {
             self.key = Some(key_columns_of(storage, self.index)?);
         }
         // Filled just above: the default is not reached.
-        let key = self.key.as_deref().unwrap_or_default();
-        let Some(range) = evaluate_range(&self.range, key, ctx)? else {
+        let key = self.key.as_ref().map(|(_, key)| key.as_slice());
+        let Some(range) = evaluate_range(&self.range, key.unwrap_or_default(), ctx)? else {
             return Ok(());
         };
-        self.iter = Some(storage.seek(snap, self.index, &range, self.direction)?);
+        self.iter = Some(storage.seek(&snap, self.index, &range, self.direction)?);
         Ok(())
     }
 
@@ -147,37 +157,55 @@ impl<'a> Operator<'a> for IndexSeek<'a> {
     /// An `Err` item of the iterator, which ends the iteration, and the internal error
     /// 50000 for an `index` past the end of the row the storage handed out.
     fn next(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<Option<Row>> {
-        let Some(iter) = self.iter.as_mut() else {
-            return Ok(None);
-        };
-        if ctx.cancelled() {
-            self.iter = None;
-            return Ok(None);
-        }
-        let source = match iter.next() {
-            None => {
+        loop {
+            let Some(iter) = self.iter.as_mut() else {
+                return Ok(None);
+            };
+            if ctx.cancelled() {
                 self.iter = None;
                 return Ok(None);
             }
-            Some(Err(err)) => {
-                self.iter = None;
-                return Err(err);
+            let (id, mut source) = match iter.next() {
+                None => {
+                    self.iter = None;
+                    return Ok(None);
+                }
+                Some(Err(err)) => {
+                    self.iter = None;
+                    return Err(err);
+                }
+                Some(Ok(pair)) => pair,
+            };
+            let table = match &self.key {
+                Some((table, _)) => *table,
+                // `open` fills it before the first row: an operator that produced a row
+                // without looking its index up is a bug of this file.
+                None => return Err(bug("IndexSeek: the table of the index is not known")),
+            };
+            match locking::read_lock(ctx, table, id, &self.hints)? {
+                RowVisibility::Skip => continue,
+                RowVisibility::Latest => {
+                    if let Some((_, latest)) = ctx.storage()?.latest_version(table, id)? {
+                        source = latest;
+                    }
+                }
+                RowVisibility::Visible => {}
             }
-            Some(Ok((_, source))) => source,
-        };
-        let mut row = Vec::with_capacity(self.columns.len());
-        for binding in &self.columns {
-            let value = source.0.get(binding.index).ok_or_else(|| {
-                bug(&format!(
-                    "IndexSeek: column `{}` is at index {} of a row of {} value(s)",
-                    binding.name,
-                    binding.index,
-                    source.0.len()
-                ))
-            })?;
-            row.push(value.clone());
+            let mut row = Vec::with_capacity(self.columns.len());
+            for binding in &self.columns {
+                let value = source.0.get(binding.index).ok_or_else(|| {
+                    bug(&format!(
+                        "IndexSeek: column `{}` is at index {} of a row of {} value(s)",
+                        binding.name,
+                        binding.index,
+                        source.0.len()
+                    ))
+                })?;
+                row.push(value.clone());
+            }
+            locking::end_row_read(ctx, table, id)?;
+            return Ok(Some(row));
         }
-        Ok(Some(row))
     }
 
     fn close(&mut self) {
@@ -189,26 +217,31 @@ impl<'a> Operator<'a> for IndexSeek<'a> {
     }
 }
 
-/// The key columns of `index`, found by walking the databases, tables and indexes of
-/// the storage: the shape of the index says which columns of its table form the key, the
-/// shape of the table says their type.
+/// The table `index` belongs to and the key columns of `index`, found by walking the
+/// databases, tables and indexes of the storage: the shape of the index says which columns
+/// of its table form the key, the shape of the table says their type. The table comes back
+/// with them because a row lock names a table and a row, and the node names an index.
 ///
 /// # Errors
 ///
 /// What the introspection of the storage raises. The internal error 50000 for an index
 /// no table of no database holds (`tests/seek.rs`, `seek_on_an_unknown_index_is_a_bug`).
-fn key_columns_of(storage: &dyn Storage, index: IndexId) -> SqlResult<Vec<KeyColumnType>> {
+fn key_columns_of(
+    storage: &dyn Storage,
+    index: IndexId,
+) -> SqlResult<(TableId, Vec<KeyColumnType>)> {
     for (db, _) in storage.databases()? {
         for (table, shape) in storage.tables(db)? {
             for (candidate, def) in storage.indexes(table)? {
                 if candidate != index {
                     continue;
                 }
-                return def
+                let key: Vec<KeyColumnType> = def
                     .columns
                     .iter()
                     .map(|column| key_column_type(column, &shape.columns, index))
-                    .collect();
+                    .collect::<SqlResult<_>>()?;
+                return Ok((table, key));
             }
         }
     }

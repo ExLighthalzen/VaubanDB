@@ -11,6 +11,7 @@ use crate::context::ExecContext;
 use crate::dml::assign::assign_value;
 use crate::errors::at;
 use crate::expr::eval_expr;
+use crate::locking;
 use crate::row::{ExecOutcome, Row};
 
 /// Runs one `UPDATE`.
@@ -41,6 +42,7 @@ pub(crate) fn execute_update(
             new_row[binding.index] = assign_value(expr_value, &expr.ty, col_meta)?;
         }
 
+        locking::write_lock(ctx, stmt.table, *row_id)?;
         let decision = txn_mgr.check_write_conflict(handle, stmt.table, *row_id)?;
         match decision {
             WriteDecision::Proceed => {
@@ -106,6 +108,7 @@ pub(crate) fn execute_delete(
 
     let mut count: u64 = 0;
     for (row_id, _) in &materialized {
+        locking::write_lock(ctx, stmt.table, *row_id)?;
         let decision = txn_mgr.check_write_conflict(handle, stmt.table, *row_id)?;
         match decision {
             WriteDecision::Proceed => {

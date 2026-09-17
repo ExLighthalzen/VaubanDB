@@ -4,7 +4,7 @@ use vauban_catalog::{Catalog, ColumnMeta, ObjectId};
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{Expr, Literal, UnaryOp};
 use vauban_planner::PhysicalInsert;
-use vauban_storage::{Storage, TableId, TxnId};
+use vauban_storage::{RowId, Storage, TableId, TxnId};
 use vauban_txn::TxnHandle;
 use vauban_types::{
     BinaryOp, Decimal, LiteralKind, SqlType, TypeInfo, Value, eval_binary, parse_literal,
@@ -13,6 +13,7 @@ use vauban_types::{
 use crate::context::ExecContext;
 use crate::dml::assign::assign_value;
 use crate::errors::at;
+use crate::locking;
 use crate::operator::build_operator;
 use crate::row::{ExecOutcome, Row};
 
@@ -63,7 +64,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
 
     if stmt.spool {
         for row in &rows {
-            write_one(
+            let id = write_one(
                 row,
                 stmt,
                 &col_metas,
@@ -75,6 +76,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 catalog,
                 handle,
             )?;
+            locking::write_lock(ctx, table_id, id)?;
             count += 1;
         }
     } else {
@@ -84,7 +86,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 root.close();
                 return Ok(ExecOutcome::Cancelled);
             }
-            write_one(
+            let id = write_one(
                 &row,
                 stmt,
                 &col_metas,
@@ -96,6 +98,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 catalog,
                 handle,
             )?;
+            locking::write_lock(ctx, table_id, id)?;
             count += 1;
         }
         root.close();
@@ -107,6 +110,13 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
     Ok(ExecOutcome::NoRows)
 }
 
+/// Builds the storage row of one source row and writes it, answering the identifier the
+/// storage gave it.
+///
+/// The exclusive lock of that row is taken by the caller, on the identifier this function
+/// answers: a lock names a row, and the row has no identifier before it is written. Nothing
+/// reads the row in between — another transaction sees neither the version nor its
+/// identifier until this one commits.
 #[allow(clippy::too_many_arguments)]
 fn write_one(
     row: &[Value],
@@ -119,7 +129,7 @@ fn write_one(
     storage: &dyn Storage,
     catalog: &Catalog,
     handle: &TxnHandle,
-) -> SqlResult<()> {
+) -> SqlResult<RowId> {
     let mut output = vec![Value::Null; col_metas.len()];
     let mut covered: HashSet<usize> = HashSet::new();
     for (i, binding) in stmt.columns.iter().enumerate() {
@@ -158,8 +168,7 @@ fn write_one(
             0,
         ));
     }
-    storage.insert(txn_id, table_id, &vauban_storage::Row(output))?;
-    Ok(())
+    storage.insert(txn_id, table_id, &vauban_storage::Row(output))
 }
 
 /// 515 for a `NULL` landing in a column that refuses it, whichever way the value reached

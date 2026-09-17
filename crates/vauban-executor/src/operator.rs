@@ -83,8 +83,9 @@ pub fn build_operator<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a>
             table,
             columns,
             schema,
+            hints,
             ..
-        } => ops::scan::build(*table, columns, schema),
+        } => ops::scan::build(*table, columns, schema, *hints),
         PhysicalPlan::IndexSeek { .. } => ops::seek::build(plan),
         PhysicalPlan::Filter { input, predicate } => ops::filter::build(input, predicate),
         PhysicalPlan::Project {

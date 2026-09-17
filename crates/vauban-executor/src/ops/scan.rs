@@ -26,12 +26,25 @@
 //! The [`ColumnId`](vauban_catalog::ColumnId) a binding also carries is not consulted
 //! here: it identifies the column for the catalogue and survives the drop of a column
 //! before it, which makes it useless as a position.
+//!
+//! # One lock per row handed over
+//!
+//! The [`LockHints`] written on the table reference travel with the node, and each row the
+//! iterator reaches goes through [`crate::locking::read_lock`] before its values are
+//! copied out, then through [`crate::locking::end_row_read`] once they are: a row read at
+//! `READ COMMITTED` therefore holds its shared lock for the width of one row and no longer
+//! (`tests/locking.rs`, `read_committed_blocks_on_a_written_row`). A row `READPAST` leaves
+//! out is stepped over and the scan goes on to the next one, so a scan of three rows one of
+//! which is held answers two (`tests/locking.rs`, `readpast_skips_the_locked_row`); a dirty
+//! read answers the latest version of the row instead of the one the iterator produced
+//! (`tests/locking.rs`, `nolock_reads_the_uncommitted_row`).
 
-use vauban_binder::{ColumnBinding, OutputSchema};
+use vauban_binder::{ColumnBinding, LockHints, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::{RowIter, TableId};
 
 use crate::context::ExecContext;
+use crate::locking::{self, RowVisibility};
 use crate::operator::Operator;
 use crate::row::Row;
 
@@ -41,6 +54,8 @@ struct TableScan<'a> {
     table: TableId,
     columns: Vec<ColumnBinding>,
     schema: OutputSchema,
+    /// The locking words written on the table reference, read once per row.
+    hints: LockHints,
     /// The iterator of `storage.scan`, `Some` between `open` and the end of the rows.
     iter: Option<Box<dyn RowIter + 'a>>,
 }
@@ -59,6 +74,7 @@ pub(crate) fn build<'a>(
     table: TableId,
     columns: &[ColumnBinding],
     schema: &OutputSchema,
+    hints: LockHints,
 ) -> SqlResult<Box<dyn Operator<'a> + 'a>> {
     if schema.columns.len() != columns.len() {
         return Err(bug(&format!(
@@ -71,6 +87,7 @@ pub(crate) fn build<'a>(
         table,
         columns: columns.to_vec(),
         schema: schema.clone(),
+        hints,
         iter: None,
     }))
 }
@@ -85,45 +102,59 @@ impl<'a> Operator<'a> for TableScan<'a> {
     /// The internal error 50000 of a context with no engine ([`ExecContext::storage`]).
     fn open(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<()> {
         let storage = ctx.storage()?;
-        let snap = ctx.snapshot()?;
-        self.iter = Some(storage.scan(snap, self.table)?);
+        let snap = locking::snapshot_for_scan(ctx, &self.hints)?;
+        self.iter = Some(storage.scan(&snap, self.table)?);
         Ok(())
     }
 
-    /// The next visible row, its columns picked by `index`.
+    /// The next visible row, its columns picked by `index`, once the row lock its hints and
+    /// its level ask for is taken. A row `READPAST` leaves out is stepped over.
     ///
     /// # Errors
     ///
-    /// An `Err` item of the iterator, which ends the iteration, and the internal error
-    /// 50000 for an `index` past the end of the row `storage` handed out.
-    fn next(&mut self, _ctx: &mut ExecContext<'a>) -> SqlResult<Option<Row>> {
-        let Some(iter) = self.iter.as_mut() else {
-            return Ok(None);
-        };
-        let source = match iter.next() {
-            None => {
-                self.iter = None;
+    /// An `Err` item of the iterator, which ends the iteration; what a refused lock raises
+    /// (1222, 1205); the internal error 50000 for an `index` past the end of the row
+    /// `storage` handed out.
+    fn next(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<Option<Row>> {
+        loop {
+            let Some(iter) = self.iter.as_mut() else {
                 return Ok(None);
+            };
+            let (id, mut source) = match iter.next() {
+                None => {
+                    self.iter = None;
+                    return Ok(None);
+                }
+                Some(Err(err)) => {
+                    self.iter = None;
+                    return Err(err);
+                }
+                Some(Ok(pair)) => pair,
+            };
+            match locking::read_lock(ctx, self.table, id, &self.hints)? {
+                RowVisibility::Skip => continue,
+                RowVisibility::Latest => {
+                    if let Some((_, latest)) = ctx.storage()?.latest_version(self.table, id)? {
+                        source = latest;
+                    }
+                }
+                RowVisibility::Visible => {}
             }
-            Some(Err(err)) => {
-                self.iter = None;
-                return Err(err);
+            let mut row = Vec::with_capacity(self.columns.len());
+            for binding in &self.columns {
+                let value = source.0.get(binding.index).ok_or_else(|| {
+                    bug(&format!(
+                        "TableScan: column `{}` is at index {} of a row of {} value(s)",
+                        binding.name,
+                        binding.index,
+                        source.0.len()
+                    ))
+                })?;
+                row.push(value.clone());
             }
-            Some(Ok((_, source))) => source,
-        };
-        let mut row = Vec::with_capacity(self.columns.len());
-        for binding in &self.columns {
-            let value = source.0.get(binding.index).ok_or_else(|| {
-                bug(&format!(
-                    "TableScan: column `{}` is at index {} of a row of {} value(s)",
-                    binding.name,
-                    binding.index,
-                    source.0.len()
-                ))
-            })?;
-            row.push(value.clone());
+            locking::end_row_read(ctx, self.table, id)?;
+            return Ok(Some(row));
         }
-        Ok(Some(row))
     }
 
     fn close(&mut self) {
