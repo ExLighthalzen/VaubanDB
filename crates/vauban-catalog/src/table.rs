@@ -59,7 +59,7 @@ use vauban_txn::{CommitAction, RollbackAction, TxnHandle};
 use vauban_types::TypeInfo;
 
 use crate::catalog::{Catalog, not_implemented};
-use crate::def::TableDef;
+use crate::def::{ConstraintDef, TableDef};
 use crate::ids::{ColumnId, ObjectId};
 use crate::meta::{AlterTable, ColumnMeta, TableMeta};
 
@@ -299,6 +299,20 @@ pub(crate) fn create_table(
     // objects of the catalogue, after the keys so that a foreign key pointing at the table
     // being created finds its index (`constraints.rs`).
     crate::constraints::apply_table_constraints(&mut store, def, &mut meta)?;
+    // A named `DEFAULT` constraint fills the default of its column when the column does
+    // not carry one: the executor reads `ColumnMeta::default`, and the constraint keeps its
+    // name in `meta.constraints` for the catalogue views.
+    for constraint in &def.constraints {
+        if let ConstraintDef::Default { column, expr, .. } = constraint
+            && let Some(meta_column) = meta
+                .columns
+                .iter_mut()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(column))
+            && meta_column.default.is_none()
+        {
+            meta_column.default = Some(expr.clone());
+        }
+    }
     // The metadata is final here — the keys of `apply_table_keys` have filled
     // `meta.clustered` and `meta.constraints` — so this is where the rows the internal tables
     // carry about the table are written, inside `txn` (`sys_rows.rs`).

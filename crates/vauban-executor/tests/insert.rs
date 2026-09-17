@@ -7,7 +7,7 @@ use vauban_binder::{
     BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LockHints, OutputColumn, OutputSchema,
     SessionOptions,
 };
-use vauban_catalog::{Catalog, ColumnDef, IdentitySpec, QualifiedName, TableDef};
+use vauban_catalog::{Catalog, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, TableDef};
 use vauban_executor::{ExecContext, ExecSession, execute_collect};
 use vauban_parser::{Expr, Literal, Span};
 use vauban_planner::{PhysicalInsert, PhysicalPlan, PhysicalStatement};
@@ -252,7 +252,89 @@ fn missing_column_takes_its_default() {
     let read_stmt = PhysicalStatement::Query(read_plan);
     let (_, set) = execute_collect(&read_stmt, &mut ctx).expect("scan succeeds");
     assert_eq!(set.rows.len(), 1, "one row was inserted");
-    assert_eq!(set.rows[0], vec![Value::I32(7), Value::I64(42)]);
+    assert_eq!(set.rows[0], vec![Value::I32(7), Value::I32(42)]);
+}
+
+#[test]
+fn missing_column_takes_its_named_default() {
+    let storage = Arc::new(MemoryStorage::new());
+    let txn_mgr = Arc::new(TransactionManager::new(
+        storage.clone() as Arc<dyn vauban_storage::Storage>
+    ));
+    let catalog = Catalog::bootstrap(storage.clone(), txn_mgr.clone()).expect("bootstrap succeeds");
+    let handle = txn_mgr.begin(IsolationLevel::ReadCommitted);
+    let meta = catalog
+        .create_table(
+            &handle,
+            &TableDef {
+                name: tbl_name("insert_test_named_default"),
+                columns: vec![
+                    ColumnDef {
+                        name: "a".to_owned(),
+                        ty: int(false),
+                        default: None,
+                        identity: None,
+                        computed: None,
+                    },
+                    ColumnDef {
+                        name: "b".to_owned(),
+                        ty: int(false),
+                        default: None,
+                        identity: None,
+                        computed: None,
+                    },
+                ],
+                constraints: vec![ConstraintDef::Default {
+                    name: Some("df_b".to_owned()),
+                    column: "b".to_owned(),
+                    expr: Expr::Literal(Literal::Integer("42".to_owned()), Span::EMPTY),
+                }],
+            },
+        )
+        .expect("create_table succeeds");
+
+    let stmt = PhysicalStatement::Insert(PhysicalInsert {
+        table: meta.storage_id,
+        columns: vec![col_binding(0, "a", int(false))],
+        source: values_plan(vec![vec![Value::I32(7)]], &[int(false)]),
+        spool: false,
+    });
+
+    let eval = StaticContext::default();
+    let snap = txn_mgr.statement_snapshot(&handle);
+    let mut session = ExecSession::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default())
+        .with_engine(
+            storage.as_ref() as &dyn vauban_storage::Storage,
+            txn_mgr.as_ref(),
+            &snap,
+        )
+        .with_catalog(&catalog)
+        .with_handle(&handle)
+        .with_session(&mut session);
+    let (outcome, _) = execute_collect(&stmt, &mut ctx).expect("INSERT succeeds");
+    assert!(matches!(outcome, vauban_executor::ExecOutcome::NoRows));
+
+    let read_plan = PhysicalPlan::TableScan {
+        table: meta.storage_id,
+        columns: vec![
+            col_binding(0, "a", int(false)),
+            col_binding(1, "b", int(false)),
+        ],
+        schema: OutputSchema {
+            columns: vec![out_col("a", int(false)), out_col("b", int(false))],
+        },
+        alias: "".to_owned(),
+        hints: LockHints::default(),
+    };
+    let read_stmt = PhysicalStatement::Query(read_plan);
+    let (_, set) = execute_collect(&read_stmt, &mut ctx).expect("scan succeeds");
+    assert_eq!(set.rows.len(), 1, "one row was inserted");
+    assert_eq!(
+        set.rows[0],
+        vec![Value::I32(7), Value::I32(42)],
+        "the named DEFAULT filled b"
+    );
 }
 
 #[test]

@@ -6,7 +6,7 @@ use vauban_parser::{Expr, Literal};
 use vauban_planner::PhysicalInsert;
 use vauban_storage::{Storage, TableId, TxnId};
 use vauban_txn::TxnHandle;
-use vauban_types::{Decimal, Value};
+use vauban_types::{Decimal, Len, SqlType, TypeInfo, Value};
 
 use crate::context::ExecContext;
 use crate::dml::assign::assign_value;
@@ -148,8 +148,10 @@ fn write_one(
             continue;
         }
         if let Some(ref default) = col_meta.default {
-            let value = eval_default(default)?;
-            output[ordinal] = value;
+            // The literal of the constraint follows the conversion an explicit value goes
+            // through: `eval_default` gives its own type, `assign_value` writes the column's.
+            let (value, from) = eval_default(default)?;
+            output[ordinal] = assign_value(value, &from, col_meta).map_err(|e| at(e, 0))?;
             continue;
         }
         if col_meta.ty.nullable {
@@ -166,9 +168,13 @@ fn write_one(
     Ok(())
 }
 
-fn eval_default(expr: &Expr) -> SqlResult<Value> {
+/// Evaluates the literal of a `DEFAULT` constraint, with the type it is written with.
+///
+/// The type is what [`assign_value`] converts from, so that an `int` column receives an
+/// `I32` and not the `I64` an integer literal is parsed into.
+fn eval_default(expr: &Expr) -> SqlResult<(Value, TypeInfo)> {
     match expr {
-        Expr::Literal(Literal::Null, _) => Ok(Value::Null),
+        Expr::Literal(Literal::Null, _) => Ok((Value::Null, TypeInfo::new(SqlType::Int, true))),
         Expr::Literal(Literal::Default, _) => Err(bug(
             "INSERT: DEFAULT keyword in a DEFAULT constraint is a self-reference",
         )),
@@ -176,12 +182,20 @@ fn eval_default(expr: &Expr) -> SqlResult<Value> {
             let n: i64 = text
                 .parse()
                 .map_err(|_| bug("INSERT: default integer literal does not parse"))?;
-            Ok(Value::I64(n))
+            Ok((Value::I64(n), TypeInfo::new(SqlType::BigInt, false)))
         }
-        Expr::Literal(Literal::Str { value, unicode: _ }, _) => {
-            Ok(Value::String(vauban_types::SqlString {
-                text: value.clone(),
-            }))
+        Expr::Literal(Literal::Str { value, unicode }, _) => {
+            let ty = if *unicode {
+                SqlType::NVarChar(Len::Max)
+            } else {
+                SqlType::VarChar(Len::Max)
+            };
+            Ok((
+                Value::String(vauban_types::SqlString {
+                    text: value.clone(),
+                }),
+                TypeInfo::new(ty, false),
+            ))
         }
         _ => Err(bug("INSERT: default expression is not a literal")),
     }
@@ -189,7 +203,6 @@ fn eval_default(expr: &Expr) -> SqlResult<Value> {
 
 fn identity_value(dec: &Decimal, col_meta: &ColumnMeta) -> SqlResult<Value> {
     let int_val = dec.mantissa;
-    use vauban_types::SqlType;
     match col_meta.ty.ty {
         SqlType::TinyInt => Ok(Value::I8(int_val as u8)),
         SqlType::SmallInt => Ok(Value::I16(int_val as i16)),

@@ -208,3 +208,38 @@ fn a_foreign_key_that_points_at_nothing_is_refused_by_create_table() {
     assert!(err.message.contains("1767"), "{}", err.message);
     txn.commit(handle).expect("commit");
 }
+
+#[test]
+fn a_named_default_fills_the_column_and_keeps_its_name() {
+    let (catalog, _storage, txn) = instance();
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let meta = catalog
+        .create_table(
+            &handle,
+            &TableDef {
+                name: QualifiedName {
+                    database: "master".to_owned(),
+                    schema: "dbo".to_owned(),
+                    name: "tbl_named_default".to_owned(),
+                },
+                columns: vec![
+                    column("id", SqlType::Int, None),
+                    column("amount", SqlType::Int, None),
+                ],
+                constraints: vec![ConstraintDef::Default {
+                    name: Some("df_amount".to_owned()),
+                    column: "amount".to_owned(),
+                    expr: integer("0"),
+                }],
+            },
+        )
+        .expect("a named DEFAULT is accepted");
+    txn.commit(handle).expect("commit");
+
+    // The column carries the expression, which is what the executor reads...
+    assert_eq!(meta.columns[1].default, Some(integer("0")));
+    // ...and the constraint keeps its name, which is what the catalogue views read.
+    let constraints = catalog.constraints_of(meta.id).expect("constraints_of");
+    assert_eq!(constraints.len(), 1);
+    assert_eq!(constraints[0].name.name, "df_amount");
+}

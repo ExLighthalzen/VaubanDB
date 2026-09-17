@@ -628,3 +628,59 @@ async fn empty_batch_gets_a_single_done() {
     drop(client);
     running.stop().await;
 }
+
+/// A named `DEFAULT` reaches the wire: the `INSERT` that omits the column succeeds, the
+/// value comes back as the column's own `int`, and the connection stays usable. A value
+/// written with the wrong Rust type closes the connection here, which is what this test
+/// catches.
+#[tokio::test]
+async fn a_named_default_is_written_and_read_over_the_wire() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let create = batch(
+        &mut client,
+        "CREATE TABLE dbo.t (id int NOT NULL, amount int NOT NULL CONSTRAINT df_amount DEFAULT 0)",
+    )
+    .await;
+    assert_eq!(
+        tokens(&create.payload),
+        vec![Tok::Done {
+            status: 0,
+            cur_cmd: 0,
+            row_count: 0,
+        }],
+        "the DDL answers one DONE"
+    );
+
+    let insert = batch(&mut client, "INSERT INTO dbo.t (id) VALUES (1)").await;
+    assert!(
+        !tokens(&insert.payload)
+            .iter()
+            .any(|token| matches!(token, Tok::Error { .. })),
+        "the named DEFAULT filled the column: {:?}",
+        tokens(&insert.payload)
+    );
+
+    let select = batch(&mut client, "SELECT amount FROM dbo.t").await;
+    assert_eq!(
+        tokens(&select.payload),
+        vec![
+            Tok::ColMetaData(vec![(0, INT4TYPE, "amount".to_owned())]),
+            Tok::Row(vec![0]),
+            Tok::Done {
+                status: DONE_COUNT,
+                cur_cmd: CUR_CMD_SELECT,
+                row_count: 1,
+            },
+        ],
+        "the value is read as an int, over a connection still open"
+    );
+
+    // The connection survived: a later batch still answers.
+    let after = batch(&mut client, "SELECT 1").await;
+    assert_eq!(tokens(&after.payload), select_1_tokens(false));
+
+    drop(client);
+    running.stop().await;
+}
