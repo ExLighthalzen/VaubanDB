@@ -200,7 +200,7 @@ pub enum PhysicalPlan {
         /// that order, whichever side was built from.
         schema: OutputSchema,
     },
-    /// Groups the rows of `input` through a hash table. Not produced yet.
+    /// Groups the rows of `input` through a hash table, in whichever order they arrive.
     HashAggregate {
         /// The rows to group.
         input: Box<PhysicalPlan>,
@@ -212,7 +212,7 @@ pub enum PhysicalPlan {
         /// [`LogicalPlan::Aggregate`](vauban_binder::LogicalPlan::Aggregate) orders them.
         schema: OutputSchema,
     },
-    /// Groups the rows of an input already ordered on `group_by`. Not produced yet.
+    /// Groups the rows of an input already ordered on `group_by`, one group at a time.
     StreamAggregate {
         /// The rows to group, ordered on the grouping keys.
         input: Box<PhysicalPlan>,
@@ -224,7 +224,10 @@ pub enum PhysicalPlan {
         /// [`PhysicalPlan::HashAggregate`].
         schema: OutputSchema,
     },
-    /// Orders the rows of `input`. Not produced yet.
+    /// Orders the rows of `input`.
+    ///
+    /// Built for an `ORDER BY` whose keys the input does not deliver already; `sort.rs`
+    /// says which ones it does.
     Sort {
         /// The rows to order.
         input: Box<PhysicalPlan>,
@@ -232,7 +235,7 @@ pub enum PhysicalPlan {
         keys: Vec<SortKey>,
     },
     /// Orders the rows of `input` and keeps the first ones, without sorting the whole
-    /// input. Not produced yet.
+    /// input.
     TopN {
         /// The rows to order.
         input: Box<PhysicalPlan>,
@@ -241,7 +244,7 @@ pub enum PhysicalPlan {
         /// How many rows to keep.
         top: BoundTop,
     },
-    /// Removes the duplicate rows of its input. Not produced yet.
+    /// Removes the duplicate rows of its input.
     Distinct(Box<PhysicalPlan>),
     /// Evaluates the subqueries an expression of `input` holds, once per row for a
     /// correlated one. Not produced yet.

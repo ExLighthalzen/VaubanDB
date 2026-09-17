@@ -263,15 +263,22 @@ fn a_join_with_an_equality_on_a_literal_produces_a_hash_join() {
     );
 }
 
+/// An aggregate over a scan produces a HashAggregate: the scan delivers no order, so the
+/// grouping goes through a hash table. With the aggregate rule written, the form that
+/// used to answer an internal error now plans (`tests/aggregate_sort.rs`).
 #[test]
-fn aggregate_is_not_implemented_yet() {
+fn an_aggregate_over_a_scan_produces_a_hash_aggregate() {
     let aggregate = LogicalPlan::Aggregate {
         input: Box::new(scan()),
         group_by: vec![literal(1)],
         aggregates: Vec::new(),
         schema: schema_of(&["n"]),
     };
-    assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(aggregate))));
+    let planned = plan_query(aggregate);
+    assert!(
+        matches!(&planned, PhysicalPlan::HashAggregate { .. }),
+        "expected a HashAggregate, got {planned:?}"
+    );
 }
 
 #[test]
@@ -538,11 +545,12 @@ fn control_flow_is_planned_branch_by_branch() {
     // A branch that reaches an unfilled node still fails the whole statement.
     let err = plan_error(BoundStatement::While {
         condition: id_equals_one(),
-        body: Box::new(BoundStatement::Query(Box::new(LogicalPlan::Aggregate {
-            input: Box::new(scan()),
-            group_by: vec![literal(1)],
-            aggregates: Vec::new(),
-            schema: schema_of(&["n"]),
+        body: Box::new(BoundStatement::Query(Box::new(LogicalPlan::SetOp {
+            op: SetOpKind::Union,
+            all: true,
+            left: Box::new(scan()),
+            right: Box::new(scan()),
+            schema: schema_of(&["id"]),
         }))),
     });
     assert_not_implemented(&err);

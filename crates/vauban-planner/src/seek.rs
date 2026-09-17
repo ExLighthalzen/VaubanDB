@@ -38,7 +38,9 @@
 //! `the_first_applicable_index_wins`). There is no comparison between two applicable
 //! indexes, no cost, and no preference for a unique index over a non-unique one; a
 //! cost-based choice belongs to a later version, where statistics exist. The seek is
-//! [`Direction::Forward`]; a rule that avoids a descending sort may flip it.
+//! built [`Direction::Forward`] and [`flip_direction`] turns it round when a descending
+//! order is asked for over the whole key (`tests/aggregate_sort.rs`,
+//! `a_descending_sort_flips_the_seek_direction`).
 //!
 //! # What is left out
 //!
@@ -50,7 +52,7 @@ use std::ops::Bound;
 
 use vauban_binder::{BoundExpr, BoundExprKind, CompareOp, LogicalOp};
 use vauban_errors::SqlResult;
-use vauban_storage::{Direction, IndexShape};
+use vauban_storage::{Direction, IndexId, IndexShape, KeyColumn, TableId};
 
 use crate::context::PlanContext;
 use crate::physical::{KeyRangeExpr, PhysicalPlan};
@@ -127,6 +129,41 @@ pub(crate) fn try_index_seek(
         }));
     }
     Ok(None)
+}
+
+/// The key columns of `index`, in key order, as the catalogue declares them on `table`.
+///
+/// An [`IndexSeek`](PhysicalPlan::IndexSeek) names its index and not its table, so the
+/// caller passes the table the read comes from; the empty vector when the catalogue
+/// declares no index of that identifier on it.
+pub(crate) fn index_key(index: IndexId, table: TableId, ctx: &PlanContext<'_>) -> Vec<KeyColumn> {
+    ctx.catalog
+        .indexes_of(table)
+        .into_iter()
+        .find(|(id, _)| *id == index)
+        .map(|(_, shape)| shape.columns)
+        .unwrap_or_default()
+}
+
+/// Turns the direction of the seek `plan` reads through, and answers whether it found one.
+///
+/// A seek walks the same keys in either direction, so reversing it changes the order the
+/// rows arrive in and nothing else. The walk goes down through the `Filter` a residual
+/// predicate left above the seek, which keeps the order of what it forwards, and stops at
+/// any other node: a `Top` truncates, so reversing what feeds it would change which rows
+/// come out (`tests/aggregate_sort.rs`, `a_descending_sort_flips_the_seek_direction`).
+pub(crate) fn flip_direction(plan: &mut PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::IndexSeek { direction, .. } => {
+            *direction = match direction {
+                Direction::Forward => Direction::Backward,
+                Direction::Backward => Direction::Forward,
+            };
+            true
+        }
+        PhysicalPlan::Filter { input, .. } => flip_direction(input),
+        _ => false,
+    }
 }
 
 /// One usable conjunction: a column of the scanned table, compared with a bound.
