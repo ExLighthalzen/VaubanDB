@@ -187,8 +187,46 @@ jobs:
           docker tag vauban:ci "${dest}"
           docker push "${dest}"
 
+  # Separate from `build`: no container image is produced for Windows, and the runner
+  # builds natively rather than inside rust:*-bookworm.
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      # aws-lc-sys (rustls) assembles its primitives with NASM, which the Windows runner
+      # image does not ship. The crate carries prebuilt objects for x86_64.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-x86_64-pc-windows-msvc
+      - name: Release binary
+        run: cargo build --release -p vauban-cli --target x86_64-pc-windows-msvc
+      - name: Check the binary
+        run: .\target\x86_64-pc-windows-msvc\release\vauban.exe version
+      - name: Archive zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "vauban-${{ needs.prepare.outputs.tag }}-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force -Path "dist/$name", artifacts | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/vauban.exe" "dist/$name/vauban.exe"
+          Copy-Item LICENSE "dist/$name/LICENSE"
+          Compress-Archive -Path "dist/$name" -DestinationPath "artifacts/$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vauban-x86_64-pc-windows-msvc
+          path: artifacts/*.zip
+          if-no-files-found: error
+
   publish:
-    needs: [prepare, build]
+    needs: [prepare, build, build-windows]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -204,7 +242,7 @@ jobs:
         run: |
           set -euo pipefail
           cd artifacts
-          sha256sum vauban-*.tar.gz | tee SHA256SUMS
+          sha256sum vauban-*.tar.gz vauban-*.zip | tee SHA256SUMS
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -232,11 +270,14 @@ jobs:
         with:
           files: |
             artifacts/vauban-*.tar.gz
+            artifacts/vauban-*.zip
             artifacts/SHA256SUMS
           fail_on_unmatched_files: true
           generate_release_notes: true
           prerelease: ${{ needs.prepare.outputs.stable != 'true' }}
           body: |
+            Archives: `.tar.gz` for `linux/amd64` and `linux/arm64`, `.zip` holding `vauban.exe` for `windows/x86_64`.
+
             GHCR images (`linux/amd64`, `linux/arm64`):
 
             ```
