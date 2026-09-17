@@ -11,13 +11,16 @@
 
 use std::fmt::Write;
 
-use crate::physical::PhysicalPlan;
+use crate::physical::{KeyRangeExpr, PhysicalPlan};
 
 /// Writes `plan` as one line per node, each indented by two spaces per level.
 ///
 /// The root is written at indentation zero and the lines are joined by `\n`, with no
 /// trailing newline: a `Project` over a `Filter` over a `TableScan` is three lines
 /// indented by 0, 2 and 4 spaces (`tests/trivial.rs`, `explain_writes_one_line_per_node`).
+///
+/// A node that holds a vector of inputs writes each of them one level deeper, as a node
+/// that holds one input does (`tests/setop.rs`, `explain_indents_union_inputs`).
 #[must_use]
 pub fn explain(plan: &PhysicalPlan) -> String {
     let mut out = String::new();
@@ -41,6 +44,10 @@ fn write_node(plan: &PhysicalPlan, depth: usize, out: &mut String) {
 }
 
 /// Writes the operator name of `plan` and the few details that tell two of them apart.
+///
+/// The match below is exhaustive, so a variant added to [`PhysicalPlan`] without a line
+/// here fails to compile; `tests/setop.rs`, `explain_names_every_variant` reads the name
+/// back from the output for each variant.
 fn write_label(plan: &PhysicalPlan, out: &mut String) -> std::fmt::Result {
     match plan {
         PhysicalPlan::OneRow => write!(out, "OneRow"),
@@ -49,8 +56,15 @@ fn write_label(plan: &PhysicalPlan, out: &mut String) -> std::fmt::Result {
             write!(out, "TableScan(table={table}, alias={alias})")
         }
         PhysicalPlan::IndexSeek {
-            index, direction, ..
-        } => write!(out, "IndexSeek(index={index}, direction={direction:?})"),
+            index,
+            range,
+            direction,
+            ..
+        } => write!(
+            out,
+            "IndexSeek(index={index}, range={}, direction={direction:?})",
+            range_kind(range)
+        ),
         PhysicalPlan::Filter { .. } => write!(out, "Filter"),
         PhysicalPlan::Project { exprs, .. } => write!(out, "Project(columns={})", exprs.len()),
         PhysicalPlan::Top { .. } => write!(out, "Top"),
@@ -87,6 +101,20 @@ fn write_label(plan: &PhysicalPlan, out: &mut String) -> std::fmt::Result {
         PhysicalPlan::Union { all, .. } => write!(out, "Union(all={all})"),
         PhysicalPlan::Except { all, .. } => write!(out, "Except(all={all})"),
         PhysicalPlan::Intersect { all, .. } => write!(out, "Intersect(all={all})"),
+    }
+}
+
+/// How much of an index a seek walks, in one word.
+///
+/// The bound expressions of the range are not written: they are evaluated at run time and
+/// a line of this output is meant to be read, not parsed. Which of the three shapes was
+/// chosen is what tells an access path from another (`tests/setop.rs`,
+/// `explain_names_every_variant`).
+fn range_kind(range: &KeyRangeExpr) -> &'static str {
+    match range {
+        KeyRangeExpr::Point(_) => "Point",
+        KeyRangeExpr::Between(..) => "Between",
+        KeyRangeExpr::Full => "Full",
     }
 }
 

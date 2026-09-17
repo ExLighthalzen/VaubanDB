@@ -449,7 +449,7 @@ fn dml_plans_to_physical_delete() {
 }
 
 #[test]
-fn a_set_operator_is_not_implemented_yet() {
+fn a_set_operator_plans_to_union() {
     let set_op = LogicalPlan::SetOp {
         op: SetOpKind::Union,
         all: true,
@@ -457,7 +457,11 @@ fn a_set_operator_is_not_implemented_yet() {
         right: Box::new(scan()),
         schema: schema_of(&["id"]),
     };
-    assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(set_op))));
+    let planned = plan_query(set_op);
+    assert!(
+        matches!(&planned, PhysicalPlan::Union { .. }),
+        "got {planned:?}"
+    );
 }
 
 #[test]
@@ -542,18 +546,31 @@ fn control_flow_is_planned_branch_by_branch() {
         Some(PhysicalStatement::Continue)
     ));
 
-    // A branch that reaches an unfilled node still fails the whole statement.
-    let err = plan_error(BoundStatement::While {
-        condition: id_equals_one(),
-        body: Box::new(BoundStatement::Query(Box::new(LogicalPlan::SetOp {
-            op: SetOpKind::Union,
-            all: true,
-            left: Box::new(scan()),
-            right: Box::new(scan()),
-            schema: schema_of(&["id"]),
-        }))),
-    });
-    assert_not_implemented(&err);
+    // A branch whose body is a set operation is planned like any other query.
+    let planned = plan(
+        BoundStatement::While {
+            condition: id_equals_one(),
+            body: Box::new(BoundStatement::Query(Box::new(LogicalPlan::SetOp {
+                op: SetOpKind::Union,
+                all: true,
+                left: Box::new(scan()),
+                right: Box::new(scan()),
+                schema: schema_of(&["id"]),
+            }))),
+        },
+        &context(&catalog),
+    )
+    .expect("the While plans");
+    let PhysicalStatement::While { body, .. } = &planned else {
+        panic!("expected a While, got {planned:?}")
+    };
+    assert!(
+        matches!(
+            body.as_ref(),
+            PhysicalStatement::Query(PhysicalPlan::Union { .. })
+        ),
+        "expected a Union in the body, got {body:?}"
+    );
 }
 
 #[test]
