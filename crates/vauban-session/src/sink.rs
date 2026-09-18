@@ -28,6 +28,9 @@ pub(crate) const CHANNEL_CAPACITY: usize = 256;
 /// `CurCmd` of the DONE token that closes a SELECT, as SQL Server sends it.
 pub(crate) const CUR_CMD_SELECT: u16 = 0xC1;
 
+/// `CurCmd` of the closing DONEPROC of a nested batch or an RPC.
+pub(crate) const CUR_CMD_PROC: u16 = 0xE0;
+
 /// Where the results of a statement go: implemented for TDS here, and by the recording
 /// sinks of the tests.
 ///
@@ -53,6 +56,17 @@ pub trait ResultSink {
     fn return_value(&mut self, name: &str, ty: &TypeInfo, value: &Value) -> SqlResult<()>;
     /// The return status of a stored procedure ([MS-TDS] 2.2.7 RETURNSTATUS).
     fn return_status(&mut self, status: i32) -> SqlResult<()>;
+    /// A statement ends inside a nested batch or a procedure ([MS-TDS] 2.2.7 DONEINPROC).
+    /// Nested batches emit one DONEINPROC per executed statement in the nested text;
+    /// plain SQL batches use [`done`] instead. The default delegates to [`done`].
+    fn done_in_proc(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
+        self.done(rowcount, more)
+    }
+    /// The nested batch or procedure ends: DONEPROC after the last DONEINPROC
+    /// ([MS-TDS] 2.2.7 DONEPROC). The default delegates to [`done`].
+    fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
+        self.done(rowcount, false)
+    }
 }
 
 /// Adapts [`executor::RowSink`] to a [`ResultSink`].
@@ -115,7 +129,7 @@ impl RowSink for RowSinkAdapter<'_> {
 /// The sender is owned by the sink and dropped with it, so the receiver sees the end of
 /// the channel exactly when the request is over: the connection task needs no other
 /// signal.
-pub(crate) struct TdsSink {
+pub struct TdsSink {
     tx: mpsc::Sender<Token>,
     /// `true` for an RPC: `done()` emits DONEPROC instead of DONE.
     rpc: bool,
@@ -127,7 +141,7 @@ pub(crate) struct TdsSink {
 
 impl TdsSink {
     /// A sink for a SQL batch: `done()` emits `Token::Done`.
-    pub(crate) fn new(tx: mpsc::Sender<Token>) -> Self {
+    pub fn new(tx: mpsc::Sender<Token>) -> Self {
         Self {
             tx,
             rpc: false,
@@ -153,6 +167,32 @@ impl TdsSink {
             .map_err(|_| InternalError::Bug("result channel closed by the connection task".into()))
             .map_err(SqlError::from)
     }
+
+    fn done_fields(
+        &self,
+        rowcount: Option<u64>,
+        more: bool,
+        proc_close: bool,
+    ) -> (DoneStatus, u16) {
+        let mut status = DoneStatus::FINAL;
+        if more {
+            status |= DoneStatus::MORE;
+        }
+        if rowcount.is_some() {
+            status |= DoneStatus::COUNT;
+        }
+        if self.error_since_done {
+            status |= DoneStatus::ERROR;
+        }
+        let cur_cmd = if proc_close {
+            CUR_CMD_PROC
+        } else if self.columns_since_done {
+            CUR_CMD_SELECT
+        } else {
+            0
+        };
+        (status, cur_cmd)
+    }
 }
 
 impl ResultSink for TdsSink {
@@ -166,21 +206,7 @@ impl ResultSink for TdsSink {
     }
 
     fn done(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
-        let mut status = DoneStatus::FINAL;
-        if more {
-            status |= DoneStatus::MORE;
-        }
-        if rowcount.is_some() {
-            status |= DoneStatus::COUNT;
-        }
-        if self.error_since_done {
-            status |= DoneStatus::ERROR;
-        }
-        let cur_cmd = if self.columns_since_done {
-            CUR_CMD_SELECT
-        } else {
-            0
-        };
+        let (status, cur_cmd) = self.done_fields(rowcount, more, false);
         self.error_since_done = false;
         self.columns_since_done = false;
         let token = if self.rpc {
@@ -197,6 +223,28 @@ impl ResultSink for TdsSink {
             }
         };
         self.send(token)
+    }
+
+    fn done_in_proc(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
+        let (status, cur_cmd) = self.done_fields(rowcount, more, false);
+        self.error_since_done = false;
+        self.columns_since_done = false;
+        self.send(Token::DoneInProc {
+            status,
+            cur_cmd,
+            row_count: rowcount,
+        })
+    }
+
+    fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
+        let (status, cur_cmd) = self.done_fields(rowcount, false, true);
+        self.error_since_done = false;
+        self.columns_since_done = false;
+        self.send(Token::DoneProc {
+            status,
+            cur_cmd,
+            row_count: rowcount,
+        })
     }
 
     fn info(&mut self, msg: &InfoMessage) -> SqlResult<()> {
@@ -403,6 +451,34 @@ mod tests {
                 Token::ReturnStatus(0),
             ]
         );
+    }
+
+    #[test]
+    fn done_in_proc_and_done_proc_match_procedure_shape() {
+        let (mut sink, mut rx) = sink();
+        sink.columns(&[int_column()]).unwrap();
+        sink.row(&[Value::I32(42)]).unwrap();
+        sink.done_in_proc(Some(1), true).unwrap();
+        sink.return_status(0).unwrap();
+        sink.done_proc(None).unwrap();
+        let tokens = drain(&mut rx);
+        assert!(matches!(
+            tokens[2],
+            Token::DoneInProc {
+                status,
+                cur_cmd: CUR_CMD_SELECT,
+                row_count: Some(1),
+            } if status.contains(DoneStatus::MORE | DoneStatus::COUNT)
+        ));
+        assert_eq!(tokens[3], Token::ReturnStatus(0));
+        assert!(matches!(
+            tokens[4],
+            Token::DoneProc {
+                status: DoneStatus::FINAL,
+                cur_cmd: CUR_CMD_PROC,
+                row_count: None,
+            }
+        ));
     }
 
     #[test]
