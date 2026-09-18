@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use vauban_catalog::{Catalog, ColumnDef, IdentitySpec, ObjectId, QualifiedName, TableDef};
+use vauban_errors::SqlError;
 use vauban_parser::{Expr, Literal, Span};
 use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager, TxnHandle};
@@ -589,4 +590,30 @@ fn a_second_catalogue_hands_out_other_object_ids() {
     txn.commit(handle).expect("commit");
     assert!(table_ids(&storage, db).contains(&old.storage_id));
     assert!(table_ids(&storage, db).contains(&new.storage_id));
+}
+
+/// `CREATE TABLE nosuchdb.dbo.t` answers 2702, severity 16, state 2.
+#[test]
+fn create_table_in_unknown_database_is_2702() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let err = catalog
+        .create_table(
+            &handle,
+            &TableDef {
+                name: QualifiedName {
+                    database: "nosuchdb".to_owned(),
+                    schema: "dbo".to_owned(),
+                    name: "t".to_owned(),
+                },
+                columns: vec![column("a", SqlType::Int, false)],
+                constraints: Vec::new(),
+            },
+        )
+        .expect_err("nosuchdb");
+    let expected = SqlError::database_does_not_exist("nosuchdb");
+    assert_eq!(err.number, 2702);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 2);
+    assert_eq!(err.message, expected.message);
 }

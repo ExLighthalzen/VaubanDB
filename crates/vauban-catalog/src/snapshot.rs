@@ -1251,6 +1251,8 @@ mod tests {
                 (3, "collation_name".to_owned(), 2, true),
                 (4, "is_read_committed_snapshot_on".to_owned(), 3, false),
                 (5, "snapshot_isolation_state".to_owned(), 4, false),
+                (6, "owner_sid".to_owned(), 5, true),
+                (7, "create_date".to_owned(), 6, false),
             ],
             "the identifier counts from 1, the ordinal from 0, the nullability is the declared one"
         );

@@ -225,11 +225,15 @@ pub(crate) mod objects_columns {
     pub(crate) const TYPE_DESC: usize = 6;
     /// `is_ms_shipped bit`: `1` for a system view, `0` for an object a client created.
     pub(crate) const IS_MS_SHIPPED: usize = 7;
+    /// `create_date datetime`: kept in sync with `views/sys_tables.rs`.
+    pub(crate) const CREATE_DATE: usize = 8;
+    /// `modify_date datetime`: kept in sync with `views/sys_tables.rs`.
+    pub(crate) const MODIFY_DATE: usize = 9;
     /// `max_column_id_used int`: no view of this file reads it; the column is here so that a
     /// row of the table of `views/sys_tables.rs` is a row of this one.
-    pub(crate) const MAX_COLUMN_ID_USED: usize = 8;
+    pub(crate) const MAX_COLUMN_ID_USED: usize = 10;
     /// Width of a row of the table.
-    pub(crate) const WIDTH: usize = 9;
+    pub(crate) const WIDTH: usize = 11;
 }
 
 /// Where each column of [`PARTITIONS_TABLE`] sits in a [`Row`]. Same rule as
@@ -643,6 +647,8 @@ fn system_view_rows(views: &[QualifiedName]) -> Vec<Row> {
             row[objects_columns::TYPE] = text(VIEW_TYPE);
             row[objects_columns::TYPE_DESC] = text(VIEW_TYPE_DESC);
             row[objects_columns::IS_MS_SHIPPED] = Value::Bit(true);
+            row[objects_columns::CREATE_DATE] = Value::Null;
+            row[objects_columns::MODIFY_DATE] = Value::Null;
             row[objects_columns::MAX_COLUMN_ID_USED] = Value::I32(0);
             Row(row)
         })

@@ -28,18 +28,16 @@
 //! counts them, `the_literal_columns_are_the_published_values` compares each literal with
 //! the row it comes from.
 //!
-//! `create_date` and `modify_date` are `CAST(NULL AS datetime)`: [`TableMeta`] carries no
-//! instant, as [`DatabaseMeta`](crate::DatabaseMeta) carries none for `sys.databases`.
-//! SQL Server publishes them as a non-nullable `datetime`.
+//! `create_date` and `modify_date` read [`OBJECTS_TABLE`]: the instant comes from the
+//! transaction that wrote the row, as for `sys.databases.create_date`.
 //!
 //! # Which objects have a row
 //!
 //! The rows of the two tables are built from the `*Meta` of the catalogue by [`object_rows`]
 //! and [`column_rows`] — a user table gives one row of type `U ` and one row per column
-//! (unit test `user_table_has_object_and_column_rows`). The internal `vauban_sys_*` tables
-//! have no row: `internal_tables` gives both tables an empty `rows`, and the internal names
-//! are out of what `sys.tables` publishes (unit test `internal_tables_are_not_user_tables`,
-//! which reads the rows of a catalogue holding one user table).
+//! (unit test `user_table_has_object_and_column_rows`). The internal `vauban_sys_*` tables of
+//! `master` are written at bootstrap with type `S ` / `SYSTEM_TABLE` (unit test
+//! `internal_tables_are_system_tables_in_sys_objects`).
 //!
 //! What that leaves aside: a fresh SQL Server database answers 111 rows to
 //! `SELECT COUNT(*) FROM sys.objects` — 72 of type `S `, 36 of type `IT`, 3 of type `SQ`,
@@ -57,9 +55,11 @@
 
 use vauban_errors::{InternalError, SqlResult};
 use vauban_storage::{DbId, Row};
+use vauban_txn::TxnHandle;
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
-use crate::bootstrap::{DEFAULT_COLLATION_NAME, SYSTEM_DATABASES, SYSTEM_SCHEMAS};
+use crate::bootstrap::{self, DEFAULT_COLLATION_NAME, SYSTEM_DATABASES, SYSTEM_SCHEMAS};
+use crate::catalog::Catalog;
 use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
 use crate::meta::{ColumnMeta, QualifiedName, TableMeta};
 
@@ -93,6 +93,16 @@ const USER_TABLE_TYPE_DESC: &str = "USER_TABLE";
 /// `parent_object_id` of an object that is not a constraint: `0`, not `NULL`.
 const NO_PARENT: i32 = 0;
 
+/// The [`ObjectId`](crate::ObjectId) of the first internal table of `master`; the next ones
+/// count up with the position of each description in [`bootstrap::internal_table_defs`].
+pub(crate) const FIRST_INTERNAL_TABLE_OBJECT_ID: i32 = 100_000;
+
+/// `sys.objects.type` of an internal table: a `char(2)`, so its second byte is a space.
+const SYSTEM_TABLE_TYPE: &str = "S ";
+
+/// The `type_desc` that goes with [`SYSTEM_TABLE_TYPE`].
+const SYSTEM_TABLE_TYPE_DESC: &str = "SYSTEM_TABLE";
+
 /// The `schema_id` written for a schema the bootstrap does not know.
 ///
 /// The three schemas of [`SYSTEM_SCHEMAS`] are the ones an instance holds (`CREATE SCHEMA`
@@ -122,10 +132,14 @@ pub(crate) mod objects_columns {
     pub(crate) const TYPE_DESC: usize = 6;
     /// `is_ms_shipped bit`: `0` for an object a client created.
     pub(crate) const IS_MS_SHIPPED: usize = 7;
+    /// `create_date datetime`: the instant the object was created.
+    pub(crate) const CREATE_DATE: usize = 8;
+    /// `modify_date datetime`: the instant the object was last changed by DDL.
+    pub(crate) const MODIFY_DATE: usize = 9;
     /// `max_column_id_used int`: read by `sys.tables`, not by `sys.objects`.
-    pub(crate) const MAX_COLUMN_ID_USED: usize = 8;
+    pub(crate) const MAX_COLUMN_ID_USED: usize = 10;
     /// Width of a row of the table.
-    pub(crate) const WIDTH: usize = 9;
+    pub(crate) const WIDTH: usize = 11;
 }
 
 /// Where each column of [`COLUMNS_TABLE`] sits in a [`Row`]. Same rule as
@@ -175,8 +189,8 @@ const OBJECTS_VIEW: [(&str, &str); 12] = [
     ("parent_object_id", "parent_object_id"),
     ("type", "type"),
     ("type_desc", "type_desc"),
-    ("create_date", "CAST(NULL AS datetime)"),
-    ("modify_date", "CAST(NULL AS datetime)"),
+    ("create_date", "create_date"),
+    ("modify_date", "modify_date"),
     ("is_ms_shipped", "is_ms_shipped"),
     ("is_published", "CAST(0 AS bit)"),
     ("is_schema_published", "CAST(0 AS bit)"),
@@ -195,8 +209,8 @@ const TABLES_VIEW: [(&str, &str); 48] = [
     ("parent_object_id", "parent_object_id"),
     ("type", "type"),
     ("type_desc", "type_desc"),
-    ("create_date", "CAST(NULL AS datetime)"),
-    ("modify_date", "CAST(NULL AS datetime)"),
+    ("create_date", "create_date"),
+    ("modify_date", "modify_date"),
     ("is_ms_shipped", "is_ms_shipped"),
     ("is_published", "CAST(0 AS bit)"),
     ("is_schema_published", "CAST(0 AS bit)"),
@@ -357,12 +371,27 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
 ///
 /// [`InternalError::Bug`] when a [`DbId`] does not fit in the `int` the view publishes,
 /// which is the check `bootstrap.rs` makes on the same value.
+/// Rows of [`OBJECTS_TABLE`] with undated `create_date` and `modify_date` columns.
+///
+/// Used by `views/sys_extra.rs` for `sys.all_objects`, which this task does not date.
 pub(crate) fn object_rows(tables: &[TableMeta]) -> SqlResult<Vec<Row>> {
-    tables.iter().map(object_row).collect()
+    dated_object_rows(tables, &Value::Null, &Value::Null)
+}
+
+/// Rows of [`OBJECTS_TABLE`] with the instants the caller supplies.
+pub(crate) fn dated_object_rows(
+    tables: &[TableMeta],
+    create_date: &Value,
+    modify_date: &Value,
+) -> SqlResult<Vec<Row>> {
+    tables
+        .iter()
+        .map(|table| object_row(table, create_date, modify_date))
+        .collect()
 }
 
 /// The row of [`OBJECTS_TABLE`] of one table. See [`object_rows`].
-fn object_row(table: &TableMeta) -> SqlResult<Row> {
+fn object_row(table: &TableMeta, create_date: &Value, modify_date: &Value) -> SqlResult<Row> {
     let max_column_id_used = table
         .columns
         .iter()
@@ -378,8 +407,71 @@ fn object_row(table: &TableMeta) -> SqlResult<Row> {
         text(USER_TABLE_TYPE),
         text(USER_TABLE_TYPE_DESC),
         Value::Bit(false),
+        create_date.clone(),
+        modify_date.clone(),
         Value::I32(max_column_id_used),
     ]))
+}
+
+/// The rows of [`OBJECTS_TABLE`] for the internal tables of `master`, one per description.
+pub(crate) fn internal_table_object_rows(
+    master: i32,
+    tables: &[InternalTableDef],
+    create_date: &Value,
+    modify_date: &Value,
+) -> SqlResult<Vec<Row>> {
+    tables
+        .iter()
+        .enumerate()
+        .map(|(position, def)| {
+            let rank = i32::try_from(position).map_err(|_| {
+                InternalError::Bug(format!(
+                    "sys.objects: internal table position {position} does not fit in an int"
+                ))
+            })?;
+            let object_id = FIRST_INTERNAL_TABLE_OBJECT_ID
+                .checked_add(rank)
+                .ok_or_else(|| {
+                    InternalError::Bug(format!(
+                        "sys.objects: internal table object id for position {position} overflows"
+                    ))
+                })?;
+            Ok(Row(vec![
+                Value::I32(master),
+                Value::I32(object_id),
+                text(&def.name),
+                Value::I32(schema_id("dbo")),
+                Value::I32(NO_PARENT),
+                text(SYSTEM_TABLE_TYPE),
+                text(SYSTEM_TABLE_TYPE_DESC),
+                Value::Bit(true),
+                create_date.clone(),
+                modify_date.clone(),
+                Value::I32(0),
+            ]))
+        })
+        .collect()
+}
+
+/// Writes the rows [`internal_table_object_rows`] builds into [`OBJECTS_TABLE`].
+pub(crate) fn write_internal_object_rows(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    master: DbId,
+    instant: Value,
+) -> SqlResult<()> {
+    let master_id = database_id(master)?;
+    let defs = bootstrap::internal_table_defs()?;
+    let rows = internal_table_object_rows(master_id, &defs, &instant, &instant)?;
+    let Some(table) = bootstrap::internal_table_id(catalog, OBJECTS_TABLE)? else {
+        return Err(
+            InternalError::Bug(format!("internal table {OBJECTS_TABLE} is missing")).into(),
+        );
+    };
+    for row in rows {
+        catalog.storage.insert(txn.id, table, &row)?;
+    }
+    Ok(())
 }
 
 /// The rows of [`COLUMNS_TABLE`] for `tables`: one per column, in `column_id` order within
@@ -582,6 +674,7 @@ fn database_id(id: DbId) -> SqlResult<i32> {
 ///
 /// Compared without regard to case, as `SQL_Latin1_General_CP1_CI_AS` compares identifiers.
 fn schema_id(name: &str) -> i32 {
+    let name = if name.is_empty() { "dbo" } else { name };
     SYSTEM_SCHEMAS
         .iter()
         .find(|(schema, _, _)| schema.eq_ignore_ascii_case(name))
@@ -599,6 +692,8 @@ fn objects_table_columns() -> Vec<InternalColumnDef> {
         column("type", SqlType::Char(Len::Fixed(2)), false),
         column("type_desc", SqlType::NVarChar(Len::Fixed(60)), false),
         column("is_ms_shipped", SqlType::Bit, false),
+        column("create_date", SqlType::DateTime, false),
+        column("modify_date", SqlType::DateTime, false),
         column("max_column_id_used", SqlType::Int, false),
     ]
 }
@@ -707,7 +802,7 @@ mod tests {
     use vauban_txn::{IsolationLevel, TransactionManager};
 
     use super::*;
-    use crate::bootstrap::{DATABASES_TABLE, SCHEMAS_TABLE};
+    use crate::bootstrap;
     use crate::catalog::Catalog;
     use crate::def::{ColumnDef, TableDef};
     use crate::meta::IdentitySpec;
@@ -1297,6 +1392,23 @@ mod tests {
         ))
     }
 
+    /// The rows of the internal table called `name`.
+    fn rows_of(catalog: &Catalog, name: &str) -> Vec<Row> {
+        let table = bootstrap::internal_table_id(catalog, name)
+            .expect("internal_table_id")
+            .expect("the table");
+        let handle = catalog.txn.begin(IsolationLevel::ReadCommitted);
+        let snapshot = catalog.txn.statement_snapshot(&handle);
+        let rows: Vec<Row> = catalog
+            .storage
+            .scan(&snapshot, table)
+            .expect("scan")
+            .map(|row| row.expect("row").1)
+            .collect();
+        catalog.txn.commit(handle).expect("commit");
+        rows
+    }
+
     /// A catalogue bootstrapped on a fresh `MemoryStorage`.
     fn bootstrapped() -> Catalog {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
@@ -1517,16 +1629,11 @@ mod tests {
                 .map(|(name, _)| (*name).to_owned())
                 .collect()
         };
-        assert_eq!(
-            nulls(&OBJECTS_VIEW),
-            ["principal_id", "create_date", "modify_date"]
-        );
+        assert_eq!(nulls(&OBJECTS_VIEW), ["principal_id"]);
         assert_eq!(
             nulls(&TABLES_VIEW),
             [
                 "principal_id",
-                "create_date",
-                "modify_date",
                 "filestream_data_space_id",
                 "history_table_id",
                 "history_retention_period",
@@ -1747,36 +1854,31 @@ mod tests {
     }
 
     #[test]
-    fn internal_tables_are_not_user_tables() {
-        // The internal tables of the five files of `views/` and the two of `bootstrap.rs`
-        // are created by the bootstrap, not by `create_table`, and this file writes no row for
-        // them: the rows `sys.tables` reads come from `object_rows`, whose input is the
-        // tables a client created.
-        let internal: Vec<String> = crate::views::internal_tables()
-            .into_iter()
-            .map(|table| table.name)
-            .chain([DATABASES_TABLE.to_owned(), SCHEMAS_TABLE.to_owned()])
-            .collect();
-        assert!(internal.contains(&OBJECTS_TABLE.to_owned()), "{internal:?}");
-        for table in internal_tables() {
-            assert!(table.rows.is_empty(), "{} carries a row", table.name);
-        }
-
+    fn internal_tables_are_system_tables_in_sys_objects() {
         let catalog = bootstrapped();
+        let objects = rows_of(&catalog, OBJECTS_TABLE);
+        assert!(!objects.is_empty());
+        for row in &objects {
+            assert_eq!(
+                rendered(&row.0[objects_columns::TYPE]).as_deref(),
+                Some(SYSTEM_TABLE_TYPE)
+            );
+            assert_eq!(
+                rendered(&row.0[objects_columns::TYPE_DESC]).as_deref(),
+                Some(SYSTEM_TABLE_TYPE_DESC)
+            );
+            assert_eq!(row.0[objects_columns::IS_MS_SHIPPED], Value::Bit(true));
+        }
         let tables = created(
             &catalog,
             &table_def("t", vec![column_def("a", SqlType::Int, false, false)]),
         );
-        let names: Vec<Option<String>> = object_rows(&tables)
+        let user = object_rows(&tables)
             .expect("the rows of the objects table")
-            .iter()
+            .into_iter()
             .map(|row| rendered(&row.0[objects_columns::NAME]))
-            .collect();
-        // The user table is there, which is what makes the absence below meaningful.
-        assert_eq!(names, vec![Some("t".to_owned())]);
-        for name in internal {
-            assert!(!names.contains(&Some(name.clone())), "{name} is published");
-        }
+            .collect::<Vec<_>>();
+        assert_eq!(user, vec![Some("t".to_owned())]);
     }
 
     #[test]

@@ -46,7 +46,10 @@ use vauban_storage::{DbId, Row, RowId, TableId};
 use vauban_txn::TxnHandle;
 use vauban_types::Value;
 
-use crate::bootstrap::internal_table_id;
+use crate::bootstrap::{
+    DATABASES_TABLE, SCHEMAS_TABLE, databases_columns, internal_table_id, schemas_columns,
+    transaction_datetime,
+};
 use crate::catalog::Catalog;
 use crate::index::IndexStore;
 use crate::meta::TableMeta;
@@ -129,7 +132,12 @@ struct Rows {
 /// # Errors
 ///
 /// The error of a row constructor of `views/`.
-fn rows_of(table: &TableMeta, indexes: &IndexStore) -> SqlResult<Vec<Rows>> {
+fn rows_of(
+    table: &TableMeta,
+    indexes: &IndexStore,
+    create_date: &Value,
+    modify_date: &Value,
+) -> SqlResult<Vec<Rows>> {
     let one = std::slice::from_ref(table);
     Ok(vec![
         Rows {
@@ -138,7 +146,7 @@ fn rows_of(table: &TableMeta, indexes: &IndexStore) -> SqlResult<Vec<Rows>> {
                 sys_tables::objects_columns::DATABASE_ID,
                 sys_tables::objects_columns::OBJECT_ID,
             ),
-            rows: sys_tables::object_rows(one)?,
+            rows: sys_tables::dated_object_rows(one, create_date, modify_date)?,
         },
         Rows {
             name: sys_tables::COLUMNS_TABLE,
@@ -252,7 +260,8 @@ pub(crate) fn write(
     table: &TableMeta,
     indexes: &IndexStore,
 ) -> SqlResult<()> {
-    for described in rows_of(table, indexes)? {
+    let instant = transaction_datetime(catalog, txn)?;
+    for described in rows_of(table, indexes, &instant, &instant)? {
         let id = table_id(catalog, described.name)?;
         for row in &described.rows {
             catalog.storage.insert(txn.id, id, row)?;
@@ -278,7 +287,11 @@ pub(crate) fn remove(
 ) -> SqlResult<()> {
     let database = database_id(table.database)?;
     let containers = containers(catalog, txn, table, database)?;
-    for described in rows_of(table, indexes)? {
+    let placeholder = Value::DateTime(vauban_types::DateTime {
+        days: 0,
+        ticks_300th: 0,
+    });
+    for described in rows_of(table, indexes, &placeholder, &placeholder)? {
         let id = table_id(catalog, described.name)?;
         for (row_id, values) in scan(catalog, txn, id)? {
             if described
@@ -309,9 +322,107 @@ pub(crate) fn rewrite(
     table: &TableMeta,
     indexes: &IndexStore,
 ) -> SqlResult<()> {
+    let modify = transaction_datetime(catalog, txn)?;
+    let create = object_create_date(catalog, txn, table)?.unwrap_or_else(|| modify.clone());
     remove(catalog, txn, table, indexes)?;
-    write(catalog, txn, table, indexes)
+    for described in rows_of(table, indexes, &create, &modify)? {
+        let id = table_id(catalog, described.name)?;
+        for row in &described.rows {
+            catalog.storage.insert(txn.id, id, row)?;
+        }
+    }
+    Ok(())
 }
+
+/// Deletes from the internal tables of `master` each row whose `database_id` names `database`
+/// (`tests/database.rs`, `drop_database_removes_its_rows_from_master`).
+pub(crate) fn remove_database(catalog: &Catalog, txn: &TxnHandle, database: DbId) -> SqlResult<()> {
+    let published = database_id(database)?;
+    for (name, column) in INTERNAL_TABLE_DATABASE_COLUMNS {
+        let id = table_id(catalog, name)?;
+        for (row_id, values) in scan(catalog, txn, id)? {
+            if values.0.get(column) == Some(&Value::I32(published)) {
+                catalog.storage.delete(txn.id, id, row_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `create_date` row of [`sys_tables::OBJECTS_TABLE`] carries for `table`, if any.
+fn object_create_date(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    table: &TableMeta,
+) -> SqlResult<Option<Value>> {
+    let id = table_id(catalog, sys_tables::OBJECTS_TABLE)?;
+    let database = database_id(table.database)?;
+    for (_, values) in scan(catalog, txn, id)? {
+        if values.0.get(sys_tables::objects_columns::DATABASE_ID) == Some(&Value::I32(database))
+            && values.0.get(sys_tables::objects_columns::OBJECT_ID) == Some(&Value::I32(table.id.0))
+        {
+            return Ok(values
+                .0
+                .get(sys_tables::objects_columns::CREATE_DATE)
+                .cloned());
+        }
+    }
+    Ok(None)
+}
+
+/// Internal tables that carry a `database_id` column and the position of that column.
+const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 14] = [
+    (DATABASES_TABLE, databases_columns::DATABASE_ID),
+    (SCHEMAS_TABLE, schemas_columns::DATABASE_ID),
+    (
+        sys_tables::OBJECTS_TABLE,
+        sys_tables::objects_columns::DATABASE_ID,
+    ),
+    (
+        sys_tables::COLUMNS_TABLE,
+        sys_tables::columns_columns::DATABASE_ID,
+    ),
+    (
+        sys_indexes::INDEXES_TABLE,
+        sys_indexes::indexes_columns::DATABASE_ID,
+    ),
+    (
+        sys_indexes::INDEX_COLUMNS_TABLE,
+        sys_indexes::index_columns_columns::DATABASE_ID,
+    ),
+    (
+        sys_indexes::KEY_CONSTRAINTS_TABLE,
+        sys_indexes::key_constraints_columns::DATABASE_ID,
+    ),
+    (
+        sys_indexes::IDENTITY_COLUMNS_TABLE,
+        sys_indexes::identity_columns_columns::DATABASE_ID,
+    ),
+    (
+        info_schema::TABLES_TABLE,
+        info_schema::tables_columns::DATABASE_ID,
+    ),
+    (
+        info_schema::COLUMNS_TABLE,
+        info_schema::columns_columns::DATABASE_ID,
+    ),
+    (
+        sys_extra::ALL_OBJECTS_TABLE,
+        sys_extra::objects_columns::DATABASE_ID,
+    ),
+    (
+        sys_extra::ALL_COLUMNS_TABLE,
+        sys_tables::columns_columns::DATABASE_ID,
+    ),
+    (
+        sys_extra::PARTITIONS_TABLE,
+        sys_extra::partitions_columns::DATABASE_ID,
+    ),
+    (
+        sys_extra::ALLOCATION_UNITS_TABLE,
+        sys_extra::allocation_units_columns::DATABASE_ID,
+    ),
+];
 
 /// The `container_id` of each partition row `txn` sees for `table`, which is what
 /// [`Owner::Container`] matches an allocation unit against.
@@ -424,7 +535,9 @@ mod tests {
             .into_iter()
             .map(|def| def.name)
             .collect();
-        let listed = rows_of(&one_table(), &IndexStore::default()).expect("the rows");
+        let undated = Value::Null;
+        let listed =
+            rows_of(&one_table(), &IndexStore::default(), &undated, &undated).expect("the rows");
         assert_eq!(listed.len(), 12, "the twelve tables of the module list");
         for table in &listed {
             assert!(

@@ -593,9 +593,7 @@ fn live_tables(catalog: &Catalog) -> SqlResult<BTreeSet<TableId>> {
 ///
 /// # Errors
 ///
-/// [`InternalError::Bug`] when the name matches no database: a [`TableDef`] reaching the
-/// catalogue is already resolved, and the client-facing error of an unknown database is
-/// raised before, by the binder and `snapshot.rs`.
+/// Error 2702 when the name matches no database ([`SqlError::database_does_not_exist`]).
 fn database_of(catalog: &Catalog, name: &str) -> SqlResult<DbId> {
     catalog
         .storage
@@ -603,13 +601,7 @@ fn database_of(catalog: &Catalog, name: &str) -> SqlResult<DbId> {
         .into_iter()
         .find(|(_, stored)| stored.eq_ignore_ascii_case(name))
         .map(|(id, _)| id)
-        .ok_or_else(|| {
-            InternalError::Bug(format!(
-                "Catalog::create_table: no database named {name}; resolving a name is the \
-                 business of the binder"
-            ))
-            .into()
-        })
+        .ok_or_else(|| SqlError::database_does_not_exist(name))
 }
 
 #[cfg(test)]

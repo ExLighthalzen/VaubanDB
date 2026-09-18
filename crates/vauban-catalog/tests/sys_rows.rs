@@ -164,8 +164,7 @@ fn sysname(nullable: bool) -> TypeInfo {
     TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), nullable)
 }
 
-/// The shape of the internal table `sys.objects` and `sys.tables` read: 9 columns
-/// (`tests/sys_tables.rs`).
+/// The shape of the internal table `sys.objects` and `sys.tables` read (`tests/sys_tables.rs`).
 fn objects_shape() -> Vec<TypeInfo> {
     vec![
         ty(SqlType::Int),
@@ -176,6 +175,8 @@ fn objects_shape() -> Vec<TypeInfo> {
         ty(SqlType::Char(Len::Fixed(2))),
         ty(SqlType::NVarChar(Len::Fixed(60))),
         ty(SqlType::Bit),
+        ty(SqlType::DateTime),
+        ty(SqlType::DateTime),
         ty(SqlType::Int),
     ]
 }

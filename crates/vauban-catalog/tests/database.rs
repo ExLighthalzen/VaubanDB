@@ -13,9 +13,10 @@
 
 use std::sync::Arc;
 
-use vauban_catalog::Catalog;
-use vauban_storage::{MemoryStorage, Storage};
+use vauban_catalog::{Catalog, ColumnDef, QualifiedName, TableDef};
+use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager, TxnHandle};
+use vauban_types::{Len, SqlType, TypeInfo, Value};
 
 /// A catalogue bootstrapped on a fresh `MemoryStorage`, with that storage and the
 /// transaction manager it was given: `Catalog` keeps its own reference `pub(crate)`, so a
@@ -247,4 +248,151 @@ fn a_drop_is_invisible_to_another_transaction_until_the_commit() {
     );
     txn.rollback(writer).expect("rollback");
     txn.rollback(reader).expect("rollback");
+}
+
+fn master(storage: &Arc<dyn Storage>) -> DbId {
+    storage
+        .databases()
+        .expect("databases")
+        .into_iter()
+        .find(|(_, name)| name.eq_ignore_ascii_case("master"))
+        .expect("master")
+        .0
+}
+
+fn table_shaped(storage: &Arc<dyn Storage>, columns: &[TypeInfo]) -> TableId {
+    let mut found: Vec<TableId> = storage
+        .tables(master(storage))
+        .expect("tables(master)")
+        .into_iter()
+        .filter(|(_, shape)| shape.columns == columns)
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(found.len(), 1, "one table of master has that shape");
+    found.pop().expect("the shape was found")
+}
+
+fn rows(
+    storage: &Arc<dyn Storage>,
+    txn: &Arc<TransactionManager>,
+    table: TableId,
+) -> Vec<Vec<Value>> {
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = txn.statement_snapshot(&handle);
+    let read = storage
+        .scan(&snapshot, table)
+        .expect("scan")
+        .map(|row| row.expect("row").1.0)
+        .collect();
+    txn.commit(handle).expect("commit");
+    read
+}
+
+fn objects_shape() -> Vec<TypeInfo> {
+    vec![
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), false),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::Char(Len::Fixed(2)), false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(60)), false),
+        TypeInfo::new(SqlType::Bit, false),
+        TypeInfo::new(SqlType::DateTime, false),
+        TypeInfo::new(SqlType::DateTime, false),
+        TypeInfo::new(SqlType::Int, false),
+    ]
+}
+
+fn columns_shape() -> Vec<TypeInfo> {
+    vec![
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), false),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::TinyInt, false),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::SmallInt, false),
+        TypeInfo::new(SqlType::TinyInt, false),
+        TypeInfo::new(SqlType::TinyInt, false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), true),
+        TypeInfo::new(SqlType::Bit, false),
+        TypeInfo::new(SqlType::Bit, false),
+        TypeInfo::new(SqlType::Bit, false),
+        TypeInfo::new(SqlType::Bit, false),
+    ]
+}
+
+fn column(name: &str, ty: SqlType, nullable: bool) -> ColumnDef {
+    ColumnDef {
+        name: name.to_owned(),
+        ty: TypeInfo::new(ty, nullable),
+        default: None,
+        identity: None,
+        computed: None,
+    }
+}
+
+/// After `DROP DATABASE`, no object or column row of the dropped base remains in `master`.
+#[test]
+fn drop_database_removes_its_rows_from_master() {
+    let (storage, txn, catalog) = bootstrapped();
+    let created = committed(&txn, |handle| {
+        catalog
+            .create_database(handle, "d", None)
+            .expect("create_database")
+    });
+    let db_id = i32::try_from(created.0).expect("database_id fits i32");
+    committed(&txn, |handle| {
+        catalog
+            .create_table(
+                handle,
+                &TableDef {
+                    name: QualifiedName {
+                        database: "d".to_owned(),
+                        schema: "dbo".to_owned(),
+                        name: "t".to_owned(),
+                    },
+                    columns: vec![column("a", SqlType::Int, false)],
+                    constraints: Vec::new(),
+                },
+            )
+            .expect("create_table");
+    });
+    let objects = table_shaped(&storage, &objects_shape());
+    let columns = table_shaped(&storage, &columns_shape());
+    assert!(
+        rows(&storage, &txn, objects)
+            .iter()
+            .any(|row| row.first() == Some(&Value::I32(db_id)) && text_of(row, 2) == "t"),
+        "the table row is there before the drop"
+    );
+    assert!(
+        rows(&storage, &txn, columns)
+            .iter()
+            .any(|row| row.first() == Some(&Value::I32(db_id)) && text_of(row, 2) == "a"),
+        "the column row is there before the drop"
+    );
+    committed(&txn, |handle| {
+        catalog.drop_database(handle, "d").expect("drop")
+    });
+    assert!(
+        rows(&storage, &txn, objects)
+            .iter()
+            .all(|row| row.first() != Some(&Value::I32(db_id))),
+        "no object row of the dropped database"
+    );
+    assert!(
+        rows(&storage, &txn, columns)
+            .iter()
+            .all(|row| row.first() != Some(&Value::I32(db_id))),
+        "no column row of the dropped database"
+    );
+}
+
+fn text_of(row: &[Value], position: usize) -> String {
+    match row.get(position) {
+        Some(Value::String(text)) => text.text.clone(),
+        other => panic!("column {position} is not a string: {other:?}"),
+    }
 }

@@ -1141,6 +1141,13 @@ fn vauban_sys_databases_resolves_to_a_table_with_its_columns() {
                 4,
                 TypeInfo::new(SqlType::TinyInt, false),
             ),
+            (
+                6,
+                "owner_sid",
+                5,
+                TypeInfo::new(SqlType::VarBinary(Len::Fixed(85)), true),
+            ),
+            (7, "create_date", 6, TypeInfo::new(SqlType::DateTime, false),),
         ]
     );
     assert_eq!(meta.clustered, None);
@@ -1334,11 +1341,9 @@ fn a_user_table_and_an_internal_table_do_not_collide() {
 }
 
 #[test]
-fn an_internal_table_is_not_published_by_sys_objects() {
-    // `views/sys_tables.rs` builds the rows of `vauban_sys_objects` from the user tables of the catalogue
-    // and leaves the internal tables out (`views/sys_tables.rs`, unit test
-    // `internal_tables_are_not_user_tables`). Read from the outside: the table holds no row
-    // naming one of the twenty internal tables, before and after a `CREATE TABLE` in `master`.
+fn internal_tables_are_system_tables_in_sys_objects() {
+    // The bootstrap writes one row per internal table of `master` into `vauban_sys_objects`,
+    // with type `S ` / `SYSTEM_TABLE`. A user table adds its own row and does not remove them.
     let (catalog, manager, storage) = instance_with_its_storage();
     let handle = begin(&manager);
     let snapshot = catalog.snapshot(&handle);
@@ -1354,9 +1359,15 @@ fn an_internal_table_is_not_published_by_sys_objects() {
             .filter(|value| names.contains(value))
             .collect()
     };
-    assert_eq!(published(rows(&storage, &manager, objects)), Vec::new());
+    assert_eq!(
+        published(rows(&storage, &manager, objects)).len(),
+        names.len()
+    );
     table(&catalog, &manager, &def("master", "dbo", "t"));
-    assert_eq!(published(rows(&storage, &manager, objects)), Vec::new());
+    assert_eq!(
+        published(rows(&storage, &manager, objects)).len(),
+        names.len()
+    );
     // Counter-proof that the scan is not blind: the same reading of the table of the
     // databases finds the four names the bootstrap wrote there.
     let databases = catalog

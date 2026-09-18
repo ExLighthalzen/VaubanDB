@@ -53,7 +53,7 @@ use vauban_types::{Collation, SqlString, Value};
 
 use crate::bootstrap::{
     DATABASES_TABLE, DEFAULT_COLLATION_NAME, SCHEMAS_TABLE, SYSTEM_DATABASES, SYSTEM_SCHEMAS,
-    databases_columns, internal_table_id, schemas_columns,
+    databases_columns, internal_table_id, owner_sid_value, schemas_columns, transaction_datetime,
 };
 use crate::catalog::Catalog;
 use crate::meta::{DatabaseOption, SnapshotIsolationState};
@@ -155,6 +155,8 @@ pub(crate) fn create_database(
     row[databases_columns::COLLATION_NAME] = collation_name(collation);
     row[databases_columns::READ_COMMITTED_SNAPSHOT] = Value::Bit(NEW_DATABASE_OPTIONS.0);
     row[databases_columns::SNAPSHOT_ISOLATION_STATE] = Value::I8(NEW_DATABASE_OPTIONS.1.state());
+    row[databases_columns::OWNER_SID] = owner_sid_value();
+    row[databases_columns::CREATE_DATE] = transaction_datetime(catalog, txn)?;
     catalog
         .storage
         .insert(txn.id, table_of(catalog, DATABASES_TABLE)?, &Row(row))?;
@@ -204,6 +206,7 @@ pub(crate) fn drop_database(catalog: &Catalog, txn: &TxnHandle, name: &str) -> S
             catalog.storage.delete(txn.id, schemas, row)?;
         }
     }
+    crate::sys_rows::remove_database(catalog, txn, db_id(id)?)?;
     catalog
         .txn
         .register_on_commit(txn, CommitAction::DropDatabase(db_id(id)?))?;

@@ -78,7 +78,7 @@ fn column(name: &str, ty: SqlType, nullable: bool) -> ColumnDef {
     }
 }
 
-/// The shape of the copy of the objects table `sys.all_objects` and `sys.views` read: the 9
+/// The shape of the copy of the objects table `sys.all_objects` and `sys.views` read: the
 /// columns of the table of `views/sys_tables.rs` with a nullable `database_id`.
 fn all_objects_shape() -> Vec<TypeInfo> {
     vec![
@@ -90,6 +90,8 @@ fn all_objects_shape() -> Vec<TypeInfo> {
         TypeInfo::new(SqlType::Char(Len::Fixed(2)), false),
         TypeInfo::new(SqlType::NVarChar(Len::Fixed(60)), false),
         TypeInfo::new(SqlType::Bit, false),
+        TypeInfo::new(SqlType::DateTime, false),
+        TypeInfo::new(SqlType::DateTime, false),
         TypeInfo::new(SqlType::Int, false),
     ]
 }

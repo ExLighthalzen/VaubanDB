@@ -12,7 +12,7 @@ use std::sync::Arc;
 use vauban_catalog::{Catalog, ColumnDef, QualifiedName, TableDef};
 use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager};
-use vauban_types::{Len, SqlType, TypeInfo};
+use vauban_types::{Len, SqlType, TypeInfo, Value};
 
 /// A bootstrapped catalogue over a fresh `MemoryStorage`, with its storage and its manager.
 fn instance() -> (Catalog, Arc<dyn Storage>, Arc<TransactionManager>) {
@@ -50,6 +50,23 @@ fn table_shaped(storage: &Arc<dyn Storage>, columns: &[TypeInfo]) -> TableId {
     found.pop().expect("the shape was found")
 }
 
+/// The rows of `table`, read through a transaction of its own.
+fn rows(
+    storage: &Arc<dyn Storage>,
+    txn: &Arc<TransactionManager>,
+    table: TableId,
+) -> Vec<Vec<Value>> {
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = txn.statement_snapshot(&handle);
+    let read = storage
+        .scan(&snapshot, table)
+        .expect("scan")
+        .map(|row| row.expect("row").1.0)
+        .collect();
+    txn.commit(handle).expect("commit of the reading txn");
+    read
+}
+
 /// The number of rows of `table`, read through a transaction of its own.
 fn row_count(storage: &Arc<dyn Storage>, txn: &Arc<TransactionManager>, table: TableId) -> usize {
     let handle = txn.begin(IsolationLevel::ReadCommitted);
@@ -70,7 +87,7 @@ fn column(name: &str, ty: SqlType, nullable: bool) -> ColumnDef {
     }
 }
 
-/// The shape of the internal table `sys.objects` and `sys.tables` read: 9 columns.
+/// The shape of the internal table `sys.objects` and `sys.tables` read.
 fn objects_shape() -> Vec<TypeInfo> {
     vec![
         TypeInfo::new(SqlType::Int, false),
@@ -81,6 +98,8 @@ fn objects_shape() -> Vec<TypeInfo> {
         TypeInfo::new(SqlType::Char(Len::Fixed(2)), false),
         TypeInfo::new(SqlType::NVarChar(Len::Fixed(60)), false),
         TypeInfo::new(SqlType::Bit, false),
+        TypeInfo::new(SqlType::DateTime, false),
+        TypeInfo::new(SqlType::DateTime, false),
         TypeInfo::new(SqlType::Int, false),
     ]
 }
@@ -108,13 +127,10 @@ fn columns_shape() -> Vec<TypeInfo> {
 #[test]
 fn the_bootstrap_creates_the_two_internal_tables_of_this_file() {
     let (_catalog, storage, txn) = instance();
-    for shape in [objects_shape(), columns_shape()] {
-        let table = table_shaped(&storage, &shape);
-        // No row at bootstrap: the rows of the two tables are those of the objects a client
-        // creates, and a fresh instance holds none (unit test
-        // `internal_tables_are_not_user_tables`).
-        assert_eq!(row_count(&storage, &txn, table), 0);
-    }
+    let objects = table_shaped(&storage, &objects_shape());
+    assert!(row_count(&storage, &txn, objects) > 0);
+    let columns = table_shaped(&storage, &columns_shape());
+    assert_eq!(row_count(&storage, &txn, columns), 0);
 }
 
 #[test]
@@ -124,6 +140,7 @@ fn a_created_table_writes_its_object_row_and_its_two_column_rows() {
     let objects = table_shaped(&storage, &objects_shape());
     let columns = table_shaped(&storage, &columns_shape());
 
+    let before_objects = row_count(&storage, &txn, objects);
     let handle = txn.begin(IsolationLevel::ReadCommitted);
     let meta = catalog
         .create_table(
@@ -145,6 +162,39 @@ fn a_created_table_writes_its_object_row_and_its_two_column_rows() {
     txn.commit(handle).expect("commit");
 
     assert_eq!(meta.columns.len(), 2);
-    assert_eq!(row_count(&storage, &txn, objects), 1);
+    assert_eq!(row_count(&storage, &txn, objects), before_objects + 1);
     assert_eq!(row_count(&storage, &txn, columns), 2);
+}
+
+#[test]
+fn schema_id_is_the_resolved_schema() {
+    let (catalog, storage, txn) = instance();
+    let objects = table_shaped(&storage, &objects_shape());
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    catalog
+        .create_table(
+            &handle,
+            &TableDef {
+                name: QualifiedName {
+                    database: "master".to_owned(),
+                    schema: "sys".to_owned(),
+                    name: "schema_id_probe".to_owned(),
+                },
+                columns: vec![column("a", SqlType::Int, false)],
+                constraints: Vec::new(),
+            },
+        )
+        .expect("create_table");
+    txn.commit(handle).expect("commit");
+    let read = rows(&storage, &txn, objects);
+    let row = read
+        .into_iter()
+        .find(|row| {
+            matches!(
+                row.get(2),
+                Some(Value::String(text)) if text.text == "schema_id_probe"
+            )
+        })
+        .expect("the object row");
+    assert_eq!(row[3], Value::I32(4));
 }

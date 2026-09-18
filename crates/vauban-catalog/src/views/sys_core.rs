@@ -29,13 +29,11 @@
 //!
 //! - a column whose value would need a datum the catalogue does not store is `CAST(NULL AS
 //!   …)`. The unit test `the_columns_written_null_are_the_ones_with_no_datum_behind_them`
-//!   holds their names and counts them: 13 of the 85, among them `create_date` (the instant
-//!   a database was created), `owner_sid` (principals are not served), `source_database_id`,
+//!   holds their names and counts them: 11 of the 85, among them `source_database_id`,
 //!   `replica_id`, `group_database_id`, `resource_pool_id`, the four `default_…_language_…`
 //!   columns, `two_digit_year_cutoff` and the two `bit`s `is_nested_triggers_on` and
 //!   `is_transform_noise_words_on`, which SQL Server reads from the configuration of the
-//!   instance rather than from the database. SQL Server publishes `create_date` as not
-//!   nullable, so that one departs from the published nullability;
+//!   instance rather than from the database;
 //! - a flag or an option VaubanDB does not serve yet is written with the value of the state
 //!   it is in: `0` for a `bit` the database itself carries — the two `bit`s above are `NULL`
 //!   instead, being options of the instance — and for a coded pair the number and its text
@@ -96,8 +94,8 @@ const DATABASES_VIEW: [(&str, &str); 89] = [
     ("name", "name"),
     ("database_id", "database_id"),
     ("source_database_id", "CAST(NULL AS int)"),
-    ("owner_sid", "CAST(NULL AS varbinary(85))"),
-    ("create_date", "CAST(NULL AS datetime)"),
+    ("owner_sid", "owner_sid"),
+    ("create_date", "create_date"),
     ("compatibility_level", "CAST(160 AS tinyint)"),
     ("collation_name", "collation_name"),
     ("user_access", "CAST(0 AS tinyint)"),
@@ -674,6 +672,8 @@ mod tests {
             [
                 "name",
                 "database_id",
+                "owner_sid",
+                "create_date",
                 "collation_name",
                 "snapshot_isolation_state",
                 "is_read_committed_snapshot_on",
@@ -688,7 +688,7 @@ mod tests {
             .map(|(name, _)| *name)
             .collect();
         assert_eq!(derived, ["snapshot_isolation_state_desc"]);
-        assert_eq!(DATABASES_VIEW.len() - read.len() - derived.len(), 82);
+        assert_eq!(DATABASES_VIEW.len() - read.len() - derived.len(), 80);
         // The `CASE` lists the four couples of the enum, so a state added there shows up in
         // the text of the view rather than falling to `NULL`.
         let text = DATABASES_VIEW
@@ -789,8 +789,6 @@ mod tests {
             written_null,
             [
                 "source_database_id",
-                "owner_sid",
-                "create_date",
                 "replica_id",
                 "group_database_id",
                 "resource_pool_id",
@@ -803,7 +801,7 @@ mod tests {
                 "two_digit_year_cutoff",
             ]
         );
-        assert_eq!(written_null.len(), 13);
+        assert_eq!(written_null.len(), 11);
         // The two `bit`s written `NULL`: the rule of the documentation writes `0` for the
         // `bit`s a database carries, these two being options of the instance.
         let null_bits: Vec<&str> = DATABASES_VIEW

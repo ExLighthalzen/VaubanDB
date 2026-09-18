@@ -46,11 +46,15 @@
 //! back rather than left open, so its rows stay invisible to a later reader.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use vauban_errors::{InternalError, SqlError};
+use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::{DbId, Row, Storage, TableId, TableShape};
 use vauban_txn::{IsolationLevel, TransactionManager, TxnHandle};
-use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+use vauban_types::{
+    Date, DateTime, DateTime2, Len, SqlString, SqlType, Time, TypeInfo, Value,
+    calendar::days_from_civil, convert,
+};
 
 use crate::catalog::Catalog;
 use crate::def::{InternalColumnDef, InternalTableDef};
@@ -138,9 +142,17 @@ pub(crate) mod databases_columns {
     /// [`SnapshotIsolationState`](crate::meta::SnapshotIsolationState); the view derives
     /// `snapshot_isolation_state_desc` from it (`views/sys_core.rs`).
     pub(crate) const SNAPSHOT_ISOLATION_STATE: usize = 4;
+    /// `owner_sid varbinary(85)`: the owner of the database, `0x01` for the bootstrap and
+    /// for a database created by `sa`.
+    pub(crate) const OWNER_SID: usize = 5;
+    /// `create_date datetime`: the instant the database was created.
+    pub(crate) const CREATE_DATE: usize = 6;
     /// Width of a row of the table.
-    pub(crate) const WIDTH: usize = 5;
+    pub(crate) const WIDTH: usize = 7;
 }
+
+/// `owner_sid` written for each database: `0x01`.
+pub(crate) const SA_OWNER_SID: [u8; 1] = [0x01];
 
 /// Where each column of [`SCHEMAS_TABLE`] sits in a [`Row`]. Same rule as
 /// [`databases_columns`].
@@ -222,13 +234,16 @@ fn install(catalog: &Catalog, txn: &TxnHandle) -> Result<(), InternalError> {
         databases.push((id, name));
     }
     let master = databases[0].0;
-    for def in internal_tables(&databases)? {
+    let instant = transaction_datetime(catalog, txn).map_err(internal)?;
+    for def in internal_tables(&databases, &instant)? {
         let table = catalog
             .storage
             .create_table(master, &shape_of(&def))
             .map_err(internal)?;
         insert_rows(catalog, txn, table, &def)?;
     }
+    views::sys_tables::write_internal_object_rows(catalog, txn, master, instant)
+        .map_err(internal)?;
     Ok(())
 }
 
@@ -245,7 +260,7 @@ fn insert_rows(
     def: &InternalTableDef,
 ) -> Result<(), InternalError> {
     for row in &def.rows {
-        if row.0.len() != def.columns.len() {
+        if row.0.len() > def.columns.len() {
             return Err(InternalError::Bug(format!(
                 "bootstrap: table {} describes {} columns and carries a row of {} values",
                 def.name,
@@ -253,9 +268,13 @@ fn insert_rows(
                 row.0.len()
             )));
         }
+        let mut values = row.0.clone();
+        while values.len() < def.columns.len() {
+            values.push(Value::Null);
+        }
         catalog
             .storage
-            .insert(txn.id, table, row)
+            .insert(txn.id, table, &Row(values))
             .map_err(internal)?;
     }
     Ok(())
@@ -267,9 +286,12 @@ fn insert_rows(
 /// objects — then the tables of the bootstrap whose name a file of `views/` has not taken.
 /// The comparison of the names ignores case, as `SQL_Latin1_General_CP1_CI_AS` does for an
 /// identifier.
-fn internal_tables(databases: &[(DbId, &str)]) -> Result<Vec<InternalTableDef>, InternalError> {
+fn internal_tables(
+    databases: &[(DbId, &str)],
+    instant: &Value,
+) -> Result<Vec<InternalTableDef>, InternalError> {
     let mut tables = views::internal_tables();
-    for own in bootstrap_tables(databases)? {
+    for own in bootstrap_tables(databases, instant)? {
         if !tables
             .iter()
             .any(|table| table.name.eq_ignore_ascii_case(&own.name))
@@ -296,7 +318,11 @@ fn internal_tables(databases: &[(DbId, &str)]) -> Result<Vec<InternalTableDef>, 
 ///
 /// The error [`internal_tables`] answers with.
 pub(crate) fn internal_table_defs() -> Result<Vec<InternalTableDef>, InternalError> {
-    internal_tables(&[])
+    let placeholder = Value::DateTime(DateTime {
+        days: 0,
+        ticks_300th: 0,
+    });
+    internal_tables(&[], &placeholder)
 }
 
 /// The two internal tables the bootstrap owns, carrying the rows it computed for them.
@@ -306,7 +332,10 @@ pub(crate) fn internal_table_defs() -> Result<Vec<InternalTableDef>, InternalErr
 /// text of `sys.databases` and `sys.schemas` is the business of that file, while the two
 /// tables stay here because their rows carry the [`DbId`]s of this bootstrap (unit test
 /// `the_two_tables_of_the_bootstrap_carry_the_views_of_sys_core`).
-fn bootstrap_tables(databases: &[(DbId, &str)]) -> Result<Vec<InternalTableDef>, InternalError> {
+fn bootstrap_tables(
+    databases: &[(DbId, &str)],
+    instant: &Value,
+) -> Result<Vec<InternalTableDef>, InternalError> {
     let mut database_rows = Vec::with_capacity(databases.len());
     let mut schema_rows = Vec::with_capacity(databases.len() * SYSTEM_SCHEMAS.len());
     for &(id, name) in databases {
@@ -318,6 +347,8 @@ fn bootstrap_tables(databases: &[(DbId, &str)]) -> Result<Vec<InternalTableDef>,
         let (read_committed_snapshot, snapshot_isolation) = database_options(name);
         row[databases_columns::READ_COMMITTED_SNAPSHOT] = Value::Bit(read_committed_snapshot);
         row[databases_columns::SNAPSHOT_ISOLATION_STATE] = Value::I8(snapshot_isolation.state());
+        row[databases_columns::OWNER_SID] = owner_sid_value();
+        row[databases_columns::CREATE_DATE] = instant.clone();
         database_rows.push(Row(row));
         for (schema, schema_id, principal_id) in SYSTEM_SCHEMAS {
             let mut row = vec![Value::Null; schemas_columns::WIDTH];
@@ -342,6 +373,8 @@ fn bootstrap_tables(databases: &[(DbId, &str)]) -> Result<Vec<InternalTableDef>,
                 // `sys.databases` that publish them: `bit` and `tinyint`.
                 column("is_read_committed_snapshot_on", SqlType::Bit, false),
                 column("snapshot_isolation_state", SqlType::TinyInt, false),
+                column("owner_sid", SqlType::VarBinary(Len::Fixed(85)), true),
+                column("create_date", SqlType::DateTime, false),
             ],
             clustered_key: None,
             rows: database_rows,
@@ -402,7 +435,7 @@ pub(crate) fn internal_table_id(
     let Some(master) = find_database(catalog, SYSTEM_DATABASES[0])? else {
         return Ok(None);
     };
-    let Some(position) = internal_tables(&[])?
+    let Some(position) = internal_table_defs()?
         .iter()
         .position(|def| def.name.eq_ignore_ascii_case(name))
     else {
@@ -468,6 +501,67 @@ fn text(value: &str) -> Value {
     })
 }
 
+/// The `varbinary(85)` value `sys.databases.owner_sid` carries for a database created here.
+pub(crate) fn owner_sid_value() -> Value {
+    Value::Bytes(SA_OWNER_SID.to_vec())
+}
+
+/// The `datetime` of `txn`, taken from when the transaction began.
+///
+/// Two objects created in the same transaction carry the same instant.
+///
+/// # Errors
+///
+/// [`InternalError::Bug`] when `txn` is not open on this manager.
+pub(crate) fn transaction_datetime(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<Value> {
+    catalog
+        .txn
+        .active_sessions()
+        .into_iter()
+        .find(|info| info.id == txn.id)
+        .map(|info| Value::DateTime(system_time_to_datetime(info.began_at)))
+        .ok_or_else(|| {
+            InternalError::Bug(format!(
+                "Catalog: transaction {} is not open on this manager",
+                txn.id
+            ))
+            .into()
+        })
+}
+
+/// Maps a [`SystemTime`] to the `datetime` the internal tables store.
+fn system_time_to_datetime(time: SystemTime) -> DateTime {
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    const SECONDS_PER_DAY: u64 = 86_400;
+    let elapsed = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    let ticks_100ns = elapsed
+        .as_secs()
+        .saturating_mul(TICKS_PER_SECOND)
+        .saturating_add(u64::from(elapsed.subsec_nanos()) / 100);
+    let dt2 = DateTime2 {
+        date: Date {
+            days: days_from_civil(1970, 1, 1)
+                .saturating_add((elapsed.as_secs() / SECONDS_PER_DAY) as i32),
+        },
+        time: Time {
+            ticks_100ns: (elapsed.as_secs() % SECONDS_PER_DAY) * TICKS_PER_SECOND
+                + ticks_100ns % TICKS_PER_SECOND,
+        },
+    };
+    match convert(
+        &Value::DateTime2(dt2),
+        &TypeInfo::new(SqlType::DateTime2(7), false),
+        &TypeInfo::new(SqlType::DateTime, false),
+        None,
+    ) {
+        Ok(Value::DateTime(dt)) => dt,
+        _ => DateTime {
+            days: 0,
+            ticks_300th: 0,
+        },
+    }
+}
+
 /// Turns the error of a `storage` or `txn` call into the one `bootstrap` answers with.
 ///
 /// Those two layers hand back a [`SqlError`] built from an [`InternalError`] (number 50000)
@@ -499,7 +593,7 @@ mod tests {
     /// to read the position.
     fn rows_of(catalog: &Catalog, name: &str) -> Vec<Vec<Value>> {
         let master = find_database(catalog, "master").unwrap().unwrap();
-        let position = internal_tables(&[])
+        let position = internal_table_defs()
             .unwrap()
             .iter()
             .position(|def| def.name == name)
@@ -537,39 +631,31 @@ mod tests {
     fn the_database_rows_carry_the_id_the_name_and_the_collation() {
         let catalog = bootstrapped();
         let collation = text(DEFAULT_COLLATION_NAME);
-        assert_eq!(
-            rows_of(&catalog, DATABASES_TABLE),
-            vec![
-                vec![
-                    Value::I32(1),
-                    text("master"),
-                    collation.clone(),
-                    Value::Bit(false),
-                    Value::I8(1),
-                ],
-                vec![
-                    Value::I32(2),
-                    text("tempdb"),
-                    collation.clone(),
-                    Value::Bit(false),
-                    Value::I8(0),
-                ],
-                vec![
-                    Value::I32(3),
-                    text("model"),
-                    collation.clone(),
-                    Value::Bit(false),
-                    Value::I8(0),
-                ],
-                vec![
-                    Value::I32(4),
-                    text("msdb"),
-                    collation,
-                    Value::Bit(false),
-                    Value::I8(1),
-                ],
-            ]
-        );
+        let rows = rows_of(&catalog, DATABASES_TABLE);
+        assert_eq!(rows.len(), 4);
+        for (row, (id, name, read_committed, snapshot)) in rows.iter().zip([
+            (1, "master", false, 1_u8),
+            (2, "tempdb", false, 0_u8),
+            (3, "model", false, 0_u8),
+            (4, "msdb", false, 1_u8),
+        ]) {
+            assert_eq!(row[databases_columns::DATABASE_ID], Value::I32(id));
+            assert_eq!(row[databases_columns::NAME], text(name));
+            assert_eq!(row[databases_columns::COLLATION_NAME], collation);
+            assert_eq!(
+                row[databases_columns::READ_COMMITTED_SNAPSHOT],
+                Value::Bit(read_committed)
+            );
+            assert_eq!(
+                row[databases_columns::SNAPSHOT_ISOLATION_STATE],
+                Value::I8(snapshot)
+            );
+            assert_eq!(row[databases_columns::OWNER_SID], owner_sid_value());
+            assert!(matches!(
+                row[databases_columns::CREATE_DATE],
+                Value::DateTime(_)
+            ));
+        }
     }
 
     #[test]
@@ -628,7 +714,7 @@ mod tests {
             "{expected:?}"
         );
         expected.extend([DATABASES_TABLE.to_owned(), SCHEMAS_TABLE.to_owned()]);
-        let names: Vec<String> = internal_tables(&[])
+        let names: Vec<String> = internal_table_defs()
             .unwrap()
             .into_iter()
             .map(|def| def.name)
@@ -638,7 +724,7 @@ mod tests {
 
     #[test]
     fn the_two_tables_of_the_bootstrap_carry_the_views_of_sys_core() {
-        let tables = internal_tables(&[]).unwrap();
+        let tables = internal_table_defs().unwrap();
         for (table, view) in [(DATABASES_TABLE, "databases"), (SCHEMAS_TABLE, "schemas")] {
             let described = tables
                 .iter()
@@ -681,7 +767,7 @@ mod tests {
 
     #[test]
     fn the_column_order_of_the_internal_tables_is_the_one_the_constants_name() {
-        let tables = internal_tables(&[]).unwrap();
+        let tables = internal_table_defs().unwrap();
         let databases = tables
             .iter()
             .find(|def| def.name == DATABASES_TABLE)
@@ -734,7 +820,7 @@ mod tests {
         // One table created per description, in the order of the list, so the position of a
         // name in the list is the position of its `TableId`; the positions are read from the
         // list rather than written down, a file of `views/` adding its tables in front.
-        let names: Vec<String> = internal_tables(&[])
+        let names: Vec<String> = internal_table_defs()
             .unwrap()
             .into_iter()
             .map(|def| def.name)
