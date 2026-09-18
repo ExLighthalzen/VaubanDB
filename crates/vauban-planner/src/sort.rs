@@ -34,6 +34,7 @@
 use vauban_binder::{BoundExpr, BoundExprKind, BoundTop, LogicalPlan, SortKey};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::{Direction, TableId};
+use vauban_types::Collation;
 
 use crate::context::PlanContext;
 use crate::physical::PhysicalPlan;
@@ -136,6 +137,9 @@ struct DeliveredKey<'a> {
     by: OrderedBy<'a>,
     /// True when the values run from the highest to the lowest.
     desc: bool,
+    /// The collation a `Sort` or a `TopN` ordered on, `None` when the key used the
+    /// collation of its expression.
+    collation: Option<Collation>,
 }
 
 /// What a delivered key orders the rows on.
@@ -162,6 +166,9 @@ impl DeliveredKey<'_> {
         if (self.desc != reversed) != required.desc {
             return false;
         }
+        if required.collation != self.collation {
+            return false;
+        }
         match self.by {
             OrderedBy::Expr(_) => self.orders_on(&required.expr),
             // An index keys a column under the collation that column carries, so a key
@@ -186,6 +193,7 @@ fn delivered_order<'a>(
             .map(|key| DeliveredKey {
                 by: OrderedBy::Expr(&key.expr),
                 desc: key.desc,
+                collation: key.collation,
             })
             .collect(),
         PhysicalPlan::IndexSeek {
@@ -200,6 +208,7 @@ fn delivered_order<'a>(
                 .map(|key| DeliveredKey {
                     by: OrderedBy::Column(usize::from(key.column)),
                     desc: key.descending != backwards,
+                    collation: None,
                 })
                 .collect()
         }

@@ -14,7 +14,7 @@ use vauban_binder::{
 };
 use vauban_catalog::ColumnId;
 use vauban_storage::{Direction, KeyColumn, TableId};
-use vauban_types::{SqlType, TypeInfo, Value};
+use vauban_types::{Collation, SqlType, TypeInfo, Value};
 
 const TABLE: TableId = TableId(7);
 
@@ -364,6 +364,40 @@ fn a_sort_on_another_column_is_kept() {
         matches!(&planned, PhysicalPlan::Sort { .. }),
         "expected a Sort node, got {planned:?}"
     );
+}
+
+#[test]
+fn two_sorts_with_different_collations_both_stay() {
+    let ci = Collation::parse("Latin1_General_CI_AS").expect("a known collation");
+    let cs = Collation::parse("Latin1_General_CS_AS").expect("a known collation");
+    let inner = LogicalPlan::Sort {
+        input: Box::new(scan()),
+        keys: vec![SortKey {
+            expr: column("a"),
+            desc: false,
+            collation: Some(ci),
+        }],
+    };
+    let outer = LogicalPlan::Sort {
+        input: Box::new(inner),
+        keys: vec![SortKey {
+            expr: column("a"),
+            desc: false,
+            collation: Some(cs),
+        }],
+    };
+    let planned = plan_with(&FakeCatalog::new(), outer);
+    let PhysicalPlan::Sort { input, keys, .. } = &planned else {
+        panic!("expected an outer Sort, got {planned:?}");
+    };
+    assert_eq!(keys[0].collation, Some(cs));
+    let PhysicalPlan::Sort {
+        keys: inner_keys, ..
+    } = input.as_ref()
+    else {
+        panic!("expected an inner Sort, got {input:?}");
+    };
+    assert_eq!(inner_keys[0].collation, Some(ci));
 }
 
 #[test]

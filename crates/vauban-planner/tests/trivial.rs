@@ -282,7 +282,7 @@ fn an_aggregate_over_a_scan_produces_a_hash_aggregate() {
 }
 
 #[test]
-fn a_subquery_expression_is_not_implemented_yet() {
+fn a_subquery_expression_plans() {
     let exists = BoundExpr {
         kind: BoundExprKind::Exists(Box::new(LogicalPlan::OneRow)),
         ty: TypeInfo::new(SqlType::Bit, false),
@@ -292,14 +292,22 @@ fn a_subquery_expression_is_not_implemented_yet() {
         input: Box::new(scan()),
         predicate: exists,
     };
-    assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(filtered))));
+    let planned = plan_query(filtered);
+    assert!(matches!(
+        planned,
+        PhysicalPlan::NestedLoopJoin {
+            kind: PhysicalJoinKind::Semi,
+            ..
+        }
+    ));
 
     let derived = LogicalPlan::Subquery {
         input: Box::new(scan()),
         alias: "d".to_owned(),
         schema: schema_of(&["id"]),
     };
-    assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(derived))));
+    let planned = plan_query(derived);
+    assert!(matches!(planned, PhysicalPlan::TableScan { .. }));
 }
 
 /// `EXISTS (SELECT …)`, the subquery expression the holders below carry.
@@ -371,7 +379,7 @@ fn subquery_holders_outside_the_two_call_sites_go_through() {
     }
 
     // Counter-proof on the two sites `plan.rs` does hand over: the same `EXISTS` in the
-    // predicate of a `Filter` and in an expression of a `Project` is refused.
+    // predicate of a `Filter` and in an expression of a `Project` is planned there too.
     for logical in [
         LogicalPlan::Filter {
             input: Box::new(scan()),
@@ -386,7 +394,10 @@ fn subquery_holders_outside_the_two_call_sites_go_through() {
             schema: schema_of(&["b"]),
         },
     ] {
-        assert_not_implemented(&plan_error(BoundStatement::Query(Box::new(logical))));
+        assert!(
+            plan(BoundStatement::Query(Box::new(logical)), &context(&catalog)).is_ok(),
+            "the two call sites must plan a subquery expression"
+        );
     }
 }
 

@@ -17,7 +17,7 @@ use vauban_errors::{InternalError, SqlError, SqlResult};
 
 use crate::context::PlanContext;
 use crate::physical::{PhysicalPlan, PhysicalStatement};
-use crate::{aggregate, dml, seek, setop, sort, subquery};
+use crate::{aggregate, dml, setop, sort, subquery};
 
 /// Turns a bound statement into the physical statement the `executor` runs.
 ///
@@ -108,17 +108,7 @@ pub(crate) fn plan_node(plan: &LogicalPlan, ctx: &PlanContext<'_>) -> SqlResult<
             schema: schema.clone(),
             hints: *hints,
         }),
-        LogicalPlan::Filter { input, predicate } => {
-            let input = plan_node(input, ctx)?;
-            if let Some(seek) = seek::try_index_seek(predicate, &input, ctx)? {
-                return Ok(seek);
-            }
-            let input = subquery::plan_expr_subqueries(predicate, input, ctx)?;
-            Ok(PhysicalPlan::Filter {
-                input: Box::new(input),
-                predicate: predicate.clone(),
-            })
-        }
+        LogicalPlan::Filter { input, predicate } => subquery::plan_filter(input, predicate, ctx),
         LogicalPlan::Project {
             input,
             exprs,
