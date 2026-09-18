@@ -58,10 +58,10 @@ use vauban_storage::{DbId, TableId, TableShape, TxnId};
 use vauban_txn::{CommitAction, RollbackAction, TxnHandle};
 use vauban_types::TypeInfo;
 
-use crate::catalog::{Catalog, not_implemented};
+use crate::catalog::Catalog;
 use crate::def::{ConstraintDef, TableDef};
 use crate::ids::{ColumnId, ObjectId};
-use crate::meta::{AlterTable, ColumnMeta, TableMeta};
+use crate::meta::{ColumnMeta, TableMeta};
 
 /// The [`ObjectId`] of the first table a catalogue creates.
 ///
@@ -83,7 +83,7 @@ pub(crate) struct TableStore {
     /// Identifier the next [`create_table`] hands out.
     next_object_id: i32,
     /// One entry per table created through this catalogue and still in `storage`.
-    entries: BTreeMap<ObjectId, TableEntry>,
+    pub(crate) entries: BTreeMap<ObjectId, TableEntry>,
     /// The indexes of those tables. `index.rs` owns the type and the accesses to it, as
     /// this file owns [`TableStore`]: the store sits here because the two are read
     /// together, a `DROP TABLE` taking the indexes of the table with it.
@@ -195,14 +195,18 @@ impl TableStore {
 
 /// One table of a [`TableStore`].
 #[derive(Debug)]
-struct TableEntry {
+pub(crate) struct TableEntry {
     /// What [`create_table`] gave back to its caller.
-    meta: TableMeta,
+    pub(crate) meta: TableMeta,
+    /// The shape before the current `ALTER TABLE`, kept until the statement commits so a
+    /// `ROLLBACK` can put [`TableMeta::storage_id`] back (`tests/alter.rs`,
+    /// `alter_rollback_restores_the_old_shape`).
+    pub(crate) previous_meta: Option<TableMeta>,
     /// The transaction that registered the deferred [`CommitAction::DropTable`], `None` when
     /// the table carries no pending `DROP`. Cleared by [`refresh`] when that transaction
     /// closed without the drop taking effect, which is what a rolled-back `DROP TABLE` looks
     /// like from here (`tests/table.rs`, `a_rolled_back_drop_leaves_the_table_droppable`).
-    dropped_by: Option<TxnId>,
+    pub(crate) dropped_by: Option<TxnId>,
 }
 
 /// Creates a table. See [`Catalog::create_table`].
@@ -330,6 +334,7 @@ pub(crate) fn create_table(
         id,
         TableEntry {
             meta: meta.clone(),
+            previous_meta: None,
             dropped_by: None,
         },
     );
@@ -387,21 +392,6 @@ fn table_name_for_8148(def: &TableDef) -> String {
     } else {
         format!("{}.{}", def.name.schema, def.name.name)
     }
-}
-
-/// Changes the shape of a table. See [`Catalog::alter_table`].
-///
-/// # Errors
-///
-/// For now, on each call: `Catalog::alter_table not implemented`.
-pub(crate) fn alter_table(
-    catalog: &Catalog,
-    txn: &TxnHandle,
-    table: ObjectId,
-    change: &AlterTable,
-) -> SqlResult<TableMeta> {
-    let _ = (&catalog.storage, &catalog.txn, txn, table, change);
-    Err(not_implemented("alter_table"))
 }
 
 /// Drops a table. See [`Catalog::drop_table`].
@@ -556,6 +546,20 @@ pub(crate) fn refresh(catalog: &Catalog, store: &mut TableStore) -> SqlResult<()
         .into_iter()
         .map(|info| info.id)
         .collect();
+    for entry in store.entries.values_mut() {
+        if !live.contains(&entry.meta.storage_id)
+            && let Some(previous) = entry.previous_meta.take()
+            && live.contains(&previous.storage_id)
+        {
+            entry.meta = previous;
+        }
+        if let Some(previous) = &entry.previous_meta
+            && live.contains(&entry.meta.storage_id)
+            && !live.contains(&previous.storage_id)
+        {
+            entry.previous_meta = None;
+        }
+    }
     store
         .entries
         .retain(|_, entry| live.contains(&entry.meta.storage_id));

@@ -102,7 +102,7 @@ const CONSTRAINT_EXISTS_2714_STATE: u8 = 5;
 #[derive(Debug, Default)]
 pub(crate) struct ConstraintStore {
     /// One entry per constraint of a table this catalogue holds.
-    entries: BTreeMap<ObjectId, ObjectMeta>,
+    pub(crate) entries: BTreeMap<ObjectId, ObjectMeta>,
 }
 
 impl ConstraintStore {

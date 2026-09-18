@@ -709,6 +709,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "Object '%.*ls' is referenced by a FOREIGN KEY constraint and cannot be dropped.",
     },
     ErrorDef {
+        number: 3728,
+        severity: 16,
+        template: "'%.*ls' is not the name of a constraint here.",
+    },
+    ErrorDef {
         number: 3902,
         severity: 16,
         template: "COMMIT TRANSACTION without a matching BEGIN TRANSACTION.",
@@ -792,6 +797,11 @@ const CATALOG: &[ErrorDef] = &[
         number: 4901,
         severity: 16,
         template: "A column added to a non-empty table has to be nullable, have a DEFAULT, or be an identity or timestamp column. Column '%.*ls' cannot be added to table '%.*ls'.",
+    },
+    ErrorDef {
+        number: 5074,
+        severity: 16,
+        template: "%S_MSG '%.*ls' still depends on %S_MSG '%.*ls'.",
     },
     ErrorDef {
         number: 5701,
@@ -1164,6 +1174,7 @@ mod tests {
         (3708, 16, &["%S_MSG", "%S_MSG", "%.*ls", "%S_MSG"]),
         (3723, 16, &["%.*ls", "%ls"]),
         (3726, 16, &["%.*ls"]),
+        (3728, 16, &["%.*ls"]),
         (3902, 16, &[]),
         (3903, 16, &[]),
         (3926, 10, &[]),
@@ -1181,6 +1192,7 @@ mod tests {
         (4701, 16, &["%.*ls"]),
         (4712, 16, &["%.*ls"]),
         (4901, 16, &["%.*ls", "%.*ls"]),
+        (5074, 16, &["%S_MSG", "%.*ls", "%S_MSG", "%.*ls"]),
         (5701, 10, &["%.*ls"]),
         (5703, 10, &["%.*ls"]),
         (7202, 11, &["%.*ls"]),

@@ -113,7 +113,7 @@ impl Catalog {
         table_id: ObjectId,
         change: &AlterTable,
     ) -> SqlResult<TableMeta> {
-        table::alter_table(self, txn, table_id, change)
+        crate::alter::alter_table(self, txn, table_id, change)
     }
 
     /// Drops the table of identifier `table`.

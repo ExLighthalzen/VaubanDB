@@ -320,16 +320,7 @@ pub enum ConstraintMeta {
     },
 }
 
-/// What an `ALTER TABLE` asks for.
-///
-/// `alter_table` is a stub, so the enum has the single variant the stub needs. The
-/// implementation of the statement will replace it with the actions of
-/// `vauban_parser::AlterTableAction` it supports.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AlterTable {
-    /// A change the catalogue does not perform yet.
-    Unsupported,
-}
+pub use crate::def::AlterTable;
 
 #[cfg(test)]
 mod tests {

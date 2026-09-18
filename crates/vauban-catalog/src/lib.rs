@@ -34,6 +34,7 @@
 //! The internal tables are named `vauban_sys_*` and are not published to clients; what a
 //! client reads is a view over them.
 
+mod alter;
 mod bootstrap;
 mod catalog;
 mod constraints;
@@ -49,11 +50,11 @@ mod table;
 mod views;
 
 pub use catalog::Catalog;
-pub use def::{ColumnDef, ConstraintDef, IndexDef, SortedColumn, TableDef};
+pub use def::{AlterTable, ColumnDef, ConstraintDef, IndexDef, SortedColumn, TableDef};
 pub use ids::{ColumnId, ObjectId};
 pub use meta::{
-    AlterTable, ColumnMeta, ConstraintMeta, DatabaseMeta, DatabaseOption, IdentitySpec, IndexMeta,
-    ObjectKind, ObjectMeta, QualifiedName, SnapshotIsolationState, TableMeta,
+    ColumnMeta, ConstraintMeta, DatabaseMeta, DatabaseOption, IdentitySpec, IndexMeta, ObjectKind,
+    ObjectMeta, QualifiedName, SnapshotIsolationState, TableMeta,
 };
 pub use snapshot::CatalogSnapshot;
 // Re-exported so that a crate which names a table of `storage` through the catalogue —

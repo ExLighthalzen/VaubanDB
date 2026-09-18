@@ -95,17 +95,17 @@ const INDEX_OF_A_DROPPED_TABLE_3701_STATE: u8 = 6;
 #[derive(Debug, Default)]
 pub(crate) struct IndexStore {
     /// One entry per index created through this catalogue and still in `storage`.
-    entries: BTreeMap<IndexId, IndexEntry>,
+    pub(crate) entries: BTreeMap<IndexId, IndexEntry>,
 }
 
 /// One index of an [`IndexStore`].
 #[derive(Debug)]
-struct IndexEntry {
+pub(crate) struct IndexEntry {
     /// Table the index is built on, as the catalogue numbers it.
-    table: ObjectId,
+    pub(crate) table: ObjectId,
     /// Table the index is built on, as `storage` numbers it. Kept beside `table` so that
     /// [`refresh`] can ask `storage` for the indexes of that table.
-    storage_table: TableId,
+    pub(crate) storage_table: TableId,
     /// What [`create_index`] or [`apply_table_keys`] gave back.
     meta: IndexMeta,
     /// The transaction that registered the deferred [`CommitAction::DropIndex`], `None` when

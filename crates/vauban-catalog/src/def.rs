@@ -115,6 +115,33 @@ pub struct TableDef {
     pub constraints: Vec<ConstraintDef>,
 }
 
+/// What [`Catalog::alter_table`](crate::Catalog::alter_table) is asked to do.
+///
+/// One variant per call: a statement that lists several changes is split by the binder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterTable {
+    /// `ADD` a column with the same fields as [`ColumnDef`].
+    AddColumn {
+        /// Column to append.
+        column: Box<ColumnDef>,
+    },
+    /// `DROP COLUMN`.
+    DropColumn {
+        /// Name of the column to remove.
+        name: String,
+    },
+    /// `ADD CONSTRAINT` with the same shapes as [`ConstraintDef`].
+    AddConstraint {
+        /// Constraint to attach.
+        constraint: Box<ConstraintDef>,
+    },
+    /// `DROP CONSTRAINT`.
+    DropConstraint {
+        /// Name of the constraint to remove.
+        name: String,
+    },
+}
+
 /// The index [`Catalog::create_index`](crate::Catalog::create_index) is asked to create.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDef {

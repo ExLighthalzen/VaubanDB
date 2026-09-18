@@ -2812,6 +2812,16 @@ impl SqlError {
         from_catalog(3726, 1, &[Arg::Str(name)])
     }
 
+    /// Error 3728, severity 16, state 1 (`ALTER TABLE dbo.t DROP CONSTRAINT nosuch;`
+    /// when `nosuch` is not a constraint on `t`).
+    ///
+    /// ```text
+    /// 'nosuch' is not the name of a constraint here.
+    /// ```
+    pub fn constraint_not_on_table(name: &str) -> Self {
+        from_catalog(3728, 1, &[Arg::Str(name)])
+    }
+
     /// Error 3952, severity 16, state 1 (`SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
     /// BEGIN TRANSACTION; SELECT v FROM dbo.s WHERE k = 1;` in a database whose
     /// `snapshot_isolation_state` is 0): a snapshot transaction reached a database that
@@ -2854,6 +2864,29 @@ impl SqlError {
     /// ```
     pub fn cannot_add_column_to_non_empty_table(column: &str, table: &str) -> Self {
         from_catalog(4901, 1, &[Arg::Str(column), Arg::Str(table)])
+    }
+
+    /// Error 5074, severity 16, state 1 (`ALTER TABLE dbo.ix_t DROP COLUMN b;` after
+    /// `CREATE INDEX ix ON dbo.ix_t(b);`): an index or another object still references
+    /// the column.
+    ///
+    /// The two `%S_MSG`/`%.*ls` pairs name the dependent object then the column. An index
+    /// prints `index` and `column`; a `CHECK` or `DEFAULT` prints `object` and `column`.
+    ///
+    /// ```text
+    /// index 'ix' still depends on column 'b'.
+    /// ```
+    pub fn object_depends_on_column(object_kind: &str, object: &str, column: &str) -> Self {
+        from_catalog(
+            5074,
+            1,
+            &[
+                Arg::Str(object_kind),
+                Arg::Str(object),
+                Arg::Str("column"),
+                Arg::Str(column),
+            ],
+        )
     }
 
     /// Error 8101, severity 16, state 1 (`INSERT INTO dbo.ident VALUES (5, 1);` on a table
@@ -6722,8 +6755,8 @@ mod tests {
     }
     /// The DDL and name resolution constructors, on four fields: number, severity on the
     /// wire, state, and the substituted message compared as a whole string. Each row is
-    /// built with the arguments of the query quoted next to it. Thirty-one rows for
-    /// twenty-six numbers: 1909 has one constructor per column list, 3723 one per
+    /// built with the arguments of the query quoted next to it. Thirty-three rows for
+    /// twenty-eight numbers: 1909 has one constructor per column list, 3723 one per
     /// constraint kind and 103 one per shape of token; 208 and 447 each take a second
     /// constructor for another context.
     #[test]
@@ -6847,6 +6880,22 @@ mod tests {
                 16,
                 5,
                 "Index 'dbo.t.uq_t' enforces a UNIQUE KEY constraint and cannot be dropped directly.".to_owned(),
+            ),
+            (
+                // ALTER TABLE dbo.t DROP CONSTRAINT nosuch;
+                SqlError::constraint_not_on_table("nosuch"),
+                3728,
+                16,
+                1,
+                "'nosuch' is not the name of a constraint here.".to_owned(),
+            ),
+            (
+                // CREATE INDEX ix ON dbo.ix_t(b); ALTER TABLE dbo.ix_t DROP COLUMN b;
+                SqlError::object_depends_on_column("index", "ix", "b"),
+                5074,
+                16,
+                1,
+                "index 'ix' still depends on column 'b'.".to_owned(),
             ),
             (
                 // CREATE INDEX ix_v ON dbo.v (a); over a view created without WITH SCHEMABINDING
@@ -7031,11 +7080,11 @@ mod tests {
             );
             assert_eq!(err.line, 0, "line of error {number}");
         }
-        assert_eq!(expected.len(), 35);
+        assert_eq!(expected.len(), 37);
         let mut numbers: Vec<u32> = expected.iter().map(|row| row.1).collect();
         numbers.sort_unstable();
         numbers.dedup();
-        assert_eq!(numbers.len(), 30);
+        assert_eq!(numbers.len(), 32);
     }
 
     /// Error 1909 sends two states, so it carries two constructors rather than a state
