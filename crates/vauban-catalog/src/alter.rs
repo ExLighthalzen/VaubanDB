@@ -153,19 +153,20 @@ fn uses_constraint_session(
                 | ConstraintDef::Check { .. }
                 | ConstraintDef::Default { .. }
         ),
-        AlterTable::DropConstraint { name } => !is_named_key_constraint(catalog, txn, table, name)?,
+        AlterTable::DropConstraint { name } => {
+            let mut store = table::store(catalog);
+            table::refresh(catalog, &mut store)?;
+            index::refresh(catalog, &mut store)?;
+            crate::constraints::refresh_sessions(catalog, &mut store)?;
+            crate::constraints::forget_dropped(&mut store);
+            !is_named_key_constraint(&store, table, name)?
+        }
         _ => false,
     })
 }
 
 /// Whether `name` is the index backing a `PRIMARY KEY` or `UNIQUE` constraint on `table`.
-fn is_named_key_constraint(
-    catalog: &Catalog,
-    txn: &TxnHandle,
-    table: ObjectId,
-    name: &str,
-) -> SqlResult<bool> {
-    let store = table::store(catalog);
+fn is_named_key_constraint(store: &TableStore, table: ObjectId, name: &str) -> SqlResult<bool> {
     let Some(meta) = store.get(table) else {
         return Ok(false);
     };
@@ -182,7 +183,6 @@ fn is_named_key_constraint(
             return Ok(true);
         }
     }
-    let _ = txn;
     Ok(false)
 }
 
@@ -192,6 +192,12 @@ fn alter_table_constraint(
     table: ObjectId,
     change: &AlterTable,
 ) -> SqlResult<TableMeta> {
+    if let AlterTable::AddConstraint { constraint } = change
+        && let ConstraintDef::Check { name, expr } = constraint.as_ref()
+    {
+        let meta = table_meta_for_alter(catalog, table)?;
+        refuse_check_violated_by_existing_rows(catalog, txn, &meta, name, expr)?;
+    }
     let mut store = table::store(catalog);
     table::refresh(catalog, &mut store)?;
     index::refresh(catalog, &mut store)?;
@@ -213,15 +219,9 @@ fn alter_table_constraint(
                 )
                 .into());
             }
-            ConstraintDef::Check { name, expr } => {
-                let meta = store.get(table).cloned().ok_or_else(|| {
-                    InternalError::Bug(format!("Catalog::alter_table: table {table} vanished"))
-                })?;
-                refuse_check_violated_by_existing_rows(catalog, txn, &meta, name, expr)?;
-                crate::constraints::add_table_constraint(
-                    catalog, txn, &mut store, table, constraint,
-                )?;
-            }
+            ConstraintDef::Check { .. } => crate::constraints::add_table_constraint(
+                catalog, txn, &mut store, table, constraint,
+            )?,
             _ => crate::constraints::add_table_constraint(
                 catalog, txn, &mut store, table, constraint,
             )?,
@@ -235,6 +235,23 @@ fn alter_table_constraint(
         .get(table)
         .cloned()
         .expect("alter_table stored the table"))
+}
+
+fn table_meta_for_alter(catalog: &Catalog, table: ObjectId) -> SqlResult<TableMeta> {
+    let mut store = table::store(catalog);
+    table::refresh(catalog, &mut store)?;
+    index::refresh(catalog, &mut store)?;
+    crate::constraints::refresh_sessions(catalog, &mut store)?;
+    crate::constraints::forget_dropped(&mut store);
+    let Some(entry) = store.entries.get(&table) else {
+        return Err(SqlError::cannot_drop("alter", "table", &table.to_string()));
+    };
+    if entry.dropped_by.is_some() {
+        return Err(SqlError::cannot_drop("alter", "table", &entry.meta.name));
+    }
+    store.get(table).cloned().ok_or_else(|| {
+        InternalError::Bug(format!("Catalog::alter_table: table {table} vanished")).into()
+    })
 }
 
 fn plan_change(
@@ -336,7 +353,7 @@ fn plan_change(
             old.columns.clone()
         }
         AlterTable::DropConstraint { name } => {
-            if is_named_key_constraint(catalog, txn, old.id, name)? {
+            if is_named_key_constraint(store, old.id, name)? {
                 let before = keys.len();
                 keys.retain(|key| {
                     constraint_def_name(key)

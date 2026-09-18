@@ -12,7 +12,7 @@
 //! [`CatalogSnapshot::view_definition`]) and converts the result into the types of the
 //! binder.
 
-use vauban_catalog::{CatalogSnapshot, ColumnId, ColumnMeta, ObjectId, ObjectKind};
+use vauban_catalog::{CatalogSnapshot, ColumnId, ColumnMeta, ConstraintMeta, ObjectId, ObjectKind};
 use vauban_parser::ObjectName;
 
 use crate::bound::ColumnBinding;
@@ -87,6 +87,37 @@ impl CatalogView for CatalogSnapshot {
                 .map(|column| column.id)
                 .collect()
         })
+    }
+
+    /// Names of the constraints on `table`: index-backed `PRIMARY KEY` and `UNIQUE`, then
+    /// `FOREIGN KEY`, `CHECK` and `DEFAULT` objects.
+    fn constraint_names_on_table(&self, table: ObjectId) -> Vec<String> {
+        let Some(meta) = self.table(table) else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        for index in self.indexes_of(table) {
+            if meta.constraints.iter().any(|constraint| {
+                matches!(
+                    constraint,
+                    ConstraintMeta::PrimaryKey(id) | ConstraintMeta::Unique(id) if *id == index.id
+                )
+            }) {
+                names.push(index.name.clone());
+            }
+        }
+        for constraint in &meta.constraints {
+            let object = match constraint {
+                ConstraintMeta::ForeignKey { constraint, .. }
+                | ConstraintMeta::Check { constraint, .. }
+                | ConstraintMeta::Default { constraint, .. } => *constraint,
+                _ => continue,
+            };
+            if let Some(qualified) = self.object_name(object) {
+                names.push(qualified.name);
+            }
+        }
+        names
     }
 }
 

@@ -123,7 +123,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use vauban_binder::{BatchVariables, BindContext, BoundStatement, OutputSchema};
+use vauban_binder::{BatchVariables, BindContext, BoundStatement, DdlStatement, OutputSchema};
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
 use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSink};
@@ -328,20 +328,33 @@ impl Session {
             // (blank text, comments only): without it the client would wait forever.
             return sink.done(None, false);
         }
-        let prepared = match self.prepare_batch(text, &batch.statements) {
-            Ok(prepared) => prepared,
-            Err(err) if self.cancel.is_cancelled() => return Err(err),
-            Err(err) => return self.fail(&err, sink),
-        };
-        let last = prepared.len() - 1;
-        for (index, statement) in prepared.iter().enumerate() {
+        let (mut prepared, mut bind_state, mut batch_variables) =
+            match self.prepare_batch(text, &batch.statements) {
+                Ok(prepared) => prepared,
+                Err(err) if self.cancel.is_cancelled() => return Err(err),
+                Err(err) => return self.fail(&err, sink),
+            };
+        let mut index = 0;
+        while index < prepared.len() {
             // Between two statements, as `fake_engine` did before its own work: an
             // ATTENTION that arrived during the previous one stops the batch here.
             self.cancel.check()?;
-            let more = index < last;
-            if let Flow::Stop = self.run_prepared(statement, more, sink)? {
+            let more = index + 1 < prepared.len();
+            let current = &prepared[index];
+            if let Flow::Stop = self.run_prepared(current, more, sink)? {
                 break;
             }
+            if catalog_changed(current) && index + 1 < batch.statements.len() {
+                let tail = self.reprepare_tail(
+                    text,
+                    &batch.statements[index + 1..],
+                    &mut bind_state,
+                    &mut batch_variables,
+                )?;
+                prepared.truncate(index + 1);
+                prepared.extend(tail);
+            }
+            index += 1;
         }
         // A batch may end with a transaction still open; what the end of a batch does with
         // it is `txn_session::end_of_batch`'s decision.
@@ -350,107 +363,60 @@ impl Session {
     }
 
     /// Parses, binds and compile-checks every statement without changing live session state.
-    /// A failure therefore reaches the sink before an earlier statement can emit a result set.
-    ///
-    /// # The transaction of the binding, and the one of each statement
-    ///
-    /// The binder needs a [`CatalogSnapshot`], and a snapshot is taken through a
-    /// transaction. This one is opened here, read from, and closed **before** the first
-    /// statement runs, so that no transaction stays open for the length of a batch: the
-    /// transaction a statement writes in is the one
-    /// [`Session::execute_in_a_transaction`] opens for it.
-    ///
-    /// Closing it makes the whole batch bind against the catalogue as it stood **before**
-    /// the batch, which is a deliberate difference from SQL Server: a batch that creates
-    /// a table and reads it needs deferred name resolution, and this engine has none.
-    /// `CREATE TABLE dbo.s16b (a int); SELECT * FROM dbo.s16b;` in one batch answers one
-    /// result set with the column `a` and no row on SQL Server, where the same text here
-    /// answers 208 at binding time and runs neither statement (unit test
-    /// `create_table_then_select_in_the_same_batch_is_208`). Two batches on one connection
-    /// answer the same thing here as on SQL Server
-    /// (`create_table_then_select_star_same_connection`).
-    ///
-    /// The vector that separates "bound before the batch" from "bound after the previous
-    /// statement" the other way round is a name the batch **creates twice**:
-    /// `CREATE TABLE t; CREATE TABLE t;`. Both statements bind here, because the snapshot
-    /// shows neither, and the second one raises 2714 while it runs, which is where SQL
-    /// Server raises it too: on
-    /// `SELECT 1; CREATE TABLE dbo.s16d (a int); CREATE TABLE dbo.s16d (a int); SELECT 2;`,
-    /// one result set (the `SELECT 1`), then 2714 severity 16 state 6 on the line of the
-    /// second `CREATE TABLE`, and no result set for the `SELECT 2`, 2714 being a
-    /// batch-scoped number ([`BatchErrorScope`], `errors/catalog.rs`). Pinned by
-    /// `create_table_twice_in_one_batch_is_2714_at_run_time`.
     fn prepare_batch(
         &self,
         text: &str,
         statements: &[Statement],
-    ) -> SqlResult<Vec<PreparedStatement>> {
+    ) -> SqlResult<(Vec<PreparedStatement>, SessionState, BatchVariables)> {
+        let mut state = self.state.clone();
+        let mut batch_variables = BatchVariables::new();
         let binding = self.engine.txn.begin(IsolationLevel::ReadCommitted);
         let snapshot = self.engine.catalog.snapshot(&binding);
-        let prepared = self.bind_batch(text, statements, &snapshot);
-        // The binding transaction wrote nothing, so it is committed rather than rolled
-        // back in both branches of the binding, the successful one and the failing one: a
-        // rollback would run the compensations of a transaction that created nothing. Its
-        // own failure is internal, and it does not hide the error the binding already found.
+        let prepared = self.bind_batch(
+            text,
+            statements,
+            &snapshot,
+            &mut state,
+            &mut batch_variables,
+        );
         let closed = self.engine.txn.commit(binding);
         match (prepared, closed) {
-            (Ok(prepared), Ok(())) => Ok(prepared),
+            (Ok(prepared), Ok(())) => Ok((prepared, state, batch_variables)),
             (Err(err), _) => Err(err),
             (Ok(_), Err(err)) => Err(err),
         }
     }
 
-    /// Binds and compile-checks the statements of the batch against `snapshot`, the
-    /// catalogue as it
-    /// stood when [`Session::prepare_batch`] opened its transaction.
-    ///
-    /// # Where the 911 of a `USE` belongs, and why it is here
-    ///
-    /// On SQL Server a `USE` that names a database which is not there is a
-    /// **compilation** error: nothing of the batch runs, not even the statements written
-    /// before it. The same here, each batch carrying a statement after the failing one so
-    /// that "the batch stops" and "the batch goes on" answer differently (unit tests
-    /// `use_unknown_is_911`, `a_database_created_by_the_batch_is_not_usable_by_it`):
-    ///
-    /// | batch | result |
-    /// |---|---|
-    /// | `SELECT 1; USE nosuchdb; SELECT 2;` | 911, **not one** result set |
-    /// | `CREATE DATABASE d; USE d; SELECT DB_NAME();` (one batch) | 911, and `d` is **not** created |
-    /// | `USE master; USE nosuchdb; SELECT 2;` | 911, no result set |
-    /// | `SELECT 1; USE d; SELECT 2;` (`d` exists) | row `1`, 5701, row `2` |
-    ///
-    /// The second row is the one that separates a compile-time check from a run-time one:
-    /// a 911 raised while the statement ran would have let the `CREATE DATABASE` before it
-    /// through. Raising it here, where the batch is bound, is the same frontier as SQL
-    /// Server's.
-    ///
-    /// The line is the one of the **name**, not of the statement
-    /// ([`use_name_line`]), and the batch is left alone by
-    /// [`BatchErrorScope`]: `prepare_batch` fails, so `run_batch` sends one ERROR and one
-    /// DONE.
-    ///
-    /// What this layer does **not** reproduce is the order between a 911 and a **syntax**
-    /// error of a later statement: `USE nosuchdb; SELEC 2;` answers 911 on SQL Server,
-    /// which compiles statement by statement, and 102 here, because `parse_batch` reads
-    /// the whole text first (module header). A binding error of a later statement does
-    /// fall on the same side as SQL Server (911 both times).
+    /// Re-binds the tail of a batch after a catalogue-changing statement ran.
+    fn reprepare_tail(
+        &self,
+        text: &str,
+        statements: &[Statement],
+        state: &mut SessionState,
+        batch_variables: &mut BatchVariables,
+    ) -> SqlResult<Vec<PreparedStatement>> {
+        let binding = self.engine.txn.begin(IsolationLevel::ReadCommitted);
+        let snapshot = self.engine.catalog.snapshot(&binding);
+        let prepared = self.bind_batch(text, statements, &snapshot, state, batch_variables);
+        self.engine.txn.commit(binding)?;
+        prepared
+    }
+
     fn bind_batch(
         &self,
         text: &str,
         statements: &[Statement],
         snapshot: &CatalogSnapshot,
+        state: &mut SessionState,
+        batch_variables: &mut BatchVariables,
     ) -> SqlResult<Vec<PreparedStatement>> {
-        let mut state = self.state.clone();
-        let mut batch_variables = BatchVariables::new();
         let mut prepared = Vec::with_capacity(statements.len());
 
         for (index, original) in statements.iter().enumerate() {
             self.cancel.check()?;
             let raw = statement_text(text, original);
             if matches!(original, Statement::SetOption(_)) {
-                // SET options affect compilation of following statements but are not committed
-                // to the connection unless the whole batch compiles and execution reaches them.
-                apply_set_statement(&mut state, &raw);
+                apply_set_statement(state, &raw);
                 prepared.push(PreparedStatement::Set {
                     text: raw,
                     line: statement_span(original).line,
@@ -458,9 +424,6 @@ impl Session {
                 continue;
             }
 
-            // The first parse establishes safe statement boundaries for the whole batch. Reparse
-            // each statement under the options produced by preceding SETs. Leading newlines keep
-            // client-visible error lines anchored in the original batch.
             let line = statement_line(original);
             let source = statement_fragment(text, original, statements.get(index + 1));
             let padded = format!("{}{}", "\n".repeat(line.saturating_sub(1) as usize), source);
@@ -477,7 +440,7 @@ impl Session {
                 catalog: Some(snapshot),
                 database: &state.database,
                 default_schema: DEFAULT_SCHEMA,
-                variables: &batch_variables,
+                variables: batch_variables,
                 options,
             };
             let bound = match vauban_binder::bind(statement, &ctx) {
@@ -497,15 +460,11 @@ impl Session {
                 }
             }
 
-            // The planner reads the indexes of the storage; the rules that would choose
-            // one are not written, so a read is planned as a scan.
             let indexes = StorageIndexes(self.engine.storage.as_ref());
             let physical = vauban_planner::plan(bound, &PlanContext { catalog: &indexes })
                 .map_err(|error| at_statement(error, statement_line(statement)))?;
 
-            // The compiler folds what it can, so the context it gets reads the same
-            // catalogue as the binder: `snapshot` (`eval_context.rs`).
-            let eval = SessionEvalContext::new(&state, Some(snapshot));
+            let eval = SessionEvalContext::new(state, Some(snapshot));
             let mut exec = ExecContext::scalar(&eval, state.options.to_binder());
             vauban_executor::compile(&physical, &mut exec)
                 .map_err(|error| at_statement(error, statement_line(statement)))?;
@@ -518,9 +477,6 @@ impl Session {
                         SqlError::database_not_found(database)
                             .with_line(use_name_line(&padded, statement))
                     })?;
-                // The statements that follow bind in the new database, as they do on SQL
-                // Server: `USE d; SELECT 1 FROM dbo.only_in_master;` answers 208
-                // (`use_moves_the_binding_of_the_rest_of_the_batch`).
                 state.database = found.clone();
                 prepared.push(PreparedStatement::Use {
                     statement: physical,
@@ -884,6 +840,24 @@ fn column_metadata(schema: &OutputSchema) -> Vec<ColumnMeta> {
         .collect()
 }
 
+/// Whether the batch tail must be rebound after this statement ran.
+///
+/// The whole batch binds against one catalogue snapshot; that is deliberate for
+/// `CREATE TABLE` followed by a `SELECT` on the new name in the same batch, which answers
+/// 208 and runs neither statement (`create_table_then_select_in_the_same_batch_is_208`).
+/// An `ALTER TABLE` that changes the shape bound by following statements is the exception:
+/// the tail is rebound after it commits so a `SELECT` in the same batch reads the new
+/// columns.
+fn catalog_changed(prepared: &PreparedStatement) -> bool {
+    matches!(
+        prepared,
+        PreparedStatement::Bound {
+            statement: PhysicalStatement::Ddl(DdlStatement::AlterTable { .. }),
+            ..
+        }
+    )
+}
+
 /// Whether a successful statement resets `@@ERROR` to `0`. A bare `DECLARE` with no
 /// initializer on any item leaves the previous error in place
 /// (`tests/session_variables.rs`, `last_error_is_cleared_by_a_successful_statement`).
@@ -941,6 +915,7 @@ fn statement_line(stmt: &Statement) -> u32 {
         | Statement::CreateDatabase(_)
         | Statement::DropDatabase { .. }
         | Statement::CreateTable(_)
+        | Statement::AlterTable(_)
         | Statement::DropTable { .. }
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
