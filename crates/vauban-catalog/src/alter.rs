@@ -5,7 +5,8 @@
 //! The copy includes rows visible to the current transaction; uncommitted writes from
 //! other sessions fall outside that snapshot until a schema lock serializes readers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{Expr, InList};
@@ -18,6 +19,46 @@ use crate::ids::{ColumnId, ObjectId};
 use crate::index;
 use crate::meta::{ColumnMeta, ConstraintMeta, QualifiedName, TableMeta};
 use crate::table::{self, TableStore};
+
+/// Key for [`column_id_watermarks`]: one catalogue instance and one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct WatermarkKey {
+    catalogue: usize,
+    table: ObjectId,
+}
+
+/// Highest `column_id` handed out per table, including ids of columns since dropped
+/// (`tests/alter.rs`, `drop_last_column_then_add_uses_high_water`).
+fn column_id_watermarks() -> &'static Mutex<BTreeMap<WatermarkKey, i32>> {
+    static WATERMARKS: Mutex<BTreeMap<WatermarkKey, i32>> = Mutex::new(BTreeMap::new());
+    &WATERMARKS
+}
+
+fn watermark_key(catalog: &Catalog, table: ObjectId) -> WatermarkKey {
+    WatermarkKey {
+        catalogue: Arc::as_ptr(&catalog.storage) as *const () as usize,
+        table,
+    }
+}
+
+/// The highest `column_id` already used on `table`, live or dropped.
+fn max_column_id_used(catalog: &Catalog, table: ObjectId, columns: &[ColumnMeta]) -> i32 {
+    let live_max = columns.iter().map(|column| column.id.0).max().unwrap_or(0);
+    column_id_watermarks()
+        .lock()
+        .expect("column_id watermarks mutex")
+        .get(&watermark_key(catalog, table))
+        .copied()
+        .unwrap_or(0)
+        .max(live_max)
+}
+
+fn set_max_column_id_used(catalog: &Catalog, table: ObjectId, value: i32) {
+    column_id_watermarks()
+        .lock()
+        .expect("column_id watermarks mutex")
+        .insert(watermark_key(catalog, table), value);
+}
 
 /// What one `ALTER TABLE` builds before the copy.
 struct AlterPlan {
@@ -35,7 +76,8 @@ struct AlterPlan {
 /// - 4901 when a `NOT NULL` column without a default is added to a table that already holds
 ///   rows (`tests/alter.rs`, `add_not_null_without_default_follows_the_measure`);
 /// - 5074 when a column an index or constraint still references
-///   (`tests/alter.rs`, `drop_column_used_by_an_index_is_refused`);
+///   (`tests/alter.rs`, `drop_column_used_by_an_index_is_refused`,
+///   `add_column_default_then_drop_is_5074`);
 /// - 3728 when a constraint name is unknown on `DROP CONSTRAINT`
 ///   (`tests/alter.rs`, `drop_unknown_constraint_is_3728`);
 /// - what [`crate::index::table_keys`], [`crate::index::apply_table_keys`] and
@@ -167,8 +209,10 @@ fn plan_change(
                     old.name
                 ))
             })?;
+            let next = max_column_id_used(catalog, old.id, &old.columns) + 1;
+            set_max_column_id_used(catalog, old.id, next);
             columns.push(ColumnMeta {
-                id: next_column_id(&columns),
+                id: ColumnId(next),
                 name: column.name.clone(),
                 ty: column.ty.clone(),
                 ordinal,
@@ -187,6 +231,11 @@ fn plan_change(
                 return Err(SqlError::column_does_not_exist_in_target(name));
             };
             refuse_drop_column_used(store, old, target)?;
+            set_max_column_id_used(
+                catalog,
+                old.id,
+                max_column_id_used(catalog, old.id, &old.columns).max(target.id.0),
+            );
             let mut columns = Vec::new();
             for (position, column) in old
                 .columns
@@ -270,6 +319,11 @@ fn copy_table(
         let mut store = table::store(catalog);
         index::apply_table_keys(catalog, txn, &mut store, &keys, &mut meta)?;
         meta.constraints.extend(plan.preserved.clone());
+        crate::constraints::apply_table_constraints(
+            &mut store,
+            &build_table_def(old, &plan.columns, &[], &[]),
+            &mut meta,
+        )?;
         if !plan.add.is_empty() {
             let def = build_table_def(old, &plan.columns, &[], &plan.add);
             crate::constraints::apply_table_constraints(&mut store, &def, &mut meta)?;
@@ -337,11 +391,6 @@ fn table_is_empty(catalog: &Catalog, txn: &TxnHandle, table: &TableMeta) -> SqlR
         .scan(&snap, table.storage_id)?
         .next()
         .is_none())
-}
-
-fn next_column_id(columns: &[ColumnMeta]) -> ColumnId {
-    let max = columns.iter().map(|column| column.id.0).max().unwrap_or(0);
-    ColumnId(max + 1)
 }
 
 fn refuse_duplicate_column(table: &TableMeta, name: &str) -> SqlResult<()> {

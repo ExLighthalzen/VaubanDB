@@ -345,6 +345,78 @@ fn drop_column_used_by_an_index_is_refused() {
 }
 
 #[test]
+fn drop_last_column_then_add_uses_high_water() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &two_int_columns("t"))
+        .expect("create_table");
+    let without_b = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::DropColumn {
+                name: "b".to_owned(),
+            },
+        )
+        .expect("drop b");
+    assert_eq!(without_b.columns.len(), 1);
+    let with_d = catalog
+        .alter_table(
+            &handle,
+            without_b.id,
+            &AlterTable::AddColumn {
+                column: Box::new(column("d", SqlType::Int, true)),
+            },
+        )
+        .expect("add d");
+    assert_eq!(with_d.columns[0].id.0, 1);
+    assert_eq!(with_d.columns[1].id.0, 3);
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
+fn drop_last_of_three_then_add_uses_high_water() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(
+            &handle,
+            &table(
+                "t",
+                vec![
+                    column("a", SqlType::Int, false),
+                    column("b", SqlType::Int, false),
+                    column("c", SqlType::Int, false),
+                ],
+            ),
+        )
+        .expect("create_table");
+    let without_c = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::DropColumn {
+                name: "c".to_owned(),
+            },
+        )
+        .expect("drop c");
+    let with_d = catalog
+        .alter_table(
+            &handle,
+            without_c.id,
+            &AlterTable::AddColumn {
+                column: Box::new(column("d", SqlType::Int, true)),
+            },
+        )
+        .expect("add d");
+    assert_eq!(with_d.columns[0].id.0, 1);
+    assert_eq!(with_d.columns[1].id.0, 2);
+    assert_eq!(with_d.columns[2].id.0, 4);
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
 fn add_after_drop_does_not_reuse_freed_column_id() {
     let (catalog, _storage, txn) = instance();
     let handle = begin(&txn);
@@ -762,6 +834,45 @@ fn constraint_changes_roll_back() {
         .expect("constraints_of after drop rollback");
     assert_eq!(objects.len(), 1);
     assert_eq!(objects[0].name.name, "ck");
+}
+
+#[test]
+fn add_column_default_then_drop_is_5074() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &table("t", vec![column("a", SqlType::Int, false)]))
+        .expect("create_table");
+    let mut with_default = column("b", SqlType::Int, true);
+    with_default.default = Some(Expr::Literal(Literal::Integer("0".to_owned()), Span::EMPTY));
+    let with_b = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::AddColumn {
+                column: Box::new(with_default),
+            },
+        )
+        .expect("add b");
+    assert_eq!(
+        catalog
+            .constraints_of(with_b.id)
+            .expect("constraints_of")
+            .len(),
+        1,
+        "ADD COLUMN with DEFAULT creates one default object"
+    );
+    let err = catalog
+        .alter_table(
+            &handle,
+            with_b.id,
+            &AlterTable::DropColumn {
+                name: "b".to_owned(),
+            },
+        )
+        .expect_err("drop b");
+    assert_eq!(err.number, 5074);
+    txn.rollback(handle).expect("rollback");
 }
 
 #[test]
