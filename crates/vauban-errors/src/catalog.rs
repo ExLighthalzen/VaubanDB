@@ -839,6 +839,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "Identity column '%.*ls' cannot be updated.",
     },
     ErrorDef {
+        number: 8106,
+        severity: 16,
+        template: "Table '%.*ls' lacks an IDENTITY column; SET IDENTITY_INSERT cannot run on it.",
+    },
+    ErrorDef {
         number: 8107,
         severity: 16,
         template: "A session holds IDENTITY_INSERT for one table at a time; '%.*ls.%.*ls.%.*ls' already has it, and '%.*ls' is refused.",
@@ -1039,8 +1044,8 @@ mod tests {
     /// informational (severity <= 10).
     const REQUIRED_NUMBERS: &[u32] = &[
         102, 105, 137, 148, 156, 207, 208, 209, 213, 2812, 4104, 4145, 8120, 241, 242, 245, 8114,
-        8115, 8134, 8152, 2628, 515, 544, 8107, 547, 2601, 2627, 911, 1801, 2714, 3701, 4060, 226,
-        1205, 1222, 3902, 3903, 3926, 3960, 3971, 3989, 18452, 18456, 5701, 5703,
+        8115, 8134, 8152, 2628, 515, 544, 8106, 8107, 547, 2601, 2627, 911, 1801, 2714, 3701, 4060,
+        226, 1205, 1222, 3902, 3903, 3926, 3960, 3971, 3989, 18452, 18456, 5701, 5703,
     ];
 
     /// The specifiers that consume an argument, longest first so that `%ls` is not read
@@ -1210,6 +1215,7 @@ mod tests {
         (7202, 11, &["%.*ls"]),
         (8101, 16, &["%.*ls"]),
         (8102, 16, &["%.*ls"]),
+        (8106, 16, &["%.*ls"]),
         (8107, 16, &["%.*ls", "%.*ls", "%.*ls", "%.*ls"]),
         (8110, 16, &["%.*ls"]),
         (8111, 16, &["%.*ls"]),

@@ -626,6 +626,106 @@ fn identity_increments_per_row() {
 }
 
 #[test]
+fn explicit_identity_value_bumps_the_counter_for_the_next_row() {
+    let storage = Arc::new(MemoryStorage::new());
+    let txn_mgr = Arc::new(TransactionManager::new(
+        storage.clone() as Arc<dyn vauban_storage::Storage>
+    ));
+    let catalog = Catalog::bootstrap(storage.clone(), txn_mgr.clone()).expect("bootstrap succeeds");
+    let handle = txn_mgr.begin(IsolationLevel::ReadCommitted);
+    let meta = catalog
+        .create_table(
+            &handle,
+            &TableDef {
+                name: tbl_name("insert_explicit_bump"),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_owned(),
+                        ty: int(false),
+                        default: None,
+                        identity: Some(IdentitySpec::default()),
+                        computed: None,
+                    },
+                    ColumnDef {
+                        name: "v".to_owned(),
+                        ty: int(true),
+                        default: None,
+                        identity: None,
+                        computed: None,
+                    },
+                ],
+                constraints: Vec::new(),
+            },
+        )
+        .expect("create_table succeeds");
+
+    let id = col_binding(0, "id", int(false));
+    let v = col_binding(1, "v", int(true));
+    let seed = PhysicalStatement::Insert(PhysicalInsert {
+        table: meta.storage_id,
+        columns: vec![v.clone()],
+        source: values_plan(
+            vec![
+                vec![Value::I32(1)],
+                vec![Value::I32(2)],
+                vec![Value::I32(3)],
+            ],
+            &[int(true)],
+        ),
+        spool: false,
+    });
+    let explicit = PhysicalStatement::Insert(PhysicalInsert {
+        table: meta.storage_id,
+        columns: vec![id.clone(), v.clone()],
+        source: values_plan(
+            vec![vec![Value::I32(104), Value::I32(99)]],
+            &[int(false), int(true)],
+        ),
+        spool: false,
+    });
+    let automatic = PhysicalStatement::Insert(PhysicalInsert {
+        table: meta.storage_id,
+        columns: vec![v],
+        source: values_plan(vec![vec![Value::I32(100)]], &[int(true)]),
+        spool: false,
+    });
+
+    let eval = StaticContext::default();
+    let snap = txn_mgr.statement_snapshot(&handle);
+    let options =
+        SessionOptions::default().with_identity_insert("master", "dbo", "insert_explicit_bump");
+    let mut session = ExecSession::default();
+    let mut ctx = ExecContext::scalar(&eval, options)
+        .with_engine(
+            storage.as_ref() as &dyn vauban_storage::Storage,
+            txn_mgr.as_ref(),
+            &snap,
+        )
+        .with_catalog(&catalog)
+        .with_handle(&handle)
+        .with_session(&mut session);
+
+    execute_collect(&seed, &mut ctx).expect("seed INSERT succeeds");
+    execute_collect(&explicit, &mut ctx).expect("explicit INSERT succeeds");
+    execute_collect(&automatic, &mut ctx).expect("automatic INSERT succeeds");
+
+    let read_plan = PhysicalPlan::TableScan {
+        table: meta.storage_id,
+        columns: vec![id, col_binding(1, "v", int(true))],
+        schema: OutputSchema {
+            columns: vec![out_col("id", int(false)), out_col("v", int(true))],
+        },
+        alias: "".to_owned(),
+        hints: LockHints::default(),
+    };
+    let (_, set) =
+        execute_collect(&PhysicalStatement::Query(read_plan), &mut ctx).expect("scan succeeds");
+    assert_eq!(set.rows.len(), 5);
+    assert_eq!(set.rows[3], vec![Value::I32(104), Value::I32(99)]);
+    assert_eq!(set.rows[4], vec![Value::I32(105), Value::I32(100)]);
+}
+
+#[test]
 fn string_too_long_for_a_varchar_column_is_2628() {
     let mut f = Fixture::new();
     let table = f.create(

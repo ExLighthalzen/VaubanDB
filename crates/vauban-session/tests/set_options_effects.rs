@@ -736,6 +736,218 @@ fn identity_insert_on_a_double_quoted_name_needs_quoted_identifier_on() {
 }
 
 #[test]
+fn identity_insert_on_an_unknown_table_is_1088_and_leaves_the_option_closed() {
+    let mut session = session();
+    let events = run_on(&mut session, "SET IDENTITY_INSERT dbo.nosuch ON");
+    let err = only_error(&events);
+    assert_eq!(err.number, 1088);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 11);
+    assert_eq!(session.state().identity_insert, None);
+}
+
+#[test]
+fn identity_insert_on_a_table_without_identity_is_8106_and_leaves_the_option_closed() {
+    let mut session = session();
+    no_error(
+        &run_on(
+            &mut session,
+            "CREATE TABLE dbo.plain (id int NOT NULL PRIMARY KEY, v int NOT NULL)",
+        ),
+        "CREATE TABLE",
+    );
+    let events = run_on(&mut session, "SET IDENTITY_INSERT dbo.plain ON");
+    let err = only_error(&events);
+    assert_eq!(err.number, 8106);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 1);
+    assert_eq!(session.state().identity_insert, None);
+}
+
+#[test]
+fn identity_insert_on_a_valid_table_still_succeeds_after_refusals_were_added() {
+    let mut session = session();
+    create_identity_table(&mut session, "ok");
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.ok ON"),
+        "valid SET ON",
+    );
+    assert_eq!(
+        session
+            .state()
+            .identity_insert
+            .as_ref()
+            .map(|t| t.name.as_str()),
+        Some("ok")
+    );
+}
+
+#[test]
+fn identity_insert_off_on_an_unknown_table_is_1088_and_leaves_the_option_closed() {
+    let mut session = session();
+    let events = run_on(&mut session, "SET IDENTITY_INSERT dbo.nosuch OFF");
+    let err = only_error(&events);
+    assert_eq!(err.number, 1088);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 11);
+    assert_eq!(session.state().identity_insert, None);
+}
+
+#[test]
+fn identity_insert_off_on_a_table_without_identity_is_8106_and_leaves_the_option_closed() {
+    let mut session = session();
+    no_error(
+        &run_on(
+            &mut session,
+            "CREATE TABLE dbo.plain (id int NOT NULL PRIMARY KEY, v int NOT NULL)",
+        ),
+        "CREATE TABLE",
+    );
+    let events = run_on(&mut session, "SET IDENTITY_INSERT dbo.plain OFF");
+    let err = only_error(&events);
+    assert_eq!(err.number, 8106);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 1);
+    assert_eq!(session.state().identity_insert, None);
+}
+
+#[test]
+fn identity_insert_off_on_an_unknown_table_leaves_an_open_option_unchanged() {
+    let mut session = session();
+    create_identity_table(&mut session, "t1");
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.t1 ON"),
+        "SET ON",
+    );
+    let events = run_on(&mut session, "SET IDENTITY_INSERT dbo.nosuch OFF");
+    let err = only_error(&events);
+    assert_eq!(err.number, 1088);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 11);
+    assert_eq!(
+        session
+            .state()
+            .identity_insert
+            .as_ref()
+            .map(|t| t.name.as_str()),
+        Some("t1")
+    );
+}
+
+#[test]
+fn identity_insert_off_on_a_table_without_identity_leaves_an_open_option_unchanged() {
+    let mut session = session();
+    create_identity_table(&mut session, "t1");
+    no_error(
+        &run_on(
+            &mut session,
+            "CREATE TABLE dbo.plain (id int NOT NULL PRIMARY KEY, v int NOT NULL)",
+        ),
+        "CREATE TABLE",
+    );
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.t1 ON"),
+        "SET ON",
+    );
+    let events = run_on(&mut session, "SET IDENTITY_INSERT dbo.plain OFF");
+    let err = only_error(&events);
+    assert_eq!(err.number, 8106);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 1);
+    assert_eq!(
+        session
+            .state()
+            .identity_insert
+            .as_ref()
+            .map(|t| t.name.as_str()),
+        Some("t1")
+    );
+}
+
+#[test]
+fn explicit_identity_bump_lets_the_next_automatic_insert_continue_the_sequence() {
+    let mut session = session();
+    create_identity_table(&mut session, "seq");
+    no_error(
+        &run_on(&mut session, "INSERT INTO dbo.seq (v) VALUES (1), (2), (3)"),
+        "seed rows",
+    );
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.seq ON"),
+        "SET ON",
+    );
+    no_error(
+        &run_on(&mut session, "INSERT INTO dbo.seq (id, v) VALUES (104, 99)"),
+        "explicit 104",
+    );
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.seq OFF"),
+        "SET OFF",
+    );
+    no_error(
+        &run_on(&mut session, "INSERT INTO dbo.seq (v) VALUES (100)"),
+        "automatic after explicit",
+    );
+    let events = run_on(&mut session, "SELECT id, v FROM dbo.seq ORDER BY id");
+    assert_eq!(
+        rows(&events),
+        vec![
+            vec![Value::I32(1), Value::I32(1)],
+            vec![Value::I32(2), Value::I32(2)],
+            vec![Value::I32(3), Value::I32(3)],
+            vec![Value::I32(104), Value::I32(99)],
+            vec![Value::I32(105), Value::I32(100)],
+        ],
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn a_lower_explicit_identity_value_does_not_rewind_the_counter() {
+    let mut session = session();
+    create_identity_table(&mut session, "seq2");
+    no_error(
+        &run_on(
+            &mut session,
+            "INSERT INTO dbo.seq2 (v) VALUES (1), (2), (3)",
+        ),
+        "seed rows",
+    );
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.seq2 ON"),
+        "SET ON",
+    );
+    no_error(
+        &run_on(
+            &mut session,
+            "INSERT INTO dbo.seq2 (id, v) VALUES (99, 10), (50, 20)",
+        ),
+        "explicit 99 then 50",
+    );
+    no_error(
+        &run_on(&mut session, "SET IDENTITY_INSERT dbo.seq2 OFF"),
+        "SET OFF",
+    );
+    no_error(
+        &run_on(&mut session, "INSERT INTO dbo.seq2 (v) VALUES (30)"),
+        "automatic after lower explicit",
+    );
+    let events = run_on(&mut session, "SELECT id FROM dbo.seq2 ORDER BY id");
+    assert_eq!(
+        rows(&events),
+        vec![
+            vec![Value::I32(1)],
+            vec![Value::I32(2)],
+            vec![Value::I32(3)],
+            vec![Value::I32(50)],
+            vec![Value::I32(99)],
+            vec![Value::I32(100)],
+        ],
+        "{events:#?}"
+    );
+}
+
+#[test]
 fn identity_insert_survives_the_next_batch_and_is_not_shared() {
     let (mut a, mut b) = shared_sessions();
     no_error(

@@ -62,7 +62,6 @@ use crate::catalog::Catalog;
 use crate::def::{ConstraintDef, TableDef};
 use crate::ids::{ColumnId, ObjectId};
 use crate::meta::{ColumnMeta, TableMeta};
-
 /// The [`ObjectId`] of the first table a catalogue creates.
 ///
 /// The value is ours: a client reads an `object_id` through `sys.objects` and compares
@@ -606,6 +605,19 @@ fn database_of(catalog: &Catalog, name: &str) -> SqlResult<DbId> {
         .find(|(_, stored)| stored.eq_ignore_ascii_case(name))
         .map(|(id, _)| id)
         .ok_or_else(|| SqlError::database_does_not_exist(name))
+}
+
+impl Catalog {
+    /// Raises the identity counter after an explicit value was written under
+    /// `IDENTITY_INSERT`.
+    pub fn bump_identity_after_explicit(
+        &self,
+        txn: &TxnHandle,
+        table: ObjectId,
+        explicit: i64,
+    ) -> SqlResult<()> {
+        crate::identity::bump_after_explicit(self, txn, table, explicit)
+    }
 }
 
 #[cfg(test)]

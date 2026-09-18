@@ -416,7 +416,7 @@ impl Session {
             self.cancel.check()?;
             let raw = statement_text(text, original);
             if matches!(original, Statement::SetOption(_)) {
-                apply_set_statement(state, &raw);
+                apply_set_statement(state, &raw, Some(snapshot));
                 prepared.push(PreparedStatement::Set {
                     text: raw,
                     line: statement_span(original).line,
@@ -502,7 +502,19 @@ impl Session {
         sink: &mut dyn ResultSink,
     ) -> SqlResult<Flow> {
         if let PreparedStatement::Set { text, line } = prepared {
-            match apply_set_statement(&mut self.state, text) {
+            let snapshot = if let Some(session_txn) = &self.state.txn {
+                self.engine.catalog.snapshot(&session_txn.handle)
+            } else {
+                let binding = crate::set_options::begin_autocommit_txn(
+                    &self.state,
+                    &self.engine.storage,
+                    &self.engine.txn,
+                )?;
+                let snap = self.engine.catalog.snapshot(&binding);
+                self.engine.txn.commit(binding)?;
+                snap
+            };
+            match apply_set_statement(&mut self.state, text, Some(&snapshot)) {
                 SetOutcome::Applied | SetOutcome::Ignored(_) => {}
                 SetOutcome::Failed(err) => {
                     let err = at_statement(err, *line);

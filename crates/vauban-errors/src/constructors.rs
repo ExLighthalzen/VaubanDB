@@ -2991,6 +2991,35 @@ impl SqlError {
         )
     }
 
+    /// Error 8106, severity 16, state 1 (`SET IDENTITY_INSERT dbo.plain ON` on a table
+    /// without an identity column): the setting cannot open on that table.
+    ///
+    /// `name` is the qualified name the server prints, usually `schema.object`.
+    ///
+    /// ```text
+    /// Table 'dbo.plain' lacks an IDENTITY column; SET IDENTITY_INSERT cannot run on it.
+    /// ```
+    pub fn identity_insert_table_has_no_identity(name: &str) -> Self {
+        from_catalog(8106, 1, &[Arg::Str(name)])
+    }
+
+    /// Error 1088, severity 16, state 11 (`SET IDENTITY_INSERT dbo.nosuch ON` when the
+    /// name resolves to nothing).
+    ///
+    /// `name` is the qualified name the server prints, usually `schema.object`.
+    ///
+    /// ```text
+    /// Object "dbo.nosuch" was not found: it does not exist or is not accessible.
+    /// ```
+    pub fn cannot_find_object_for_identity_insert(name: &str) -> Self {
+        from_catalog_with_severity(
+            1088,
+            CANNOT_FIND_OBJECT_1088_SEVERITY,
+            11,
+            &[Arg::Str(name)],
+        )
+    }
+
     /// Error 271, severity 16, state 1 (`UPDATE dbo.tc SET c = 1;` where `c` is a computed
     /// column): an `UPDATE` writes a computed column.
     ///
@@ -4017,6 +4046,8 @@ mod tests {
             SqlError::identity_insert_requires_column_list("dbo.ident"),
             SqlError::cannot_update_identity_column("id"),
             SqlError::identity_insert_already_on("master", "dbo", "t1", "dbo.t2"),
+            SqlError::identity_insert_table_has_no_identity("dbo.plain"),
+            SqlError::cannot_find_object_for_identity_insert("dbo.nosuch"),
             SqlError::cannot_update_computed_column("c"),
             SqlError::column_invalid_in_having("dbo.t2", "b"),
             SqlError::column_count_does_not_match_table(),
@@ -6647,6 +6678,22 @@ mod tests {
                 "A session holds IDENTITY_INSERT for one table at a time; 'master.dbo.t1' already has it, and 'dbo.t2' is refused.",
             ),
             (
+                // SET IDENTITY_INSERT dbo.plain ON;
+                SqlError::identity_insert_table_has_no_identity("dbo.plain"),
+                8106,
+                16,
+                1,
+                "Table 'dbo.plain' lacks an IDENTITY column; SET IDENTITY_INSERT cannot run on it.",
+            ),
+            (
+                // SET IDENTITY_INSERT dbo.nosuch ON;
+                SqlError::cannot_find_object_for_identity_insert("dbo.nosuch"),
+                1088,
+                16,
+                11,
+                "Object \"dbo.nosuch\" was not found: it does not exist or is not accessible.",
+            ),
+            (
                 // two sessions updating the same two rows in opposite order
                 SqlError::deadlock_victim(60, "lock"),
                 1205,
@@ -6714,11 +6761,11 @@ mod tests {
             );
             assert_eq!(err.line, 0, "line of error {number}");
         }
-        assert_eq!(expected.len(), 30);
+        assert_eq!(expected.len(), 32);
         let mut numbers: Vec<u32> = expected.iter().map(|row| row.1).collect();
         numbers.sort_unstable();
         numbers.dedup();
-        assert_eq!(numbers.len(), 29);
+        assert_eq!(numbers.len(), 31);
     }
 
     /// Fifteen DML numbers and their sixteen constructors, 1222 counting twice, each

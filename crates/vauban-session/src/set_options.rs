@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use tracing::debug;
 use vauban_binder::SessionOptions as BinderOptions;
+use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{SqlError, SqlResult};
 
 use vauban_executor::ExecSession;
@@ -525,9 +526,13 @@ fn is_keyword(word: &str) -> bool {
 /// malformed value) is `Ignored` with a `debug` log and leaves the state untouched: no
 /// error here. A second `IDENTITY_INSERT ON` while another table is open is `Failed`
 /// with 8107 (`tests/set_options_effects.rs`).
-pub(crate) fn apply_set_statement(state: &mut SessionState, stmt: &str) -> SetOutcome {
+pub(crate) fn apply_set_statement(
+    state: &mut SessionState,
+    stmt: &str,
+    catalog: Option<&CatalogSnapshot>,
+) -> SetOutcome {
     let tokens: Vec<Token<'_>> = tokenize(stmt).into_iter().map(|s| s.token).collect();
-    match apply_tokens(state, &tokens) {
+    match apply_tokens(state, &tokens, catalog) {
         Ok(Some(())) => SetOutcome::Applied,
         Ok(None) => {
             debug!(statement = stmt, "SET statement ignored");
@@ -539,7 +544,11 @@ pub(crate) fn apply_set_statement(state: &mut SessionState, stmt: &str) -> SetOu
 
 /// `Ok(Some(()))` once the state is updated; `Ok(None)` leaves it untouched; `Err` is a
 /// recognised `SET` that was refused (8107).
-fn apply_tokens(state: &mut SessionState, tokens: &[Token<'_>]) -> Result<Option<()>, SqlError> {
+fn apply_tokens(
+    state: &mut SessionState,
+    tokens: &[Token<'_>],
+    catalog: Option<&CatalogSnapshot>,
+) -> Result<Option<()>, SqlError> {
     let (first, rest) = match tokens.split_first() {
         Some(pair) => pair,
         None => return Ok(None),
@@ -555,7 +564,7 @@ fn apply_tokens(state: &mut SessionState, tokens: &[Token<'_>]) -> Result<Option
         return Ok(None);
     };
     if option.eq_ignore_ascii_case("IDENTITY_INSERT") {
-        return apply_identity_insert(state, args);
+        return apply_identity_insert(state, args, catalog);
     }
     Ok(apply_known_option(state, option, args))
 }
@@ -565,9 +574,31 @@ const DEFAULT_SCHEMA: &str = "dbo";
 
 /// `SET IDENTITY_INSERT <table> {ON|OFF}`. A second `ON` while another table is open
 /// answers 8107 and leaves the first table open.
+/// Refuses `SET IDENTITY_INSERT … ON` or `… OFF` when the name resolves to nothing or to
+/// a table without an identity column. An unknown table is checked before a missing identity.
+fn validate_identity_insert_target(
+    catalog: &CatalogSnapshot,
+    database: &str,
+    schema: &str,
+    name: &str,
+) -> Result<(), SqlError> {
+    let qualified = format!("{schema}.{name}");
+    let Some(object) = catalog.resolve_object(database, Some(schema), name, DEFAULT_SCHEMA) else {
+        return Err(SqlError::cannot_find_object_for_identity_insert(&qualified));
+    };
+    let Some(meta) = catalog.table(object.id) else {
+        return Err(SqlError::cannot_find_object_for_identity_insert(&qualified));
+    };
+    if !meta.columns.iter().any(|column| column.identity.is_some()) {
+        return Err(SqlError::identity_insert_table_has_no_identity(&qualified));
+    }
+    Ok(())
+}
+
 fn apply_identity_insert(
     state: &mut SessionState,
     args: &[Token<'_>],
+    catalog: Option<&CatalogSnapshot>,
 ) -> Result<Option<()>, SqlError> {
     let [Token::Word(table), Token::Word(on_off)] = args else {
         return Ok(None);
@@ -582,6 +613,14 @@ fn apply_identity_insert(
         Some(target) => target,
         None => return Ok(None),
     };
+    if let Some(catalog) = catalog {
+        validate_identity_insert_target(
+            catalog,
+            &target.table.database,
+            &target.table.schema,
+            &target.table.name,
+        )?;
+    }
     if on {
         if let Some(open) = &state.identity_insert {
             if open.same_as(&target.table) {
@@ -1026,7 +1065,7 @@ mod tests {
     }
 
     fn apply(state: &mut SessionState, stmt: &str) -> SetOutcome {
-        apply_set_statement(state, stmt)
+        apply_set_statement(state, stmt, None)
     }
 
     #[test]

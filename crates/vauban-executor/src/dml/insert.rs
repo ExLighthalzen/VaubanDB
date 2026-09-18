@@ -151,12 +151,16 @@ fn write_one(
     let mut output = vec![Value::Null; col_metas.len()];
     let mut covered: HashSet<usize> = HashSet::new();
     let mut generated_identity: Option<Decimal> = None;
+    let mut explicit_identity: Option<i64> = None;
     for (i, binding) in stmt.columns.iter().enumerate() {
         let ordinal = binding.index;
         let src = &row[i];
         let col_meta = &col_metas[ordinal];
         let converted = assign_value(src.clone(), &binding.ty, col_meta, table_name, "INSERT")
             .map_err(|e| at(e, 0))?;
+        if col_meta.identity.is_some() {
+            explicit_identity = Some(identity_as_i64(&converted, col_meta)?);
+        }
         output[ordinal] = converted;
         covered.insert(ordinal);
     }
@@ -189,6 +193,9 @@ fn write_one(
         ));
     }
     fk_check::check_row(table_meta, &output, "INSERT", ctx)?;
+    if let Some(explicit) = explicit_identity {
+        catalog.bump_identity_after_explicit(handle, table_obj_id, explicit)?;
+    }
     let stored = vauban_storage::Row(output);
     let id = storage.insert(txn_id, table_id, &stored).map_err(|err| {
         let snap = catalog.snapshot(handle);
@@ -294,6 +301,22 @@ fn zero_of(value: &Value) -> SqlResult<Value> {
         Value::F64(_) => Ok(Value::F64(0.0)),
         _ => Err(bug("INSERT: a signed default needs a numeric literal")),
     }
+}
+
+fn identity_as_i64(value: &Value, _col_meta: &ColumnMeta) -> SqlResult<i64> {
+    Ok(match value {
+        Value::I8(v) => i64::from(*v),
+        Value::I16(v) => i64::from(*v),
+        Value::I32(v) => i64::from(*v),
+        Value::I64(v) => *v,
+        Value::Decimal(dec) => i64::try_from(dec.mantissa)
+            .map_err(|_| bug("INSERT: explicit identity value does not fit in i64"))?,
+        _ => {
+            return Err(bug(
+                "INSERT: explicit identity value has an unexpected type",
+            ));
+        }
+    })
 }
 
 fn identity_value(dec: &Decimal, col_meta: &ColumnMeta) -> SqlResult<Value> {

@@ -365,6 +365,66 @@ fn master(catalog: &Catalog) -> SqlResult<DbId> {
         .ok_or_else(|| bug("this storage holds no master database"))
 }
 
+/// Raises the stored counter of `table` to at least `explicit` when an `INSERT` wrote that
+/// value under `IDENTITY_INSERT`.
+///
+/// When the counter row is absent, the baseline is [`IdentitySpec::seed`] minus
+/// [`IdentitySpec::increment`]. A value below the stored counter leaves it unchanged.
+pub(crate) fn bump_after_explicit(
+    catalog: &Catalog,
+    caller: &TxnHandle,
+    table: ObjectId,
+    explicit: i64,
+) -> SqlResult<()> {
+    let mut store = table::store(catalog);
+    table::refresh(catalog, &mut store)?;
+    let spec = identity_spec(&store, table)?;
+    drop(store);
+    let handle = catalog.txn.begin(IsolationLevel::ReadCommitted);
+    match bump_counter(catalog, &handle, caller, table, spec, explicit) {
+        Ok(()) => {
+            catalog.txn.commit(handle)?;
+            Ok(())
+        }
+        Err(err) => {
+            catalog.txn.rollback(handle)?;
+            Err(err)
+        }
+    }
+}
+
+/// Writes `max(stored, explicit)` into the counter row of `table`, creating one when needed.
+fn bump_counter(
+    catalog: &Catalog,
+    handle: &TxnHandle,
+    caller: &TxnHandle,
+    table: ObjectId,
+    spec: IdentitySpec,
+    explicit: i64,
+) -> SqlResult<()> {
+    let caller_snapshot = catalog.txn.statement_snapshot(caller);
+    let baseline = spec.seed.checked_sub(spec.increment).unwrap_or(spec.seed);
+    let stored = find_counter_row(catalog, &caller_snapshot, table)?.map(|(_, _, last)| last);
+    let current = stored.unwrap_or(baseline);
+    if explicit <= current {
+        return Ok(());
+    }
+    match find_counter_row(catalog, &caller_snapshot, table)? {
+        Some((counters, row, _)) => {
+            catalog
+                .storage
+                .update(handle.id, counters, row, &counter_row(table, explicit))?;
+        }
+        None => {
+            let counters = counters_table(catalog, handle)?;
+            catalog
+                .storage
+                .insert(handle.id, counters, &counter_row(table, explicit))?;
+        }
+    }
+    Ok(())
+}
+
 /// Removes the counter row of `table` in `caller`, so the next [`next_identity`] hands out
 /// the seed again.
 ///
