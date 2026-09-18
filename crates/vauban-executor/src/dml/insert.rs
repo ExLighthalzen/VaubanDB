@@ -168,7 +168,14 @@ fn write_one(
             0,
         ));
     }
-    storage.insert(txn_id, table_id, &vauban_storage::Row(output))
+    let stored = vauban_storage::Row(output);
+    storage.insert(txn_id, table_id, &stored).map_err(|err| {
+        let snap = catalog.snapshot(handle);
+        let meta = snap
+            .table_by_storage(table_id)
+            .expect("INSERT: table not found in the catalogue");
+        crate::dml::constraints::translate_unique(err, meta, &snap, &stored.0, "INSERT")
+    })
 }
 
 /// 515 for a `NULL` landing in a column that refuses it, whichever way the value reached

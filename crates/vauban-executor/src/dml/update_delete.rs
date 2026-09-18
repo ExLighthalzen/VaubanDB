@@ -46,12 +46,14 @@ pub(crate) fn execute_update(
         let decision = txn_mgr.check_write_conflict(handle, stmt.table, *row_id)?;
         match decision {
             WriteDecision::Proceed => {
-                storage.update(
-                    handle.id,
-                    stmt.table,
-                    *row_id,
-                    &vauban_storage::Row(new_row),
-                )?;
+                let stored = vauban_storage::Row(new_row);
+                storage
+                    .update(handle.id, stmt.table, *row_id, &stored)
+                    .map_err(|err| {
+                        crate::dml::constraints::translate_unique(
+                            err, meta, &cat_snap, &stored.0, "UPDATE",
+                        )
+                    })?;
                 count += 1;
             }
             WriteDecision::Reread(id) => {
@@ -64,7 +66,14 @@ pub(crate) fn execute_update(
                     let col_meta = &meta.columns[binding.index];
                     re_row[binding.index] = assign_value(expr_value, &expr.ty, col_meta)?;
                 }
-                storage.update(handle.id, stmt.table, id, &vauban_storage::Row(re_row))?;
+                let stored = vauban_storage::Row(re_row);
+                storage
+                    .update(handle.id, stmt.table, id, &stored)
+                    .map_err(|err| {
+                        crate::dml::constraints::translate_unique(
+                            err, meta, &cat_snap, &stored.0, "UPDATE",
+                        )
+                    })?;
                 count += 1;
             }
             WriteDecision::Conflict => {
