@@ -36,6 +36,9 @@ pub enum BoundStatement {
     },
     /// `INSERT`..
     Insert(InsertPlan),
+    /// `SELECT … INTO`: a table definition deduced from the source plan and the rows that
+    /// fill it.
+    SelectInto(SelectIntoPlan),
     /// `UPDATE`..
     Update(UpdatePlan),
     /// `DELETE`..
@@ -144,6 +147,15 @@ pub struct InsertPlan {
     /// list, or the columns of the table for an `INSERT` written without that list.
     pub columns: Vec<ColumnBinding>,
     /// The rows to insert, one column of the schema per entry of `columns`.
+    pub source: Box<LogicalPlan>,
+}
+
+/// A `SELECT … INTO`, bound.
+#[derive(Debug, Clone)]
+pub struct SelectIntoPlan {
+    /// The table to create, with one column per output column of `source`.
+    pub def: TableDef,
+    /// The query whose rows populate the new table.
     pub source: Box<LogicalPlan>,
 }
 
@@ -271,6 +283,11 @@ pub enum DdlStatement {
         /// takes it. The payload here is the pair the catalogue reads, so growing the
         /// action list does not reopen this file.
         action: AlterTable,
+    },
+    /// `TRUNCATE TABLE t`..
+    TruncateTable {
+        /// Three-part name of the table to empty.
+        name: QualifiedName,
     },
 }
 

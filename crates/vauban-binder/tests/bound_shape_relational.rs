@@ -311,6 +311,7 @@ fn every_statement_variant_exists() {
             }
             BoundStatement::Transaction(_) => 0,
             BoundStatement::Query(_) | BoundStatement::Ddl(_) | BoundStatement::Use { .. } => 0,
+            BoundStatement::SelectInto(_) => 1,
             BoundStatement::Execute(_) => 0,
         };
     }
@@ -412,8 +413,6 @@ fn an_unimplemented_form_names_itself() {
         // `BEGIN … END` are bound (`tests/bind_control_flow.rs`).
         ("ALTER TABLE a ADD d int", "ALTER TABLE"),
         ("ALTER DATABASE d SET READ_ONLY", "ALTER DATABASE"),
-        ("SELECT 1 INTO b FROM a", "SELECT … INTO"),
-        ("TRUNCATE TABLE a", "TRUNCATE TABLE"),
     ];
     for (text, form) in shapes {
         let error = error_of(text);
@@ -422,6 +421,23 @@ fn an_unimplemented_form_names_itself() {
             error.message.contains(form) && error.message.contains("is not implemented yet"),
             "{text} should name {form}: {}",
             error.message
+        );
+    }
+    for text in ["SELECT c INTO d FROM a", "TRUNCATE TABLE a"] {
+        let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+        let catalog = TwoTables;
+        let variables = NoVariables;
+        let ctx = BindContext {
+            text,
+            catalog: Some(&catalog),
+            database: "master",
+            default_schema: "dbo",
+            variables: &variables,
+            options: SessionOptions::default(),
+        };
+        assert!(
+            bind(&batch.statements[0], &ctx).is_ok(),
+            "{text} binds against the two-table catalogue"
         );
     }
     // `SELECT @x = 1` is not in that table: the undeclared variable answers **137** before

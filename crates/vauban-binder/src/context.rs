@@ -98,6 +98,12 @@ pub trait CatalogView {
         Vec::new()
     }
 
+    /// Whether another table holds a `FOREIGN KEY` that references `object`.
+    fn is_referenced_by_foreign_key(&self, object: ObjectId) -> bool {
+        let _ = object;
+        false
+    }
+
     /// Classifies the written name in the current database and default schema.
     /// `Unknown` means no classification is available, not that the object is absent.
     ///

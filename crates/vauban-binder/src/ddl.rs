@@ -82,11 +82,13 @@ use vauban_parser::{
 use vauban_types::{Collation, TypeInfo};
 
 use crate::bound::{BoundStatement, DdlStatement};
-use crate::context::BindContext;
+use crate::context::{BindContext, ResolvedTableKind};
 use crate::datatype::resolve_data_type;
 use crate::ddl_index::{
     primary_key_clustered_by_default, refuse_duplicate_key_column, refuse_two_keys,
 };
+use crate::names::from_needs_the_catalogue;
+use crate::query::not_yet;
 
 /// Binds `CREATE DATABASE d [options]`.
 ///
@@ -536,6 +538,50 @@ pub(crate) fn bind_drop_table(
         names: resolved,
         if_exists,
     }))
+}
+
+// -------------------------------------------------------------------------------------------
+// TRUNCATE TABLE
+// -------------------------------------------------------------------------------------------
+
+/// Binds `TRUNCATE TABLE t` into [`DdlStatement::TruncateTable`].
+///
+/// A name the catalogue does not resolve answers 4701 state 1 on the line of the statement
+/// (`TRUNCATE TABLE dbo.nosuch;`). A table another table references through a `FOREIGN KEY`
+/// answers 4712 state 1 (`TRUNCATE TABLE dbo.parent;` while `dbo.child` references it).
+/// A view or a temporary table is
+/// the internal error 50000 naming V2, as for [`bind_drop_table`].
+///
+/// # Errors
+///
+/// - 4701 when the target is not in the catalogue;
+/// - 4712 when [`CatalogView::is_referenced_by_foreign_key`] is true for the table;
+/// - the internal 50000 for a view, a temporary table or a four-part name.
+pub(crate) fn bind_truncate(
+    table: &ObjectName,
+    span: Span,
+    ctx: &BindContext<'_>,
+) -> SqlResult<BoundStatement> {
+    let catalog = ctx.catalog.ok_or_else(from_needs_the_catalogue)?;
+    let name = table_name(table, ctx).map_err(|err| on_statement(err, &span))?;
+    let resolved = catalog
+        .resolve_table(table, ctx.database, ctx.default_schema)
+        .ok_or_else(|| {
+            SqlError::cannot_find_object_to_truncate(&table.name.value).with_line(span.line)
+        })?;
+    match resolved.kind {
+        ResolvedTableKind::View => {
+            return Err(not_yet(
+                "bind_truncate: TRUNCATE TABLE on a view is not implemented yet (V2)",
+            ));
+        }
+        ResolvedTableKind::Table => {}
+    }
+    if catalog.is_referenced_by_foreign_key(resolved.object) {
+        let printed = format!("{}.{}", name.schema, name.name);
+        return Err(SqlError::cannot_truncate_referenced_table(&printed).with_line(span.line));
+    }
+    Ok(BoundStatement::Ddl(DdlStatement::TruncateTable { name }))
 }
 
 /// The three-part name a written table name denotes: the database of the session when the

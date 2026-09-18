@@ -119,6 +119,11 @@ pub(crate) fn execute_ddl(stmt: &DdlStatement, ctx: &ExecContext<'_>) -> SqlResu
         DdlStatement::CreateIndex { .. } | DdlStatement::DropIndex { .. } => {
             return execute_index_ddl(stmt, catalog, handle);
         }
+        DdlStatement::TruncateTable { .. } => {
+            return Err(SqlError::from(InternalError::Bug(
+                "execute_ddl: TRUNCATE TABLE is not implemented yet".to_owned(),
+            )));
+        }
     }
     Ok(ExecOutcome::NoRows)
 }

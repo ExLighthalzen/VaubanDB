@@ -11,7 +11,7 @@
 //! else.
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_parser::Statement;
+use vauban_parser::{QueryBody, Statement};
 
 use crate::alter::bind_alter_table;
 use crate::bound::BoundStatement;
@@ -21,13 +21,13 @@ use crate::control::{
 };
 use crate::ddl::{
     bind_alter_database, bind_create_database, bind_create_table, bind_drop_database,
-    bind_drop_table, bind_use,
+    bind_drop_table, bind_truncate, bind_use,
 };
 use crate::ddl_index::{bind_create_index, bind_drop_index};
 use crate::depth::at_statement;
 use crate::errors::on_the_statement;
 use crate::execute::bind_execute;
-use crate::insert::{bind_insert, bind_truncate};
+use crate::insert::{bind_insert, bind_select_into};
 use crate::query::bind_select;
 use crate::txn_stmt::{bind_begin, bind_commit, bind_rollback, bind_save};
 use crate::update_delete::{bind_delete, bind_update};
@@ -59,6 +59,11 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
         // `SELECT @x = e` assigns a variable and is not a query: `variables.rs` binds it.
         Statement::Select(select) if is_assignment_select(select) => {
             bind_select_assignment(select, ctx)
+                .map_err(|err| at_statement(err, select.span.line))
+                .map_err(|err| on_the_statement(err, select.span.line))
+        }
+        Statement::Select(select) if select_into_target(select).is_some() => {
+            bind_select_into(select, ctx)
                 .map_err(|err| at_statement(err, select.span.line))
                 .map_err(|err| on_the_statement(err, select.span.line))
         }
@@ -109,6 +114,16 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
         Statement::Save { name, .. } => bind_save(name, ctx),
         Statement::Execute(execute) => bind_execute(execute, ctx),
         other => Err(unsupported(other)),
+    }
+}
+
+/// The `INTO` target of a top-level `SELECT`, when the statement writes one.
+fn select_into_target(
+    select: &vauban_parser::SelectStatement,
+) -> Option<&vauban_parser::ObjectName> {
+    match &select.body {
+        QueryBody::Select(spec) => spec.into.as_ref(),
+        QueryBody::SetOp { .. } | QueryBody::Nested(..) => None,
     }
 }
 

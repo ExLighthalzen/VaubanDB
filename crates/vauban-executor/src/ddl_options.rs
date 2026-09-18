@@ -63,6 +63,7 @@ pub(crate) fn execute_set_options(
         | DdlStatement::DropTable { .. }
         | DdlStatement::CreateIndex { .. }
         | DdlStatement::DropIndex { .. }
+        | DdlStatement::TruncateTable { .. }
         | DdlStatement::AlterTable { .. } => {
             return Err(bug(
                 "execute_set_options: only ALTER DATABASE … SET is run here; the rest is \

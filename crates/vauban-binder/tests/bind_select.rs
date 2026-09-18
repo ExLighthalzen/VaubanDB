@@ -347,12 +347,7 @@ fn unsupported_clauses_are_internal_errors() {
 
     // UNION, EXCEPT and INTERSECT are supported: the tests are in tests/bind_setop.rs.
 
-    // INTO, built by hand.
-    let mut spec = spec_of_select_one();
-    spec.into = Some(object("t"));
-    let error = err_of(&select_of(spec));
-    assert_eq!(error.number, 50000);
-    assert!(error.message.contains("INTO"), "{}", error.message);
+    // INTO binds at statement level: tests/bind_select_into_truncate.rs.
 }
 
 #[test]

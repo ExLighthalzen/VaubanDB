@@ -121,6 +121,7 @@ pub(crate) fn execute_index_ddl(
         // The two `ALTER` statements reach `ddl.rs`, which answers for them; they are
         // listed here for the same reason as the four above.
         | DdlStatement::AlterDatabase { .. }
+        | DdlStatement::TruncateTable { .. }
         | DdlStatement::AlterTable { .. } => {
             return Err(bug(
                 "execute_index_ddl: only CREATE INDEX and DROP INDEX are run here; the \

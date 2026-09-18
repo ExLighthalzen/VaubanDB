@@ -1,5 +1,5 @@
 //! `INSERT`: `VALUES`, `INSERT … SELECT` and `DEFAULT VALUES`, bound into an
-//! [`InsertPlan`]; and the entry point of `TRUNCATE TABLE`, declared and not bound yet.
+//! [`InsertPlan`]; and `SELECT … INTO`, bound into a [`SelectIntoPlan`].
 //!
 //! # What the plan holds
 //!
@@ -91,19 +91,20 @@
 //! (`'ti'`); the spelling of the catalogue, which SQL Server prints there, is not available
 //! to the binder.
 
-use vauban_catalog::{ColumnId, TableId};
+use vauban_catalog::{ColumnDef, ColumnId, TableDef, TableId};
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{
-    Expr, Ident, InsertSource, InsertStatement, Literal, ObjectName, SelectStatement, Span,
+    Expr, Ident, InsertSource, InsertStatement, Literal, ObjectName, QueryBody, SelectStatement,
     TableRef,
 };
 use vauban_types::{TypeInfo, Value, implicit_result_type};
 
 use crate::bound::{
     BoundExpr, BoundExprKind, BoundStatement, ColumnBinding, InsertPlan, LogicalPlan, OutputColumn,
-    OutputSchema,
+    OutputSchema, SelectIntoPlan,
 };
 use crate::context::{BindContext, CatalogView, ResolvedTable, ResolvedTableKind};
+use crate::ddl::table_name;
 use crate::errors::{line_of, on_the_statement};
 use crate::expr::{Scope, bind_expr};
 use crate::names::{check_object_exists, from_needs_the_catalogue};
@@ -150,18 +151,104 @@ pub(crate) fn bind_insert(
     }))
 }
 
-/// Binds a `TRUNCATE TABLE`.
+// -------------------------------------------------------------------------------------------
+// SELECT … INTO
+// -------------------------------------------------------------------------------------------
+
+/// Binds `SELECT … INTO` into [`BoundStatement::SelectInto`].
 ///
-/// `statement.rs` routes the form here rather than leaving it in its `unsupported` list:
-/// the table it empties is the table an `INSERT` fills, and the two share the same
-/// resolution.
-pub(crate) fn bind_truncate(
-    table: &ObjectName,
-    span: Span,
+/// The table [`SelectIntoPlan::def`] carries is deduced from [`LogicalPlan::schema`] of
+/// the source query: one column per output column, name and type included. A column without
+/// a name answers 1038 state 5 (`SELECT a, a + 1 INTO dbo.t FROM dbo.s;`). Two columns
+/// sharing a name reuse [`SqlError::duplicate_column_name`]
+/// (2705 state 3). A name the catalogue resolves already answers 2714 before the source is
+/// bound, as for [`crate::ddl::bind_create_table`].
+///
+/// # Errors
+///
+/// - 2714 when the `INTO` target already exists;
+/// - 1038 state 5 when an output column lacks a name;
+/// - 2705 when two output columns share a name;
+/// - the errors of [`bind_select`] on the source query.
+pub(crate) fn bind_select_into(
+    stmt: &SelectStatement,
     ctx: &BindContext<'_>,
 ) -> SqlResult<BoundStatement> {
-    let _ = (table, span, ctx);
-    Err(not_implemented("TRUNCATE TABLE"))
+    let line = line_of(&stmt.span);
+    let into = into_target(stmt)?;
+    let catalog = ctx.catalog.ok_or_else(from_needs_the_catalogue)?;
+    let name = table_name(into, ctx).map_err(|err| on_the_statement(err, line))?;
+    if catalog
+        .resolve_table(into, ctx.database, ctx.default_schema)
+        .is_some()
+    {
+        return Err(SqlError::object_already_exists(&into.name.value).with_line(line));
+    }
+    let mut source_stmt = stmt.clone();
+    clear_into(&mut source_stmt);
+    let plan = bind_select(&source_stmt, ctx).map_err(|err| on_the_statement(err, line))?;
+    let schema = plan.schema();
+    check_output_columns(schema, &name.name, line)?;
+    let columns = schema
+        .columns
+        .iter()
+        .map(|column| ColumnDef {
+            name: column.name.clone(),
+            ty: column.ty.clone(),
+            default: None,
+            identity: None,
+            computed: None,
+        })
+        .collect();
+    Ok(BoundStatement::SelectInto(SelectIntoPlan {
+        def: TableDef {
+            name,
+            columns,
+            constraints: Vec::new(),
+        },
+        source: Box::new(plan),
+    }))
+}
+
+/// The `INTO` table of `stmt`, which the dispatch of `statement.rs` already looked for.
+fn into_target(stmt: &SelectStatement) -> SqlResult<&ObjectName> {
+    match &stmt.body {
+        QueryBody::Select(spec) => spec
+            .into
+            .as_ref()
+            .ok_or_else(|| bug("bind_select_into: the statement carries no INTO target")),
+        QueryBody::SetOp { .. } => Err(not_yet(
+            "bind_select_into: SELECT … INTO over a set operator is not implemented yet",
+        )),
+        QueryBody::Nested(..) => Err(not_yet(
+            "bind_select_into: SELECT … INTO over a parenthesised query body is not implemented yet",
+        )),
+    }
+}
+
+/// Clears the `INTO` clause so [`bind_select`] can bind the source query alone.
+fn clear_into(stmt: &mut SelectStatement) {
+    if let QueryBody::Select(spec) = &mut stmt.body {
+        spec.into = None;
+    }
+}
+
+/// 1038 state 5 for a column without a name, 2705 for a duplicate output name.
+fn check_output_columns(schema: &OutputSchema, table: &str, line: u32) -> SqlResult<()> {
+    for (index, column) in schema.columns.iter().enumerate() {
+        if column.name.is_empty() {
+            let mut err = SqlError::object_or_column_name_missing();
+            err.state = 5;
+            return Err(err.with_line(line));
+        }
+        if schema.columns[..index]
+            .iter()
+            .any(|before| before.name.eq_ignore_ascii_case(&column.name))
+        {
+            return Err(SqlError::duplicate_column_name(&column.name, table).with_line(line));
+        }
+    }
+    Ok(())
 }
 
 /// The resolved target of the statement: the table, its columns, and the two kinds of
