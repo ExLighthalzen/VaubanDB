@@ -178,7 +178,7 @@
 use std::ops::Bound;
 
 use vauban_binder::{BoundExpr, BoundExprKind, BoundTop, SortKey};
-use vauban_errors::{InternalError, SqlError, SqlResult};
+use vauban_errors::{SqlError, SqlResult};
 use vauban_planner::{KeyRangeExpr, PhysicalPlan, PhysicalStatement};
 use vauban_sysfn::FunctionDef;
 use vauban_types::{SqlType, TypeInfo, Value, convert};
@@ -504,12 +504,9 @@ fn compile_expr(expr: &BoundExpr, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
             }
             Ok(())
         }
-        // The relational expressions, which are not evaluated yet.
         BoundExprKind::Exists(_)
         | BoundExprKind::ScalarSubquery(_)
-        | BoundExprKind::InSubquery { .. } => {
-            Err(bug("compile_expr: a subquery is not implemented yet"))
-        }
+        | BoundExprKind::InSubquery { .. } => Ok(()),
         BoundExprKind::Like {
             expr,
             pattern,
@@ -705,11 +702,6 @@ fn folds(expr: &BoundExpr, ctx: &mut ExecContext<'_>, length: bool) -> bool {
             else_.as_ref().is_none_or(|else_| folds(else_, ctx, length))
         }
     }
-}
-
-/// An engine bug, reported to the client as the generic error 50000.
-fn bug(what: &str) -> SqlError {
-    SqlError::from(InternalError::Bug(what.to_owned()))
 }
 
 #[cfg(test)]

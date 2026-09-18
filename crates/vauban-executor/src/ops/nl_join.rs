@@ -229,12 +229,11 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                 inner.close();
                 self.matched = vec![false; self.inner_rows.len()];
             }
-            PhysicalJoinKind::Cross | PhysicalJoinKind::Inner | PhysicalJoinKind::Left => {}
-            PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi => {
-                return Err(SqlError::from(InternalError::Bug(
-                    "NestedLoopJoin: Semi/AntiSemi are not implemented yet".to_owned(),
-                )));
-            }
+            PhysicalJoinKind::Cross
+            | PhysicalJoinKind::Inner
+            | PhysicalJoinKind::Left
+            | PhysicalJoinKind::Semi
+            | PhysicalJoinKind::AntiSemi => {}
         }
 
         self.phase = Phase::NeedOuter;
@@ -287,11 +286,33 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                 } => {
                     match inner.next(ctx)? {
                         Some(inner_row) => {
-                            if let Some(combined) =
-                                Self::pair(&self.on, outer_row, &inner_row, ctx)?
-                            {
+                            let holds = match self.kind {
+                                PhysicalJoinKind::Cross => true,
+                                PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi => {
+                                    Self::pair(&self.on, outer_row, &inner_row, ctx)?.is_some()
+                                }
+                                _ => Self::pair(&self.on, outer_row, &inner_row, ctx)?.is_some(),
+                            };
+                            if holds {
                                 *had_match = true;
-                                return Ok(Some(combined));
+                                if self.kind == PhysicalJoinKind::Semi {
+                                    inner.close();
+                                    let _ = ctx.pop_outer();
+                                    let row = outer_row.clone();
+                                    self.phase = Phase::NeedOuter;
+                                    return Ok(Some(row));
+                                }
+                                if self.kind == PhysicalJoinKind::AntiSemi {
+                                    inner.close();
+                                    let _ = ctx.pop_outer();
+                                    self.phase = Phase::NeedOuter;
+                                    continue;
+                                }
+                                if let Some(combined) =
+                                    Self::pair(&self.on, outer_row, &inner_row, ctx)?
+                                {
+                                    return Ok(Some(combined));
+                                }
                             }
                             continue;
                         }
@@ -306,6 +327,11 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 matched,
                                 &mut self.unmatched_outer,
                             );
+                            if self.kind == PhysicalJoinKind::AntiSemi && !matched {
+                                let row = outer_row.clone();
+                                self.phase = Phase::NeedOuter;
+                                return Ok(Some(row));
+                            }
                             // LEFT: emit padded row if no match.
                             if self.kind == PhysicalJoinKind::Left && !matched {
                                 let padded = Self::padded(
@@ -356,7 +382,11 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                         had_match: false,
                                     };
                                 }
-                                _ => {
+                                PhysicalJoinKind::Semi
+                                | PhysicalJoinKind::AntiSemi
+                                | PhysicalJoinKind::Cross
+                                | PhysicalJoinKind::Inner
+                                | PhysicalJoinKind::Left => {
                                     ctx.push_outer(row.clone());
                                     let mut inner = build_operator(&self.inner_plan)?;
                                     inner.open(ctx)?;

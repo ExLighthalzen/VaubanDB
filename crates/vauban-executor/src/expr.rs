@@ -111,11 +111,16 @@ pub fn eval_expr(
 ) -> SqlResult<Value> {
     match &expr.kind {
         BoundExprKind::Literal(value) => Ok(value.clone()),
-        // The relational expressions: evaluating one runs a plan, which is not written.
         BoundExprKind::Exists(_)
         | BoundExprKind::ScalarSubquery(_)
         | BoundExprKind::InSubquery { .. } => {
-            Err(bug("eval_expr: a subquery is not implemented yet"))
+            if ctx.has_active_subplans() {
+                crate::ops::subquery::eval_subquery_expr(expr, row, ctx)
+            } else {
+                Err(bug(
+                    "eval_expr: a subquery is evaluated without SubqueryEval",
+                ))
+            }
         }
         BoundExprKind::Arith { op, left, right } => {
             let left = eval_expr(left, row, ctx)?;
@@ -192,7 +197,14 @@ pub fn eval_expr(
         // reference is to an outer row pushed by a correlated join, in which case the
         // outer rows of the context are consulted instead.
         BoundExprKind::ColumnRef(binding) => {
-            let row = if let Some(row) = row {
+            let row = if ctx.column_is_outer(binding.column) {
+                ctx.outer_rows().last().ok_or_else(|| {
+                    bug(&format!(
+                        "eval_expr: outer column `{}` is evaluated without an outer row",
+                        binding.name
+                    ))
+                })?
+            } else if let Some(row) = row {
                 row
             } else {
                 ctx.outer_rows().last().ok_or_else(|| {
@@ -394,7 +406,7 @@ pub(crate) fn as_condition(value: &Value) -> SqlResult<Option<bool>> {
 
 /// The [`Value`] a truth value is returned as: `bit` for true and false, `NULL` for
 /// unknown.
-fn from_condition(condition: Option<bool>) -> Value {
+pub(crate) fn from_condition(condition: Option<bool>) -> Value {
     match condition {
         Some(b) => Value::Bit(b),
         None => Value::Null,

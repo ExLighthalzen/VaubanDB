@@ -2,13 +2,16 @@
 //! it runs: the context, the cancellation token, the session state it writes, the sink
 //! the rows go to.
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use vauban_binder::{OutputSchema, SessionOptions};
-use vauban_catalog::Catalog;
+use vauban_catalog::{Catalog, ColumnId};
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
+use vauban_planner::SubPlan;
 use vauban_storage::{SavepointId, Snapshot, Storage};
 use vauban_sysfn::EvalContext;
 use vauban_txn::{IsolationLevel, LockTimeout, LockWait, TransactionManager, TxnHandle};
@@ -303,6 +306,19 @@ pub struct ExecContext<'a> {
     /// row through [`eval_expr`](crate::expr::eval_expr), which consults this stack when
     /// the current row is `None`.
     outer_rows: Vec<Row>,
+    /// The subplans of the active [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval)
+    /// row, in expression order.
+    active_subplans: Option<Vec<SubPlan>>,
+    /// The next subplan slot [`eval_expr`](crate::expr::eval_expr) reads on this row.
+    subquery_slot: usize,
+    /// Values of uncorrelated subqueries, indexed like `active_subplans`.
+    subquery_cache: Vec<Option<Value>>,
+    /// Column identifiers exposed by the inner plan currently being evaluated.
+    subquery_locals: Option<HashSet<ColumnId>>,
+    /// When set, each `open` of a subquery inner plan increments this counter.
+    subquery_open_count: Option<Rc<Cell<usize>>>,
+    /// When set, each `next` of a subquery inner plan increments this counter.
+    subquery_next_count: Option<Rc<Cell<usize>>>,
 }
 
 impl<'a> ExecContext<'a> {
@@ -325,6 +341,12 @@ impl<'a> ExecContext<'a> {
             session: None,
             infos: Vec::new(),
             outer_rows: Vec::new(),
+            active_subplans: None,
+            subquery_slot: 0,
+            subquery_cache: Vec::new(),
+            subquery_locals: None,
+            subquery_open_count: None,
+            subquery_next_count: None,
         }
     }
 
@@ -408,6 +430,123 @@ impl<'a> ExecContext<'a> {
     #[must_use]
     pub(crate) fn outer_rows(&self) -> &[Row] {
         &self.outer_rows
+    }
+
+    /// Resets the uncorrelated cache for a new [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval).
+    pub(crate) fn reset_subquery_cache(&mut self, slots: usize) {
+        self.subquery_cache = vec![None; slots];
+    }
+
+    /// Starts one output row of a [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval).
+    pub(crate) fn begin_subquery_row(&mut self, subplans: &[SubPlan]) {
+        self.active_subplans = Some(subplans.to_vec());
+        self.subquery_slot = 0;
+    }
+
+    /// Clears subquery state once the operator is exhausted.
+    pub(crate) fn clear_subquery_state(&mut self) {
+        self.active_subplans = None;
+        self.subquery_slot = 0;
+    }
+
+    /// Whether a [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval) row is active.
+    #[must_use]
+    pub(crate) fn has_active_subplans(&self) -> bool {
+        self.active_subplans.is_some()
+    }
+
+    /// The next subplan slot for this row.
+    ///
+    /// # Errors
+    ///
+    /// The internal error 50000 when the walk order diverges from the planner.
+    pub(crate) fn take_subplan(&mut self) -> SqlResult<(SubPlan, usize)> {
+        let subplans = self
+            .active_subplans
+            .as_ref()
+            .ok_or_else(|| bug("ExecContext: no active subquery row"))?;
+        let slot = self.subquery_slot;
+        let Some(subplan) = subplans.get(slot) else {
+            return Err(bug("ExecContext: subquery slot out of range"));
+        };
+        self.subquery_slot += 1;
+        Ok((subplan.clone(), slot))
+    }
+
+    /// A cached uncorrelated subquery value, when one was stored for `slot`.
+    #[must_use]
+    pub(crate) fn subquery_cached(&self, slot: usize) -> Option<Value> {
+        self.subquery_cache.get(slot)?.clone()
+    }
+
+    /// Stores the value of an uncorrelated subquery for `slot`.
+    pub(crate) fn store_subquery_cache(&mut self, slot: usize, value: Value) {
+        if let Some(entry) = self.subquery_cache.get_mut(slot) {
+            *entry = Some(value);
+        }
+    }
+
+    /// Marks which columns belong to the inner plan of a correlated subquery.
+    pub(crate) fn push_subquery_locals(&mut self, locals: HashSet<ColumnId>) {
+        self.subquery_locals = Some(locals);
+    }
+
+    /// Clears [`ExecContext::push_subquery_locals`].
+    pub(crate) fn pop_subquery_locals(&mut self) {
+        self.subquery_locals = None;
+    }
+
+    /// Whether `column` is read from the outer row pushed by [`ExecContext::push_outer`].
+    pub(crate) fn column_is_outer(&self, column: ColumnId) -> bool {
+        self.subquery_locals
+            .as_ref()
+            .is_some_and(|local| !local.contains(&column))
+            && !self.outer_rows.is_empty()
+    }
+
+    /// Hooks used by integration tests to count inner-plan `open` calls.
+    #[doc(hidden)]
+    pub fn set_subquery_open_count(&mut self, counter: Rc<Cell<usize>>) {
+        self.subquery_open_count = Some(counter);
+    }
+
+    /// Hooks used by integration tests to count inner-plan `next` calls.
+    #[doc(hidden)]
+    pub fn set_subquery_next_count(&mut self, counter: Rc<Cell<usize>>) {
+        self.subquery_next_count = Some(counter);
+    }
+
+    pub(crate) fn note_subquery_open(&self) {
+        if let Some(counter) = &self.subquery_open_count {
+            counter.set(counter.get() + 1);
+        }
+    }
+
+    pub(crate) fn note_subquery_next(&self) {
+        if let Some(counter) = &self.subquery_next_count {
+            counter.set(counter.get() + 1);
+        }
+    }
+
+    /// Integration tests in `tests/subquery.rs` exercise the production path.
+    #[doc(hidden)]
+    pub fn test_eval_exists_plan(
+        &mut self,
+        plan: &vauban_planner::PhysicalPlan,
+    ) -> SqlResult<Value> {
+        crate::ops::subquery::eval_exists_plan(plan, self)
+    }
+
+    /// Integration tests in `tests/subquery.rs` exercise the production path.
+    #[doc(hidden)]
+    pub fn test_eval_in_subquery_plan(
+        &mut self,
+        plan: &vauban_planner::PhysicalPlan,
+        tested: &vauban_binder::BoundExpr,
+        row: Option<&Row>,
+        line: u32,
+    ) -> SqlResult<Value> {
+        crate::ops::subquery::eval_in_subquery_plan(plan, tested, row, self, line)
     }
 
     /// Queues an informational message for the sink. An operator has no sink of its own;

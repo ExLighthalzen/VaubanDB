@@ -106,8 +106,11 @@ fn assert_correlated_exists(inner: LogicalPlan) {
         predicate: exists(inner),
     };
     let planned = plan_with(&FakeCatalog::new(), filtered);
-    let PhysicalPlan::SubqueryEval { subplans, .. } = &planned else {
-        panic!("expected SubqueryEval, got {planned:?}");
+    let PhysicalPlan::Filter { input, .. } = &planned else {
+        panic!("expected Filter over SubqueryEval, got {planned:?}");
+    };
+    let PhysicalPlan::SubqueryEval { subplans, .. } = input.as_ref() else {
+        panic!("expected SubqueryEval, got {input:?}");
     };
     assert_eq!(subplans.len(), 1);
     assert!(
@@ -360,9 +363,12 @@ fn not_in_stays_a_subquery_eval() {
         predicate: in_subquery(column(binding_a("k", 1, 0)), inner, true),
     };
     let planned = plan_with(&FakeCatalog::new(), filtered);
+    let PhysicalPlan::Filter { input, .. } = &planned else {
+        panic!("expected Filter over SubqueryEval, got {planned:?}");
+    };
     assert!(
-        matches!(planned, PhysicalPlan::SubqueryEval { .. }),
-        "expected SubqueryEval, got {planned:?}"
+        matches!(input.as_ref(), PhysicalPlan::SubqueryEval { .. }),
+        "expected SubqueryEval, got {input:?}"
     );
     assert!(
         !matches!(
@@ -626,8 +632,11 @@ fn correlated_exists_is_evaluated_per_row() {
         predicate: exists(correlated_inner),
     };
     let planned = plan_with(&FakeCatalog::new(), filtered);
-    let PhysicalPlan::SubqueryEval { subplans, .. } = &planned else {
-        panic!("expected SubqueryEval, got {planned:?}");
+    let PhysicalPlan::Filter { input, .. } = &planned else {
+        panic!("expected Filter over SubqueryEval, got {planned:?}");
+    };
+    let PhysicalPlan::SubqueryEval { subplans, .. } = input.as_ref() else {
+        panic!("expected SubqueryEval, got {input:?}");
     };
     assert_eq!(subplans.len(), 1);
     assert!(subplans[0].correlated);

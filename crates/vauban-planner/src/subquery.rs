@@ -65,9 +65,6 @@ pub(crate) fn plan_filter(
         return Ok(plan);
     }
     let planned = plan_expr_subqueries(predicate, input, ctx)?;
-    if matches!(planned, PhysicalPlan::SubqueryEval { .. }) {
-        return Ok(planned);
-    }
     Ok(PhysicalPlan::Filter {
         input: Box::new(planned),
         predicate: predicate.clone(),
@@ -203,7 +200,7 @@ fn try_decorrelate_conjunct(
                 return Ok(None);
             }
             let inner = plan_node(plan, ctx)?;
-            let on = in_subquery_equality(expr, plan)?;
+            let on = in_subquery_equality(expr, plan, outer)?;
             Ok(Some(semi_join(
                 outer,
                 inner,
@@ -264,8 +261,13 @@ fn semi_join(
 
 /// The equality `on` for `e IN (SELECT x …)` when the subquery select list is a bare
 /// column reference.
-fn in_subquery_equality(tested: &BoundExpr, plan: &LogicalPlan) -> SqlResult<BoundExpr> {
-    let inner_expr = subquery_select_expr(plan)?;
+fn in_subquery_equality(
+    tested: &BoundExpr,
+    plan: &LogicalPlan,
+    outer: &PhysicalPlan,
+) -> SqlResult<BoundExpr> {
+    let outer_width = outer.schema().columns.len();
+    let inner_expr = shift_column_indices(subquery_select_expr(plan)?, outer_width);
     let ty = tested.ty.clone();
     Ok(BoundExpr {
         kind: BoundExprKind::Compare {
@@ -276,6 +278,107 @@ fn in_subquery_equality(tested: &BoundExpr, plan: &LogicalPlan) -> SqlResult<Bou
         ty,
         line: tested.line,
     })
+}
+
+/// Shifts [`ColumnRef`](vauban_binder::BoundExprKind::ColumnRef) indices by `offset`
+/// so a semi-join predicate reads the concatenated row.
+fn shift_column_indices(expr: BoundExpr, offset: usize) -> BoundExpr {
+    BoundExpr {
+        kind: shift_column_indices_kind(expr.kind, offset),
+        ty: expr.ty,
+        line: expr.line,
+    }
+}
+
+fn shift_column_indices_kind(kind: BoundExprKind, offset: usize) -> BoundExprKind {
+    match kind {
+        BoundExprKind::ColumnRef(mut binding) => {
+            binding.index += offset;
+            BoundExprKind::ColumnRef(binding)
+        }
+        BoundExprKind::Negate(inner) => {
+            BoundExprKind::Negate(Box::new(shift_column_indices(*inner, offset)))
+        }
+        BoundExprKind::BitNot(inner) => {
+            BoundExprKind::BitNot(Box::new(shift_column_indices(*inner, offset)))
+        }
+        BoundExprKind::Not(inner) => {
+            BoundExprKind::Not(Box::new(shift_column_indices(*inner, offset)))
+        }
+        BoundExprKind::IsNull { expr, negated } => BoundExprKind::IsNull {
+            expr: Box::new(shift_column_indices(*expr, offset)),
+            negated,
+        },
+        BoundExprKind::Convert { expr, style, try_ } => BoundExprKind::Convert {
+            expr: Box::new(shift_column_indices(*expr, offset)),
+            style,
+            try_,
+        },
+        BoundExprKind::Collate { expr } => BoundExprKind::Collate {
+            expr: Box::new(shift_column_indices(*expr, offset)),
+        },
+        BoundExprKind::Arith { op, left, right } => BoundExprKind::Arith {
+            op,
+            left: Box::new(shift_column_indices(*left, offset)),
+            right: Box::new(shift_column_indices(*right, offset)),
+        },
+        BoundExprKind::Compare { op, left, right } => BoundExprKind::Compare {
+            op,
+            left: Box::new(shift_column_indices(*left, offset)),
+            right: Box::new(shift_column_indices(*right, offset)),
+        },
+        BoundExprKind::Logical { op, left, right } => BoundExprKind::Logical {
+            op,
+            left: Box::new(shift_column_indices(*left, offset)),
+            right: Box::new(shift_column_indices(*right, offset)),
+        },
+        BoundExprKind::In {
+            expr,
+            list,
+            negated,
+        } => BoundExprKind::In {
+            expr: Box::new(shift_column_indices(*expr, offset)),
+            list: list
+                .into_iter()
+                .map(|item| shift_column_indices(item, offset))
+                .collect(),
+            negated,
+        },
+        BoundExprKind::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => BoundExprKind::Like {
+            expr: Box::new(shift_column_indices(*expr, offset)),
+            pattern: Box::new(shift_column_indices(*pattern, offset)),
+            escape: escape.map(|item| Box::new(shift_column_indices(*item, offset))),
+            negated,
+        },
+        BoundExprKind::Case {
+            operand,
+            arms,
+            else_,
+        } => BoundExprKind::Case {
+            operand: operand.map(|item| Box::new(shift_column_indices(*item, offset))),
+            arms: arms
+                .into_iter()
+                .map(|arm| vauban_binder::BoundCaseArm {
+                    when: shift_column_indices(arm.when, offset),
+                    then: shift_column_indices(arm.then, offset),
+                })
+                .collect(),
+            else_: else_.map(|item| Box::new(shift_column_indices(*item, offset))),
+        },
+        BoundExprKind::Function { def, args } => BoundExprKind::Function {
+            def,
+            args: args
+                .into_iter()
+                .map(|arg| shift_column_indices(arg, offset))
+                .collect(),
+        },
+        other => other,
+    }
 }
 
 /// The single expression of a one-column subquery select list.
