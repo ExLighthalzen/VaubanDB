@@ -276,6 +276,7 @@ async fn start_capturing_spids() -> (Running, Spids) {
 /// response, PRELOGIN response included ([MS-TDS] 2.2.6.5).
 const PACKET_SQL_BATCH: u8 = 0x01;
 const PACKET_TABULAR_RESULT: u8 = 0x04;
+const PACKET_TRANSACTION_MANAGER: u8 = 0x0E;
 const PACKET_LOGIN7: u8 = 0x10;
 const PACKET_PRELOGIN: u8 = 0x12;
 /// Status EOM ([MS-TDS] 2.2.3.1.2).
@@ -309,6 +310,12 @@ const DONE_ERROR: u16 = 0x0002;
 const DONE_COUNT: u16 = 0x0010;
 /// `CurCmd` of the DONE of a SELECT.
 const CUR_CMD_SELECT: u16 = 0xC1;
+/// TRANSACTION_MANAGER request types ([MS-TDS] 2.2.6.9).
+const TM_BEGIN_XACT: u16 = 5;
+/// ENVCHANGE kinds for transaction boundaries.
+const ENV_BEGIN: u8 = 8;
+/// `CurCmd` of the DONE that closes a TRANSACTION_MANAGER response.
+const CUR_CMD_TRANSACTION_MANAGER: u16 = 0x00FD;
 
 /// Wraps `payload` in one packet of type `kind` with the EOM status, SPID 0 and
 /// PacketID 1 ([MS-TDS] 2.2.3.1): Type, Status, Length (big-endian, header included),
@@ -397,19 +404,24 @@ fn login7_packet() -> Vec<u8> {
 }
 
 /// ALL_HEADERS with the Transaction Descriptor header alone ([MS-TDS] 2.2.5.3.1).
-fn all_headers() -> Vec<u8> {
+fn all_headers(descriptor: u64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(22);
     bytes.extend_from_slice(&22u32.to_le_bytes()); // TotalLength
     bytes.extend_from_slice(&18u32.to_le_bytes()); // HeaderLength
     bytes.extend_from_slice(&HEADER_TRANSACTION_DESCRIPTOR.to_le_bytes()); // HeaderType
-    bytes.extend_from_slice(&0u64.to_le_bytes()); // TransactionDescriptor
+    bytes.extend_from_slice(&descriptor.to_le_bytes()); // TransactionDescriptor
     bytes.extend_from_slice(&1u32.to_le_bytes()); // OutstandingRequestCount
     bytes
 }
 
 /// A SQL_BATCH message ([MS-TDS] 2.2.6.7): ALL_HEADERS then `SQLText` in UCS-2.
 fn sql_batch_packet(text: &str) -> Vec<u8> {
-    let mut payload = all_headers();
+    sql_batch_packet_with_descriptor(0, text)
+}
+
+/// Like [`sql_batch_packet`], with an explicit transaction descriptor in ALL_HEADERS.
+fn sql_batch_packet_with_descriptor(descriptor: u64, text: &str) -> Vec<u8> {
+    let mut payload = all_headers(descriptor);
     payload.extend_from_slice(&utf16le(text));
     packet(PACKET_SQL_BATCH, &payload)
 }
@@ -515,7 +527,9 @@ enum Tok {
     },
     /// ERROR, by `Number` ([MS-TDS] 2.2.7.9): the text is not asserted on.
     Error(u32),
-    /// INFO, ENVCHANGE or LOGINACK, by type: not inspected here.
+    /// INFO, by `Number`: the text is not asserted on.
+    Info(u32),
+    /// ENVCHANGE or LOGINACK, by type: not inspected here.
     Other(u8),
 }
 
@@ -614,7 +628,13 @@ fn tokens(payload: &[u8]) -> Vec<Tok> {
                 pos += 2 + len;
                 out.push(Tok::Error(number));
             }
-            TOKEN_INFO | TOKEN_ENVCHANGE | TOKEN_LOGINACK => {
+            TOKEN_INFO => {
+                let len = usize::from(u16_at(payload, pos));
+                let number = u32::from_le_bytes(payload[pos + 2..pos + 6].try_into().unwrap());
+                pos += 2 + len;
+                out.push(Tok::Info(number));
+            }
+            TOKEN_ENVCHANGE | TOKEN_LOGINACK => {
                 let len = usize::from(u16_at(payload, pos));
                 pos += 2 + len;
                 out.push(Tok::Other(kind));
@@ -648,6 +668,123 @@ async fn connect_and_login(addr: SocketAddr) -> TcpStream {
 async fn run_batch(client: &mut TcpStream, text: &str, budget: Duration) -> Vec<Tok> {
     client.write_all(&sql_batch_packet(text)).await.unwrap();
     tokens(&read_response(client, budget).await)
+}
+
+/// Sends `text` as a SQL batch with the given transaction descriptor.
+async fn run_batch_at(
+    client: &mut TcpStream,
+    descriptor: u64,
+    text: &str,
+    budget: Duration,
+) -> Vec<Tok> {
+    client
+        .write_all(&sql_batch_packet_with_descriptor(descriptor, text))
+        .await
+        .unwrap();
+    tokens(&read_response(client, budget).await)
+}
+
+fn tm_begin_packet() -> Vec<u8> {
+    let mut payload = all_headers(0);
+    payload.extend_from_slice(&TM_BEGIN_XACT.to_le_bytes());
+    payload.extend_from_slice(&[0, 0]); // isolation, empty BEGIN_XACT_NAME
+    packet(PACKET_TRANSACTION_MANAGER, &payload)
+}
+
+/// Decodes TRANSACTION_MANAGER responses just enough for the refusal tests.
+#[derive(Debug, PartialEq, Eq)]
+enum TmTok {
+    EnvBegin(u64),
+    Error(u32),
+    Info(u32),
+    Done { status: u16, cur_cmd: u16 },
+}
+
+fn tm_tokens(payload: &[u8]) -> Vec<TmTok> {
+    let mut pos = 0;
+    let mut out = Vec::new();
+    while pos < payload.len() {
+        let kind = payload[pos];
+        pos += 1;
+        match kind {
+            TOKEN_ENVCHANGE => {
+                let len = usize::from(u16_at(payload, pos));
+                pos += 2;
+                let body = &payload[pos..pos + len];
+                pos += len;
+                let mut body_pos = 1;
+                let new = varbyte_u64(body, &mut body_pos);
+                let _old = varbyte_u64(body, &mut body_pos);
+                if body[0] == ENV_BEGIN {
+                    out.push(TmTok::EnvBegin(new));
+                }
+            }
+            TOKEN_INFO => {
+                let len = usize::from(u16_at(payload, pos));
+                let body = &payload[pos + 2..pos + 2 + len];
+                out.push(TmTok::Info(u32::from_le_bytes(
+                    body[..4].try_into().unwrap(),
+                )));
+                pos += 2 + len;
+            }
+            TOKEN_ERROR => {
+                let len = usize::from(u16_at(payload, pos));
+                let body = &payload[pos + 2..pos + 2 + len];
+                out.push(TmTok::Error(u32::from_le_bytes(
+                    body[..4].try_into().unwrap(),
+                )));
+                pos += 2 + len;
+            }
+            TOKEN_DONE => {
+                out.push(TmTok::Done {
+                    status: u16_at(payload, pos),
+                    cur_cmd: u16_at(payload, pos + 2),
+                });
+                pos += 12;
+            }
+            other => panic!("unexpected TRANSACTION_MANAGER token 0x{other:02X}"),
+        }
+    }
+    out
+}
+
+fn varbyte_u64(body: &[u8], pos: &mut usize) -> u64 {
+    let len = usize::from(body[*pos]);
+    *pos += 1;
+    let value = if len == 0 {
+        0
+    } else {
+        assert_eq!(len, 8);
+        u64::from_le_bytes(body[*pos..*pos + 8].try_into().unwrap())
+    };
+    *pos += len;
+    value
+}
+
+async fn tm_request(client: &mut TcpStream, packet: &[u8]) -> Vec<TmTok> {
+    client.write_all(packet).await.unwrap();
+    tm_tokens(&read_response(client, RESPONSE_BUDGET).await)
+}
+
+async fn begin_tm(client: &mut TcpStream) -> u64 {
+    match tm_request(client, &tm_begin_packet()).await.as_slice() {
+        [
+            TmTok::EnvBegin(descriptor),
+            TmTok::Done {
+                cur_cmd: CUR_CMD_TRANSACTION_MANAGER,
+                ..
+            },
+        ] if *descriptor != 0 => *descriptor,
+        other => panic!("unexpected BEGIN response: {other:?}"),
+    }
+}
+
+/// The first integer column of a scalar response, or `None` when the batch failed.
+fn first_int(tokens: &[Tok]) -> Option<i64> {
+    tokens.iter().find_map(|tok| match tok {
+        Tok::Row(values) => values.first().copied().flatten(),
+        _ => None,
+    })
 }
 
 /// 16 bytes from a xorshift generator seeded by the clock; the seed is printed so that a
@@ -879,4 +1016,111 @@ async fn successive_connections_get_spids_51_then_52() {
 
     running.stop().await.unwrap();
     assert_eq!(spids.collect(), vec![51, 52]);
+}
+
+/// Registers built-in functions such as `@@TRANCOUNT` for wire-level transaction tests.
+fn register_builtins_once() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(vauban_sysfn::register_builtins);
+}
+
+/// After a second `TM_BEGIN` refusal (3989), the session transaction stays open on the wire.
+#[tokio::test]
+async fn transaction_stays_open_after_second_tm_begin_refusal() {
+    register_builtins_once();
+    let running = start_accepting_logins().await;
+    let mut client = connect_and_login(running.addr).await;
+    let descriptor = begin_tm(&mut client).await;
+
+    assert_eq!(
+        tm_request(&mut client, &tm_begin_packet()).await,
+        vec![
+            TmTok::Error(3989),
+            TmTok::Done {
+                status: DONE_ERROR,
+                cur_cmd: 0,
+            },
+        ]
+    );
+
+    let trancount = run_batch_at(
+        &mut client,
+        descriptor,
+        "SELECT @@TRANCOUNT",
+        RESPONSE_BUDGET,
+    )
+    .await;
+    assert_eq!(first_int(&trancount), Some(1));
+
+    drop(client);
+    running.stop().await.unwrap();
+}
+
+/// After ALL_HEADERS carry a mismatched descriptor (3926 then 3971), the session transaction
+/// stays open on the wire.
+#[tokio::test]
+async fn transaction_stays_open_after_mismatched_batch_descriptor_refusal() {
+    register_builtins_once();
+    let running = start_accepting_logins().await;
+    let mut client = connect_and_login(running.addr).await;
+    let descriptor = begin_tm(&mut client).await;
+
+    assert_eq!(
+        run_batch_at(&mut client, descriptor + 1, "SELECT 1", RESPONSE_BUDGET,).await,
+        vec![
+            Tok::Info(3926),
+            Tok::Error(3971),
+            Tok::Done {
+                status: DONE_ERROR,
+                cur_cmd: 0,
+                row_count: 0,
+            },
+        ]
+    );
+
+    let trancount = run_batch_at(
+        &mut client,
+        descriptor,
+        "SELECT @@TRANCOUNT",
+        RESPONSE_BUDGET,
+    )
+    .await;
+    assert_eq!(first_int(&trancount), Some(1));
+
+    drop(client);
+    running.stop().await.unwrap();
+}
+
+/// After a batch with descriptor 0 while a transaction is open (3989), the session transaction
+/// stays open on the wire.
+#[tokio::test]
+async fn transaction_stays_open_after_zero_descriptor_batch_refusal() {
+    register_builtins_once();
+    let running = start_accepting_logins().await;
+    let mut client = connect_and_login(running.addr).await;
+    let descriptor = begin_tm(&mut client).await;
+
+    assert_eq!(
+        run_batch(&mut client, "SELECT 1", RESPONSE_BUDGET).await,
+        vec![
+            Tok::Error(3989),
+            Tok::Done {
+                status: DONE_ERROR,
+                cur_cmd: 0,
+                row_count: 0,
+            },
+        ]
+    );
+
+    let trancount = run_batch_at(
+        &mut client,
+        descriptor,
+        "SELECT @@TRANCOUNT",
+        RESPONSE_BUDGET,
+    )
+    .await;
+    assert_eq!(first_int(&trancount), Some(1));
+
+    drop(client);
+    running.stop().await.unwrap();
 }

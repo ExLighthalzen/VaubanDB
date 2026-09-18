@@ -412,7 +412,6 @@ async fn run_connection(
             ClientMessage::SqlBatch(batch) => {
                 let descriptor = batch.transaction_descriptor;
                 let text = batch.text;
-                let engine = Arc::clone(&transaction_engine);
                 let outcome = run_request(
                     &mut writer,
                     &mut client_rx,
@@ -423,7 +422,7 @@ async fn run_connection(
                         let mut state = session.state().clone();
                         if !txn_request::reject_mismatched_descriptor(descriptor, &mut state, sink)?
                         {
-                            *session = Session::new(engine, state);
+                            session.replace_state(state);
                             return Ok(());
                         }
                         session.run_batch(&text, sink)
@@ -437,7 +436,6 @@ async fn run_connection(
             }
             ClientMessage::Rpc(rpc) => {
                 let descriptor = rpc.transaction_descriptor;
-                let engine = Arc::clone(&transaction_engine);
                 let outcome = run_request(
                     &mut writer,
                     &mut client_rx,
@@ -448,7 +446,7 @@ async fn run_connection(
                         let mut state = session.state().clone();
                         if !txn_request::reject_mismatched_descriptor(descriptor, &mut state, sink)?
                         {
-                            *session = Session::new(engine, state);
+                            session.replace_state(state);
                             return Ok(());
                         }
                         session.run_rpc(&rpc, sink)
@@ -475,12 +473,9 @@ async fn run_connection(
                     false,
                     Some(CUR_CMD_TRANSACTION_MANAGER),
                     move |session, sink| {
-                        // `Session` intentionally exposes its state read-only. Preserve every
-                        // field through a clone, let the TRANSACTION_MANAGER owner mutate it,
-                        // then rebuild the wrapper with the same shared engine.
                         let mut state = session.state().clone();
                         let result = txn_request::handle(&request, &engine, &mut state, sink);
-                        *session = Session::new(engine, state);
+                        session.replace_state(state);
                         result
                     },
                 )

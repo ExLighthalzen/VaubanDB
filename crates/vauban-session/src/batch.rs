@@ -272,6 +272,14 @@ impl Session {
         &self.state
     }
 
+    /// Replaces [`SessionState`] without reconstructing the wrapper.
+    ///
+    /// [`Session::new`] runs [`Drop`] on the old value, which rolls back an open transaction;
+    /// the TRANSACTION_MANAGER path uses this after `txn_request::handle` instead.
+    pub(crate) fn replace_state(&mut self, state: SessionState) {
+        self.state = state;
+    }
+
     /// A handle that cancels the running request (ATTENTION).
     pub fn cancel_handle(&self) -> CancelHandle {
         self.cancel.clone()
