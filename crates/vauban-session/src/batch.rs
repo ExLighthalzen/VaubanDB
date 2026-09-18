@@ -210,11 +210,32 @@ pub struct Session {
 }
 
 impl Drop for Session {
-    /// Rolls back a transaction the connection left open. The full release (locks given
-    /// back, a waiting request cut) is the connection-teardown work; this one cancels the
-    /// open transaction and clears its descriptor.
+    /// Rolls back a transaction the connection left open and gives locks back through
+    /// [`crate::disconnect::release`].
     fn drop(&mut self) {
-        let _ = txn_session::rollback_all(&mut self.state, &self.engine);
+        let _ = crate::disconnect::release(self, crate::disconnect::Release::Disconnect);
+    }
+}
+
+impl Session {
+    /// Shared engine of the connection.
+    pub(crate) fn engine(&self) -> &Arc<Engine> {
+        &self.engine
+    }
+
+    /// Mutable session state.
+    pub(crate) fn state_mut(&mut self) -> &mut SessionState {
+        &mut self.state
+    }
+
+    /// Executor session state shared across statements.
+    pub(crate) fn exec(&self) -> &ExecSession {
+        &self.exec
+    }
+
+    /// Mutable executor session state.
+    pub(crate) fn exec_mut(&mut self) -> &mut ExecSession {
+        &mut self.exec
     }
 }
 
@@ -641,7 +662,10 @@ impl Session {
                 self.state.rowcount = 0;
                 Ok(Flow::Stop)
             }
-            Ok(outcome @ (ExecOutcome::Cancelled | ExecOutcome::Break | ExecOutcome::Continue)) => {
+            Ok(ExecOutcome::Cancelled) => Err(SqlError::from(InternalError::Bug(
+                crate::cancel::CANCELLED.to_owned(),
+            ))),
+            Ok(outcome @ (ExecOutcome::Break | ExecOutcome::Continue)) => {
                 let err = SqlError::from(InternalError::Bug(format!(
                     "run_prepared: the executor answered {outcome:?}, which this layer does \
                      not handle"

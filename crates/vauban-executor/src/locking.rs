@@ -139,8 +139,9 @@ pub(crate) fn read_lock(
     let (Some(manager), Some(handle)) = (ctx.txn, ctx.handle) else {
         return Ok(RowVisibility::Visible);
     };
+    let wait = ctx.cancel.lock_wait();
     Ok(
-        match manager.read_lock(handle, table, id, &intent_of(hints))? {
+        match manager.read_lock(handle, table, id, &intent_of(hints), &wait)? {
             ReadAccess::Locked | ReadAccess::Dirty => RowVisibility::Latest,
             ReadAccess::Versioned => RowVisibility::Visible,
             ReadAccess::Skip => RowVisibility::Skip,
@@ -179,7 +180,8 @@ pub(crate) fn write_lock(ctx: &mut ExecContext<'_>, table: TableId, id: RowId) -
     let (Some(manager), Some(handle)) = (ctx.txn, ctx.handle) else {
         return Ok(());
     };
-    manager.write_lock(handle, table, id, &LockIntent::default())
+    let wait = ctx.cancel.lock_wait();
+    manager.write_lock(handle, table, id, &LockIntent::default(), &wait)
 }
 
 /// The snapshot a scan or a seek iterates under `hints`.

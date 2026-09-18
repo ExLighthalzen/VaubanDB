@@ -151,7 +151,7 @@ fn deadlock_priority_is_reported() {
 fn held_locks_are_reported_as_grant() -> SqlResult<()> {
     let mgr = manager();
     let a = mgr.begin(IsolationLevel::RepeatableRead);
-    mgr.read_lock(&a, T, R, &LockIntent::default())?;
+    mgr.read_lock(&a, T, R, &LockIntent::default(), &LockWait::none())?;
 
     let mine = lines_of(&mgr, a.id);
     let shape: Vec<(LockResource, LockMode, LockStatus, u64)> = mine
@@ -248,8 +248,8 @@ fn a_conversion_is_reported_as_convert() -> SqlResult<()> {
     let mgr = manager();
     let a = mgr.begin(IsolationLevel::RepeatableRead);
     let b = mgr.begin(IsolationLevel::RepeatableRead);
-    mgr.read_lock(&a, T, R, &LockIntent::default())?;
-    mgr.read_lock(&b, T, R, &LockIntent::default())?;
+    mgr.read_lock(&a, T, R, &LockIntent::default(), &LockWait::none())?;
+    mgr.read_lock(&b, T, R, &LockIntent::default(), &LockWait::none())?;
 
     let a_id = a.id;
     let rx = {

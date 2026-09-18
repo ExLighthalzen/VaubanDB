@@ -312,6 +312,7 @@ impl TransactionManager {
         table: TableId,
         row: RowId,
         hints: &LockIntent,
+        wait: &LockWait,
     ) -> SqlResult<ReadAccess> {
         let level = self.effective_level(txn, hints);
         let Some(mode) = read_mode(level, hints) else {
@@ -320,20 +321,26 @@ impl TransactionManager {
         if mode == LockMode::S && self.read_versioning(txn, level) != VersioningMode::Locking {
             return Ok(ReadAccess::Versioned);
         }
-        let wait = if hints.nowait {
+        let lock_wait = if hints.nowait {
             LockTimeout::NoWait
         } else {
             session_timeout(txn)
         };
-        self.take(txn.id, LockResource::Table(table), intent_of(mode), wait)?;
+        self.take(
+            txn.id,
+            LockResource::Table(table),
+            intent_of(mode),
+            lock_wait,
+            wait,
+        )?;
         let resource = LockResource::Row(table, row);
         let held_before = self.data_mode_held(txn.id, resource);
-        let row_wait = if hints.readpast {
+        let row_timeout = if hints.readpast {
             LockTimeout::NoWait
         } else {
-            wait
+            lock_wait
         };
-        if let Err(refused) = self.take(txn.id, resource, mode, row_wait) {
+        if let Err(refused) = self.take(txn.id, resource, mode, row_timeout, wait) {
             if hints.readpast {
                 return Ok(ReadAccess::Skip);
             }
@@ -399,14 +406,27 @@ impl TransactionManager {
         table: TableId,
         row: RowId,
         hints: &LockIntent,
+        wait: &LockWait,
     ) -> SqlResult<()> {
-        let wait = if hints.nowait {
+        let lock_wait = if hints.nowait {
             LockTimeout::NoWait
         } else {
             session_timeout(txn)
         };
-        self.take(txn.id, LockResource::Table(table), LockMode::IX, wait)?;
-        self.take(txn.id, LockResource::Row(table, row), LockMode::X, wait)?;
+        self.take(
+            txn.id,
+            LockResource::Table(table),
+            LockMode::IX,
+            lock_wait,
+            wait,
+        )?;
+        self.take(
+            txn.id,
+            LockResource::Row(table, row),
+            LockMode::X,
+            lock_wait,
+            wait,
+        )?;
         // Housekeeping: the entry of a `ReadCommitted` read of this row is not needed any
         // more. What keeps the `X` is the mode `end_row_read` reads before it gives a lock
         // back (`tests/isolation.rs`, `a_row_converted_to_x_keeps_its_lock`, which stays
@@ -423,11 +443,9 @@ impl TransactionManager {
         resource: LockResource,
         mode: LockMode,
         timeout: LockTimeout,
+        wait: &LockWait,
     ) -> SqlResult<()> {
-        match self
-            .locks()
-            .try_acquire(txn, resource, mode, timeout, &LockWait::none())
-        {
+        match self.locks().try_acquire(txn, resource, mode, timeout, wait) {
             LockOutcome::Granted => Ok(()),
             other => Err(deadlock::to_error(self.locks(), other, resource)),
         }

@@ -117,7 +117,7 @@ fn read_in_background(
 ) -> Receiver<Result<(), u32>> {
     let (mgr, handle) = (Arc::clone(mgr), handle.clone());
     in_background(move || {
-        mgr.read_lock(&handle, T, R, &hints)
+        mgr.read_lock(&handle, T, R, &hints, &LockWait::none())
             .map(|_| ())
             .map_err(|e| e.number)
     })
@@ -135,7 +135,7 @@ fn tablock_takes_a_shared_table_lock() {
     assert_eq!(table_modes(&mgr, &first), vec![LockMode::S]);
 
     let second = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.read_lock(&second, T, R, &plain())
+    mgr.read_lock(&second, T, R, &plain(), &LockWait::none())
         .expect("a shared table lock lets another reader through");
 }
 
@@ -169,7 +169,8 @@ fn rowlock_keeps_row_granularity() {
     assert_eq!(decision, TableLockDecision::RowLevel);
     assert!(table_modes(&mgr, &txn).is_empty());
 
-    mgr.read_lock(&txn, T, R, &plain()).expect("the row read");
+    mgr.read_lock(&txn, T, R, &plain(), &LockWait::none())
+        .expect("the row read");
     assert_eq!(table_modes(&mgr, &txn), vec![LockMode::IS]);
     assert!(
         mgr.locks()
@@ -203,7 +204,7 @@ fn tablock_is_released_after_the_statement_under_read_committed() {
     assert!(table_modes(&mgr, &holder).is_empty());
 
     let writer = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.write_lock(&writer, T, R, &plain())
+    mgr.write_lock(&writer, T, R, &plain(), &LockWait::none())
         .expect("the table is free after end_table_lock");
 }
 
@@ -240,7 +241,7 @@ fn tablock_is_held_to_commit_under_repeatable_read() {
         let mgr = Arc::clone(&mgr);
         let writer = writer.clone();
         move || {
-            mgr.write_lock(&writer, T, R, &plain())
+            mgr.write_lock(&writer, T, R, &plain(), &LockWait::none())
                 .map_err(|e| e.number)
         }
     });

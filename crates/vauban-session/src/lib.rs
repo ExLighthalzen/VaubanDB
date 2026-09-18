@@ -14,6 +14,7 @@
 //! | `sink.rs` | `ResultSink` and its TDS implementation |
 //! | `batch.rs`, `fake_engine.rs` | batch and RPC dispatch, the `WAITFOR DELAY` fallback |
 //! | `cancel.rs` | ATTENTION handling |
+//! | `disconnect.rs` | connection teardown and ATTENTION cleanup |
 //! | `eval_context.rs` | `EvalContext` of the session for `sysfn` |
 //! | `txn_request.rs` | TRANSACTION_MANAGER requests |
 //! | `txn_session.rs` | the session transaction: opening, holding across batches, closing, descriptor |
@@ -21,6 +22,7 @@
 mod auth;
 mod batch;
 mod cancel;
+mod disconnect;
 mod eval_context;
 mod fake_engine;
 mod login;

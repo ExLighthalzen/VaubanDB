@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use vauban_storage::testsuite::{int_table_shape, row};
 use vauban_storage::{DbId, MemoryStorage, Row, RowId, Snapshot, Storage, TableId, TxnId};
 use vauban_txn::{
-    IsolationLevel, LockIntent, LockManager, LockMode, LockResource, ReadAccess,
+    IsolationLevel, LockIntent, LockManager, LockMode, LockResource, LockWait, ReadAccess,
     TransactionManager, TxnHandle, VersioningMode, VersioningOptions, WriteDecision,
 };
 
@@ -116,7 +116,7 @@ impl Fixture {
     /// Sets row `id` to `value` on behalf of `txn`, `X` taken first.
     fn update(&self, txn: &TxnHandle, id: RowId, value: i32) {
         self.mgr
-            .write_lock(txn, self.table, id, &plain())
+            .write_lock(txn, self.table, id, &plain(), &LockWait::none())
             .expect("write_lock");
         self.storage
             .update(txn.id, self.table, id, &row(&[value]))
@@ -277,7 +277,8 @@ fn rcsi_off_blocks_the_reader() {
 
     let b = f.begin(IsolationLevel::ReadCommitted);
     let (mgr, handle, table, id) = (Arc::clone(&f.mgr), b.clone(), f.table, f.id);
-    let read = in_background(move || mgr.read_lock(&handle, table, id, &plain()));
+    let read =
+        in_background(move || mgr.read_lock(&handle, table, id, &plain(), &LockWait::none()));
     await_waiter(f.mgr.locks(), b.id);
     still_waiting(&read, "the READ COMMITTED reader");
 
@@ -302,7 +303,8 @@ fn rcsi_on_does_not() {
     let b = f.begin(IsolationLevel::ReadCommitted);
     assert_eq!(f.mgr.versioning_mode(&b), VersioningMode::StatementSnapshot);
     let (mgr, handle, table, id) = (Arc::clone(&f.mgr), b.clone(), f.table, f.id);
-    let read = in_background(move || mgr.read_lock(&handle, table, id, &plain()));
+    let read =
+        in_background(move || mgr.read_lock(&handle, table, id, &plain(), &LockWait::none()));
     assert_eq!(
         read.recv_timeout(SOON).expect("the reader answers at once"),
         Ok(ReadAccess::Versioned)
@@ -367,13 +369,16 @@ fn a_read_committed_hint_is_versioned_under_rcsi() {
         ..LockIntent::default()
     };
     assert_eq!(
-        f.mgr.read_lock(&b, f.table, f.id, &hint).expect("B reads"),
+        f.mgr
+            .read_lock(&b, f.table, f.id, &hint, &LockWait::none())
+            .expect("B reads"),
         ReadAccess::Versioned
     );
     assert!(f.mgr.locks().held(b.id).is_empty());
 
     let (mgr, handle, table, id) = (Arc::clone(&f.mgr), b.clone(), f.table, f.id);
-    let read = in_background(move || mgr.read_lock(&handle, table, id, &plain()));
+    let read =
+        in_background(move || mgr.read_lock(&handle, table, id, &plain(), &LockWait::none()));
     await_waiter(f.mgr.locks(), b.id);
     still_waiting(&read, "the plain REPEATABLE READ read");
     f.mgr.commit(a).expect("A commits");
@@ -396,7 +401,8 @@ fn updlock_still_waits_under_rcsi() {
         ..LockIntent::default()
     };
     let (mgr, handle, table, id) = (Arc::clone(&f.mgr), b.clone(), f.table, f.id);
-    let read = in_background(move || mgr.read_lock(&handle, table, id, &updlock));
+    let read =
+        in_background(move || mgr.read_lock(&handle, table, id, &updlock, &LockWait::none()));
     await_waiter(f.mgr.locks(), b.id);
     still_waiting(&read, "the UPDLOCK read");
     f.mgr.commit(a).expect("A commits");
@@ -416,7 +422,8 @@ fn write_locks_are_still_taken_under_rcsi() {
 
     let b = f.begin(IsolationLevel::ReadCommitted);
     let (mgr, handle, table, id) = (Arc::clone(&f.mgr), b.clone(), f.table, f.id);
-    let written = in_background(move || mgr.write_lock(&handle, table, id, &plain()));
+    let written =
+        in_background(move || mgr.write_lock(&handle, table, id, &plain(), &LockWait::none()));
     await_waiter(f.mgr.locks(), b.id);
     still_waiting(&written, "the second writer");
 
@@ -443,7 +450,7 @@ fn a_row_changed_since_the_statement_is_reread() {
         assert_eq!(f.read(&b), Some(row(&[10])));
         f.commit_update(11);
         f.mgr
-            .write_lock(&b, f.table, f.id, &plain())
+            .write_lock(&b, f.table, f.id, &plain(), &LockWait::none())
             .expect("B takes the row");
         assert_eq!(
             f.check(&b, f.id),
@@ -531,7 +538,8 @@ fn snapshot_txn_reads_take_no_lock() {
     f.update(&a, f.id, 11);
     let b = f.begin(IsolationLevel::Snapshot);
     let (mgr, handle, table, id) = (Arc::clone(&f.mgr), b.clone(), f.table, f.id);
-    let read = in_background(move || mgr.read_lock(&handle, table, id, &plain()));
+    let read =
+        in_background(move || mgr.read_lock(&handle, table, id, &plain(), &LockWait::none()));
     assert_eq!(
         read.recv_timeout(SOON).expect("the reader answers at once"),
         Ok(ReadAccess::Versioned)
@@ -551,7 +559,7 @@ fn update_conflict_is_reported() {
     assert_eq!(f.check(&a, f.id), WriteDecision::Proceed, "its own write");
     f.mgr.commit(a).expect("A commits");
     f.mgr
-        .write_lock(&b, f.table, f.id, &plain())
+        .write_lock(&b, f.table, f.id, &plain(), &LockWait::none())
         .expect("B takes the row");
     assert_eq!(f.check(&b, f.id), WriteDecision::Conflict);
     assert_eq!(
@@ -581,7 +589,7 @@ fn no_conflict_when_rows_differ() {
     f.update(&a, f.id, 11);
     f.mgr.commit(a).expect("A commits");
     f.mgr
-        .write_lock(&b, f.table, other, &plain())
+        .write_lock(&b, f.table, other, &plain(), &LockWait::none())
         .expect("B takes the other row");
     assert_eq!(f.check(&b, other), WriteDecision::Proceed);
     assert_eq!(
@@ -598,7 +606,7 @@ fn a_delete_after_the_snapshot_is_a_conflict() {
     assert_eq!(f.read(&b), Some(row(&[10])));
     let a = f.begin(IsolationLevel::ReadCommitted);
     f.mgr
-        .write_lock(&a, f.table, f.id, &plain())
+        .write_lock(&a, f.table, f.id, &plain(), &LockWait::none())
         .expect("A takes the row");
     f.storage.delete(a.id, f.table, f.id).expect("delete");
     f.mgr.commit(a).expect("A commits");
@@ -614,7 +622,7 @@ fn a_rolled_back_update_is_no_conflict() {
     f.update(&a, f.id, 11);
     f.mgr.rollback(a).expect("A rolls back");
     f.mgr
-        .write_lock(&b, f.table, f.id, &plain())
+        .write_lock(&b, f.table, f.id, &plain(), &LockWait::none())
         .expect("B takes the row");
     assert_eq!(f.check(&b, f.id), WriteDecision::Proceed);
 }
@@ -627,7 +635,7 @@ fn a_write_committed_before_the_snapshot_is_no_conflict() {
     let b = f.begin(IsolationLevel::Snapshot);
     assert_eq!(f.read(&b), Some(row(&[11])));
     f.mgr
-        .write_lock(&b, f.table, f.id, &plain())
+        .write_lock(&b, f.table, f.id, &plain(), &LockWait::none())
         .expect("B takes the row");
     assert_eq!(f.check(&b, f.id), WriteDecision::Proceed);
 }
@@ -645,7 +653,7 @@ fn a_snapshot_writer_waits_then_conflicts() {
     assert_eq!(f.read(&b), Some(row(&[10])));
     let (mgr, handle, table, id) = (Arc::clone(&f.mgr), b.clone(), f.table, f.id);
     let written = in_background(move || {
-        mgr.write_lock(&handle, table, id, &plain())?;
+        mgr.write_lock(&handle, table, id, &plain(), &LockWait::none())?;
         mgr.check_write_conflict(&handle, table, id)
     });
     await_waiter(f.mgr.locks(), b.id);

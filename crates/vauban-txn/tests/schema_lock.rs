@@ -224,7 +224,8 @@ fn nolock_still_takes_sch_s() {
         let mgr = manager();
         let reader = mgr.begin(level);
         assert_eq!(
-            mgr.read_lock(&reader, T, R, &hints).expect("the row read"),
+            mgr.read_lock(&reader, T, R, &hints, &LockWait::none())
+                .expect("the row read"),
             ReadAccess::Dirty,
             "the read takes no data lock at {level:?}"
         );
@@ -268,7 +269,7 @@ fn sch_s_does_not_block_a_writer() {
     let writer = mgr.begin(IsolationLevel::ReadCommitted);
     let (bg, handle) = (Arc::clone(&mgr), writer.clone());
     let written = in_background(move || {
-        bg.write_lock(&handle, T, R, &LockIntent::default())
+        bg.write_lock(&handle, T, R, &LockIntent::default(), &LockWait::none())
             .map_err(|e| e.number)
     });
     assert_eq!(

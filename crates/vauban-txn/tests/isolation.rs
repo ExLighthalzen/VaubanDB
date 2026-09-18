@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use vauban_storage::{MemoryStorage, RowId, TableId, TxnId};
 use vauban_txn::{
-    IsolationLevel, LockIntent, LockManager, LockMode, LockResource, ReadAccess,
+    IsolationLevel, LockIntent, LockManager, LockMode, LockResource, LockWait, ReadAccess,
     TransactionManager, TxnHandle,
 };
 
@@ -133,13 +133,16 @@ fn holds(
 fn read_committed_blocks_on_x_then_releases() {
     let mgr = manager();
     let a = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.write_lock(&a, T, R, &plain()).expect("A takes the row");
+    mgr.write_lock(&a, T, R, &plain(), &LockWait::none())
+        .expect("A takes the row");
 
     let b = mgr.begin(IsolationLevel::ReadCommitted);
     let (reader, handle) = (Arc::clone(&mgr), b.clone());
     let (started_tx, started) = channel();
     let ended = in_background(move || {
-        let access = reader.read_lock(&handle, T, R, &plain()).expect("B reads");
+        let access = reader
+            .read_lock(&handle, T, R, &plain(), &LockWait::none())
+            .expect("B reads");
         started_tx.send(access).expect("the test is listening");
         reader.end_row_read(&handle, T, R).expect("B ends its row")
     });
@@ -167,7 +170,8 @@ fn repeatable_read_holds_the_share_lock() {
     let mgr = manager();
     let b = mgr.begin(IsolationLevel::RepeatableRead);
     assert_eq!(
-        mgr.read_lock(&b, T, R, &plain()).expect("B reads"),
+        mgr.read_lock(&b, T, R, &plain(), &LockWait::none())
+            .expect("B reads"),
         ReadAccess::Locked
     );
     mgr.end_row_read(&b, T, R).expect("B ends its row");
@@ -179,7 +183,8 @@ fn repeatable_read_holds_the_share_lock() {
 
     let a = mgr.begin(IsolationLevel::ReadCommitted);
     let (writer, handle) = (Arc::clone(&mgr), a.clone());
-    let written = in_background(move || writer.write_lock(&handle, T, R, &plain()));
+    let written =
+        in_background(move || writer.write_lock(&handle, T, R, &plain(), &LockWait::none()));
     await_waiter(mgr.locks(), a.id);
     still_waiting(&written, "the writer against a REPEATABLE READ reader");
 
@@ -196,12 +201,14 @@ fn repeatable_read_holds_the_share_lock() {
 fn read_committed_lets_the_writer_through() {
     let mgr = manager();
     let b = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.read_lock(&b, T, R, &plain()).expect("B reads");
+    mgr.read_lock(&b, T, R, &plain(), &LockWait::none())
+        .expect("B reads");
     mgr.end_row_read(&b, T, R).expect("B ends its row");
 
     let a = mgr.begin(IsolationLevel::ReadCommitted);
     let (writer, handle) = (Arc::clone(&mgr), a.clone());
-    let written = in_background(move || writer.write_lock(&handle, T, R, &plain()));
+    let written =
+        in_background(move || writer.write_lock(&handle, T, R, &plain(), &LockWait::none()));
     written
         .recv_timeout(SOON)
         .expect("the writer answers without waiting for a commit")
@@ -215,13 +222,14 @@ fn read_committed_lets_the_writer_through() {
 fn read_uncommitted_does_not_block() {
     let mgr = manager();
     let a = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.write_lock(&a, T, R, &plain()).expect("A takes the row");
+    mgr.write_lock(&a, T, R, &plain(), &LockWait::none())
+        .expect("A takes the row");
 
     let b = mgr.begin(IsolationLevel::ReadUncommitted);
     // In the background with a deadline: a read that took a shared lock here would wait for
     // the exclusive lock of A, and this test would hang instead of failing.
     let (reader, handle) = (Arc::clone(&mgr), b.clone());
-    let read = in_background(move || reader.read_lock(&handle, T, R, &plain()));
+    let read = in_background(move || reader.read_lock(&handle, T, R, &plain(), &LockWait::none()));
     assert_eq!(
         read.recv_timeout(SOON)
             .expect("the dirty read answers without waiting")
@@ -242,7 +250,8 @@ fn read_uncommitted_does_not_block() {
 fn nolock_hint_overrides_the_level() {
     let mgr = manager();
     let a = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.write_lock(&a, T, R, &plain()).expect("A takes the row");
+    mgr.write_lock(&a, T, R, &plain(), &LockWait::none())
+        .expect("A takes the row");
 
     let b = mgr.begin(IsolationLevel::RepeatableRead);
     let hints = LockIntent {
@@ -254,7 +263,7 @@ fn nolock_hint_overrides_the_level() {
         IsolationLevel::ReadUncommitted
     );
     let (reader, handle) = (Arc::clone(&mgr), b.clone());
-    let read = in_background(move || reader.read_lock(&handle, T, R, &hints));
+    let read = in_background(move || reader.read_lock(&handle, T, R, &hints, &LockWait::none()));
     assert_eq!(
         read.recv_timeout(SOON)
             .expect("the hinted read answers without waiting")
@@ -276,8 +285,9 @@ fn commit_releases_every_level() {
     ] {
         let mgr = manager();
         let txn = mgr.begin(level);
-        mgr.read_lock(&txn, T, R, &plain()).expect("the read");
-        mgr.write_lock(&txn, T, RowId(2), &plain())
+        mgr.read_lock(&txn, T, R, &plain(), &LockWait::none())
+            .expect("the read");
+        mgr.write_lock(&txn, T, RowId(2), &plain(), &LockWait::none())
             .expect("the write");
         assert!(
             !mgr.locks().held(txn.id).is_empty(),
@@ -305,7 +315,8 @@ fn a_read_committed_hint_lowers_a_repeatable_read_transaction() {
         level: Some(IsolationLevel::ReadCommitted),
         ..LockIntent::default()
     };
-    mgr.read_lock(&b, T, R, &hints).expect("B reads");
+    mgr.read_lock(&b, T, R, &hints, &LockWait::none())
+        .expect("B reads");
     mgr.end_row_read(&b, T, R).expect("B ends its row");
     assert!(
         !holds(&mgr, &b, row_res(), LockMode::S),
@@ -324,7 +335,8 @@ fn a_repeatable_read_hint_raises_a_read_committed_transaction() {
         level: Some(IsolationLevel::RepeatableRead),
         ..LockIntent::default()
     };
-    mgr.read_lock(&b, T, R, &hints).expect("B reads");
+    mgr.read_lock(&b, T, R, &hints, &LockWait::none())
+        .expect("B reads");
     mgr.end_row_read(&b, T, R).expect("B ends its row");
     assert!(
         holds(&mgr, &b, row_res(), LockMode::S),
@@ -347,7 +359,8 @@ fn holdlock_is_the_serializable_hint() {
         mgr.effective_level(&b, &hints),
         IsolationLevel::Serializable
     );
-    mgr.read_lock(&b, T, R, &hints).expect("B reads");
+    mgr.read_lock(&b, T, R, &hints, &LockWait::none())
+        .expect("B reads");
     mgr.end_row_read(&b, T, R).expect("B ends its row");
     assert!(holds(&mgr, &b, row_res(), LockMode::S));
 }
@@ -403,8 +416,9 @@ fn a_held_read_overrules_an_earlier_released_read_of_the_same_row() {
         level: Some(IsolationLevel::RepeatableRead),
         ..LockIntent::default()
     };
-    mgr.read_lock(&b, T, R, &plain()).expect("B reads plainly");
-    mgr.read_lock(&b, T, R, &held)
+    mgr.read_lock(&b, T, R, &plain(), &LockWait::none())
+        .expect("B reads plainly");
+    mgr.read_lock(&b, T, R, &held, &LockWait::none())
         .expect("B reads under a hint");
     mgr.end_row_read(&b, T, R).expect("B ends its row");
     assert!(
@@ -415,7 +429,8 @@ fn a_held_read_overrules_an_earlier_released_read_of_the_same_row() {
 
     let a = mgr.begin(IsolationLevel::ReadCommitted);
     let (writer, handle) = (Arc::clone(&mgr), a.clone());
-    let written = in_background(move || writer.write_lock(&handle, T, R, &plain()));
+    let written =
+        in_background(move || writer.write_lock(&handle, T, R, &plain(), &LockWait::none()));
     await_waiter(mgr.locks(), a.id);
     still_waiting(&written, "the writer against the row read twice");
 
@@ -441,8 +456,10 @@ fn a_plain_repeatable_read_overrules_an_earlier_read_committed_hint() {
         level: Some(IsolationLevel::ReadCommitted),
         ..LockIntent::default()
     };
-    mgr.read_lock(&b, T, R, &lowered).expect("B reads lowered");
-    mgr.read_lock(&b, T, R, &plain()).expect("B reads plainly");
+    mgr.read_lock(&b, T, R, &lowered, &LockWait::none())
+        .expect("B reads lowered");
+    mgr.read_lock(&b, T, R, &plain(), &LockWait::none())
+        .expect("B reads plainly");
     mgr.end_row_read(&b, T, R).expect("B ends its row");
     assert!(
         holds(&mgr, &b, row_res(), LockMode::S),
@@ -452,7 +469,8 @@ fn a_plain_repeatable_read_overrules_an_earlier_read_committed_hint() {
 
     let a = mgr.begin(IsolationLevel::ReadCommitted);
     let (writer, handle) = (Arc::clone(&mgr), a.clone());
-    let written = in_background(move || writer.write_lock(&handle, T, R, &plain()));
+    let written =
+        in_background(move || writer.write_lock(&handle, T, R, &plain(), &LockWait::none()));
     await_waiter(mgr.locks(), a.id);
     still_waiting(&written, "the writer against the row read twice");
 
@@ -475,8 +493,10 @@ fn a_plain_repeatable_read_overrules_an_earlier_read_committed_hint() {
 fn two_open_reads_of_one_row_give_the_lock_back_at_the_first_end() {
     let mgr = manager();
     let b = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.read_lock(&b, T, R, &plain()).expect("the outer read");
-    mgr.read_lock(&b, T, R, &plain()).expect("the inner read");
+    mgr.read_lock(&b, T, R, &plain(), &LockWait::none())
+        .expect("the outer read");
+    mgr.read_lock(&b, T, R, &plain(), &LockWait::none())
+        .expect("the inner read");
     mgr.end_row_read(&b, T, R).expect("the inner read ends");
     assert!(
         !holds(&mgr, &b, row_res(), LockMode::S),
@@ -503,7 +523,8 @@ fn updlock_is_held_to_the_end() {
         ..LockIntent::default()
     };
     assert_eq!(
-        mgr.read_lock(&txn, T, R, &hints).expect("the read"),
+        mgr.read_lock(&txn, T, R, &hints, &LockWait::none())
+            .expect("the read"),
         ReadAccess::Locked
     );
     assert!(holds(&mgr, &txn, row_res(), LockMode::U));
@@ -528,7 +549,8 @@ fn updlock_refuses_updlock_and_lets_a_plain_read_through() {
         updlock: true,
         ..LockIntent::default()
     };
-    mgr.read_lock(&a, T, R, &updlock).expect("A takes the U");
+    mgr.read_lock(&a, T, R, &updlock, &LockWait::none())
+        .expect("A takes the U");
 
     let b = mgr.begin(IsolationLevel::ReadCommitted);
     let second_u = LockIntent {
@@ -536,10 +558,11 @@ fn updlock_refuses_updlock_and_lets_a_plain_read_through() {
         nowait: true,
         ..LockIntent::default()
     };
-    mgr.read_lock(&b, T, R, &second_u)
+    mgr.read_lock(&b, T, R, &second_u, &LockWait::none())
         .expect_err("a second UPDLOCK is refused");
     assert_eq!(
-        mgr.read_lock(&b, T, R, &nowait()).expect("a plain read"),
+        mgr.read_lock(&b, T, R, &nowait(), &LockWait::none())
+            .expect("a plain read"),
         ReadAccess::Locked
     );
 }
@@ -554,7 +577,8 @@ fn updlock_under_read_uncommitted_still_takes_the_u() {
         ..LockIntent::default()
     };
     assert_eq!(
-        mgr.read_lock(&txn, T, R, &hints).expect("the read"),
+        mgr.read_lock(&txn, T, R, &hints, &LockWait::none())
+            .expect("the read"),
         ReadAccess::Locked
     );
     assert!(holds(&mgr, &txn, row_res(), LockMode::U));
@@ -569,7 +593,8 @@ fn xlock_blocks_a_reader() {
         xlock: true,
         ..LockIntent::default()
     };
-    mgr.read_lock(&a, T, R, &hints).expect("A reads with XLOCK");
+    mgr.read_lock(&a, T, R, &hints, &LockWait::none())
+        .expect("A reads with XLOCK");
     assert!(holds(&mgr, &a, row_res(), LockMode::X));
     mgr.end_row_read(&a, T, R).expect("the end of the row");
     assert!(
@@ -579,7 +604,7 @@ fn xlock_blocks_a_reader() {
 
     let b = mgr.begin(IsolationLevel::ReadCommitted);
     let (reader, handle) = (Arc::clone(&mgr), b.clone());
-    let read = in_background(move || reader.read_lock(&handle, T, R, &plain()));
+    let read = in_background(move || reader.read_lock(&handle, T, R, &plain(), &LockWait::none()));
     await_waiter(mgr.locks(), b.id);
     still_waiting(&read, "the reader against an XLOCK");
     mgr.commit(a).expect("A commits");
@@ -597,7 +622,8 @@ fn xlock_blocks_a_reader() {
 fn readpast_skips_instead_of_waiting() {
     let mgr = manager();
     let a = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.write_lock(&a, T, R, &plain()).expect("A takes row 1");
+    mgr.write_lock(&a, T, R, &plain(), &LockWait::none())
+        .expect("A takes row 1");
 
     let b = mgr.begin(IsolationLevel::ReadCommitted);
     let hints = LockIntent {
@@ -605,11 +631,13 @@ fn readpast_skips_instead_of_waiting() {
         ..LockIntent::default()
     };
     assert_eq!(
-        mgr.read_lock(&b, T, R, &hints).expect("no error"),
+        mgr.read_lock(&b, T, R, &hints, &LockWait::none())
+            .expect("no error"),
         ReadAccess::Skip
     );
     assert_eq!(
-        mgr.read_lock(&b, T, RowId(2), &hints).expect("no error"),
+        mgr.read_lock(&b, T, RowId(2), &hints, &LockWait::none())
+            .expect("no error"),
         ReadAccess::Locked,
         "the rows it can lock are still read"
     );
@@ -627,7 +655,8 @@ fn readpast_skips_instead_of_waiting() {
 fn readpast_does_not_apply_to_a_write() {
     let mgr = manager();
     let a = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.write_lock(&a, T, R, &plain()).expect("A takes the row");
+    mgr.write_lock(&a, T, R, &plain(), &LockWait::none())
+        .expect("A takes the row");
 
     let b = mgr.begin(IsolationLevel::ReadCommitted);
     let hints = LockIntent {
@@ -635,7 +664,7 @@ fn readpast_does_not_apply_to_a_write() {
         nowait: true,
         ..LockIntent::default()
     };
-    mgr.write_lock(&b, T, R, &hints)
+    mgr.write_lock(&b, T, R, &hints, &LockWait::none())
         .expect_err("the write reports the refused row");
 }
 
@@ -647,11 +676,12 @@ fn readpast_does_not_apply_to_a_write() {
 fn nowait_yields_1222() {
     let mgr = manager();
     let a = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.write_lock(&a, T, R, &plain()).expect("A takes the row");
+    mgr.write_lock(&a, T, R, &plain(), &LockWait::none())
+        .expect("A takes the row");
 
     let b = mgr.begin(IsolationLevel::ReadCommitted);
     let refused = mgr
-        .read_lock(&b, T, R, &nowait())
+        .read_lock(&b, T, R, &nowait(), &LockWait::none())
         .expect_err("the row is taken");
     assert_eq!(
         (refused.number, refused.state),
@@ -668,7 +698,8 @@ fn nowait_yields_1222() {
 fn intent_locks_are_taken() {
     let mgr = manager();
     let reader = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.read_lock(&reader, T, R, &plain()).expect("the read");
+    mgr.read_lock(&reader, T, R, &plain(), &LockWait::none())
+        .expect("the read");
     assert!(
         holds(&mgr, &reader, table_res(), LockMode::IS),
         "held after the read: {:?}",
@@ -676,7 +707,7 @@ fn intent_locks_are_taken() {
     );
 
     let writer = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.write_lock(&writer, T, RowId(2), &plain())
+    mgr.write_lock(&writer, T, RowId(2), &plain(), &LockWait::none())
         .expect("the write");
     assert!(
         holds(&mgr, &writer, table_res(), LockMode::IX),
@@ -690,7 +721,8 @@ fn intent_locks_are_taken() {
 fn end_row_read_keeps_the_intent_lock() {
     let mgr = manager();
     let txn = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.read_lock(&txn, T, R, &plain()).expect("the read");
+    mgr.read_lock(&txn, T, R, &plain(), &LockWait::none())
+        .expect("the read");
     mgr.end_row_read(&txn, T, R).expect("the end of the row");
     assert_eq!(
         mgr.locks().held(txn.id),
@@ -705,8 +737,10 @@ fn end_row_read_keeps_the_intent_lock() {
 fn a_row_converted_to_x_keeps_its_lock() {
     let mgr = manager();
     let txn = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.read_lock(&txn, T, R, &plain()).expect("the read");
-    mgr.write_lock(&txn, T, R, &plain()).expect("the write");
+    mgr.read_lock(&txn, T, R, &plain(), &LockWait::none())
+        .expect("the read");
+    mgr.write_lock(&txn, T, R, &plain(), &LockWait::none())
+        .expect("the write");
     mgr.end_row_read(&txn, T, R).expect("the end of the row");
     assert!(
         holds(&mgr, &txn, row_res(), LockMode::X),
@@ -721,7 +755,8 @@ fn end_row_read_without_a_read_is_quiet() {
     let mgr = manager();
     let txn = mgr.begin(IsolationLevel::ReadCommitted);
     mgr.end_row_read(&txn, T, R).expect("nothing to give back");
-    mgr.write_lock(&txn, T, R, &plain()).expect("the write");
+    mgr.write_lock(&txn, T, R, &plain(), &LockWait::none())
+        .expect("the write");
     mgr.end_row_read(&txn, T, R)
         .expect("a lock this method did not take");
     assert!(
@@ -738,7 +773,7 @@ fn a_row_read_split_over_two_threads_holds_its_lock() {
     let mgr = manager();
     let txn = mgr.begin(IsolationLevel::ReadCommitted);
     let (reader, handle) = (Arc::clone(&mgr), txn.clone());
-    in_background(move || reader.read_lock(&handle, T, R, &plain()))
+    in_background(move || reader.read_lock(&handle, T, R, &plain(), &LockWait::none()))
         .recv_timeout(SOON)
         .expect("the read returns")
         .expect("the read takes the row");
@@ -763,7 +798,8 @@ fn write_lock_takes_x_at_every_level() {
     ] {
         let mgr = manager();
         let txn = mgr.begin(level);
-        mgr.write_lock(&txn, T, R, &plain()).expect("the write");
+        mgr.write_lock(&txn, T, R, &plain(), &LockWait::none())
+            .expect("the write");
         assert!(holds(&mgr, &txn, row_res(), LockMode::X), "X at {level:?}");
         assert!(
             holds(&mgr, &txn, table_res(), LockMode::IX),
@@ -785,7 +821,8 @@ fn tablock_fields_are_carried_not_applied() {
     for hints in [with_hints, plain()] {
         let mgr = manager();
         let txn = mgr.begin(IsolationLevel::RepeatableRead);
-        mgr.read_lock(&txn, T, R, &hints).expect("the read");
+        mgr.read_lock(&txn, T, R, &hints, &LockWait::none())
+            .expect("the read");
         held.push(mgr.locks().held(txn.id));
     }
     assert_eq!(held[0], held[1], "TABLOCK changed the locks taken");
@@ -798,13 +835,14 @@ fn tablock_fields_are_carried_not_applied() {
 fn serializable_locks_the_rows_it_read_not_the_range() {
     let mgr = manager();
     let reader = mgr.begin(IsolationLevel::Serializable);
-    mgr.read_lock(&reader, T, R, &plain()).expect("the read");
+    mgr.read_lock(&reader, T, R, &plain(), &LockWait::none())
+        .expect("the read");
     mgr.end_row_read(&reader, T, R).expect("the end of the row");
     assert!(holds(&mgr, &reader, row_res(), LockMode::S));
 
     let writer = mgr.begin(IsolationLevel::ReadCommitted);
-    mgr.write_lock(&writer, T, RowId(2), &nowait())
+    mgr.write_lock(&writer, T, RowId(2), &nowait(), &LockWait::none())
         .expect("a row the reader did not read is free");
-    mgr.write_lock(&writer, T, R, &nowait())
+    mgr.write_lock(&writer, T, R, &nowait(), &LockWait::none())
         .expect_err("the row the reader read is held");
 }

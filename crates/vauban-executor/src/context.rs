@@ -11,7 +11,7 @@ use vauban_catalog::Catalog;
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
 use vauban_storage::{SavepointId, Snapshot, Storage};
 use vauban_sysfn::EvalContext;
-use vauban_txn::{IsolationLevel, LockTimeout, TransactionManager, TxnHandle};
+use vauban_txn::{IsolationLevel, LockTimeout, LockWait, TransactionManager, TxnHandle};
 use vauban_types::{Decimal, TypeInfo, Value};
 
 use crate::row::Row;
@@ -77,6 +77,14 @@ impl CancelToken {
         self.flag
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    /// The wait token passed to a lock the statement takes while it runs.
+    #[must_use]
+    pub fn lock_wait(&self) -> LockWait {
+        self.flag
+            .as_ref()
+            .map_or_else(LockWait::none, |flag| LockWait::from_flag(Arc::clone(flag)))
     }
 }
 

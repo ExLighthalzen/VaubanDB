@@ -83,6 +83,7 @@ use vauban_txn::TransactionManager;
 use crate::auth::Authenticator;
 use crate::batch::Session;
 use crate::cancel::CancelHandle;
+use crate::disconnect::{Release, release};
 use crate::login::{self, EDITION, MASTER, VERSION_BANNER};
 use crate::sink::{CHANNEL_CAPACITY, ResultSink, TdsSink};
 use crate::state::SessionState;
@@ -406,6 +407,7 @@ async fn run_connection(
     loop {
         // `None`: the reader task is gone, which only happens once its message reached us.
         let Some(message) = client_rx.recv().await else {
+            let _ = release(&mut session, Release::Disconnect);
             return Ok(());
         };
         match message? {
@@ -462,6 +464,7 @@ async fn run_connection(
             // owed all the same ([MS-TDS] 2.2.1.7).
             ClientMessage::Attention => {
                 info!("ATTENTION received outside a request, acknowledged");
+                let _ = release(&mut session, Release::Attention);
                 acknowledge_attention(&mut writer).await?;
             }
             ClientMessage::TransactionManager(request) => {
@@ -593,7 +596,7 @@ where
     // The relay left the channel empty and closed: whatever happens next, no `blocking_send`
     // is holding a pool thread and the request task is on its way out.
     drop(rx);
-    let (session, result) = match handle.await {
+    let (mut session, result) = match handle.await {
         Ok(outcome) => outcome,
         Err(err) => {
             error!(error = %err, "request task panicked, closing the connection");
@@ -606,6 +609,7 @@ where
         // The result of the cancelled request is dropped here: `Ok` or the internal
         // "cancelled" error, the client only sees the acknowledgement.
         Relayed::Attention => {
+            let _ = release(&mut session, Release::Attention);
             acknowledge_attention(writer).await?;
             return Ok(RequestOutcome::Served(session));
         }

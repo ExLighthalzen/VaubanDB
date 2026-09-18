@@ -61,7 +61,7 @@ impl CancelHandle {
 }
 
 /// Text of the internal error [`CancelHandle::check`] raises; logged, never sent.
-const CANCELLED: &str = "request cancelled by an ATTENTION";
+pub(crate) const CANCELLED: &str = "request cancelled by an ATTENTION";
 
 #[cfg(test)]
 mod tests {
