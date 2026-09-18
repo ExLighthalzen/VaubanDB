@@ -1,5 +1,6 @@
-//! `UPDATE` and `DELETE` over **one** table: the target, the `SET` list, the `WHERE`, and
-//! the errors they raise at bind time (208, 4145, 207, 4104, 8102, 271, 264, 206).
+//! `UPDATE` and `DELETE`: the target, the `SET` list, the `WHERE`, and the errors they
+//! raise at bind time (208, 4145, 207, 4104, 8102, 271, 264, 206, 8154). Over one table,
+//! and over the `FROM` of a join, whose rules are the last section of this file.
 //!
 //! [`bind_update`] fills an [`UpdatePlan`] and [`bind_delete`] a [`DeletePlan`]. The rows
 //! to touch are the same node for both: the `Scan` of the target, under the `Filter` of the
@@ -48,8 +49,7 @@
 //! Each form below answers the internal error 50000 naming it, and not a plan of the target
 //! alone (`the_other_forms_name_themselves`):
 //!
-//! - `UPDATE … FROM` and `DELETE … FROM` with a second `FROM`, the joined form, and `TOP`
-//!   (`update_from_join_is_not_bound_yet`);
+//! - `TOP` in either statement (`the_other_forms_name_themselves`);
 //! - `OUTPUT`, a view or a table variable as the target;
 //! - `SET @x = e` and `SET @x = c = e`, which assign a variable;
 //! - `SET c = DEFAULT`: no node of the bound plan says "the default of the column", so the
@@ -66,7 +66,7 @@ use vauban_catalog::{ColumnId, ObjectId, TableId};
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{
     AssignOp, AssignTarget, Assignment, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement, Expr,
-    Literal, ObjectName, TableRef, UpdateStatement,
+    Ident, Literal, ObjectName, TableRef, UpdateStatement,
 };
 use vauban_types::{TypeInfo, Value, implicit_result_type};
 
@@ -77,7 +77,7 @@ use crate::context::{BindContext, CatalogView, ResolvedTableKind};
 use crate::depth::at_statement;
 use crate::errors::{line_of, on_the_statement};
 use crate::expr::{Scope, bind_condition, bind_expr};
-use crate::names::{bind_from, from_needs_the_catalogue};
+use crate::names::{alias_of, bind_from, from_needs_the_catalogue};
 use crate::query::{bug, dotted, not_implemented};
 use crate::star::{self, Lookup, Source};
 
@@ -127,13 +127,18 @@ fn update(stmt: &UpdateStatement, ctx: &BindContext<'_>, line: u32) -> SqlResult
         return Err(not_implemented("OUTPUT in an UPDATE (V2)"));
     }
     if !stmt.from.is_empty() {
-        return Err(not_implemented(
-            "UPDATE with a FROM clause, the joined form",
-        ));
+        return update_from(stmt, ctx, line);
     }
     let target = bind_target(&stmt.target, &[], line, ctx)?;
     let input = filtered(target.scan, stmt.where_.as_ref(), &target.scope, ctx)?;
-    let assignments = bind_assignments(&stmt.assignments, &target.scope, target.object, line, ctx)?;
+    let assignments = bind_assignments(
+        &stmt.assignments,
+        &target.scope,
+        &target.scope,
+        target.object,
+        line,
+        ctx,
+    )?;
     Ok(BoundStatement::Update(UpdatePlan {
         table: target.table,
         input: Box::new(input),
@@ -150,9 +155,7 @@ fn delete(stmt: &DeleteStatement, ctx: &BindContext<'_>, line: u32) -> SqlResult
         return Err(not_implemented("OUTPUT in a DELETE (V2)"));
     }
     if !stmt.from.is_empty() {
-        return Err(not_implemented(
-            "DELETE with a second FROM clause, the joined form",
-        ));
+        return delete_from(stmt, ctx, line);
     }
     let target = bind_target(&stmt.target, &[], line, ctx)?;
     let input = filtered(target.scan, stmt.where_.as_ref(), &target.scope, ctx)?;
@@ -299,24 +302,30 @@ fn filtered(
 
 /// Binds the `SET` list: steps 3, 4 and 5 of the module documentation.
 ///
+/// The two sides of a `SET` are resolved against two scopes, which the joined form tells
+/// apart: `target` holds the target alone, under the name the statement exposes it by, and
+/// `values` holds the sources a `FROM` put in scope. Over one table the caller hands the
+/// same scope twice.
+///
 /// # Errors
 ///
 /// 207 and 4104 on a left side; what binding a right side raises; 8102, 271, 264 and 206,
 /// on `line`; the internal error 50000 for a `DEFAULT` or a variable on the left.
 fn bind_assignments(
     assignments: &[Assignment],
-    scope: &Scope,
+    target: &Scope,
+    values_scope: &Scope,
     object: ObjectId,
     line: u32,
     ctx: &BindContext<'_>,
 ) -> SqlResult<Vec<(ColumnBinding, BoundExpr)>> {
     let mut columns = Vec::with_capacity(assignments.len());
     for assignment in assignments {
-        columns.push(assigned_column(assignment, scope, line)?);
+        columns.push(assigned_column(assignment, target, line)?);
     }
     let mut values = Vec::with_capacity(assignments.len());
     for assignment in assignments {
-        values.push(assigned_value(assignment, scope, ctx)?);
+        values.push(assigned_value(assignment, values_scope, ctx)?);
     }
     let catalog: Option<&dyn CatalogView> = ctx.catalog;
     let identity = catalog.and_then(|catalog| catalog.identity_column(object));
@@ -476,9 +485,407 @@ fn dotted_column(column: &ColumnRef) -> String {
 // The joined form: `UPDATE … FROM` and `DELETE … FROM`
 // ---------------------------------------------------------------------------------------
 //
-// Reserved. The target of that form is matched against the sources of the `FROM` by
-// `target_source`; the rest of the form (8154, 1013, the `Join` under the plan) is not
-// written here, and `update` and `delete` refuse the clause before reaching `bind_target`.
+// `UPDATE <target> SET … FROM <sources> [WHERE …]` and `DELETE [FROM] <target>
+// FROM <sources> [WHERE …]` write into one of the tables the `FROM` reads. The plan is the
+// tree `join.rs` builds for that `FROM`, under the `Filter` of the `WHERE`, and the target
+// is the table one source of it names. The statements below are stated over
+// `dbo.t (k int NOT NULL, a int NULL)` and `dbo.u (k int NOT NULL, b int NULL, c int NULL)`;
+// `tests/bind_update_from.rs` binds each of them.
+//
+// # Which source the target names
+//
+// The target is matched against the sources of the `FROM` **before** any lookup, on the
+// names as they were written, the parts neither name carries completed from the context
+// (`same_table`). An alias does not hide the table name from the target, where it does hide
+// it from a column qualifier:
+//
+// | written | the target is |
+// |---|---|
+// | `UPDATE x … FROM dbo.t AS x JOIN dbo.u AS y ON …` | `x`, matched by its alias |
+// | `UPDATE dbo.t … FROM dbo.t JOIN dbo.u AS y ON …` | the source `dbo.t` |
+// | `UPDATE t … FROM dbo.t JOIN dbo.u AS y ON …` | the same, one part completed with `dbo` |
+// | `UPDATE dbo.t … FROM dbo.t AS x JOIN dbo.u AS y ON …` | `x`: its alias hides nothing here |
+// | `UPDATE dbo.t … FROM master.dbo.t JOIN dbo.u AS y ON …` | that source, from `master` |
+//
+// The fourth line is what tells this rule from a match on the exposed name: `UPDATE dbo.t
+// SET a = 99 FROM dbo.t AS x JOIN dbo.u AS y ON x.k = y.k` writes the rows the join keeps,
+// not the whole table, which is what a target read as one more source would do.
+//
+// When several sources are the target's table, exactly one of them must carry no
+// alias; that one is the target. Otherwise the reference is ambiguous, error 8154 printing
+// the target as written:
+//
+// | written | answer |
+// |---|---|
+// | `UPDATE dbo.t … FROM dbo.t JOIN dbo.t AS y ON …` | the source without an alias |
+// | `UPDATE dbo.t … FROM dbo.t AS x JOIN dbo.t AS y ON …` | 8154 `'dbo.t'` |
+// | `UPDATE t … FROM dbo.t AS x JOIN dbo.u AS t ON …` | `u`, matched by the alias `t` |
+// | `UPDATE t … FROM dbo.t AS x JOIN dbo.t AS y ON …` | 8154 `'t'` |
+// | `UPDATE dbo.t … FROM dbo.t AS x, dbo.t AS y` | 8154 `'dbo.t'` |
+// | `DELETE dbo.t FROM dbo.t AS x JOIN dbo.t AS y ON …` | 8154 `'dbo.t'` |
+// | `UPDATE dbo.t … FROM dbo.t JOIN dbo.t ON 1 = 1` | 1013, raised by the `FROM` itself |
+//
+// A one-part target that names an alias of a source wins over a source of the same table
+// name (`update_from_target_t_when_x_and_u_as_t_set_b_binds_u`). When unaliased `dbo.t` and
+// `dbo.u AS t` would expose the same name, the `FROM` answers 1012 before the target is
+// read (`update_from_target_t_when_u_is_aliased_as_t_from_refuses_1012`).
+//
+// A target no source names is looked up in the catalogue: 208 when it reaches nothing
+// (`UPDATE z … FROM dbo.t AS x JOIN dbo.u AS y ON …`), and otherwise the table the name
+// resolves to (`update_target_outside_the_from_binds_the_catalogue_table`).
+//
+// # What each part of the statement sees
+//
+// The **left** side of a `SET` is a column of the target alone, named bare or qualified by
+// the name the target is exposed by — its alias when it carries one, in which case the
+// table name reaches nothing there. The **right** side of a `SET` and the `WHERE` see the
+// sources of the join, under the rules of `join.rs`:
+//
+// | written over `FROM dbo.t AS x JOIN dbo.u AS y ON x.k = y.k` | answer |
+// |---|---|
+// | `UPDATE x SET x.a = y.b …` | binds: the value is a column of `y` |
+// | `UPDATE x SET a = 1 …` | binds |
+// | `UPDATE x SET t.a = 1 …`, `UPDATE x SET dbo.t.a = 1 …` | 4104: the alias hides the name |
+// | `UPDATE x SET y.b = 1 …` | 4104 `"y.b"`: `y` is not the target |
+// | `UPDATE x SET z.a = 1 …` | 4104 `"z.a"` |
+// | `UPDATE x SET x.nocol = 1 …` | 207 |
+// | `UPDATE x SET b = 1 …` | 207: `b` is a column of `y`, not of the target |
+// | `UPDATE x SET k = 1 …` | binds: the left side sees the target alone, so `k` is not 209 |
+// | `UPDATE x SET x.a = k …`, `… WHERE k = 1` | 209: both sources carry `k` |
+// | `UPDATE x SET x.a = z.k …`, `… WHERE z.k = 1` | 4104 |
+// | `UPDATE x SET x.a = 1 … WHERE nocol = 1` | 207 |
+// | `UPDATE x SET x.a = 1 … WHERE 1` | 4145 |
+//
+// The line `SET k = 1` is what separates the two scopes: a left side resolved against the
+// join scope would answer 209 there, and a right side resolved against the target alone would
+// not answer 209.
+//
+// # The order of the checks
+//
+// One statement can carry several faults; each step below is exhausted before the next one
+// starts, and the tests named after each pair pin the order:
+//
+// 1. the `FROM`: 208 for a source that reaches nothing, 1011 to 1013 for two sources of one
+//    exposed name, then what binding each `ON` raises;
+// 2. the target: 8154, or the 208 of a name the catalogue does not hold;
+// 3. the `WHERE`;
+// 4. the `SET` list, in the three steps the module documentation gives for one table.
+//
+// 8154, 208 and a 4104 on the left side of a `SET` carry the line the statement starts on;
+// the errors of the `ON`, of the `WHERE` and of a right side keep the lines `expr.rs` gives
+// them (`the_errors_of_the_joined_form_carry_their_line`).
+//
+// # What the plan does not carry
+//
+// `UpdatePlan` and `DeletePlan` name the target by its `TableId` alone. When the same table
+// is read twice by the `FROM`, that identifier does not say which of the two sources the
+// rows are written through, and the columns of `assignments` index the row of the target and
+// not the row of the `Join`. A field naming the source is what a planner would need, and
+// adding one is not this file's to do.
+
+/// The body of the joined `UPDATE`, in the order of the section above.
+///
+/// # Errors
+///
+/// The numbers of that section; the internal error 50000 for a target absent from the
+/// `FROM` and for the forms `update` refuses before calling this.
+fn update_from(
+    stmt: &UpdateStatement,
+    ctx: &BindContext<'_>,
+    line: u32,
+) -> SqlResult<BoundStatement> {
+    let (sources, scope) = crate::join::bind_from(&stmt.from, line, ctx)?;
+    let target = joined_target(&stmt.target, &stmt.from, line, ctx)?;
+    let input = filtered(sources, stmt.where_.as_ref(), &scope, ctx)?;
+    let assignments = bind_assignments(
+        &stmt.assignments,
+        &target.scope,
+        &scope,
+        target.object,
+        line,
+        ctx,
+    )?;
+    Ok(BoundStatement::Update(UpdatePlan {
+        table: target.table,
+        input: Box::new(input),
+        assignments,
+    }))
+}
+
+/// The body of the joined `DELETE`: as [`update_from`], without a `SET` list.
+///
+/// # Errors
+///
+/// As [`update_from`].
+fn delete_from(
+    stmt: &DeleteStatement,
+    ctx: &BindContext<'_>,
+    line: u32,
+) -> SqlResult<BoundStatement> {
+    let (sources, scope) = crate::join::bind_from(&stmt.from, line, ctx)?;
+    let target = joined_target(&stmt.target, &stmt.from, line, ctx)?;
+    let input = filtered(sources, stmt.where_.as_ref(), &scope, ctx)?;
+    Ok(BoundStatement::Delete(DeletePlan {
+        table: target.table,
+        input: Box::new(input),
+    }))
+}
+
+/// The target of a joined statement: the table written into, and the scope the left side of
+/// a `SET` resolves against.
+struct JoinedTarget {
+    /// The table in `storage`, which the plan names.
+    table: TableId,
+    /// The object in the catalogue, read for the `IDENTITY` and the computed columns.
+    object: ObjectId,
+    /// The target alone, exposed under the name the statement refers to it by: the columns
+    /// index the row of the **target**, not the row of the `Join`.
+    scope: Scope,
+}
+
+/// A source of the `FROM` as it was written, which the target is matched against.
+struct Leaf<'a> {
+    /// The name of the table, delimiters already stripped by the parser.
+    name: &'a ObjectName,
+    /// The alias, when one was written.
+    alias: Option<&'a Ident>,
+}
+
+/// Resolves the target of a joined statement against the sources of its `FROM`.
+///
+/// The rules are the ones stated above the section: the alias of a source, or its name with
+/// the parts it does not carry completed from the context; when several sources are that
+/// table, the one without an alias.
+///
+/// # Errors
+///
+/// - 8154 on `line` when several sources are the target's table and zero or more than one of
+///   them carries no alias (`update_self_join_requires_the_alias`);
+/// - 208 on `line` when no source names the target and the catalogue holds no such table;
+/// - the refusal of `names::from_needs_the_catalogue` without a catalogue;
+/// - the internal error 50000 for a table variable or a view as the target.
+fn joined_target(
+    reference: &TableRef,
+    from: &[TableRef],
+    line: u32,
+    ctx: &BindContext<'_>,
+) -> SqlResult<JoinedTarget> {
+    let target = target_name(reference)?;
+    let mut leaves = Vec::new();
+    collect_leaves(from, &mut leaves)?;
+    match pick_target_leaf(&leaves, target, line, ctx)? {
+        Some(leaf) => joined_target_from_leaf(leaf, ctx),
+        None => resolve_target_from_catalog(target, line, ctx),
+    }
+}
+
+/// Whether a source of the `FROM` is the target: by alias for a one-part target, else by table.
+enum TargetMatch {
+    /// The target names the alias of the source.
+    Alias,
+    /// The target names the table of the source.
+    TableName,
+}
+
+/// Classifies how `leaf` is named by `target`, or returns `None`.
+fn classify_target_match(
+    leaf: &Leaf<'_>,
+    target: &ObjectName,
+    ctx: &BindContext<'_>,
+) -> Option<TargetMatch> {
+    let one_part = target.server.is_none() && target.database.is_none() && target.schema.is_none();
+    if one_part
+        && let Some(alias) = leaf.alias
+        && alias.value.eq_ignore_ascii_case(&target.name.value)
+    {
+        return Some(TargetMatch::Alias);
+    }
+    same_table(target, leaf.name, ctx).then_some(TargetMatch::TableName)
+}
+
+/// The source of the `FROM` the target names, when one of them does.
+///
+/// A one-part target that matches an alias wins over a match on the table name
+/// (`update_from_target_t_when_x_and_u_as_t_set_b_binds_u`). When several sources remain,
+/// the one without an alias is the target; otherwise 8154.
+///
+/// # Errors
+///
+/// 8154 on `line` when several sources match and the rule above does not pick one.
+fn pick_target_leaf<'a>(
+    leaves: &'a [Leaf<'a>],
+    target: &ObjectName,
+    line: u32,
+    ctx: &BindContext<'_>,
+) -> SqlResult<Option<&'a Leaf<'a>>> {
+    let mut alias_matches = Vec::new();
+    let mut table_matches = Vec::new();
+    for leaf in leaves {
+        match classify_target_match(leaf, target, ctx) {
+            Some(TargetMatch::Alias) => alias_matches.push(leaf),
+            Some(TargetMatch::TableName) => table_matches.push(leaf),
+            None => {}
+        }
+    }
+    let candidates = if alias_matches.is_empty() {
+        table_matches
+    } else {
+        alias_matches
+    };
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(*only)),
+        several => {
+            let mut without_alias = several.iter().filter(|leaf| leaf.alias.is_none());
+            match (without_alias.next(), without_alias.next()) {
+                (Some(only), None) => Ok(Some(*only)),
+                _ => Err(SqlError::table_is_ambiguous(&dotted(target)).with_line(line)),
+            }
+        }
+    }
+}
+
+/// Builds the target from a source the `FROM` reads.
+fn joined_target_from_leaf(leaf: &Leaf<'_>, ctx: &BindContext<'_>) -> SqlResult<JoinedTarget> {
+    let catalog = ctx.catalog.ok_or_else(from_needs_the_catalogue)?;
+    let resolved = catalog
+        .resolve_table(leaf.name, ctx.database, ctx.default_schema)
+        .ok_or_else(|| {
+            bug("joined_target: the FROM binder resolved a source the catalogue does not hold")
+        })?;
+    if resolved.kind == ResolvedTableKind::View {
+        return Err(not_implemented(
+            "a view as the target of an UPDATE or a DELETE (V2)",
+        ));
+    }
+    let table = resolved.table.ok_or_else(|| {
+        bug("joined_target: the catalogue resolved a table without a storage identifier")
+    })?;
+    // An alias hides the name of the table on the left side of a `SET`, as it does for a
+    // column of a `SELECT`: `SET dbo.t.a = 1` over `FROM dbo.t AS x` answers 4104.
+    let written = leaf.alias.is_none().then_some(leaf.name);
+    Ok(JoinedTarget {
+        table,
+        object: resolved.object,
+        scope: Scope::over(Source::new(
+            &alias_of(leaf.name, leaf.alias),
+            written,
+            &resolved.columns,
+            ctx.default_schema,
+            ctx.database,
+        )),
+    })
+}
+
+/// Resolves a target the `FROM` does not read against the catalogue.
+///
+/// # Errors
+///
+/// 208 on `line` when the name reaches nothing; the refusal of `names::from_needs_the_catalogue`
+/// without a catalogue; the internal error 50000 for a view as the target.
+fn resolve_target_from_catalog(
+    target: &ObjectName,
+    line: u32,
+    ctx: &BindContext<'_>,
+) -> SqlResult<JoinedTarget> {
+    let catalog = ctx.catalog.ok_or_else(from_needs_the_catalogue)?;
+    if target.server.is_some() {
+        return Err(SqlError::invalid_object_name(&dotted(target)).with_line(line));
+    }
+    let resolved = catalog
+        .resolve_table(target, ctx.database, ctx.default_schema)
+        .ok_or_else(|| SqlError::invalid_object_name(&dotted(target)).with_line(line))?;
+    if resolved.kind == ResolvedTableKind::View {
+        return Err(not_implemented(
+            "a view as the target of an UPDATE or a DELETE (V2)",
+        ));
+    }
+    let table = resolved.table.ok_or_else(|| {
+        bug("resolve_target_from_catalog: the catalogue resolved a table without a storage identifier")
+    })?;
+    Ok(JoinedTarget {
+        table,
+        object: resolved.object,
+        scope: Scope::over(Source::new(
+            &alias_of(target, None),
+            Some(target),
+            &resolved.columns,
+            ctx.default_schema,
+            ctx.database,
+        )),
+    })
+}
+
+/// The name of the target of a joined statement.
+///
+/// # Errors
+///
+/// The internal error 50000 for a table variable, and for a reference the parser does not
+/// build in that position, so that a grammar that grows is noticed.
+fn target_name(reference: &TableRef) -> SqlResult<&ObjectName> {
+    match reference {
+        TableRef::Table { name, .. } | TableRef::Function { name, .. } => Ok(name),
+        TableRef::Variable { .. } => Err(not_implemented(
+            "a table variable as the target of an UPDATE or a DELETE",
+        )),
+        TableRef::Join { .. }
+        | TableRef::Apply { .. }
+        | TableRef::Derived { .. }
+        | TableRef::Pivot(_)
+        | TableRef::Unpivot(_) => Err(bug(
+            "joined_target: the parser does not build this reference as the target of an \
+             UPDATE or a DELETE",
+        )),
+    }
+}
+
+/// Collects the sources of a `FROM` in written order, walking each `JOIN` left side first.
+///
+/// # Errors
+///
+/// The internal error 50000 for a source that is neither a table nor a `name(…)`:
+/// `join::bind_from` refuses those before this point.
+fn collect_leaves<'a>(from: &'a [TableRef], leaves: &mut Vec<Leaf<'a>>) -> SqlResult<()> {
+    for reference in from {
+        match reference {
+            TableRef::Join { left, right, .. } => {
+                collect_leaves(std::slice::from_ref(left.as_ref()), leaves)?;
+                collect_leaves(std::slice::from_ref(right.as_ref()), leaves)?;
+            }
+            TableRef::Table { name, alias, .. } | TableRef::Function { name, alias, .. } => {
+                leaves.push(Leaf {
+                    name,
+                    alias: alias.as_ref(),
+                });
+            }
+            _ => {
+                return Err(bug(
+                    "collect_leaves: a source the FROM binder does not read as a table",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether two written names reach one table, the parts neither carries completed from the
+/// context, compared ASCII case-insensitively as a `CI` collation is.
+///
+/// A four-part name reaches no source: linked servers are not read here, as `names.rs` does
+/// not read them for a `FROM`.
+fn same_table(left: &ObjectName, right: &ObjectName, ctx: &BindContext<'_>) -> bool {
+    if left.server.is_some() || right.server.is_some() {
+        return false;
+    }
+    let part = |written: Option<&Ident>, default: &str| -> String {
+        written.map_or_else(|| default.to_owned(), |ident| ident.value.clone())
+    };
+    let schema = |name: &ObjectName| part(name.schema.as_ref(), ctx.default_schema);
+    let database = |name: &ObjectName| part(name.database.as_ref(), ctx.database);
+    left.name.value.eq_ignore_ascii_case(&right.name.value)
+        && schema(left).eq_ignore_ascii_case(&schema(right))
+        && database(left).eq_ignore_ascii_case(&database(right))
+}
 
 #[cfg(test)]
 mod tests {

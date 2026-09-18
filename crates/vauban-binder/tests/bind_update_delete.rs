@@ -787,27 +787,6 @@ fn the_conversion_is_checked_in_the_same_pass_as_the_identity() {
 // What is not bound
 // ---------------------------------------------------------------------------------------
 
-/// `UPDATE … FROM` and `DELETE … FROM` with a second `FROM` answer the internal error
-/// 50000 naming the clause, not a plan of the target alone.
-#[test]
-fn update_from_join_is_not_bound_yet() {
-    for text in [
-        "UPDATE x SET a = 2 FROM dbo.t AS x;",
-        "UPDATE dbo.t SET a = 2 FROM dbo.t JOIN dbo.u ON t.a = u.k;",
-        "UPDATE dbo.t SET a = 2 FROM dbo.t;",
-        "DELETE dbo.t FROM dbo.t JOIN dbo.u ON t.a = u.k;",
-        "DELETE FROM dbo.t FROM dbo.t AS x;",
-    ] {
-        let error = error_of(text);
-        assert_eq!(error.number, 50000, "{text}: {}", error.message);
-        assert!(
-            error.message.contains("FROM") && error.message.contains("is not implemented yet"),
-            "{text}: {}",
-            error.message
-        );
-    }
-}
-
 /// `TOP`, `OUTPUT`, a view, a table variable and `SET @x = …` answer the internal error
 /// 50000 naming the form.
 #[test]
