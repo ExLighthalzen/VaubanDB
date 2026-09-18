@@ -37,7 +37,7 @@ struct AlterPlan {
 /// - 5074 when a column an index or constraint still references
 ///   (`tests/alter.rs`, `drop_column_used_by_an_index_is_refused`);
 /// - 3728 when a constraint name is unknown on `DROP CONSTRAINT`
-///   (`tests/alter.rs`, `drop_unknown_constraint_is_refused`);
+///   (`tests/alter.rs`, `drop_unknown_constraint_is_3728`);
 /// - what [`crate::index::table_keys`], [`crate::index::apply_table_keys`] and
 ///   [`crate::constraints::apply_table_constraints`] answer;
 /// - the error of `storage` or of the transaction manager otherwise.
@@ -47,10 +47,17 @@ pub(crate) fn alter_table(
     table: ObjectId,
     change: &AlterTable,
 ) -> SqlResult<TableMeta> {
+    if matches!(
+        change,
+        AlterTable::AddConstraint { .. } | AlterTable::DropConstraint { .. }
+    ) {
+        return alter_table_constraint(catalog, txn, table, change);
+    }
     let (old, plan, old_storage) = {
         let mut store = table::store(catalog);
         table::refresh(catalog, &mut store)?;
         index::refresh(catalog, &mut store)?;
+        crate::constraints::refresh_sessions(catalog, &mut store)?;
         crate::constraints::forget_dropped(&mut store);
         let Some(entry) = store.entries.get(&table) else {
             return Err(SqlError::cannot_drop("alter", "table", &table.to_string()));
@@ -87,6 +94,48 @@ pub(crate) fn alter_table(
         .expect("alter_table stored the table"))
 }
 
+fn alter_table_constraint(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    table: ObjectId,
+    change: &AlterTable,
+) -> SqlResult<TableMeta> {
+    let mut store = table::store(catalog);
+    table::refresh(catalog, &mut store)?;
+    index::refresh(catalog, &mut store)?;
+    crate::constraints::refresh_sessions(catalog, &mut store)?;
+    crate::constraints::forget_dropped(&mut store);
+    let Some(entry) = store.entries.get(&table) else {
+        return Err(SqlError::cannot_drop("alter", "table", &table.to_string()));
+    };
+    if entry.dropped_by.is_some() {
+        return Err(SqlError::cannot_drop("alter", "table", &entry.meta.name));
+    }
+    match change {
+        AlterTable::AddConstraint { constraint } => match constraint.as_ref() {
+            ConstraintDef::PrimaryKey { .. } | ConstraintDef::Unique { .. } => {
+                return Err(InternalError::Bug(
+                    "Catalog::alter_table: ADD CONSTRAINT PRIMARY KEY or UNIQUE needs an index; \
+                     index.rs owns that shape"
+                        .to_owned(),
+                )
+                .into());
+            }
+            _ => crate::constraints::add_table_constraint(
+                catalog, txn, &mut store, table, constraint,
+            )?,
+        },
+        AlterTable::DropConstraint { name } => {
+            crate::constraints::drop_table_constraint(catalog, txn, &mut store, table, name)?;
+        }
+        _ => unreachable!("alter_table_constraint called on a column alter"),
+    }
+    Ok(store
+        .get(table)
+        .cloned()
+        .expect("alter_table stored the table"))
+}
+
 fn plan_change(
     catalog: &Catalog,
     txn: &TxnHandle,
@@ -96,7 +145,7 @@ fn plan_change(
 ) -> SqlResult<AlterPlan> {
     let (mut keys, preserved) = split_constraints(store, old)?;
     let statement_indexes = statement_index_defs(store, old);
-    let mut add = Vec::new();
+    let add = Vec::new();
     let columns = match change {
         AlterTable::AddColumn { column } => {
             refuse_duplicate_column(old, &column.name)?;
@@ -169,51 +218,8 @@ fn plan_change(
                 statement_indexes,
             });
         }
-        AlterTable::AddConstraint { constraint } => {
-            match constraint.as_ref() {
-                ConstraintDef::PrimaryKey { .. } | ConstraintDef::Unique { .. } => {
-                    keys.push(constraint.as_ref().clone());
-                }
-                _ => add.push(constraint.as_ref().clone()),
-            }
-            old.columns.clone()
-        }
-        AlterTable::DropConstraint { name } => {
-            let Some(object) = store.constraints.entries.values().find(|object| {
-                object.parent == Some(old.id)
-                    && object.database == old.database
-                    && object.name.schema.eq_ignore_ascii_case(&old.schema)
-                    && object.name.name.eq_ignore_ascii_case(name)
-            }) else {
-                return Err(SqlError::constraint_not_on_table(name));
-            };
-            keys.retain(|key| {
-                constraint_def_name(key)
-                    .as_ref()
-                    .is_none_or(|candidate| !candidate.eq_ignore_ascii_case(name))
-            });
-            let preserved: Vec<ConstraintMeta> = preserved
-                .into_iter()
-                .filter(|other| {
-                    constraint_object_id(other)
-                        .and_then(|id| store.constraints.entries.get(&id))
-                        .is_none_or(|object| !object.name.name.eq_ignore_ascii_case(name))
-                })
-                .collect();
-            let removed = old
-                .constraints
-                .iter()
-                .any(|constraint| constraint_object_id(constraint) == Some(object.id));
-            if !removed {
-                return Err(SqlError::constraint_not_on_table(name));
-            }
-            return Ok(AlterPlan {
-                columns: old.columns.clone(),
-                keys,
-                preserved,
-                add,
-                statement_indexes,
-            });
+        AlterTable::AddConstraint { .. } | AlterTable::DropConstraint { .. } => {
+            unreachable!("constraint alters do not go through plan_change");
         }
     };
     Ok(AlterPlan {
@@ -521,16 +527,6 @@ fn constraint_object_id(constraint: &ConstraintMeta) -> Option<ObjectId> {
         ConstraintMeta::ForeignKey { constraint, .. }
         | ConstraintMeta::Check { constraint, .. }
         | ConstraintMeta::Default { constraint, .. } => Some(*constraint),
-    }
-}
-
-fn constraint_def_name(constraint: &ConstraintDef) -> Option<String> {
-    match constraint {
-        ConstraintDef::PrimaryKey { name, .. }
-        | ConstraintDef::Unique { name, .. }
-        | ConstraintDef::ForeignKey { name, .. }
-        | ConstraintDef::Check { name, .. }
-        | ConstraintDef::Default { name, .. } => name.clone(),
     }
 }
 

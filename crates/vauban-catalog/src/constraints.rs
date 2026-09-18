@@ -68,15 +68,16 @@
 //!   [a]<(10))` for `CHECK (b <> 'z' AND a < 10)`: the brackets around an identifier and the
 //!   parentheses around a literal are not written here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{Expr, RefAction};
-use vauban_storage::{DbId, IndexId};
-use vauban_types::TypeInfo;
+use vauban_storage::{DbId, IndexId, TableId, TxnId};
+use vauban_txn::{CommitAction, RollbackAction, TxnHandle};
+use vauban_types::{SqlType, TypeInfo};
 
 use crate::catalog::Catalog;
-use crate::def::{ConstraintDef, TableDef};
+use crate::def::{ColumnDef, ConstraintDef, TableDef};
 use crate::ids::{ColumnId, ObjectId};
 use crate::meta::{
     ColumnMeta, ConstraintMeta, IndexMeta, ObjectKind, ObjectMeta, QualifiedName, TableMeta,
@@ -99,10 +100,27 @@ const CONSTRAINT_EXISTS_2714_STATE: u8 = 5;
 /// Held by the `constraints` field of the [`TableStore`] of `table.rs`; `constraints.rs`
 /// owns the type and the accesses to it, as `index.rs` owns the index store. An entry is an
 /// [`ObjectMeta`] of kind [`ObjectKind::Constraint`] whose `parent` is the table.
+/// The catalogue state of one table before the first constraint `ALTER` of a transaction.
+#[derive(Debug, Clone)]
+struct TableAlterState {
+    original_meta: TableMeta,
+    removed: Vec<(ObjectMeta, ConstraintMeta)>,
+    added_ids: Vec<ObjectId>,
+}
+
+/// Marker tables and per-table undo for one open transaction's constraint alters.
+#[derive(Debug)]
+struct ConstraintAlterSession {
+    tables: BTreeMap<ObjectId, TableAlterState>,
+    rollback_marker: TableId,
+    commit_marker: TableId,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ConstraintStore {
     /// One entry per constraint of a table this catalogue holds.
     pub(crate) entries: BTreeMap<ObjectId, ObjectMeta>,
+    alter_sessions: BTreeMap<TxnId, ConstraintAlterSession>,
 }
 
 impl ConstraintStore {
@@ -178,6 +196,7 @@ impl Catalog {
     ) -> SqlResult<Vec<ReferencingForeignKey>> {
         let mut store = table::store(self);
         table::refresh(self, &mut store)?;
+        refresh_sessions(self, &mut store)?;
         forget_dropped(&mut store);
         let tables: Vec<TableMeta> = store.live().cloned().collect();
         Ok(referencing_foreign_keys(&tables, table))
@@ -197,6 +216,7 @@ impl Catalog {
     pub fn constraints_of(&self, table: ObjectId) -> SqlResult<Vec<ObjectMeta>> {
         let mut store = table::store(self);
         table::refresh(self, &mut store)?;
+        refresh_sessions(self, &mut store)?;
         forget_dropped(&mut store);
         Ok(store
             .constraints
@@ -225,6 +245,7 @@ impl Catalog {
     ) -> SqlResult<Option<ObjectMeta>> {
         let mut store = table::store(self);
         table::refresh(self, &mut store)?;
+        refresh_sessions(self, &mut store)?;
         forget_dropped(&mut store);
         Ok(store.constraints.named(database, schema, name).cloned())
     }
@@ -402,10 +423,19 @@ pub(crate) fn apply_table_constraints(
     // The `DEFAULT` of a column declaration, which `table.rs` keeps on
     // `ColumnMeta::default`: SQL Server gives it an object too, `DF__ab__c__3A81B327` for
     // `c int NULL DEFAULT 0`.
+    let columns_with_a_default_object: BTreeSet<ColumnId> = meta
+        .constraints
+        .iter()
+        .filter_map(|constraint| match constraint {
+            ConstraintMeta::Default { column, .. } => Some(*column),
+            _ => None,
+        })
+        .collect();
     let bare: Vec<(String, ColumnId, Expr)> = meta
         .columns
         .iter()
         .filter(|column| !columns_with_a_named_default.contains(&column.id))
+        .filter(|column| !columns_with_a_default_object.contains(&column.id))
         .filter_map(|column| {
             column
                 .default
@@ -424,6 +454,327 @@ pub(crate) fn apply_table_constraints(
         });
     }
     Ok(())
+}
+
+/// Adds one `FOREIGN KEY`, `CHECK` or `DEFAULT` constraint to a live table without recopy.
+///
+/// Reuses [`apply_table_constraints`]. The change rolls back with the transaction
+/// (`tests/alter.rs`, `constraint_changes_roll_back`).
+///
+/// # Errors
+///
+/// What [`apply_table_constraints`] answers, and the error of `storage` or of the transaction
+/// manager when the compensation tables cannot be registered.
+pub(crate) fn add_table_constraint(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    store: &mut TableStore,
+    table: ObjectId,
+    constraint: &ConstraintDef,
+) -> SqlResult<()> {
+    refresh_sessions(catalog, store)?;
+    begin_constraint_session(catalog, txn, store, table)?;
+    let before = store.get(table).cloned().ok_or_else(|| {
+        InternalError::Bug(format!("Catalog::alter_table: table {table} vanished"))
+    })?;
+    let mut meta = before.clone();
+    let count = meta.constraints.len();
+    apply_table_constraints(store, &constraint_table_def(&before, constraint), &mut meta)?;
+    let added: Vec<ObjectId> = meta
+        .constraints
+        .iter()
+        .skip(count)
+        .filter_map(constraint_object_id)
+        .collect();
+    if let ConstraintDef::Default { column, expr, .. } = constraint
+        && let Some(column) = meta
+            .columns
+            .iter_mut()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(column))
+        && column.default.is_none()
+    {
+        column.default = Some(expr.clone());
+    }
+    if let Some(session) = store.constraints.alter_sessions.get_mut(&txn.id)
+        && let Some(state) = session.tables.get_mut(&table)
+    {
+        state.added_ids.extend(added);
+    }
+    store
+        .entries
+        .get_mut(&table)
+        .ok_or_else(|| {
+            InternalError::Bug(format!(
+                "Catalog::alter_table: table {table} vanished after adding a constraint"
+            ))
+        })?
+        .meta = meta.clone();
+    crate::sys_rows::rewrite(catalog, txn, &meta, &store.indexes)?;
+    Ok(())
+}
+
+/// Removes one `FOREIGN KEY`, `CHECK` or `DEFAULT` constraint from a live table without
+/// recopy.
+///
+/// # Errors
+///
+/// 3728 when `name` is not a constraint of the table (`tests/alter.rs`,
+/// `drop_unknown_constraint_is_3728`).
+pub(crate) fn drop_table_constraint(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    store: &mut TableStore,
+    table: ObjectId,
+    name: &str,
+) -> SqlResult<()> {
+    refresh_sessions(catalog, store)?;
+    begin_constraint_session(catalog, txn, store, table)?;
+    let Some(before) = store.get(table).cloned() else {
+        return Err(
+            InternalError::Bug(format!("Catalog::alter_table: table {table} vanished")).into(),
+        );
+    };
+    let Some(object_id) = constraint_id_on_table(store, &before, name) else {
+        return Err(SqlError::constraint_not_on_table(name));
+    };
+    let Some(object) = store.constraints.entries.remove(&object_id) else {
+        return Err(SqlError::constraint_not_on_table(name));
+    };
+    let Some(constraint) = before
+        .constraints
+        .iter()
+        .find(|entry| constraint_object_id(entry) == Some(object_id))
+        .cloned()
+    else {
+        return Err(SqlError::constraint_not_on_table(name));
+    };
+    let mut meta = before;
+    meta.constraints
+        .retain(|entry| constraint_object_id(entry) != Some(object_id));
+    if let ConstraintMeta::Default { column, .. } = &constraint
+        && let Some(column) = meta.columns.iter_mut().find(|entry| entry.id == *column)
+    {
+        column.default = None;
+    }
+    if let Some(session) = store.constraints.alter_sessions.get_mut(&txn.id)
+        && let Some(state) = session.tables.get_mut(&table)
+    {
+        if state.added_ids.contains(&object_id) {
+            state.added_ids.retain(|id| *id != object_id);
+        } else {
+            state.removed.push((object, constraint));
+        }
+    }
+    store
+        .entries
+        .get_mut(&table)
+        .ok_or_else(|| {
+            InternalError::Bug(format!(
+                "Catalog::alter_table: table {table} vanished after dropping a constraint"
+            ))
+        })?
+        .meta = meta.clone();
+    crate::sys_rows::rewrite(catalog, txn, &meta, &store.indexes)?;
+    Ok(())
+}
+
+/// Brings constraint alter sessions back in line after a `COMMIT` or a `ROLLBACK`.
+pub(crate) fn refresh_sessions(catalog: &Catalog, store: &mut TableStore) -> SqlResult<()> {
+    let live = live_storage_tables(catalog)?;
+    let open: BTreeSet<TxnId> = catalog
+        .txn
+        .active_sessions()
+        .into_iter()
+        .map(|info| info.id)
+        .collect();
+    let mut rollbacks = Vec::new();
+    let mut restores = Vec::new();
+    let mut finished = Vec::new();
+    for (txn, session) in store.constraints.alter_sessions.iter() {
+        if open.contains(txn) {
+            continue;
+        }
+        let rollback_live = live.contains(&session.rollback_marker);
+        let commit_live = live.contains(&session.commit_marker);
+        if !rollback_live && commit_live {
+            rollbacks.push(session.commit_marker);
+            restores.extend(
+                session
+                    .tables
+                    .iter()
+                    .map(|(table, state)| (*table, state.clone())),
+            );
+            finished.push(*txn);
+        } else if !rollback_live && !commit_live {
+            finished.push(*txn);
+        }
+    }
+    for (table, state) in restores {
+        restore_table_alter(store, table, &state);
+    }
+    for marker in rollbacks {
+        catalog.storage.drop_table(marker)?;
+    }
+    for txn in finished {
+        store.constraints.alter_sessions.remove(&txn);
+    }
+    Ok(())
+}
+
+fn restore_table_alter(store: &mut TableStore, table: ObjectId, state: &TableAlterState) {
+    for added in &state.added_ids {
+        store.constraints.entries.remove(added);
+    }
+    for (object, _) in &state.removed {
+        store.constraints.entries.insert(object.id, object.clone());
+    }
+    if let Some(entry) = store.entries.get_mut(&table) {
+        entry.meta = state.original_meta.clone();
+    }
+}
+
+fn begin_constraint_session(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    store: &mut TableStore,
+    table: ObjectId,
+) -> SqlResult<()> {
+    if store.constraints.alter_sessions.contains_key(&txn.id) {
+        if !store
+            .constraints
+            .alter_sessions
+            .get(&txn.id)
+            .is_some_and(|session| session.tables.contains_key(&table))
+        {
+            let meta = store.get(table).cloned().ok_or_else(|| {
+                InternalError::Bug(format!(
+                    "Catalog::alter_table: table {table} vanished before a constraint alter"
+                ))
+            })?;
+            store
+                .constraints
+                .alter_sessions
+                .get_mut(&txn.id)
+                .expect("alter session exists")
+                .tables
+                .insert(table, table_alter_state(meta));
+        }
+        return Ok(());
+    }
+    let meta = store.get(table).cloned().ok_or_else(|| {
+        InternalError::Bug(format!(
+            "Catalog::alter_table: table {table} vanished before a constraint alter"
+        ))
+    })?;
+    let database = meta.database;
+    let shape = marker_table_shape();
+    let rollback_marker = catalog.storage.create_table(database, &shape)?;
+    let commit_marker = catalog.storage.create_table(database, &shape)?;
+    if let Err(err) = catalog
+        .txn
+        .register_on_rollback(txn, RollbackAction::DropTable(rollback_marker))
+    {
+        catalog.storage.drop_table(rollback_marker)?;
+        catalog.storage.drop_table(commit_marker)?;
+        return Err(err);
+    }
+    if let Err(err) = catalog
+        .txn
+        .register_on_commit(txn, CommitAction::DropTable(commit_marker))
+    {
+        catalog.storage.drop_table(rollback_marker)?;
+        catalog.storage.drop_table(commit_marker)?;
+        return Err(err);
+    }
+    if let Err(err) = catalog
+        .txn
+        .register_on_commit(txn, CommitAction::DropTable(rollback_marker))
+    {
+        catalog.storage.drop_table(rollback_marker)?;
+        catalog.storage.drop_table(commit_marker)?;
+        return Err(err);
+    }
+    let mut tables = BTreeMap::new();
+    tables.insert(table, table_alter_state(meta));
+    store.constraints.alter_sessions.insert(
+        txn.id,
+        ConstraintAlterSession {
+            tables,
+            rollback_marker,
+            commit_marker,
+        },
+    );
+    Ok(())
+}
+
+fn table_alter_state(meta: TableMeta) -> TableAlterState {
+    TableAlterState {
+        original_meta: meta,
+        removed: Vec::new(),
+        added_ids: Vec::new(),
+    }
+}
+
+fn marker_table_shape() -> vauban_storage::TableShape {
+    vauban_storage::TableShape {
+        columns: vec![TypeInfo::new(SqlType::Int, true)],
+        clustered_key: None,
+    }
+}
+
+fn live_storage_tables(catalog: &Catalog) -> SqlResult<BTreeSet<TableId>> {
+    let mut live = BTreeSet::new();
+    for (db, _) in catalog.storage.databases()? {
+        for (table, _) in catalog.storage.tables(db)? {
+            live.insert(table);
+        }
+    }
+    Ok(live)
+}
+
+fn constraint_table_def(table: &TableMeta, constraint: &ConstraintDef) -> TableDef {
+    TableDef {
+        name: QualifiedName {
+            database: "master".to_owned(),
+            schema: table.schema.clone(),
+            name: table.name.clone(),
+        },
+        columns: table
+            .columns
+            .iter()
+            .map(|column| ColumnDef {
+                name: column.name.clone(),
+                ty: column.ty.clone(),
+                default: column.default.clone(),
+                identity: column.identity,
+                computed: column.computed.clone(),
+            })
+            .collect(),
+        constraints: vec![constraint.clone()],
+    }
+}
+
+fn constraint_id_on_table(store: &TableStore, table: &TableMeta, name: &str) -> Option<ObjectId> {
+    store
+        .constraints
+        .entries
+        .values()
+        .find(|object| {
+            object.parent == Some(table.id)
+                && object.database == table.database
+                && object.name.schema.eq_ignore_ascii_case(&table.schema)
+                && object.name.name.eq_ignore_ascii_case(name)
+        })
+        .map(|object| object.id)
+}
+
+fn constraint_object_id(constraint: &ConstraintMeta) -> Option<ObjectId> {
+    match constraint {
+        ConstraintMeta::PrimaryKey(_) | ConstraintMeta::Unique(_) => None,
+        ConstraintMeta::ForeignKey { constraint, .. }
+        | ConstraintMeta::Check { constraint, .. }
+        | ConstraintMeta::Default { constraint, .. } => Some(*constraint),
+    }
 }
 
 /// Forgets the constraint objects whose table the store no longer holds.

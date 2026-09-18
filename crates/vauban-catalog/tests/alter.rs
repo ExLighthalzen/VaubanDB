@@ -434,7 +434,7 @@ fn drop_column_used_by_a_check_is_refused() {
 }
 
 #[test]
-fn drop_unknown_constraint_is_refused() {
+fn drop_unknown_constraint_is_3728() {
     let (catalog, _storage, txn) = instance();
     let handle = begin(&txn);
     let meta = catalog
@@ -450,11 +450,13 @@ fn drop_unknown_constraint_is_refused() {
         )
         .expect_err("ALTER TABLE t DROP CONSTRAINT nosuch;");
     assert_eq!(err.number, 3728);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 1);
     txn.rollback(handle).expect("rollback");
 }
 
 #[test]
-fn add_constraint_reuses_cat_014() {
+fn add_check_constraint_becomes_an_object() {
     let (catalog, _storage, txn) = instance();
     let handle = begin(&txn);
     let meta = catalog
@@ -467,7 +469,23 @@ fn add_constraint_reuses_cat_014() {
             &AlterTable::AddConstraint {
                 constraint: Box::new(ConstraintDef::Check {
                     name: Some("ck".to_owned()),
-                    expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+                    expr: Expr::Binary {
+                        op: vauban_parser::BinaryOp::Gt,
+                        op_span: Span::EMPTY,
+                        left: Box::new(Expr::Column(vauban_parser::ColumnRef {
+                            qualifier: None,
+                            name: vauban_parser::Ident {
+                                value: "a".to_owned(),
+                                quoted: false,
+                            },
+                            span: Span::EMPTY,
+                        })),
+                        right: Box::new(Expr::Literal(
+                            Literal::Integer("0".to_owned()),
+                            Span::EMPTY,
+                        )),
+                        span: Span::EMPTY,
+                    },
                 }),
             },
         )
@@ -476,6 +494,120 @@ fn add_constraint_reuses_cat_014() {
     let objects = catalog.constraints_of(with_ck.id).expect("constraints_of");
     assert_eq!(objects.len(), 1);
     assert_eq!(objects[0].parent, Some(with_ck.id));
+    assert_eq!(objects[0].name.name, "ck");
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
+fn add_check_does_not_duplicate_existing_default() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let mut bare = table("t_bare", vec![column("a", SqlType::Int, true)]);
+    bare.columns[0].default = Some(Expr::Literal(Literal::Integer("0".to_owned()), Span::EMPTY));
+    let bare_table = catalog.create_table(&handle, &bare).expect("create_table");
+    assert_eq!(
+        catalog
+            .constraints_of(bare_table.id)
+            .expect("constraints_of")
+            .len(),
+        1,
+        "the bare column default is one object"
+    );
+    catalog
+        .alter_table(
+            &handle,
+            bare_table.id,
+            &AlterTable::AddConstraint {
+                constraint: Box::new(ConstraintDef::Check {
+                    name: Some("ck_bare".to_owned()),
+                    expr: Expr::Binary {
+                        op: vauban_parser::BinaryOp::Gt,
+                        op_span: Span::EMPTY,
+                        left: Box::new(Expr::Column(vauban_parser::ColumnRef {
+                            qualifier: None,
+                            name: vauban_parser::Ident {
+                                value: "a".to_owned(),
+                                quoted: false,
+                            },
+                            span: Span::EMPTY,
+                        })),
+                        right: Box::new(Expr::Literal(
+                            Literal::Integer("0".to_owned()),
+                            Span::EMPTY,
+                        )),
+                        span: Span::EMPTY,
+                    },
+                }),
+            },
+        )
+        .expect("add check");
+    assert_eq!(
+        catalog
+            .constraints_of(bare_table.id)
+            .expect("constraints_of")
+            .len(),
+        2,
+        "one DEFAULT and one CHECK"
+    );
+
+    let mut named = table("t_named", vec![column("a", SqlType::Int, true)]);
+    named.constraints.push(ConstraintDef::Default {
+        name: Some("df_a".to_owned()),
+        column: "a".to_owned(),
+        expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+    });
+    let named_table = catalog.create_table(&handle, &named).expect("create_table");
+    assert_eq!(
+        catalog
+            .constraints_of(named_table.id)
+            .expect("constraints_of")
+            .len(),
+        1,
+        "the named DEFAULT is one object"
+    );
+    catalog
+        .alter_table(
+            &handle,
+            named_table.id,
+            &AlterTable::AddConstraint {
+                constraint: Box::new(ConstraintDef::Check {
+                    name: Some("ck_named".to_owned()),
+                    expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+                }),
+            },
+        )
+        .expect("add check");
+    assert_eq!(
+        catalog
+            .constraints_of(named_table.id)
+            .expect("constraints_of")
+            .len(),
+        2,
+        "one DEFAULT and one CHECK"
+    );
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
+fn drop_constraint_removes_the_object() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &table("t", vec![column("a", SqlType::Int, false)]))
+        .expect("create_table");
+    let storage_id = meta.storage_id;
+    let with_ck = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::AddConstraint {
+                constraint: Box::new(ConstraintDef::Check {
+                    name: Some("ck".to_owned()),
+                    expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+                }),
+            },
+        )
+        .expect("add constraint");
     let dropped = catalog
         .alter_table(
             &handle,
@@ -485,7 +617,12 @@ fn add_constraint_reuses_cat_014() {
             },
         )
         .expect("drop constraint");
+    assert_eq!(dropped.storage_id, storage_id);
     assert!(dropped.constraints.is_empty());
+    let reader = begin(&txn);
+    let snapshot = catalog.snapshot(&reader);
+    let after = snapshot.table(dropped.id).expect("table");
+    assert!(after.constraints.is_empty());
     assert!(
         catalog
             .constraints_of(dropped.id)
@@ -493,6 +630,138 @@ fn add_constraint_reuses_cat_014() {
             .is_empty()
     );
     txn.commit(handle).expect("commit");
+}
+
+#[test]
+fn drop_foreign_key_unlists_it_from_the_target() {
+    use vauban_catalog::SortedColumn;
+    let (catalog, _storage, txn) = instance();
+    let setup = begin(&txn);
+    let mut parent_def = table("parent_t", vec![column("id", SqlType::Int, false)]);
+    parent_def.constraints.push(ConstraintDef::PrimaryKey {
+        name: None,
+        columns: vec![SortedColumn {
+            column: "id".to_owned(),
+            descending: false,
+        }],
+        clustered: true,
+    });
+    let parent = catalog.create_table(&setup, &parent_def).expect("parent");
+    let child = catalog
+        .create_table(
+            &setup,
+            &table("child_t", vec![column("a", SqlType::Int, false)]),
+        )
+        .expect("child");
+    txn.commit(setup).expect("commit setup");
+
+    let handle = begin(&txn);
+    catalog
+        .alter_table(
+            &handle,
+            child.id,
+            &AlterTable::AddConstraint {
+                constraint: Box::new(ConstraintDef::ForeignKey {
+                    name: Some("fk_c".to_owned()),
+                    columns: vec!["a".to_owned()],
+                    referenced: QualifiedName {
+                        database: "master".to_owned(),
+                        schema: "dbo".to_owned(),
+                        name: "parent_t".to_owned(),
+                    },
+                    referenced_columns: vec!["id".to_owned()],
+                    on_delete: vauban_parser::RefAction::NoAction,
+                    on_update: vauban_parser::RefAction::NoAction,
+                }),
+            },
+        )
+        .expect("add fk");
+    assert_eq!(
+        catalog
+            .referencing_foreign_keys(parent.id)
+            .expect("before drop")
+            .len(),
+        1
+    );
+    catalog
+        .alter_table(
+            &handle,
+            child.id,
+            &AlterTable::DropConstraint {
+                name: "fk_c".to_owned(),
+            },
+        )
+        .expect("drop fk");
+    assert!(
+        catalog
+            .referencing_foreign_keys(parent.id)
+            .expect("after drop")
+            .is_empty()
+    );
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
+fn constraint_changes_roll_back() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &table("t", vec![column("a", SqlType::Int, false)]))
+        .expect("create_table");
+    txn.commit(handle).expect("commit create");
+
+    let handle = begin(&txn);
+    catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::AddConstraint {
+                constraint: Box::new(ConstraintDef::Check {
+                    name: Some("ck".to_owned()),
+                    expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+                }),
+            },
+        )
+        .expect("add constraint");
+    txn.rollback(handle).expect("rollback add");
+    assert!(
+        catalog
+            .constraints_of(meta.id)
+            .expect("constraints_of after add rollback")
+            .is_empty()
+    );
+
+    let handle = begin(&txn);
+    catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::AddConstraint {
+                constraint: Box::new(ConstraintDef::Check {
+                    name: Some("ck".to_owned()),
+                    expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+                }),
+            },
+        )
+        .expect("add ck");
+    txn.commit(handle).expect("commit ck");
+
+    let handle = begin(&txn);
+    catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::DropConstraint {
+                name: "ck".to_owned(),
+            },
+        )
+        .expect("drop constraint");
+    txn.rollback(handle).expect("rollback drop");
+    let objects = catalog
+        .constraints_of(meta.id)
+        .expect("constraints_of after drop rollback");
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].name.name, "ck");
 }
 
 #[test]
