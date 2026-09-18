@@ -9,11 +9,13 @@ use vauban_planner::{
 };
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundProjection, BoundStatement, ColumnBinding, CompareOp, LockHints,
-    LogicalOp, LogicalPlan, OutputColumn, OutputSchema, SortKey,
+    AggregateCall, BoundExpr, BoundExprKind, BoundProjection, BoundStatement, BoundTop,
+    ColumnBinding, CompareOp, JoinKind, LockHints, LogicalOp, LogicalPlan, OutputColumn,
+    OutputSchema, SortKey,
 };
 use vauban_catalog::ColumnId;
 use vauban_storage::{KeyColumn, TableId};
+use vauban_sysfn::{Arity, EvalArgs, EvalContext, FunctionDef, FunctionKind};
 use vauban_types::{SqlType, TypeInfo, Value};
 
 const TABLE_A: TableId = TableId(1);
@@ -112,6 +114,54 @@ fn assert_correlated_exists(inner: LogicalPlan) {
         subplans[0].correlated,
         "expected correlated: true, got {planned:?}"
     );
+}
+
+fn assert_uncorrelated_exists(inner: LogicalPlan) {
+    let filtered = LogicalPlan::Filter {
+        input: Box::new(scan_a()),
+        predicate: exists(inner),
+    };
+    let planned = plan_with(&FakeCatalog::new(), filtered);
+    assert!(
+        matches!(
+            planned,
+            PhysicalPlan::NestedLoopJoin {
+                kind: PhysicalJoinKind::Semi,
+                ..
+            }
+        ),
+        "expected Semi join, got {planned:?}"
+    );
+}
+
+fn test_aggregate_return_type(_args: &[TypeInfo]) -> vauban_errors::SqlResult<TypeInfo> {
+    Ok(int_type())
+}
+
+fn test_aggregate_eval(
+    _args: &EvalArgs<'_>,
+    _ctx: &dyn EvalContext,
+) -> vauban_errors::SqlResult<Value> {
+    Ok(Value::Null)
+}
+
+/// A stub aggregate definition: the shape under test is the plan, not the function.
+static TEST_AGGREGATE: FunctionDef = FunctionDef {
+    name: "TEST_MAX",
+    kind: FunctionKind::Aggregate,
+    deterministic: true,
+    arity: Arity::Exact(1),
+    return_type: test_aggregate_return_type,
+    eval: test_aggregate_eval,
+    aggregate: None,
+};
+
+fn max_on(binding: ColumnBinding) -> AggregateCall {
+    AggregateCall {
+        def: &TEST_AGGREGATE,
+        arg: Some(column(binding)),
+        distinct: false,
+    }
 }
 
 fn schema(names: &[&str]) -> OutputSchema {
@@ -357,6 +407,173 @@ fn exists_values_over_an_outer_column_stays_correlated() {
         schema: schema(&["k"]),
     };
     assert_correlated_exists(inner);
+}
+
+#[test]
+fn exists_max_on_an_outer_column_stays_correlated() {
+    let inner = LogicalPlan::Aggregate {
+        input: Box::new(scan_b()),
+        group_by: Vec::new(),
+        aggregates: vec![max_on(binding_a("k", 1, 0))],
+        schema: schema(&["m"]),
+    };
+    assert_correlated_exists(inner);
+}
+
+#[test]
+fn exists_max_without_an_outer_column_stays_a_semi_join() {
+    let inner = LogicalPlan::Aggregate {
+        input: Box::new(scan_b()),
+        group_by: Vec::new(),
+        aggregates: vec![max_on(binding_b("k", 11, 0))],
+        schema: schema(&["m"]),
+    };
+    assert_uncorrelated_exists(inner);
+}
+
+#[test]
+fn exists_top_on_an_outer_column_stays_correlated() {
+    let inner = LogicalPlan::Limit {
+        input: Box::new(scan_b()),
+        top: BoundTop {
+            expr: column(binding_a("k", 1, 0)),
+            percent: false,
+            with_ties: false,
+        },
+    };
+    assert_correlated_exists(inner);
+}
+
+#[test]
+fn exists_top_without_an_outer_column_stays_a_semi_join() {
+    let inner = LogicalPlan::Limit {
+        input: Box::new(scan_b()),
+        top: BoundTop {
+            expr: literal(1),
+            percent: false,
+            with_ties: false,
+        },
+    };
+    assert_uncorrelated_exists(inner);
+}
+
+/// Each [`LogicalPlan`] arm that carries a [`BoundExpr`] must be walked by
+/// `plan_holds_external_column`; extend this list when a new holder appears.
+#[test]
+fn correlation_walk_covers_every_bound_expr_holder() {
+    const HOLDERS: &[&str] = &[
+        "Filter.predicate",
+        "Project.exprs",
+        "Limit.top.expr",
+        "Join.on",
+        "Aggregate.group_by",
+        "Aggregate.aggregates[].arg",
+        "Sort.keys.expr",
+        "Values.rows",
+    ];
+    assert_eq!(
+        HOLDERS.len(),
+        8,
+        "update the holders when a new arm carries a BoundExpr"
+    );
+
+    let cases: Vec<(&str, LogicalPlan)> = vec![
+        (
+            "Filter.predicate",
+            LogicalPlan::Filter {
+                input: Box::new(scan_b()),
+                predicate: compare(
+                    CompareOp::Eq,
+                    column(binding_b("k", 11, 0)),
+                    column(binding_a("k", 1, 0)),
+                ),
+            },
+        ),
+        (
+            "Project.exprs",
+            LogicalPlan::Project {
+                input: Box::new(scan_b()),
+                exprs: vec![BoundProjection {
+                    expr: column(binding_a("k", 1, 0)),
+                    name: "k".to_owned(),
+                }],
+                schema: schema(&["k"]),
+            },
+        ),
+        (
+            "Limit.top.expr",
+            LogicalPlan::Limit {
+                input: Box::new(scan_b()),
+                top: BoundTop {
+                    expr: column(binding_a("k", 1, 0)),
+                    percent: false,
+                    with_ties: false,
+                },
+            },
+        ),
+        (
+            "Join.on",
+            LogicalPlan::Join {
+                left: Box::new(scan_b()),
+                right: Box::new(scan_b()),
+                kind: JoinKind::Inner,
+                on: Some(compare(
+                    CompareOp::Eq,
+                    column(binding_b("k", 11, 0)),
+                    column(binding_a("k", 1, 0)),
+                )),
+                schema: schema(&["k", "k"]),
+            },
+        ),
+        (
+            "Aggregate.group_by",
+            LogicalPlan::Aggregate {
+                input: Box::new(scan_b()),
+                group_by: vec![column(binding_a("k", 1, 0))],
+                aggregates: Vec::new(),
+                schema: schema(&["k"]),
+            },
+        ),
+        (
+            "Aggregate.aggregates[].arg",
+            LogicalPlan::Aggregate {
+                input: Box::new(scan_b()),
+                group_by: Vec::new(),
+                aggregates: vec![max_on(binding_a("k", 1, 0))],
+                schema: schema(&["m"]),
+            },
+        ),
+        (
+            "Sort.keys.expr",
+            LogicalPlan::Sort {
+                input: Box::new(scan_b()),
+                keys: vec![SortKey {
+                    expr: column(binding_a("k", 1, 0)),
+                    desc: false,
+                    collation: None,
+                }],
+            },
+        ),
+        (
+            "Values.rows",
+            LogicalPlan::Values {
+                rows: vec![vec![column(binding_a("k", 1, 0))]],
+                schema: schema(&["k"]),
+            },
+        ),
+    ];
+    assert_eq!(
+        cases.len(),
+        HOLDERS.len(),
+        "each holder name needs a correlated inner plan"
+    );
+    for (holder, inner) in cases {
+        assert_correlated_exists(inner);
+        assert!(
+            HOLDERS.contains(&holder),
+            "{holder} is missing from the holder list"
+        );
+    }
 }
 
 #[test]

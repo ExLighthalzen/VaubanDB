@@ -112,6 +112,7 @@ fn plan_query(logical: LogicalPlan) -> PhysicalPlan {
 }
 
 /// The error a statement answers, or the shape it planned to.
+#[expect(dead_code)]
 fn plan_error(stmt: BoundStatement) -> SqlError {
     let catalog = NoIndexes;
     match plan(stmt, &context(&catalog)) {
@@ -121,6 +122,7 @@ fn plan_error(stmt: BoundStatement) -> SqlError {
 }
 
 /// Checks that `err` is the internal error 50000 of a form not implemented yet.
+#[expect(dead_code)]
 fn assert_not_implemented(err: &SqlError) {
     assert_eq!(err.number, 50000, "error was {err:?}");
     assert_eq!(err.state, 1, "error was {err:?}");

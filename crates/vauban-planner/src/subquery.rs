@@ -9,10 +9,13 @@
 //! of the column referenced; the planner collects the ids of each column the inner
 //! [`Scan`](vauban_binder::LogicalPlan::Scan) and [`Join`](vauban_binder::LogicalPlan::Join)
 //! exposes and treats a reference outside that set as outer, including one written in a
-//! [`Aggregate`](vauban_binder::LogicalPlan::Aggregate) `group_by`, a [`Sort`](vauban_binder::LogicalPlan::Sort) key or a
-//! [`Values`](vauban_binder::LogicalPlan::Values) row
+//! [`Aggregate`](vauban_binder::LogicalPlan::Aggregate) `group_by` or aggregate argument, a
+//! [`Sort`](vauban_binder::LogicalPlan::Sort) key, a [`Limit`](vauban_binder::LogicalPlan::Limit)
+//! `top` expression, or a [`Values`](vauban_binder::LogicalPlan::Values) row
 //! (`tests/subquery.rs`, `correlated_exists_is_evaluated_per_row`,
 //! `exists_grouped_on_an_outer_column_stays_correlated`,
+//! `exists_max_on_an_outer_column_stays_correlated`,
+//! `exists_top_on_an_outer_column_stays_correlated`,
 //! `exists_ordered_on_an_outer_column_stays_correlated` and
 //! `exists_values_over_an_outer_column_stays_correlated`).
 //!
@@ -358,16 +361,25 @@ fn plan_holds_external_column(plan: &LogicalPlan, local: &HashSet<ColumnId>) -> 
                     .iter()
                     .any(|proj| expr_holds_external_column(&proj.expr, local))
         }
-        LogicalPlan::Limit { input, .. } | LogicalPlan::Subquery { input, .. } => {
-            plan_holds_external_column(input, local)
+        LogicalPlan::Limit { input, top } => {
+            plan_holds_external_column(input, local) || expr_holds_external_column(&top.expr, local)
         }
+        LogicalPlan::Subquery { input, .. } => plan_holds_external_column(input, local),
         LogicalPlan::Aggregate {
-            input, group_by, ..
+            input,
+            group_by,
+            aggregates,
+            ..
         } => {
             plan_holds_external_column(input, local)
                 || group_by
                     .iter()
                     .any(|key| expr_holds_external_column(key, local))
+                || aggregates.iter().any(|call| {
+                    call.arg
+                        .as_ref()
+                        .is_some_and(|arg| expr_holds_external_column(arg, local))
+                })
         }
         LogicalPlan::Sort { input, keys, .. } => {
             plan_holds_external_column(input, local)
