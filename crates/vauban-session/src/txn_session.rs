@@ -21,13 +21,17 @@
 
 use vauban_binder::TxnStatement;
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_executor::ExecSession;
+use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSink};
 use vauban_planner::PhysicalStatement;
 use vauban_tds::EnvChange;
-use vauban_txn::{IsolationLevel as TxnIsolation, TxnHandle};
+use vauban_txn::TxnHandle;
 
 use crate::Engine;
-use crate::set_options::IsolationLevel;
+use crate::cancel::CancelHandle;
+use crate::eval_context::SessionEvalContext;
+use crate::set_options::{
+    apply_deadlock_priority, begin_autocommit_txn, guard_snapshot_table_read, sync_exec_session,
+};
 use crate::sink::ResultSink;
 use crate::state::SessionState;
 
@@ -50,6 +54,8 @@ pub(crate) enum StatementTxn {
     /// No session transaction: one was opened for this statement alone, to commit or to roll
     /// back once it returned.
     Autocommit(TxnHandle),
+    /// Autocommit, but the statement failed before a handle was opened.
+    Skipped,
 }
 
 /// The verb of a transaction statement, which decides between the two closing ENVCHANGE.
@@ -80,21 +86,83 @@ pub(crate) fn statement_txn(
     state: &SessionState,
     engine: &Engine,
     exec: &mut ExecSession,
-) -> StatementTxn {
-    exec.isolation = txn_isolation(state.isolation);
-    exec.xact_abort = state.options.xact_abort;
+) -> SqlResult<StatementTxn> {
+    sync_exec_session(state, exec);
     match &state.txn {
         Some(txn) => {
             exec.txn = Some(txn.handle.clone());
             exec.trancount = txn.depth;
-            StatementTxn::Explicit
+            apply_deadlock_priority(&engine.txn, &txn.handle, state.options.deadlock_priority);
+            Ok(StatementTxn::Explicit)
         }
         None => {
             exec.txn = None;
             exec.trancount = 0;
-            StatementTxn::Autocommit(engine.txn.begin(exec.isolation))
+            let handle = begin_autocommit_txn(state, &engine.storage, &engine.txn)?;
+            apply_deadlock_priority(&engine.txn, &handle, state.options.deadlock_priority);
+            Ok(StatementTxn::Autocommit(handle))
         }
     }
+}
+
+/// Runs one bound statement in a transaction of its own, committed on success and rolled back
+/// on failure (autocommit: `@@TRANCOUNT` stays 0), or in the session transaction when one is
+/// open.
+pub(crate) fn execute_in_a_transaction(
+    state: &SessionState,
+    engine: &Engine,
+    exec: &mut ExecSession,
+    cancel: &CancelHandle,
+    bound: &PhysicalStatement,
+    sink: &mut dyn RowSink,
+) -> (SqlResult<ExecOutcome>, StatementTxn) {
+    if let Err(err) = guard_snapshot_table_read(state, &engine.storage, &engine.txn, bound) {
+        sync_exec_session(state, exec);
+        let txn = match &state.txn {
+            Some(session_txn) => {
+                exec.txn = Some(session_txn.handle.clone());
+                exec.trancount = session_txn.depth;
+                apply_deadlock_priority(
+                    &engine.txn,
+                    &session_txn.handle,
+                    state.options.deadlock_priority,
+                );
+                StatementTxn::Explicit
+            }
+            None => StatementTxn::Skipped,
+        };
+        return (Err(err), txn);
+    }
+    let txn = match statement_txn(state, engine, exec) {
+        Ok(txn) => txn,
+        Err(err) => return (Err(err), StatementTxn::Skipped),
+    };
+    let handle = match &txn {
+        StatementTxn::Explicit => state
+            .txn
+            .as_ref()
+            .map(|session_txn| session_txn.handle.clone()),
+        StatementTxn::Autocommit(handle) => Some(handle.clone()),
+        StatementTxn::Skipped => None,
+    };
+    let Some(handle) = handle else {
+        return (
+            Err(SqlError::from(InternalError::Bug(
+                "execute_in_a_transaction: the session transaction has no handle".to_owned(),
+            ))),
+            txn,
+        );
+    };
+    let snap = engine.txn.statement_snapshot(&handle);
+    let eval = SessionEvalContext::deferred(state, &engine.catalog, &handle);
+    let token = cancel.token();
+    let mut exec_ctx = ExecContext::scalar(&eval, state.options.to_binder())
+        .with_engine(engine.storage.as_ref(), &engine.txn, &snap)
+        .with_catalog(&engine.catalog)
+        .with_handle(&handle)
+        .with_cancel(&token)
+        .with_session(exec);
+    (vauban_executor::execute(bound, &mut exec_ctx, sink), txn)
 }
 
 /// Reads back what the executor left, emits the ENVCHANGE an opening or a closing statement
@@ -121,6 +189,7 @@ pub(crate) fn finish_statement(
     }
     match (state.txn.take(), exec.txn.clone()) {
         (None, Some(handle)) => {
+            apply_deadlock_priority(&engine.txn, &handle, state.options.deadlock_priority);
             // A transaction the wire announces carries a non-zero descriptor: an exhausted
             // descriptor space is an internal error, not a silent 0 on an open transaction.
             let Some(descriptor) = state.allocate_transaction_descriptor() else {
@@ -180,17 +249,6 @@ pub(crate) fn rollback_all(state: &mut SessionState, engine: &Engine) -> SqlResu
     state.trancount = 0;
     state.transaction_descriptor = 0;
     Ok(())
-}
-
-/// The transaction level of a session isolation level.
-fn txn_isolation(level: IsolationLevel) -> TxnIsolation {
-    match level {
-        IsolationLevel::ReadUncommitted => TxnIsolation::ReadUncommitted,
-        IsolationLevel::ReadCommitted => TxnIsolation::ReadCommitted,
-        IsolationLevel::RepeatableRead => TxnIsolation::RepeatableRead,
-        IsolationLevel::Snapshot => TxnIsolation::Snapshot,
-        IsolationLevel::Serializable => TxnIsolation::Serializable,
-    }
 }
 
 /// The internal error 50000 for a broken precondition.

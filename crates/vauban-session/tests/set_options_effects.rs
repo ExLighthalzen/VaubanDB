@@ -474,9 +474,9 @@ fn every_option_is_documented() {
 }
 
 #[test]
-fn the_honoured_options_are_the_five_with_a_test() {
+fn the_honoured_options_are_the_ones_with_a_test() {
     // The list is closed on purpose: writing `Honoured` on a field is a claim, and the
-    // claim needs its test, above or in `run_batch_pipeline.rs` for `XACT_ABORT`.
+    // claim needs its test, above, in `run_batch_pipeline.rs` or in `isolation_options.rs`.
     let honoured: BTreeSet<String> = documented_fields()
         .into_iter()
         .filter(|(_, doc)| verdict(doc) == Some("honoured"))
@@ -485,6 +485,8 @@ fn the_honoured_options_are_the_five_with_a_test() {
     let expected: BTreeSet<String> = [
         "concat_null_yields_null",
         "datefirst",
+        "deadlock_priority",
+        "lock_timeout",
         "nocount",
         "quoted_identifier",
         "xact_abort",

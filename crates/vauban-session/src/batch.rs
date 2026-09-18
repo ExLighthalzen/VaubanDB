@@ -725,33 +725,14 @@ impl Session {
         bound: &PhysicalStatement,
         sink: &mut dyn RowSink,
     ) -> (SqlResult<ExecOutcome>, StatementTxn) {
-        let txn = txn_session::statement_txn(&self.state, &self.engine, &mut self.exec);
-        let handle = match &txn {
-            StatementTxn::Explicit => self
-                .state
-                .txn
-                .as_ref()
-                .map(|session_txn| session_txn.handle.clone()),
-            StatementTxn::Autocommit(handle) => Some(handle.clone()),
-        };
-        let Some(handle) = handle else {
-            return (
-                Err(SqlError::from(InternalError::Bug(
-                    "execute_in_a_transaction: the session transaction has no handle".to_owned(),
-                ))),
-                txn,
-            );
-        };
-        let snap = self.engine.txn.statement_snapshot(&handle);
-        let eval = SessionEvalContext::deferred(&self.state, &self.engine.catalog, &handle);
-        let token = self.cancel.token();
-        let mut exec = ExecContext::scalar(&eval, self.state.options.to_binder())
-            .with_engine(self.engine.storage.as_ref(), &self.engine.txn, &snap)
-            .with_catalog(&self.engine.catalog)
-            .with_handle(&handle)
-            .with_cancel(&token)
-            .with_session(&mut self.exec);
-        (vauban_executor::execute(bound, &mut exec, sink), txn)
+        txn_session::execute_in_a_transaction(
+            &self.state,
+            &self.engine,
+            &mut self.exec,
+            &self.cancel,
+            bound,
+            sink,
+        )
     }
 
     /// Sends `err` and the DONE that closes the batch, and records `@@ERROR`.

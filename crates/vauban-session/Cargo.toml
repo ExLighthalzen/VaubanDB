@@ -30,6 +30,7 @@ vauban-txn.workspace = true
 [dev-dependencies]
 tiberius.workspace = true
 tracing-subscriber.workspace = true
+vauban-storage = { workspace = true, features = ["testsuite"] }
 
 [lints]
 workspace = true

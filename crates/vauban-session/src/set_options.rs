@@ -6,12 +6,20 @@
 //! and without failing: an unknown or malformed `SET` is `Ignored` and logged at `debug`.
 //! Both predate the T-SQL parser, which `batch.rs` uses instead.
 
+use std::sync::Arc;
 use tracing::debug;
 use vauban_binder::SessionOptions as BinderOptions;
-use vauban_errors::SqlError;
+use vauban_errors::{SqlError, SqlResult};
+
+use vauban_executor::ExecSession;
 use vauban_parser::ParseOptions;
+use vauban_planner::{PhysicalPlan, PhysicalStatement};
+use vauban_storage::{DbId, Storage};
+use vauban_txn::{LockTimeout, TransactionManager, TxnHandle};
 
 use crate::state::{IdentityInsertTable, SessionState};
+
+pub use vauban_txn::IsolationLevel;
 
 /// Options of a session settable with `SET`.
 ///
@@ -95,10 +103,10 @@ pub struct SetOptions {
     pub nocount: bool,
     /// `SET XACT_ABORT`: a run-time error rolls back the transaction.
     ///
-    /// Honoured for the scope of a run-time error (`batch.rs`): under `ON`, an error whose
-    /// catalogued scope is the statement stops the batch instead of letting it go on
-    /// (`tests/run_batch_pipeline.rs`, `xact_abort_stops_a_statement_scoped_runtime_error`).
-    /// There is no session transaction to roll back yet.
+    /// Honoured: [`sync_exec_session`](sync_exec_session) copies it to
+    /// [`ExecSession::xact_abort`], and the executor rolls the open transaction back on
+    /// a statement error when it is `ON` (`tests/isolation_options.rs`,
+    /// `xact_abort_aborts_the_transaction`).
     pub xact_abort: bool,
     /// `SET IMPLICIT_TRANSACTIONS`: a transaction opens implicitly before some statements.
     ///
@@ -125,7 +133,10 @@ pub struct SetOptions {
     pub textsize: i32,
     /// `SET LOCK_TIMEOUT`: milliseconds to wait for a lock, `-1` waits forever.
     ///
-    /// No effect: the session does not hand it to the lock manager.
+    /// Honoured: [`sync_exec_session`](sync_exec_session) copies it to
+    /// [`ExecSession::lock_timeout`] as [`LockTimeout::Infinite`] for `-1`,
+    /// [`LockTimeout::NoWait`] for `0`, and [`LockTimeout::Millis`] otherwise
+    /// (`tests/isolation_options.rs`, `lock_timeout_reaches_the_lock_manager`).
     pub lock_timeout: i32,
     /// `SET DATEFORMAT`: order of the date parts when parsing strings.
     ///
@@ -150,7 +161,9 @@ pub struct SetOptions {
     pub language: String,
     /// `SET DEADLOCK_PRIORITY`: `-10..=10`, `LOW` = -5, `NORMAL` = 0, `HIGH` = 5.
     ///
-    /// No effect: the session does not hand it to the lock manager.
+    /// Honoured for the open transaction: [`apply_deadlock_priority`](apply_deadlock_priority)
+    /// forwards the value to the transaction manager when a handle is opened
+    /// (`tests/isolation_options.rs`, `deadlock_priority_reaches_the_lock_manager`).
     pub deadlock_priority: i8,
 }
 
@@ -256,6 +269,152 @@ impl SessionState {
     }
 }
 
+/// The default isolation level of a session: `READ COMMITTED`.
+pub(crate) fn default_isolation() -> IsolationLevel {
+    IsolationLevel::ReadCommitted
+}
+
+/// The [`LockTimeout`] that matches a `SET LOCK_TIMEOUT` value.
+#[must_use]
+pub fn lock_timeout_from_ms(ms: i32) -> LockTimeout {
+    match ms {
+        -1 => LockTimeout::Infinite,
+        0 => LockTimeout::NoWait,
+        n => LockTimeout::Millis(u32::try_from(n).unwrap_or(u32::MAX)),
+    }
+}
+
+/// Copies the session options the executor reads into `exec`.
+pub fn sync_exec_session(state: &SessionState, exec: &mut ExecSession) {
+    exec.isolation = state.isolation;
+    exec.xact_abort = state.options.xact_abort;
+    exec.lock_timeout = lock_timeout_from_ms(state.options.lock_timeout);
+}
+
+/// The `DbId` of the session's current database.
+pub(crate) fn current_db_id(storage: &Arc<dyn Storage>, database: &str) -> SqlResult<DbId> {
+    storage
+        .databases()?
+        .into_iter()
+        .find(|(_, name)| name.eq_ignore_ascii_case(database))
+        .map(|(id, _)| id)
+        .ok_or_else(|| SqlError::database_not_found(database))
+}
+
+/// Turns the internal refusal of [`TransactionManager::begin_in`] into error 3952.
+#[must_use]
+pub(crate) fn map_begin_in_error(database: &str, err: SqlError) -> SqlError {
+    if err.number == 50000 && err.message.contains("ALLOW_SNAPSHOT_ISOLATION") {
+        return SqlError::snapshot_isolation_not_allowed(database);
+    }
+    err
+}
+
+/// Opens a one-statement transaction on the session's database at its isolation level.
+///
+/// When the level is [`IsolationLevel::Snapshot`] and the database has not turned
+/// `ALLOW_SNAPSHOT_ISOLATION` on, the transaction manager refuses `begin_in`; this opens
+/// at the session level on the default database instead and leaves 3952 to
+/// [`guard_snapshot_table_read`] on the first user-table read
+/// (`tests/isolation_options.rs`, `snapshot_without_the_database_option`).
+pub fn begin_autocommit_txn(
+    state: &SessionState,
+    storage: &Arc<dyn Storage>,
+    txn: &TransactionManager,
+) -> SqlResult<TxnHandle> {
+    let db = current_db_id(storage, &state.database)?;
+    txn.begin_in(db, state.isolation).or_else(|err| {
+        if err.number == 50000 && err.message.contains("ALLOW_SNAPSHOT_ISOLATION") {
+            Ok(txn.begin(state.isolation))
+        } else {
+            Err(map_begin_in_error(&state.database, err))
+        }
+    })
+}
+
+/// True when `plan` reads at least one user table.
+fn plan_reads_user_table(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::OneRow | PhysicalPlan::Values { .. } => false,
+        PhysicalPlan::TableScan { .. } | PhysicalPlan::IndexSeek { .. } => true,
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Top { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::TopN { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::HashAggregate { input, .. }
+        | PhysicalPlan::StreamAggregate { input, .. }
+        | PhysicalPlan::SubqueryEval { input, .. } => plan_reads_user_table(input),
+        PhysicalPlan::Distinct(input) => plan_reads_user_table(input),
+        PhysicalPlan::NestedLoopJoin { outer, inner, .. }
+        | PhysicalPlan::HashJoin {
+            build: outer,
+            probe: inner,
+            ..
+        } => plan_reads_user_table(outer) || plan_reads_user_table(inner),
+        PhysicalPlan::Union { inputs, .. }
+        | PhysicalPlan::Except { inputs, .. }
+        | PhysicalPlan::Intersect { inputs, .. } => inputs.iter().any(plan_reads_user_table),
+    }
+}
+
+/// True when `bound` reads at least one user table.
+fn statement_reads_user_table(bound: &PhysicalStatement) -> bool {
+    match bound {
+        PhysicalStatement::Query(plan) => plan_reads_user_table(plan),
+        PhysicalStatement::Insert(_)
+        | PhysicalStatement::Update(_)
+        | PhysicalStatement::Delete(_) => true,
+        PhysicalStatement::If { then_, else_, .. } => {
+            statement_reads_user_table(then_)
+                || else_
+                    .as_ref()
+                    .is_some_and(|branch| statement_reads_user_table(branch))
+        }
+        PhysicalStatement::While { body, .. } => statement_reads_user_table(body),
+        PhysicalStatement::Block(stmts) => stmts.iter().any(statement_reads_user_table),
+        PhysicalStatement::Ddl(_)
+        | PhysicalStatement::Use { .. }
+        | PhysicalStatement::SetVariable { .. }
+        | PhysicalStatement::Declare(_)
+        | PhysicalStatement::Break
+        | PhysicalStatement::Continue
+        | PhysicalStatement::Return(_)
+        | PhysicalStatement::Print(_)
+        | PhysicalStatement::Transaction(_) => false,
+    }
+}
+
+/// Refuses a user-table read under [`IsolationLevel::Snapshot`] when the current database
+/// has not turned `ALLOW_SNAPSHOT_ISOLATION` on.
+///
+/// # Errors
+///
+/// Error 3952, severity 16, state 1 (`tests/isolation_options.rs`,
+/// `snapshot_without_the_database_option`).
+pub(crate) fn guard_snapshot_table_read(
+    state: &SessionState,
+    storage: &Arc<dyn Storage>,
+    txn: &TransactionManager,
+    bound: &PhysicalStatement,
+) -> SqlResult<()> {
+    if !statement_reads_user_table(bound) {
+        return Ok(());
+    }
+    let db = current_db_id(storage, &state.database)?;
+    if state.isolation == IsolationLevel::Snapshot
+        && !txn.versioning_options(db).allow_snapshot_isolation
+    {
+        return Err(SqlError::snapshot_isolation_not_allowed(&state.database));
+    }
+    Ok(())
+}
+
+/// Forwards the session's `SET DEADLOCK_PRIORITY` to an open handle.
+pub(crate) fn apply_deadlock_priority(txn: &TransactionManager, handle: &TxnHandle, priority: i8) {
+    txn.set_deadlock_priority(handle, i16::from(priority));
+}
+
 /// Default session language (`sys.syslanguages`).
 const DEFAULT_LANGUAGE: &str = "us_english";
 
@@ -291,28 +450,6 @@ impl DateFormat {
         };
         Some(format)
     }
-}
-
-/// Isolation level of the session (`SET TRANSACTION ISOLATION LEVEL`).
-///
-/// A copy of `vauban_txn::IsolationLevel`, kept for `SessionState::isolation`. The
-/// default is `READ COMMITTED`, implemented as a read of the last commit (RCSI).
-///
-/// No effect: stored in `SessionState::isolation` and read by nobody; the transactions
-/// `batch.rs` opens use `READ COMMITTED`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum IsolationLevel {
-    /// `READ UNCOMMITTED`, treated as `READ COMMITTED`.
-    ReadUncommitted,
-    /// `READ COMMITTED`, the default.
-    #[default]
-    ReadCommitted,
-    /// `REPEATABLE READ`.
-    RepeatableRead,
-    /// `SNAPSHOT`.
-    Snapshot,
-    /// `SERIALIZABLE`.
-    Serializable,
 }
 
 /// Result of `apply_set_statement`.
@@ -918,7 +1055,7 @@ mod tests {
                 deadlock_priority: 0,
             }
         );
-        assert_eq!(IsolationLevel::default(), IsolationLevel::ReadCommitted);
+        assert_eq!(default_isolation(), IsolationLevel::ReadCommitted);
         assert_eq!(DateFormat::default(), DateFormat::Mdy);
     }
 

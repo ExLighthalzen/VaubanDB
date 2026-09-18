@@ -2,7 +2,9 @@
 //! descriptor and the batch-scoped functions (`@@ROWCOUNT`, `@@ERROR`, `@@TRANCOUNT`).
 
 use crate::login::{EDITION, VERSION_BANNER};
-use crate::set_options::{IsolationLevel, SetOptions};
+use vauban_txn::IsolationLevel;
+
+use crate::set_options::{SetOptions, default_isolation};
 use crate::txn_session::SessionTxn;
 
 /// Per-connection state, built by `server.rs` once the login is accepted:
@@ -26,7 +28,7 @@ pub struct SessionState {
     /// `SET` options of the session, at their client-connection defaults until a `SET`
     /// changes them.
     pub options: SetOptions,
-    /// `SET TRANSACTION ISOLATION LEVEL`, `READ COMMITTED` by default.
+    /// `SET TRANSACTION ISOLATION LEVEL`, [`IsolationLevel::ReadCommitted`] by default.
     pub isolation: IsolationLevel,
     /// `@@ROWCOUNT`: rows produced or affected by the **previous** statement of the
     /// session, `0` before the first one. `batch.rs` writes it after each statement and
@@ -113,7 +115,7 @@ impl SessionState {
             hostname: String::new(),
             packet_size: Self::DEFAULT_PACKET_SIZE,
             options: SetOptions::default(),
-            isolation: IsolationLevel::default(),
+            isolation: default_isolation(),
             rowcount: 0,
             last_error: 0,
             trancount: 0,
@@ -153,7 +155,7 @@ mod tests {
         assert!(state.hostname.is_empty());
         assert_eq!(state.packet_size, 4096);
         assert_eq!(state.options, SetOptions::default());
-        assert_eq!(state.isolation, IsolationLevel::ReadCommitted);
+        assert_eq!(state.isolation, default_isolation());
         assert_eq!(state.rowcount, 0);
         assert_eq!(state.last_error, 0);
         assert_eq!(state.trancount, 0);
