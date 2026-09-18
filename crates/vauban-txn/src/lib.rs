@@ -47,8 +47,8 @@
 //! from [`TransactionManager::active_sessions`], and [`LockInfo`] with its [`LockStatus`]
 //! from [`TransactionManager::active_locks`], holders and waiters copied under one guard of
 //! the lock table (`tests/info.rs`). No view, row or column is built here: that belongs to
-//! the catalog. Until the table hints are served, `TABLOCK` and `TABLOCKX` are carried
-//! without effect.
+//! the catalog. Table hints are served by [`TransactionManager::table_lock`]
+//! (`table_lock.rs`, `tests/table_lock.rs`).
 //!
 //! # The two database options
 //!
@@ -94,7 +94,7 @@
 //! | `deadlock.rs` | wait-for graph, victim, 1222 and 1205 |
 //! | `isolation.rs` | [`LockIntent`], [`ReadAccess`], and the four methods that decide which mode a read takes and when it is released |
 //! | `snapshot_modes.rs` | [`VersioningOptions`], [`VersioningMode`], [`TransactionManager::begin_in`] and the mode a read is served at under the two database options |
-//! | `table_lock.rs` | `TABLOCK`, `TABLOCKX`, `ROWLOCK`, escalation — empty |
+//! | `table_lock.rs` | [`TableLockDecision`], [`TransactionManager::table_lock`], [`TransactionManager::end_table_lock`] |
 //! | `schema_lock.rs` | [`TransactionManager::schema_stability_lock`] and [`TransactionManager::schema_modify_lock`], and the table of who takes which |
 //! | `info.rs` | [`TxnInfo`], [`TxnState`], [`LockInfo`], [`LockStatus`], `Display` of [`LockMode`] and [`LockStatus`], [`LockResource::resource_kind`], [`TransactionManager::active_locks`] |
 //!
@@ -121,3 +121,4 @@ pub use isolation::{LockIntent, ReadAccess};
 pub use lock::{LockManager, LockMode, LockOutcome, LockResource, LockWait};
 pub use manager::TransactionManager;
 pub use snapshot_modes::{VersioningMode, VersioningOptions};
+pub use table_lock::{ESCALATION_THRESHOLD, TableLockDecision};
