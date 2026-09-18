@@ -9,9 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_parser::{Expr, InList};
+use vauban_parser::{BinaryOp, Expr, InList, Literal};
 use vauban_storage::{IndexId, KeyColumn, Row, TableId};
 use vauban_txn::{CommitAction, RollbackAction, TxnHandle};
+use vauban_types::{Collation, LiteralKind, Value, compare, parse_literal};
 
 use crate::catalog::Catalog;
 use crate::def::{AlterTable, ColumnDef, ConstraintDef, IndexDef, SortedColumn, TableDef};
@@ -89,10 +90,7 @@ pub(crate) fn alter_table(
     table: ObjectId,
     change: &AlterTable,
 ) -> SqlResult<TableMeta> {
-    if matches!(
-        change,
-        AlterTable::AddConstraint { .. } | AlterTable::DropConstraint { .. }
-    ) {
+    if uses_constraint_session(catalog, txn, table, change)? {
         return alter_table_constraint(catalog, txn, table, change);
     }
     let (old, plan, old_storage) = {
@@ -136,6 +134,58 @@ pub(crate) fn alter_table(
         .expect("alter_table stored the table"))
 }
 
+/// Whether `change` is handled without recopying the table.
+///
+/// `FOREIGN KEY`, `CHECK` and `DEFAULT` constraints use the in-place session of
+/// `constraints.rs`; `PRIMARY KEY` and `UNIQUE` still rebuild the table through
+/// [`plan_change`] and [`copy_table`].
+fn uses_constraint_session(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    table: ObjectId,
+    change: &AlterTable,
+) -> SqlResult<bool> {
+    let _ = (catalog, txn);
+    Ok(match change {
+        AlterTable::AddConstraint { constraint } => matches!(
+            constraint.as_ref(),
+            ConstraintDef::ForeignKey { .. }
+                | ConstraintDef::Check { .. }
+                | ConstraintDef::Default { .. }
+        ),
+        AlterTable::DropConstraint { name } => !is_named_key_constraint(catalog, txn, table, name)?,
+        _ => false,
+    })
+}
+
+/// Whether `name` is the index backing a `PRIMARY KEY` or `UNIQUE` constraint on `table`.
+fn is_named_key_constraint(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    table: ObjectId,
+    name: &str,
+) -> SqlResult<bool> {
+    let store = table::store(catalog);
+    let Some(meta) = store.get(table) else {
+        return Ok(false);
+    };
+    for constraint in &meta.constraints {
+        let index = match constraint {
+            ConstraintMeta::PrimaryKey(index) | ConstraintMeta::Unique(index) => *index,
+            _ => continue,
+        };
+        if store
+            .indexes
+            .get(index)
+            .is_some_and(|entry| entry.name.eq_ignore_ascii_case(name))
+        {
+            return Ok(true);
+        }
+    }
+    let _ = txn;
+    Ok(false)
+}
+
 fn alter_table_constraint(
     catalog: &Catalog,
     txn: &TxnHandle,
@@ -162,6 +212,15 @@ fn alter_table_constraint(
                         .to_owned(),
                 )
                 .into());
+            }
+            ConstraintDef::Check { name, expr } => {
+                let meta = store.get(table).cloned().ok_or_else(|| {
+                    InternalError::Bug(format!("Catalog::alter_table: table {table} vanished"))
+                })?;
+                refuse_check_violated_by_existing_rows(catalog, txn, &meta, name, expr)?;
+                crate::constraints::add_table_constraint(
+                    catalog, txn, &mut store, table, constraint,
+                )?;
             }
             _ => crate::constraints::add_table_constraint(
                 catalog, txn, &mut store, table, constraint,
@@ -267,8 +326,69 @@ fn plan_change(
                 statement_indexes,
             });
         }
-        AlterTable::AddConstraint { .. } | AlterTable::DropConstraint { .. } => {
-            unreachable!("constraint alters do not go through plan_change");
+        AlterTable::AddConstraint { constraint } => {
+            match constraint.as_ref() {
+                ConstraintDef::PrimaryKey { .. } | ConstraintDef::Unique { .. } => {
+                    keys.push(constraint.as_ref().clone());
+                }
+                _ => unreachable!("non-key constraints use alter_table_constraint"),
+            }
+            old.columns.clone()
+        }
+        AlterTable::DropConstraint { name } => {
+            if is_named_key_constraint(catalog, txn, old.id, name)? {
+                let before = keys.len();
+                keys.retain(|key| {
+                    constraint_def_name(key)
+                        .as_ref()
+                        .is_none_or(|candidate| !candidate.eq_ignore_ascii_case(name))
+                });
+                if keys.len() == before {
+                    return Err(SqlError::constraint_not_on_table(name));
+                }
+                return Ok(AlterPlan {
+                    columns: old.columns.clone(),
+                    keys,
+                    preserved,
+                    add,
+                    statement_indexes,
+                });
+            }
+            let Some(object) = store.constraints.entries.values().find(|object| {
+                object.parent == Some(old.id)
+                    && object.database == old.database
+                    && object.name.schema.eq_ignore_ascii_case(&old.schema)
+                    && object.name.name.eq_ignore_ascii_case(name)
+            }) else {
+                return Err(SqlError::constraint_not_on_table(name));
+            };
+            keys.retain(|key| {
+                constraint_def_name(key)
+                    .as_ref()
+                    .is_none_or(|candidate| !candidate.eq_ignore_ascii_case(name))
+            });
+            let preserved: Vec<ConstraintMeta> = preserved
+                .into_iter()
+                .filter(|other| {
+                    constraint_object_id(other)
+                        .and_then(|id| store.constraints.entries.get(&id))
+                        .is_none_or(|object| !object.name.name.eq_ignore_ascii_case(name))
+                })
+                .collect();
+            let removed = old
+                .constraints
+                .iter()
+                .any(|constraint| constraint_object_id(constraint) == Some(object.id));
+            if !removed {
+                return Err(SqlError::constraint_not_on_table(name));
+            }
+            return Ok(AlterPlan {
+                columns: old.columns.clone(),
+                keys,
+                preserved,
+                add,
+                statement_indexes,
+            });
         }
     };
     Ok(AlterPlan {
@@ -359,6 +479,14 @@ fn copy_visible_rows(
         let mut copied = vec![vauban_types::Value::Null; width];
         for (from, to) in &map {
             copied[*to] = row.0[*from].clone();
+        }
+        let filled: BTreeSet<usize> = map.iter().map(|(_, to)| *to).collect();
+        for (position, column) in new_columns.iter().enumerate() {
+            if !filled.contains(&position)
+                && let Some(value) = default_for_new_column(column)?
+            {
+                copied[position] = value;
+            }
         }
         catalog.storage.insert(txn.id, new_storage, &Row(copied))?;
     }
@@ -579,6 +707,52 @@ fn constraint_object_id(constraint: &ConstraintMeta) -> Option<ObjectId> {
     }
 }
 
+fn constraint_def_name(constraint: &ConstraintDef) -> Option<String> {
+    match constraint {
+        ConstraintDef::PrimaryKey { name, .. }
+        | ConstraintDef::Unique { name, .. }
+        | ConstraintDef::ForeignKey { name, .. }
+        | ConstraintDef::Check { name, .. }
+        | ConstraintDef::Default { name, .. } => name.clone(),
+    }
+}
+
+/// The value written into existing rows for a newly added column that carries a literal
+/// `DEFAULT`.
+fn default_for_new_column(column: &ColumnMeta) -> SqlResult<Option<vauban_types::Value>> {
+    use vauban_parser::{Expr, Literal};
+    use vauban_types::{LiteralKind, parse_literal};
+    let Some(expr) = &column.default else {
+        return Ok(None);
+    };
+    let value = match expr {
+        Expr::Literal(Literal::Integer(text), _) => parse_literal(LiteralKind::Integer, text)?.0,
+        Expr::Literal(Literal::Null, _) => vauban_types::Value::Null,
+        Expr::Literal(Literal::Str { value, unicode }, _) => {
+            let kind = if *unicode {
+                LiteralKind::NStr
+            } else {
+                LiteralKind::Str
+            };
+            parse_literal(kind, value)?.0
+        }
+        Expr::Nested(inner, _) => {
+            return default_for_new_column(&ColumnMeta {
+                default: Some((**inner).clone()),
+                ..column.clone()
+            });
+        }
+        _ => {
+            return Err(InternalError::Bug(format!(
+                "Catalog::alter_table: default on column {} is not a literal",
+                column.name
+            ))
+            .into());
+        }
+    };
+    Ok(Some(value))
+}
+
 fn column_copy_map(old: &[ColumnMeta], new: &[ColumnMeta]) -> Vec<(usize, usize)> {
     let mut map = Vec::new();
     for (new_pos, new_column) in new.iter().enumerate() {
@@ -720,4 +894,194 @@ fn statement_index_defs(store: &TableStore, table: &TableMeta) -> Vec<IndexDef> 
                 })
         })
         .collect()
+}
+
+/// Refuses a `CHECK` constraint that existing rows already violate (547).
+fn refuse_check_violated_by_existing_rows(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    table: &TableMeta,
+    name: &Option<String>,
+    expr: &Expr,
+) -> SqlResult<()> {
+    let snap = catalog.txn.statement_snapshot(txn);
+    for result in catalog.storage.scan(&snap, table.storage_id)? {
+        let (_, row) = result?;
+        if check_expr_is_false(expr, &row.0, &table.columns)? {
+            let db = catalog
+                .snapshot(txn)
+                .database_by_id(table.database)
+                .map(|entry| entry.name.clone())
+                .unwrap_or_else(|| "master".to_owned());
+            let qualified = format!("{}.{}", table.schema, table.name);
+            let constraint = name.as_deref().unwrap_or("CHECK");
+            return Err(SqlError::fk_violation(
+                "ALTER TABLE",
+                "CHECK",
+                constraint,
+                &db,
+                &qualified,
+                check_violation_column(expr),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The column a simple `CHECK` names in its 547, when there is one.
+fn check_violation_column(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Column(column) => Some(column.name.value.as_str()),
+        Expr::Binary { left, .. } => check_violation_column(left),
+        Expr::Unary { expr, .. } | Expr::Nested(expr, _) => check_violation_column(expr),
+        Expr::IsNull { expr, .. } => check_violation_column(expr),
+        _ => None,
+    }
+}
+
+/// Whether `expr` evaluates to false on `row` (unknown is not false).
+fn check_expr_is_false(expr: &Expr, row: &[Value], columns: &[ColumnMeta]) -> SqlResult<bool> {
+    Ok(matches!(eval_check_expr(expr, row, columns)?, Some(false)))
+}
+
+fn eval_check_expr(expr: &Expr, row: &[Value], columns: &[ColumnMeta]) -> SqlResult<Option<bool>> {
+    match expr {
+        Expr::Literal(literal, _) => Ok(Some(check_literal_is_true(literal)?)),
+        Expr::Binary {
+            op, left, right, ..
+        } => eval_check_binary(*op, left, right, row, columns),
+        Expr::Unary {
+            op: vauban_parser::UnaryOp::Not,
+            expr,
+            ..
+        } => Ok(eval_check_expr(expr, row, columns)?.map(|value| !value)),
+        Expr::Nested(inner, _) => eval_check_expr(inner, row, columns),
+        Expr::IsNull { expr, negated, .. } => {
+            let value = eval_check_expr_value(expr, row, columns)?;
+            Ok(Some(matches!(value, Value::Null) != *negated))
+        }
+        _ => Err(InternalError::Bug(format!(
+            "Catalog::alter_table: CHECK expression {expr:?} is not evaluated here"
+        ))
+        .into()),
+    }
+}
+
+fn eval_check_expr_value(expr: &Expr, row: &[Value], columns: &[ColumnMeta]) -> SqlResult<Value> {
+    match expr {
+        Expr::Literal(literal, _) => literal_value(literal),
+        Expr::Column(column) => Ok(column_value(row, columns, &column.name.value)?
+            .cloned()
+            .unwrap_or(Value::Null)),
+        Expr::Nested(inner, _) => eval_check_expr_value(inner, row, columns),
+        _ => Err(InternalError::Bug(format!(
+            "Catalog::alter_table: CHECK operand {expr:?} is not evaluated here"
+        ))
+        .into()),
+    }
+}
+
+fn eval_check_binary(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    row: &[Value],
+    columns: &[ColumnMeta],
+) -> SqlResult<Option<bool>> {
+    match op {
+        BinaryOp::And => {
+            let left = eval_check_expr(left, row, columns)?;
+            if left == Some(false) {
+                return Ok(Some(false));
+            }
+            let right = eval_check_expr(right, row, columns)?;
+            Ok(match (left, right) {
+                (Some(true), Some(true)) => Some(true),
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                _ => None,
+            })
+        }
+        BinaryOp::Or => {
+            let left = eval_check_expr(left, row, columns)?;
+            if left == Some(true) {
+                return Ok(Some(true));
+            }
+            let right = eval_check_expr(right, row, columns)?;
+            Ok(match (left, right) {
+                (Some(false), Some(false)) => Some(false),
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                _ => None,
+            })
+        }
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            let left = eval_check_expr_value(left, row, columns)?;
+            let right = eval_check_expr_value(right, row, columns)?;
+            let ordering = compare(&left, &right, &Collation::DEFAULT)?;
+            Ok(ordering.map(|ordering| comparison_holds(op, ordering)))
+        }
+        _ => Err(InternalError::Bug(format!(
+            "Catalog::alter_table: CHECK binary operator {op:?} is not evaluated here"
+        ))
+        .into()),
+    }
+}
+
+fn comparison_holds(op: BinaryOp, ordering: std::cmp::Ordering) -> bool {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    match op {
+        BinaryOp::Eq => ordering == Equal,
+        BinaryOp::Ne => ordering != Equal,
+        BinaryOp::Lt => ordering == Less,
+        BinaryOp::Le => ordering != Equal && ordering != Greater,
+        BinaryOp::Gt => ordering == Greater,
+        BinaryOp::Ge => ordering != Less && ordering != Equal,
+        _ => false,
+    }
+}
+
+fn check_literal_is_true(literal: &Literal) -> SqlResult<bool> {
+    match literal {
+        Literal::Integer(text) => Ok(text != "0"),
+        Literal::Null => Ok(false),
+        _ => Err(InternalError::Bug(format!(
+            "Catalog::alter_table: CHECK literal {literal:?} is not evaluated here"
+        ))
+        .into()),
+    }
+}
+
+fn literal_value(literal: &Literal) -> SqlResult<Value> {
+    match literal {
+        Literal::Integer(text) => Ok(parse_literal(LiteralKind::Integer, text)?.0),
+        Literal::Null => Ok(Value::Null),
+        Literal::Str { value, unicode } => {
+            let kind = if *unicode {
+                LiteralKind::NStr
+            } else {
+                LiteralKind::Str
+            };
+            Ok(parse_literal(kind, value)?.0)
+        }
+        _ => Err(InternalError::Bug(format!(
+            "Catalog::alter_table: CHECK literal {literal:?} is not evaluated here"
+        ))
+        .into()),
+    }
+}
+
+fn column_value<'a>(
+    row: &'a [Value],
+    columns: &[ColumnMeta],
+    name: &str,
+) -> SqlResult<Option<&'a Value>> {
+    let Some(column) = columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(name))
+    else {
+        return Err(InternalError::Bug(format!(
+            "Catalog::alter_table: CHECK names the unknown column {name}"
+        ))
+        .into());
+    };
+    Ok(row.get(column.ordinal as usize))
 }

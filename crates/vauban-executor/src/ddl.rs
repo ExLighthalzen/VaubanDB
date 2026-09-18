@@ -69,6 +69,7 @@ use vauban_txn::TxnHandle;
 use vauban_types::Collation;
 
 use crate::context::ExecContext;
+use crate::ddl_alter::execute_alter_table;
 use crate::ddl_index::execute_index_ddl;
 use crate::ddl_options::execute_set_options;
 use crate::row::ExecOutcome;
@@ -110,9 +111,7 @@ pub(crate) fn execute_ddl(stmt: &DdlStatement, ctx: &ExecContext<'_>) -> SqlResu
             return execute_set_options(stmt, ctx);
         }
         DdlStatement::AlterTable { .. } => {
-            return Err(SqlError::from(InternalError::Bug(
-                "execute_ddl: ALTER TABLE is not implemented yet".to_owned(),
-            )));
+            return execute_alter_table(stmt, ctx);
         }
         // The two index variants are routed to `ddl_index.rs`, which answers the same
         // `NoRows` and takes the same catalogue and handle.
