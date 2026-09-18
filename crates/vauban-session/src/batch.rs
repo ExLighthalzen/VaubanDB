@@ -134,7 +134,7 @@ use vauban_txn::IsolationLevel;
 use vauban_types::{TypeInfo, Value};
 
 use crate::cancel::CancelHandle;
-use crate::eval_context::SessionEvalContext;
+use crate::eval_context::{SessionEvalContext, apply_exec_session};
 use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
 use crate::server::Engine;
@@ -541,6 +541,8 @@ impl Session {
             // `SET` leaves it alone" (`tests/run_batch_pipeline.rs`,
             // `a_set_puts_the_row_count_back_to_zero`).
             self.state.rowcount = 0;
+            apply_exec_session(&mut self.state, &self.exec, true, true);
+            self.exec.identity_updated = false;
             return Ok(Flow::Continue);
         }
 
@@ -566,6 +568,8 @@ impl Session {
         // executor calls `RowSink::columns` during execution, which the adapter
         // converts to `ResultSink::columns` — COLMETADATA therefore goes out when
         // the statement starts to run, not while it is prepared.
+        self.exec.identity_updated = false;
+        self.exec.rowcount = 0;
         let mut adapter = RowSinkAdapter::new(sink);
         let (result, txn) = self.execute_in_a_transaction(bound, &mut adapter);
         let succeeded = result.is_ok();
@@ -604,6 +608,8 @@ impl Session {
                 // `SELECT 1; SELECT @@ROWCOUNT` answers 1, and so it does under `NOCOUNT
                 // ON`: the option touches the DONE, not the variable.
                 self.state.rowcount = count as i64;
+                apply_exec_session(&mut self.state, &self.exec, true, true);
+                self.exec.identity_updated = false;
                 Ok(Flow::Continue)
             }
             // The DDL and `USE` answer `NoRows` (`executor`, `ddl.rs`); a `SELECT`
@@ -617,7 +623,14 @@ impl Session {
                     self.switch_database(database, line, sink)?;
                 }
                 sink.done(None, more)?;
-                self.state.rowcount = 0;
+                self.state.rowcount = self.exec.rowcount;
+                apply_exec_session(
+                    &mut self.state,
+                    &self.exec,
+                    true,
+                    statement_clears_last_error(bound),
+                );
+                self.exec.identity_updated = false;
                 Ok(Flow::Continue)
             }
             // The token handed to the executor cannot be raised, and the outcomes of the
@@ -845,6 +858,18 @@ fn column_metadata(schema: &OutputSchema) -> Vec<ColumnMeta> {
             },
         })
         .collect()
+}
+
+/// Whether a successful statement resets `@@ERROR` to `0`. A bare `DECLARE` with no
+/// initializer on any item leaves the previous error in place
+/// (`tests/session_variables.rs`, `last_error_is_cleared_by_a_successful_statement`).
+fn statement_clears_last_error(stmt: &PhysicalStatement) -> bool {
+    match stmt {
+        PhysicalStatement::Declare(declarations) => declarations
+            .iter()
+            .all(|declaration| declaration.value.is_some()),
+        _ => true,
+    }
 }
 
 /// The 1-based line the statement starts on, in the text of the batch, or 0 for a variant

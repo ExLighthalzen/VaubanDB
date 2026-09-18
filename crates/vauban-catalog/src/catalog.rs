@@ -159,6 +159,18 @@ impl Catalog {
     pub fn next_identity(&self, txn: &TxnHandle, table_id: ObjectId) -> SqlResult<Decimal> {
         identity::next_identity(self, txn, table_id)
     }
+
+    /// Reads the last identity value generated for `table_id`, for `IDENT_CURRENT`.
+    ///
+    /// `None` when the table is unknown or has no identity column; the seed of the column
+    /// when no value was handed out yet. See `identity.rs`.
+    pub fn identity_current(
+        &self,
+        txn: &TxnHandle,
+        table_id: ObjectId,
+    ) -> SqlResult<Option<Decimal>> {
+        identity::identity_current(self, txn, table_id)
+    }
 }
 
 #[cfg(test)]

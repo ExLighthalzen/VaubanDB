@@ -86,12 +86,37 @@ use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vauban_catalog::{Catalog, CatalogSnapshot, ObjectId};
+use vauban_executor::ExecSession;
 use vauban_sysfn::EvalContext;
 use vauban_txn::TxnHandle;
 use vauban_types::calendar::days_from_civil;
 use vauban_types::{Collation, Date, DateTime2, Decimal, Time, Value};
 
 use crate::state::SessionState;
+
+/// Copies what the executor wrote in `exec` into `state` after a statement that succeeded.
+///
+/// `@@ERROR` goes back to `0` after most successful statements — `SELECT`, `SET`, `PRINT`,
+/// `USE`, `BEGIN TRAN` and `DECLARE @x int = 1` after `SELECT 1/0`, but not a bare
+/// `DECLARE @x int` (`tests/session_variables.rs`,
+/// `last_error_is_cleared_by_a_successful_statement`). The identity functions follow
+/// `ExecSession` when an `INSERT` ran; `@@ROWCOUNT` is posted by `batch.rs`.
+pub(crate) fn apply_exec_session(
+    state: &mut SessionState,
+    exec: &ExecSession,
+    succeeded: bool,
+    clears_last_error: bool,
+) {
+    if !succeeded {
+        return;
+    }
+    if clears_last_error {
+        state.last_error = 0;
+    }
+    if exec.identity_updated {
+        state.last_identity = exec.last_identity;
+    }
+}
 
 /// 100-nanosecond ticks in one second, the unit of `Time` and of `datetime2(7)`.
 const TICKS_PER_SECOND: u64 = 10_000_000;
@@ -394,8 +419,52 @@ impl EvalContext for SessionEvalContext<'_> {
     }
 
     fn last_identity(&self) -> Option<Decimal> {
-        // The session does not track the identity values `INSERT` generates.
-        None
+        self.state.last_identity
+    }
+
+    /// Without trigger nor procedure, the scope is the current batch and answers the same
+    /// value as [`EvalContext::last_identity`] on the forms covered by
+    /// `tests/session_variables.rs`, `identity_after_an_insert`.
+    fn scope_identity(&self) -> Option<Decimal> {
+        self.state.last_identity
+    }
+
+    fn ident_current(&self, table: &str) -> Option<Decimal> {
+        let written = WrittenName::parse(table)?;
+        if written.server.is_some() {
+            return None;
+        }
+        let source = self.catalog.as_ref()?;
+        let (catalog, txn, snapshot) = match source {
+            CatalogSource::Deferred {
+                catalog,
+                txn,
+                built,
+            } => {
+                let snap = built.get_or_init(|| catalog.snapshot(txn));
+                (catalog, txn, snap)
+            }
+            CatalogSource::Ready(_) => return None,
+        };
+        let database = written.database.as_deref().unwrap_or(&self.state.database);
+        let object = snapshot.resolve_object(
+            database,
+            written.schema.as_deref(),
+            &written.object,
+            DEFAULT_SCHEMA,
+        )?;
+        catalog
+            .identity_current(txn, ObjectId(object.id.0))
+            .ok()
+            .flatten()
+    }
+
+    fn xact_state(&self) -> i16 {
+        if self.state.trancount == 0 { 0 } else { 1 }
+    }
+
+    fn lock_timeout(&self) -> i32 {
+        self.state.options.lock_timeout
     }
 
     fn spid(&self) -> i16 {
@@ -475,6 +544,12 @@ impl EvalContext for SessionEvalContext<'_> {
         }
         if name.eq_ignore_ascii_case("@@TRANCOUNT") {
             return Some(Value::I32(self.state.trancount));
+        }
+        if name.eq_ignore_ascii_case("@@LOCK_TIMEOUT") {
+            return Some(Value::I32(self.state.options.lock_timeout));
+        }
+        if name.eq_ignore_ascii_case("@@DEADLOCK_PRIORITY") {
+            return Some(Value::I32(i32::from(self.state.options.deadlock_priority)));
         }
         None
     }

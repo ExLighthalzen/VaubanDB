@@ -61,10 +61,11 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
     let handle: &TxnHandle = ctx.handle()?;
 
     let mut count: u64 = 0;
+    let mut last_identity: Option<Decimal> = None;
 
     if stmt.spool {
         for row in &rows {
-            let id = write_one(
+            let (id, identity) = write_one(
                 row,
                 stmt,
                 &col_metas,
@@ -77,6 +78,9 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 handle,
             )?;
             locking::write_lock(ctx, table_id, id)?;
+            if let Some(dec) = identity {
+                last_identity = Some(dec);
+            }
             count += 1;
         }
     } else {
@@ -86,7 +90,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 root.close();
                 return Ok(ExecOutcome::Cancelled);
             }
-            let id = write_one(
+            let (id, identity) = write_one(
                 &row,
                 stmt,
                 &col_metas,
@@ -99,6 +103,9 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 handle,
             )?;
             locking::write_lock(ctx, table_id, id)?;
+            if let Some(dec) = identity {
+                last_identity = Some(dec);
+            }
             count += 1;
         }
         root.close();
@@ -106,6 +113,8 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
 
     if let Some(session) = ctx.session.as_deref_mut() {
         session.rowcount = count as i64;
+        session.last_identity = last_identity;
+        session.identity_updated = true;
     }
     Ok(ExecOutcome::NoRows)
 }
@@ -129,9 +138,10 @@ fn write_one(
     storage: &dyn Storage,
     catalog: &Catalog,
     handle: &TxnHandle,
-) -> SqlResult<RowId> {
+) -> SqlResult<(RowId, Option<Decimal>)> {
     let mut output = vec![Value::Null; col_metas.len()];
     let mut covered: HashSet<usize> = HashSet::new();
+    let mut generated_identity: Option<Decimal> = None;
     for (i, binding) in stmt.columns.iter().enumerate() {
         let ordinal = binding.index;
         let src = &row[i];
@@ -147,6 +157,7 @@ fn write_one(
         }
         if col_meta.identity.is_some() {
             let dec = catalog.next_identity(handle, table_obj_id)?;
+            generated_identity = Some(dec);
             output[ordinal] = identity_value(&dec, col_meta)?;
             continue;
         }
@@ -169,13 +180,14 @@ fn write_one(
         ));
     }
     let stored = vauban_storage::Row(output);
-    storage.insert(txn_id, table_id, &stored).map_err(|err| {
+    let id = storage.insert(txn_id, table_id, &stored).map_err(|err| {
         let snap = catalog.snapshot(handle);
         let meta = snap
             .table_by_storage(table_id)
             .expect("INSERT: table not found in the catalogue");
         crate::dml::constraints::translate_unique(err, meta, &snap, &stored.0, "INSERT")
-    })
+    })?;
+    Ok((id, generated_identity))
 }
 
 /// Evaluates the literal of a `DEFAULT` constraint, with the type it is written with.

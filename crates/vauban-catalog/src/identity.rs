@@ -130,6 +130,35 @@ pub(crate) fn next_identity(
     Ok(decimal(value))
 }
 
+/// The last identity value handed out for `table`, for `IDENT_CURRENT`.
+///
+/// `None` when `table` is unknown to this catalogue or carries no `IDENTITY` column. When
+/// no value was handed out yet, answers the seed of the column — after
+/// `CREATE TABLE dbo.t (id int IDENTITY(1,1))` with no `INSERT` yet,
+/// `SELECT IDENT_CURRENT('dbo.t')` is `1` (`tests/session_variables.rs`,
+/// `ident_current_before_any_insert_returns_seed`).
+///
+/// # Errors
+///
+/// The error of a `storage` or `txn` call otherwise.
+pub(crate) fn identity_current(
+    catalog: &Catalog,
+    caller: &TxnHandle,
+    table: ObjectId,
+) -> SqlResult<Option<Decimal>> {
+    let mut store = table::store(catalog);
+    table::refresh(catalog, &mut store)?;
+    let Some(meta) = store.get(table) else {
+        return Ok(None);
+    };
+    let Some(spec) = meta.columns.iter().find_map(|column| column.identity) else {
+        return Ok(None);
+    };
+    let snapshot = catalog.txn.statement_snapshot(caller);
+    let last = read_last_value(catalog, &snapshot, table)?;
+    Ok(Some(decimal(last.unwrap_or(spec.seed))))
+}
+
 /// The [`IdentitySpec`] of the identity column of `table`.
 ///
 /// The first identity column of the table: `create_table` refuses a second one (`table.rs`,
@@ -154,6 +183,52 @@ fn identity_spec(store: &TableStore, table: ObjectId) -> SqlResult<IdentitySpec>
                 meta.schema, meta.name
             ))
         })
+}
+
+/// The `last_value` stored for `table` in [`COUNTERS_TABLE`], if the table and a row exist.
+fn read_last_value(
+    catalog: &Catalog,
+    snapshot: &vauban_storage::Snapshot,
+    table: ObjectId,
+) -> SqlResult<Option<i64>> {
+    let master = master(catalog)?;
+    let shape = counters_shape();
+    let mut counters_id = None;
+    for (id, stored) in catalog.storage.tables(master)? {
+        if stored != shape {
+            continue;
+        }
+        for row in catalog.storage.scan(snapshot, id)? {
+            let (_, values) = row?;
+            if values.0.get(counters_columns::NAME)
+                == Some(&Value::String(SqlString {
+                    text: COUNTERS_TABLE.to_owned(),
+                }))
+            {
+                counters_id = Some(id);
+                break;
+            }
+        }
+        if counters_id.is_some() {
+            break;
+        }
+    }
+    let Some(counters) = counters_id else {
+        return Ok(None);
+    };
+    for row in catalog.storage.scan(snapshot, counters)? {
+        let (_, values) = row?;
+        if values.0.get(counters_columns::OBJECT_ID) != Some(&Value::I32(table.0)) {
+            continue;
+        }
+        let Some(&Value::I64(last)) = values.0.get(counters_columns::LAST_VALUE) else {
+            return Err(bug(&format!(
+                "{COUNTERS_TABLE} holds a row whose last_value is not a bigint"
+            )));
+        };
+        return Ok(Some(last));
+    }
+    Ok(None)
 }
 
 /// Reads the counter row of `table` inside `handle`, writes the next value back and returns

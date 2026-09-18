@@ -37,9 +37,15 @@ pub struct SessionState {
     pub rowcount: i64,
     /// `@@ERROR`: number of the error the last statement raised, `0` when it succeeded.
     ///
-    /// `batch.rs` sets it on the error that stops a batch; putting it back to `0` after a
-    /// statement that succeeds is not implemented (it comes with `TRY ... CATCH`).
+    /// `batch.rs` sets it on failure and clears it after most statements that complete
+    /// without error; a bare `DECLARE` leaves it unchanged
+    /// (`tests/session_variables.rs`, `last_error_is_cleared_by_a_successful_statement`).
     pub last_error: u32,
+    /// `@@IDENTITY` and `SCOPE_IDENTITY()` without trigger nor procedure: the last identity
+    /// value this session generated, `None` before the first such insert and after an insert
+    /// into a table without an `IDENTITY` column
+    /// (`tests/session_variables.rs`, `identity_after_an_insert`).
+    pub last_identity: Option<vauban_types::Decimal>,
     /// `@@TRANCOUNT`: how many `BEGIN TRANSACTION` are open. Kept in step with
     /// [`SessionState::txn`] by `txn_session.rs`; a driver TRANSACTION_MANAGER request still
     /// writes it directly (`txn_request.rs`).
@@ -118,6 +124,7 @@ impl SessionState {
             isolation: default_isolation(),
             rowcount: 0,
             last_error: 0,
+            last_identity: None,
             trancount: 0,
             txn: None,
             transaction_descriptor: 0,
@@ -158,6 +165,7 @@ mod tests {
         assert_eq!(state.isolation, default_isolation());
         assert_eq!(state.rowcount, 0);
         assert_eq!(state.last_error, 0);
+        assert_eq!(state.last_identity, None);
         assert_eq!(state.trancount, 0);
         assert_eq!(state.transaction_descriptor, 0);
         assert_eq!(state.version_banner, VERSION_BANNER);
