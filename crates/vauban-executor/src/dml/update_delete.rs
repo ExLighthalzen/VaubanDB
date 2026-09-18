@@ -9,6 +9,7 @@ use vauban_types::{TypeInfo, Value, compare, convert};
 
 use crate::context::ExecContext;
 use crate::dml::assign::assign_value;
+use crate::dml::fk_check;
 use crate::errors::at;
 use crate::expr::eval_expr;
 use crate::locking;
@@ -52,6 +53,10 @@ pub(crate) fn execute_update(
                     .map_err(|e| at(e, expr.line))?;
         }
 
+        if fk_check::referenced_columns_changed(meta, old_row, &new_row, ctx)? {
+            fk_check::check_no_referencing_rows(meta, old_row, "UPDATE", ctx)?;
+        }
+        fk_check::check_row(meta, &new_row, "UPDATE", ctx)?;
         locking::write_lock(ctx, stmt.table, *row_id)?;
         let decision = txn_mgr.check_write_conflict(handle, stmt.table, *row_id)?;
         match decision {
@@ -78,6 +83,10 @@ pub(crate) fn execute_update(
                         assign_value(expr_value, &expr.ty, col_meta, &table_name, "UPDATE")
                             .map_err(|e| at(e, expr.line))?;
                 }
+                if fk_check::referenced_columns_changed(meta, old_row, &re_row, ctx)? {
+                    fk_check::check_no_referencing_rows(meta, old_row, "UPDATE", ctx)?;
+                }
+                fk_check::check_row(meta, &re_row, "UPDATE", ctx)?;
                 let stored = vauban_storage::Row(re_row);
                 storage
                     .update(handle.id, stmt.table, id, &stored)
@@ -128,7 +137,8 @@ pub(crate) fn execute_delete(
     let materialized = rows;
 
     let mut count: u64 = 0;
-    for (row_id, _) in &materialized {
+    for (row_id, row) in &materialized {
+        fk_check::check_no_referencing_rows(meta, row, "DELETE", ctx)?;
         locking::write_lock(ctx, stmt.table, *row_id)?;
         let decision = txn_mgr.check_write_conflict(handle, stmt.table, *row_id)?;
         match decision {

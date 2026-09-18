@@ -13,6 +13,7 @@ use vauban_types::{
 
 use crate::context::ExecContext;
 use crate::dml::assign::assign_value;
+use crate::dml::fk_check;
 use crate::errors::at;
 use crate::locking;
 use crate::operator::build_operator;
@@ -23,13 +24,14 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
     let storage: &dyn Storage = ctx.storage()?;
     let txn_id = ctx.handle()?.id;
 
-    let (col_metas, table_name, table_obj_id, table_id) = {
+    let (col_metas, table_name, table_obj_id, table_id, table_meta) = {
         let catalog: &Catalog = ctx.catalog()?;
         let handle: &TxnHandle = ctx.handle()?;
         let snap = catalog.snapshot(handle);
         let meta = snap
             .table_by_storage(stmt.table)
-            .ok_or_else(|| bug("INSERT: table not found in the catalogue"))?;
+            .ok_or_else(|| bug("INSERT: table not found in the catalogue"))?
+            .clone();
         let db_name: String = snap
             .database_by_id(meta.database)
             .map_or_else(|| "?".to_owned(), |db| db.name.clone());
@@ -37,7 +39,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
         // The three-part name 515 prints, built once for the whole statement rather than
         // per row: both loops of `write_one` need it.
         let table_name = format!("{}.{}.{}", db_name, meta.schema, meta.name);
-        (col_metas, table_name, meta.id, stmt.table)
+        (col_metas, table_name, meta.id, stmt.table, meta)
     };
 
     let mut root = build_operator(&stmt.source)?;
@@ -71,12 +73,14 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 stmt,
                 &col_metas,
                 &table_name,
+                &table_meta,
                 txn_id,
                 table_id,
                 table_obj_id,
                 storage,
                 catalog,
                 handle,
+                ctx,
             )?;
             locking::write_lock(ctx, table_id, id)?;
             if let Some(dec) = identity {
@@ -96,12 +100,14 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 stmt,
                 &col_metas,
                 &table_name,
+                &table_meta,
                 txn_id,
                 table_id,
                 table_obj_id,
                 storage,
                 catalog,
                 handle,
+                ctx,
             )?;
             locking::write_lock(ctx, table_id, id)?;
             if let Some(dec) = identity {
@@ -133,12 +139,14 @@ fn write_one(
     stmt: &PhysicalInsert,
     col_metas: &[ColumnMeta],
     table_name: &str,
+    table_meta: &vauban_catalog::TableMeta,
     txn_id: TxnId,
     table_id: TableId,
     table_obj_id: ObjectId,
     storage: &dyn Storage,
     catalog: &Catalog,
     handle: &TxnHandle,
+    ctx: &mut ExecContext<'_>,
 ) -> SqlResult<(RowId, Option<Decimal>)> {
     let mut output = vec![Value::Null; col_metas.len()];
     let mut covered: HashSet<usize> = HashSet::new();
@@ -180,6 +188,7 @@ fn write_one(
             0,
         ));
     }
+    fk_check::check_row(table_meta, &output, "INSERT", ctx)?;
     let stored = vauban_storage::Row(output);
     let id = storage.insert(txn_id, table_id, &stored).map_err(|err| {
         let snap = catalog.snapshot(handle);
