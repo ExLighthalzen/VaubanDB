@@ -19,7 +19,7 @@ use vauban_types::Value;
 use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
 use crate::expr::{as_condition, eval_expr};
 use crate::operator::{Operator, build_operator};
-use crate::ops::subquery::scan_column_bindings;
+use crate::ops::subquery::{local_column_ids, scan_column_bindings};
 use crate::row::Row;
 
 /// Where the join stands between two `next()` calls.
@@ -37,6 +37,8 @@ pub enum Phase<'a> {
         outer_row: Row,
         /// Whether at least one match was found (for `LEFT`).
         had_match: bool,
+        /// Whether [`NestedLoopJoin::push_inner_correlation`] ran for this outer row.
+        inner_correlation: bool,
     },
     /// Walking the materialised inner rows for the current outer row (`RIGHT`, `FULL`).
     ScanningMaterialised {
@@ -128,6 +130,23 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
 }
 
 impl<'a> NestedLoopJoin<'a> {
+    fn push_inner_correlation(ctx: &mut ExecContext<'a>, inner_plan: &PhysicalPlan) -> bool {
+        if ctx.subquery_locals().is_some() {
+            return false;
+        }
+        ctx.push_subquery_locals(
+            local_column_ids(inner_plan),
+            scan_column_bindings(inner_plan),
+        );
+        true
+    }
+
+    fn pop_inner_correlation(ctx: &mut ExecContext<'a>, pushed: bool) {
+        if pushed {
+            ctx.pop_subquery_locals();
+        }
+    }
+
     /// Evaluates `on` on the combined row, or answers `Some(true)` for a cross join.
     fn check_on(
         on: &Option<BoundExpr>,
@@ -298,6 +317,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                     inner,
                     outer_row,
                     had_match,
+                    inner_correlation,
                 } => {
                     let outer_width = self.outer_width;
                     let inner_width = self.inner_width;
@@ -324,6 +344,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 *had_match = true;
                                 if self.kind == PhysicalJoinKind::Semi {
                                     inner.close();
+                                    Self::pop_inner_correlation(ctx, *inner_correlation);
                                     let _ = ctx.pop_outer();
                                     let row = outer_row.clone();
                                     self.phase = Phase::NeedOuter;
@@ -331,6 +352,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 }
                                 if self.kind == PhysicalJoinKind::AntiSemi {
                                     inner.close();
+                                    Self::pop_inner_correlation(ctx, *inner_correlation);
                                     let _ = ctx.pop_outer();
                                     self.phase = Phase::NeedOuter;
                                     continue;
@@ -352,6 +374,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                         None => {
                             // Inner exhausted.
                             inner.close();
+                            Self::pop_inner_correlation(ctx, *inner_correlation);
                             let _ = ctx.pop_outer();
                             let matched = *had_match;
                             Self::note_outer_done(
@@ -433,12 +456,18 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 | PhysicalJoinKind::Inner
                                 | PhysicalJoinKind::Left => {
                                     ctx.push_outer(row.clone(), self.outer_bindings.clone());
+                                    let inner_correlation = if self.on.is_none() {
+                                        Self::push_inner_correlation(ctx, &self.inner_plan)
+                                    } else {
+                                        false
+                                    };
                                     let mut inner = build_operator(&self.inner_plan)?;
                                     inner.open(ctx)?;
                                     self.phase = Phase::Scanning {
                                         inner,
                                         outer_row: row,
                                         had_match: false,
+                                        inner_correlation,
                                     };
                                 }
                             }
@@ -500,6 +529,32 @@ fn remap_semi_on_kind(
             }
             BoundExprKind::ColumnRef(binding)
         }
+        BoundExprKind::Negate(inner) => {
+            BoundExprKind::Negate(Box::new(remap_semi_on(&inner, outer_width, inner_width)))
+        }
+        BoundExprKind::BitNot(inner) => {
+            BoundExprKind::BitNot(Box::new(remap_semi_on(&inner, outer_width, inner_width)))
+        }
+        BoundExprKind::Not(inner) => {
+            BoundExprKind::Not(Box::new(remap_semi_on(&inner, outer_width, inner_width)))
+        }
+        BoundExprKind::IsNull { expr, negated } => BoundExprKind::IsNull {
+            expr: Box::new(remap_semi_on(&expr, outer_width, inner_width)),
+            negated,
+        },
+        BoundExprKind::Convert { expr, style, try_ } => BoundExprKind::Convert {
+            expr: Box::new(remap_semi_on(&expr, outer_width, inner_width)),
+            style,
+            try_,
+        },
+        BoundExprKind::Collate { expr } => BoundExprKind::Collate {
+            expr: Box::new(remap_semi_on(&expr, outer_width, inner_width)),
+        },
+        BoundExprKind::Arith { op, left, right } => BoundExprKind::Arith {
+            op,
+            left: Box::new(remap_semi_on(&left, outer_width, inner_width)),
+            right: Box::new(remap_semi_on(&right, outer_width, inner_width)),
+        },
         BoundExprKind::Compare { op, left, right } => BoundExprKind::Compare {
             op,
             left: Box::new(remap_semi_on(&left, outer_width, inner_width)),
@@ -510,9 +565,51 @@ fn remap_semi_on_kind(
             left: Box::new(remap_semi_on(&left, outer_width, inner_width)),
             right: Box::new(remap_semi_on(&right, outer_width, inner_width)),
         },
-        BoundExprKind::Not(inner) => {
-            BoundExprKind::Not(Box::new(remap_semi_on(&inner, outer_width, inner_width)))
-        }
+        BoundExprKind::In {
+            expr,
+            list,
+            negated,
+        } => BoundExprKind::In {
+            expr: Box::new(remap_semi_on(&expr, outer_width, inner_width)),
+            list: list
+                .into_iter()
+                .map(|item| remap_semi_on(&item, outer_width, inner_width))
+                .collect(),
+            negated,
+        },
+        BoundExprKind::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => BoundExprKind::Like {
+            expr: Box::new(remap_semi_on(&expr, outer_width, inner_width)),
+            pattern: Box::new(remap_semi_on(&pattern, outer_width, inner_width)),
+            escape: escape.map(|item| Box::new(remap_semi_on(&item, outer_width, inner_width))),
+            negated,
+        },
+        BoundExprKind::Case {
+            operand,
+            arms,
+            else_,
+        } => BoundExprKind::Case {
+            operand: operand.map(|item| Box::new(remap_semi_on(&item, outer_width, inner_width))),
+            arms: arms
+                .into_iter()
+                .map(|arm| vauban_binder::BoundCaseArm {
+                    when: remap_semi_on(&arm.when, outer_width, inner_width),
+                    then: remap_semi_on(&arm.then, outer_width, inner_width),
+                })
+                .collect(),
+            else_: else_.map(|item| Box::new(remap_semi_on(&item, outer_width, inner_width))),
+        },
+        BoundExprKind::Function { def, args } => BoundExprKind::Function {
+            def,
+            args: args
+                .into_iter()
+                .map(|arg| remap_semi_on(&arg, outer_width, inner_width))
+                .collect(),
+        },
         other => other,
     }
 }

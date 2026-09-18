@@ -148,8 +148,10 @@ pub fn eval_expr(
         BoundExprKind::Compare { op, left, right } => {
             let collation = comparison_collation(left, right);
             let line = expr.line;
-            let left = eval_expr(left, row, ctx).map_err(|e| compare_operand_error(e, line))?;
-            let right = eval_expr(right, row, ctx).map_err(|e| compare_operand_error(e, line))?;
+            let left =
+                eval_expr(left, row, ctx).map_err(|e| compare_operand_error(e, left.line))?;
+            let right =
+                eval_expr(right, row, ctx).map_err(|e| compare_operand_error(e, right.line))?;
             match compare(&left, &right, &collation).map_err(|e| at(e, line))? {
                 Some(ordering) => Ok(Value::Bit(holds(*op, ordering))),
                 None => Ok(Value::Null),
@@ -210,9 +212,6 @@ pub fn eval_expr(
                 };
                 return ctx.read_local_column(row, binding);
             }
-            if ctx.column_is_outer(binding.column) {
-                return ctx.read_outer_column(binding.column, &binding.name);
-            }
             let row = if let Some(row) = row {
                 row
             } else {
@@ -223,11 +222,14 @@ pub fn eval_expr(
                     ))
                 })?
             };
+            if ctx.subquery_locals().is_some() {
+                if ctx.column_is_outer(binding.column, &binding.name) {
+                    return ctx.read_outer_column(binding.column, &binding.name);
+                }
+                return ctx.read_local_column(row, binding);
+            }
             if let Some(value) = row.get(binding.index) {
                 return Ok(value.clone());
-            }
-            if ctx.subquery_locals().is_some() {
-                return ctx.read_local_column(row, binding);
             }
             Err(bug(&format!(
                 "eval_expr: column `{}` is at index {} of a row of {} value(s)",
@@ -473,11 +475,11 @@ fn comparison_collation(left: &BoundExpr, right: &BoundExpr) -> Collation {
 }
 
 fn compare_operand_error(err: SqlError, line: u32) -> SqlError {
-    if err.number == 512 {
-        err.with_line(line)
-    } else {
-        at(err, line)
+    let err = at(err, line);
+    if err.number == 512 && err.line == line && line != 0 {
+        return err.with_line(line + 1);
     }
+    err
 }
 
 /// `left op right`, with the `NULL` of the nine arithmetic operators.

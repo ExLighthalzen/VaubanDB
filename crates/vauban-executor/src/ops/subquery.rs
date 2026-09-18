@@ -56,7 +56,7 @@ impl<'a> Operator<'a> for SubqueryEval<'a> {
         self.input.open(ctx)?;
         self.rows_since_cancel = 0;
         self.outer_pushed = false;
-        ctx.reset_subquery_cache(self.subplans.len());
+        ctx.open_subquery_eval(&self.subplans);
         Ok(())
     }
 
@@ -77,7 +77,7 @@ impl<'a> Operator<'a> for SubqueryEval<'a> {
             ctx.clear_subquery_state();
             return Ok(None);
         }
-        ctx.begin_subquery_row(&self.subplans);
+        ctx.begin_subquery_row();
         ctx.push_outer(row.clone(), self.input_bindings.clone());
         self.outer_pushed = true;
         Ok(Some(row))
@@ -205,11 +205,16 @@ pub(crate) fn eval_in_subquery_plan(
     ctx: &mut ExecContext<'_>,
     line: u32,
 ) -> SqlResult<Value> {
+    let collation = tested
+        .ty
+        .collation
+        .unwrap_or(vauban_types::Collation::DEFAULT);
+    let tested = eval_expr(tested, row, ctx)?;
     let locals = local_column_ids(plan);
     let bindings = scan_column_bindings(plan);
     ctx.push_subquery_locals(locals, bindings);
     let pushed = push_enclosing_outer(ctx, row, None);
-    let result = eval_in_subquery_plan_inner(plan, tested, row, ctx, line);
+    let result = eval_in_subquery_plan_inner(plan, tested, ctx, line, collation);
     if pushed {
         let _ = ctx.pop_outer();
     }
@@ -219,16 +224,11 @@ pub(crate) fn eval_in_subquery_plan(
 
 fn eval_in_subquery_plan_inner(
     plan: &PhysicalPlan,
-    tested: &BoundExpr,
-    row: Option<&Row>,
+    tested: Value,
     ctx: &mut ExecContext<'_>,
     line: u32,
+    collation: vauban_types::Collation,
 ) -> SqlResult<Value> {
-    let collation = tested
-        .ty
-        .collation
-        .unwrap_or(vauban_types::Collation::DEFAULT);
-    let tested = eval_expr(tested, row, ctx)?;
     let mut op = build_operator(plan)?;
     op.open(ctx)?;
     ctx.note_subquery_open();
@@ -356,7 +356,7 @@ pub(crate) fn scan_column_bindings(plan: &PhysicalPlan) -> Vec<ColumnBinding> {
     }
 }
 
-fn local_column_ids(plan: &PhysicalPlan) -> HashSet<ColumnId> {
+pub(crate) fn local_column_ids(plan: &PhysicalPlan) -> HashSet<ColumnId> {
     let mut ids = HashSet::new();
     collect_local_column_ids(plan, &mut ids);
     ids
@@ -501,11 +501,11 @@ mod tests {
             plan,
             correlated: false,
         };
-        ctx.reset_subquery_cache(1);
-        ctx.begin_subquery_row(std::slice::from_ref(&subplan));
+        ctx.open_subquery_eval(std::slice::from_ref(&subplan));
+        ctx.begin_subquery_row();
         let first = eval_subplan_slot(&subplan, 0, None, &mut ctx, 1, false).expect("first");
         assert_eq!(ctx.subquery_cached(0), Some(Value::I32(99)));
-        ctx.begin_subquery_row(std::slice::from_ref(&subplan));
+        ctx.begin_subquery_row();
         let second = eval_subplan_slot(&subplan, 0, None, &mut ctx, 1, false).expect("second");
         assert_eq!(first, Value::I32(99));
         assert_eq!(second, Value::I32(99));
