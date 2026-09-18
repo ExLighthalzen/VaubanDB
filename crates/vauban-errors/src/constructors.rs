@@ -3126,6 +3126,28 @@ impl SqlError {
         from_catalog(3903, 1, &[])
     }
 
+    /// Error 3971, severity 16, state 1: a batch carries a transaction descriptor the
+    /// session no longer owns.
+    ///
+    /// `descriptor` is printed in lowercase hexadecimal, as SQL Server does for `%I64x`.
+    ///
+    /// ```text
+    /// Could not resume the transaction. Desc:3400000021.
+    /// ```
+    pub fn failed_to_resume_transaction(descriptor: u64) -> Self {
+        from_catalog(3971, 1, &[Arg::Str(&format!("{descriptor:x}"))])
+    }
+
+    /// Error 3989, severity 16, state 1: a request arrived without the transaction
+    /// descriptor the open session transaction requires.
+    ///
+    /// ```text
+    /// The request cannot start without a valid transaction descriptor.
+    /// ```
+    pub fn invalid_transaction_descriptor() -> Self {
+        from_catalog(3989, 1, &[])
+    }
+
     /// Error 3960, severity 16, state 2: a snapshot transaction met a row another
     /// transaction had committed since it started.
     ///

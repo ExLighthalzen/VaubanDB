@@ -719,6 +719,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "ROLLBACK TRANSACTION without a matching BEGIN TRANSACTION.",
     },
     ErrorDef {
+        number: 3926,
+        severity: 10,
+        template: "The session transaction was committed or aborted elsewhere.",
+    },
+    ErrorDef {
         number: 3952,
         severity: 16,
         template: "Database '%.*ls' does not allow snapshot isolation; enable it with ALTER DATABASE.",
@@ -727,6 +732,16 @@ const CATALOG: &[ErrorDef] = &[
         number: 3960,
         severity: 16,
         template: "Update conflict under snapshot isolation: a row of table '%.*ls' in database '%.*ls' was changed by another transaction. Retry or change the isolation level.",
+    },
+    ErrorDef {
+        number: 3971,
+        severity: 16,
+        template: "Could not resume the transaction. Desc:%.*ls.",
+    },
+    ErrorDef {
+        number: 3989,
+        severity: 16,
+        template: "The request cannot start without a valid transaction descriptor.",
     },
     ErrorDef {
         number: 4060,
@@ -1005,7 +1020,7 @@ mod tests {
     const REQUIRED_NUMBERS: &[u32] = &[
         102, 105, 137, 148, 156, 207, 208, 209, 213, 2812, 4104, 4145, 8120, 241, 242, 245, 8114,
         8115, 8134, 8152, 2628, 515, 544, 8107, 547, 2601, 2627, 911, 1801, 2714, 3701, 4060, 226,
-        1205, 1222, 3902, 3903, 3960, 18452, 18456, 5701, 5703,
+        1205, 1222, 3902, 3903, 3926, 3960, 3971, 3989, 18452, 18456, 5701, 5703,
     ];
 
     /// The specifiers that consume an argument, longest first so that `%ls` is not read
@@ -1151,8 +1166,11 @@ mod tests {
         (3726, 16, &["%.*ls"]),
         (3902, 16, &[]),
         (3903, 16, &[]),
+        (3926, 10, &[]),
         (3952, 16, &["%.*ls"]),
         (3960, 16, &["%.*ls", "%.*ls"]),
+        (3971, 16, &["%.*ls"]),
+        (3989, 16, &[]),
         (4060, 11, &["%.*ls"]),
         (4063, 11, &["%.*ls", "%.*ls"]),
         (4104, 16, &["%.*ls"]),

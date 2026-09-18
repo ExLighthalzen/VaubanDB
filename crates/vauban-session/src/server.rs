@@ -23,8 +23,8 @@
 //!    onto the blocking pool, where it runs synchronously and pushes its tokens into a
 //!    bounded channel; this task drains the channel into the writer and ends the response
 //!    with one `flush`, while still watching the client channel for an ATTENTION.
-//!    TRANSACTION_MANAGER runs through the same blocking request path, tracks the driver's
-//!    descriptor and keeps the connection open; storage remains autocommit.
+//!    TRANSACTION_MANAGER runs through the same blocking request path and shares the
+//!    session transaction with T-SQL batches.
 //!
 //! # ATTENTION and the reader task ([MS-TDS] 2.2.1.7)
 //!
@@ -410,13 +410,24 @@ async fn run_connection(
         };
         match message? {
             ClientMessage::SqlBatch(batch) => {
+                let descriptor = batch.transaction_descriptor;
+                let text = batch.text;
+                let engine = Arc::clone(&transaction_engine);
                 let outcome = run_request(
                     &mut writer,
                     &mut client_rx,
                     session,
                     false,
                     None,
-                    move |session, sink| session.run_batch(&batch.text, sink),
+                    move |session, sink| {
+                        let mut state = session.state().clone();
+                        if !txn_request::reject_mismatched_descriptor(descriptor, &mut state, sink)?
+                        {
+                            *session = Session::new(engine, state);
+                            return Ok(());
+                        }
+                        session.run_batch(&text, sink)
+                    },
                 )
                 .await?;
                 match outcome {
@@ -425,13 +436,23 @@ async fn run_connection(
                 }
             }
             ClientMessage::Rpc(rpc) => {
+                let descriptor = rpc.transaction_descriptor;
+                let engine = Arc::clone(&transaction_engine);
                 let outcome = run_request(
                     &mut writer,
                     &mut client_rx,
                     session,
                     true,
                     None,
-                    move |session, sink| session.run_rpc(&rpc, sink),
+                    move |session, sink| {
+                        let mut state = session.state().clone();
+                        if !txn_request::reject_mismatched_descriptor(descriptor, &mut state, sink)?
+                        {
+                            *session = Session::new(engine, state);
+                            return Ok(());
+                        }
+                        session.run_rpc(&rpc, sink)
+                    },
                 )
                 .await?;
                 match outcome {
@@ -458,7 +479,7 @@ async fn run_connection(
                         // field through a clone, let the TRANSACTION_MANAGER owner mutate it,
                         // then rebuild the wrapper with the same shared engine.
                         let mut state = session.state().clone();
-                        let result = txn_request::handle(&request, &mut state, sink);
+                        let result = txn_request::handle(&request, &engine, &mut state, sink);
                         *session = Session::new(engine, state);
                         result
                     },

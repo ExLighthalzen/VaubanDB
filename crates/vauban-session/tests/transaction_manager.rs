@@ -34,6 +34,7 @@ const TM_BEGIN_XACT: u16 = 5;
 const TM_COMMIT_XACT: u16 = 7;
 const TM_ROLLBACK_XACT: u16 = 8;
 const TOKEN_ERROR: u8 = 0xAA;
+const TOKEN_INFO: u8 = 0xAB;
 const TOKEN_ENVCHANGE: u8 = 0xE3;
 const TOKEN_DONE: u8 = 0xFD;
 const ENV_BEGIN: u8 = 8;
@@ -44,6 +45,7 @@ const CUR_CMD_TRANSACTION_MANAGER: u16 = 0x00FD;
 
 struct Running {
     addr: SocketAddr,
+    engine: Arc<Engine>,
     shutdown: CancellationToken,
     task: JoinHandle<Result<(), InternalError>>,
 }
@@ -64,8 +66,9 @@ async fn start() -> Running {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let shutdown = CancellationToken::new();
+    let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::default())));
     let server = Server::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::default()))),
+        Arc::clone(&engine),
         ServerConfig {
             encrypt: EncryptPolicy::Off,
             tls: None,
@@ -80,6 +83,7 @@ async fn start() -> Running {
     let task = tokio::spawn(server.serve(listener, shutdown.clone()));
     Running {
         addr,
+        engine,
         shutdown,
         task,
     }
@@ -166,10 +170,25 @@ fn all_headers(descriptor: u64) -> Vec<u8> {
 }
 
 fn tm_begin_packet() -> Vec<u8> {
+    tm_begin_packet_with_isolation(0)
+}
+
+fn tm_begin_packet_with_isolation(isolation: u8) -> Vec<u8> {
     let mut payload = all_headers(0);
     payload.extend_from_slice(&TM_BEGIN_XACT.to_le_bytes());
-    payload.extend_from_slice(&[0, 0]); // isolation, empty BEGIN_XACT_NAME
+    payload.extend_from_slice(&[isolation, 0]); // isolation, empty BEGIN_XACT_NAME
     packet(PACKET_TRANSACTION_MANAGER, &payload)
+}
+
+fn sql_batch_packet(descriptor: u64, text: &str) -> Vec<u8> {
+    let mut payload = all_headers(descriptor);
+    payload.extend_from_slice(
+        &text
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    packet(PACKET_SQL_BATCH, &payload)
 }
 
 fn tm_finish_packet(request_type: u16, descriptor: u64, chain: bool) -> Vec<u8> {
@@ -231,6 +250,7 @@ async fn connect_and_login(addr: SocketAddr) -> TcpStream {
 #[derive(Debug, PartialEq, Eq)]
 enum Token {
     EnvChange { kind: u8, new: u64, old: u64 },
+    Info(u32),
     Error(u32),
     Done { status: u16, cur_cmd: u16 },
 }
@@ -274,6 +294,14 @@ fn transaction_tokens(payload: &[u8]) -> Vec<Token> {
                     old,
                 });
             }
+            TOKEN_INFO => {
+                let len = usize::from(u16_at(payload, pos));
+                let body = &payload[pos + 2..pos + 2 + len];
+                out.push(Token::Info(u32::from_le_bytes(
+                    body[..4].try_into().unwrap(),
+                )));
+                pos += 2 + len;
+            }
             TOKEN_ERROR => {
                 let len = usize::from(u16_at(payload, pos));
                 let body = &payload[pos + 2..pos + 2 + len];
@@ -298,6 +326,26 @@ fn transaction_tokens(payload: &[u8]) -> Vec<Token> {
 async fn request(client: &mut TcpStream, packet: &[u8]) -> Vec<Token> {
     client.write_all(packet).await.unwrap();
     transaction_tokens(&read_response(client).await)
+}
+
+async fn begin_descriptor(client: &mut TcpStream) -> u64 {
+    begin_descriptor_from(client, &tm_begin_packet()).await
+}
+
+const TOKEN_ROW: u8 = 0xD1;
+const INTNTYPE: u8 = 0x26;
+
+fn first_int_column(response: &[u8]) -> i32 {
+    let payload = &response[8..];
+    let row = payload
+        .iter()
+        .position(|&byte| byte == TOKEN_ROW)
+        .expect("ROW token in scalar response");
+    let mut pos = row + 1;
+    if payload.get(1) == Some(&INTNTYPE) {
+        pos += 1; // BYTELEN prefix on INTNTYPE rows
+    }
+    i32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap())
 }
 
 #[tokio::test]
@@ -420,6 +468,216 @@ async fn mismatched_and_unsupported_requests_do_not_close() {
     running.stop().await;
 }
 
+#[tokio::test]
+async fn driver_begin_then_rollback_undoes_the_insert() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+    client
+        .write_all(&sql_batch_packet(
+            0,
+            "CREATE TABLE dbo.txn_driver (id int NOT NULL)",
+        ))
+        .await
+        .unwrap();
+    read_response(&mut client).await;
+
+    let descriptor = begin_descriptor(&mut client).await;
+
+    client
+        .write_all(&sql_batch_packet(
+            descriptor,
+            "INSERT INTO dbo.txn_driver (id) VALUES (1)",
+        ))
+        .await
+        .unwrap();
+    let insert = read_response(&mut client).await;
+    assert!(
+        !insert[8..].contains(&TOKEN_ERROR),
+        "insert failed: {:?}",
+        &insert[8..]
+    );
+
+    client
+        .write_all(&sql_batch_packet(
+            descriptor,
+            "SELECT COUNT(*) FROM dbo.txn_driver",
+        ))
+        .await
+        .unwrap();
+    let before = read_response(&mut client).await;
+    assert!(
+        !before[8..].contains(&TOKEN_ERROR),
+        "count before rollback failed: {:?}",
+        &before[8..]
+    );
+    assert_eq!(
+        first_int_column(&before),
+        1,
+        "insert is visible before rollback"
+    );
+
+    request(
+        &mut client,
+        &tm_finish_packet(TM_ROLLBACK_XACT, descriptor, false),
+    )
+    .await;
+
+    client
+        .write_all(&sql_batch_packet(0, "SELECT COUNT(*) FROM dbo.txn_driver"))
+        .await
+        .unwrap();
+    let count = first_int_column(&read_response(&mut client).await);
+    assert_eq!(count, 0, "rollback must undo the insert");
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn driver_transaction_is_the_session_transaction() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+    let descriptor = begin_descriptor(&mut client).await;
+
+    client
+        .write_all(&sql_batch_packet(descriptor, "SELECT @@TRANCOUNT"))
+        .await
+        .unwrap();
+    let trancount = first_int_column(&read_response(&mut client).await);
+    assert_eq!(trancount, 1);
+
+    client
+        .write_all(&sql_batch_packet(descriptor, "COMMIT"))
+        .await
+        .unwrap();
+    read_response(&mut client).await;
+
+    client
+        .write_all(&sql_batch_packet(0, "SELECT @@TRANCOUNT"))
+        .await
+        .unwrap();
+    let trancount = first_int_column(&read_response(&mut client).await);
+    assert_eq!(trancount, 0);
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn begin_uses_the_isolation_level_of_the_message() {
+    use vauban_txn::IsolationLevel;
+
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let first = begin_descriptor_from(&mut client, &tm_begin_packet_with_isolation(2)).await;
+    assert_eq!(
+        running.engine.txn.active_sessions()[0].isolation,
+        IsolationLevel::ReadCommitted
+    );
+    request(&mut client, &tm_finish_packet(TM_COMMIT_XACT, first, false)).await;
+    assert!(running.engine.txn.active_sessions().is_empty());
+
+    request(&mut client, &tm_begin_packet_with_isolation(5)).await;
+    assert_eq!(
+        running.engine.txn.active_sessions()[0].isolation,
+        IsolationLevel::Snapshot
+    );
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn unknown_descriptor() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+    let descriptor = begin_descriptor(&mut client).await;
+
+    client
+        .write_all(&sql_batch_packet(descriptor + 1, "SELECT 1"))
+        .await
+        .unwrap();
+    let response = transaction_tokens(&read_response(&mut client).await);
+    assert_eq!(
+        response,
+        vec![
+            Token::Info(3926),
+            Token::Error(3971),
+            Token::Done {
+                status: DONE_ERROR,
+                cur_cmd: 0,
+            },
+        ]
+    );
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn second_tm_begin_returns_3989() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+    begin_descriptor(&mut client).await;
+
+    let second = request(&mut client, &tm_begin_packet()).await;
+    assert_eq!(
+        second,
+        vec![
+            Token::Error(3989),
+            Token::Done {
+                status: DONE_ERROR,
+                cur_cmd: 0,
+            },
+        ]
+    );
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn zero_descriptor_with_open_transaction_returns_3989() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+    begin_descriptor(&mut client).await;
+
+    client
+        .write_all(&sql_batch_packet(0, "SELECT 1"))
+        .await
+        .unwrap();
+    let response = transaction_tokens(&read_response(&mut client).await);
+    assert_eq!(
+        response,
+        vec![
+            Token::Error(3989),
+            Token::Done {
+                status: DONE_ERROR,
+                cur_cmd: 0,
+            },
+        ]
+    );
+
+    drop(client);
+    running.stop().await;
+}
+
+async fn begin_descriptor_from(client: &mut TcpStream, packet: &[u8]) -> u64 {
+    let begin = request(client, packet).await;
+    match begin.as_slice() {
+        [
+            Token::EnvChange {
+                kind: ENV_BEGIN,
+                new,
+                old: 0,
+            },
+            Token::Done { .. },
+        ] if *new != 0 => *new,
+        other => panic!("unexpected BEGIN response: {other:?}"),
+    }
+}
+
 /// Relays one client to VaubanDB and converts the first SQL batch into the
 /// TRANSACTION_MANAGER Begin request the ODBC driver sends. `tiberius` has no public
 /// transaction-manager method, so the marker batch is adapted at the wire boundary while the
@@ -520,6 +778,136 @@ async fn tiberius_keeps_the_connection_after_begin() {
         0,
         "tiberius must reuse the descriptor from BEGIN's ENVCHANGE"
     );
+
+    client.close().await.unwrap();
+    timeout(Duration::from_secs(5), proxy_task)
+        .await
+        .expect("proxy must stop")
+        .expect("proxy must not panic");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn tiberius_rollback_undoes_a_write() {
+    async fn proxy(listener: TcpListener, upstream_addr: SocketAddr) {
+        let (downstream, _) = listener.accept().await.unwrap();
+        let upstream = TcpStream::connect(upstream_addr).await.unwrap();
+        let (mut client_read, mut client_write) = downstream.into_split();
+        let (mut server_read, mut server_write) = upstream.into_split();
+        let mut saw_begin = false;
+
+        let client_to_server = async move {
+            loop {
+                let mut header = [0u8; 8];
+                match client_read.read_exact(&mut header).await {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return,
+                    Err(error) => panic!("proxy client read failed: {error}"),
+                }
+                let len = usize::from(u16::from_be_bytes([header[2], header[3]]));
+                let mut payload = vec![0; len - 8];
+                client_read.read_exact(&mut payload).await.unwrap();
+
+                if header[0] == PACKET_SQL_BATCH && !saw_begin {
+                    let units: Vec<u16> = payload[22..]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|chunk| u16::from_le_bytes(*chunk))
+                        .collect();
+                    let text = String::from_utf16_lossy(&units);
+                    if text.contains("CREATE TABLE dbo.txn_tiberius") {
+                        server_write.write_all(&header).await.unwrap();
+                        server_write.write_all(&payload).await.unwrap();
+                        continue;
+                    }
+                    server_write.write_all(&tm_begin_packet()).await.unwrap();
+                    saw_begin = true;
+                    continue;
+                }
+                if header[0] == PACKET_SQL_BATCH && saw_begin && payload.len() >= 18 {
+                    let descriptor = u64::from_le_bytes(payload[10..18].try_into().unwrap());
+                    let units: Vec<u16> = payload[22..]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|chunk| u16::from_le_bytes(*chunk))
+                        .collect();
+                    let text = String::from_utf16_lossy(&units);
+                    if text.trim().eq_ignore_ascii_case("ROLLBACK") {
+                        server_write
+                            .write_all(&tm_finish_packet(TM_ROLLBACK_XACT, descriptor, false))
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                }
+                server_write.write_all(&header).await.unwrap();
+                server_write.write_all(&payload).await.unwrap();
+            }
+        };
+        let server_to_client = async move {
+            tokio::io::copy(&mut server_read, &mut client_write)
+                .await
+                .unwrap();
+        };
+        tokio::join!(client_to_server, server_to_client);
+    }
+
+    let running = start().await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_task = tokio::spawn(proxy(proxy_listener, running.addr));
+
+    let mut config = Config::new();
+    config.host("127.0.0.1");
+    config.port(proxy_addr.port());
+    config.authentication(AuthMethod::sql_server("sa", "ignored"));
+    config.encryption(EncryptionLevel::NotSupported);
+    config.trust_cert();
+
+    let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+    tcp.set_nodelay(true).unwrap();
+    let mut client = Client::connect(config, tcp.compat_write()).await.unwrap();
+
+    client
+        .simple_query("CREATE TABLE dbo.txn_tiberius (id int NOT NULL)")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    client
+        .simple_query("BEGIN")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO dbo.txn_tiberius (id) VALUES (1)")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+
+    let row = client
+        .simple_query("SELECT COUNT(*) FROM dbo.txn_tiberius")
+        .await
+        .unwrap()
+        .into_row()
+        .await
+        .unwrap()
+        .expect("COUNT returns one row");
+    assert_eq!(row.get::<i32, _>(0), Some(0));
 
     client.close().await.unwrap();
     timeout(Duration::from_secs(5), proxy_task)
