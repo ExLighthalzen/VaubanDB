@@ -753,34 +753,62 @@ fn pick_target_leaf<'a>(
 /// object name but were written with different qualifiers that reach **different** tables
 /// (`master.sys.objects` against `sys.objects`).
 ///
+/// 1013 is raised when both names resolve in the catalogue and reach different tables
+/// (`update_from_three_part_target_is_1013_when_both_exist_and_not_same_table`). When the
+/// target reaches nothing, [`joined_target`] answers 208 instead
+/// (`update_from_missing_three_part_target_is_208_not_1013`).
+///
 /// # Errors
 ///
-/// 1013 on `line` when such a pair is found.
+/// 1013 on `line` when such a pair is found and both names resolve.
 fn check_update_target_exposed_names(
     target: &ObjectName,
     from: &[TableRef],
     line: u32,
     ctx: &BindContext<'_>,
 ) -> SqlResult<()> {
+    if target.server.is_some() {
+        return Ok(());
+    }
+    let Some(catalog) = ctx.catalog else {
+        return Ok(());
+    };
+    if catalog
+        .resolve_table(target, ctx.database, ctx.default_schema)
+        .is_none()
+    {
+        return Ok(());
+    }
     let mut leaves = Vec::new();
     collect_leaves(from, &mut leaves)?;
     let target_written = dotted(target);
     for leaf in leaves {
-        if leaf.alias.is_some() {
+        if leaf.alias.is_some() || leaf.name.server.is_some() {
             continue;
         }
-        if leaf
+        if !leaf
             .name
             .name
             .value
             .eq_ignore_ascii_case(&target.name.value)
-            && !dotted(leaf.name).eq_ignore_ascii_case(&target_written)
-            && !same_table(target, leaf.name, ctx)
         {
-            return Err(
-                SqlError::same_exposed_names(&target_written, &dotted(leaf.name)).with_line(line),
-            );
+            continue;
         }
+        if dotted(leaf.name).eq_ignore_ascii_case(&target_written) {
+            continue;
+        }
+        if same_table(target, leaf.name, ctx) {
+            continue;
+        }
+        if catalog
+            .resolve_table(leaf.name, ctx.database, ctx.default_schema)
+            .is_none()
+        {
+            continue;
+        }
+        return Err(
+            SqlError::same_exposed_names(&target_written, &dotted(leaf.name)).with_line(line),
+        );
     }
     Ok(())
 }

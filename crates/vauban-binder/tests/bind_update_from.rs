@@ -831,7 +831,8 @@ fn the_forms_a_joined_statement_does_not_bind_name_themselves() {
 }
 
 /// A target and an unaliased source that share an object name but reach different tables
-/// answer 1013; when the qualifiers name one table (`same_table`), the statement binds.
+/// answer 1013 when both resolve; when the qualifiers name one table (`same_table`), the
+/// statement binds.
 #[test]
 fn update_from_three_part_target_and_exposed_names() {
     for text in [
@@ -845,6 +846,161 @@ fn update_from_three_part_target_and_exposed_names() {
             .number,
         8154
     );
+}
+
+/// When the target and an unaliased source of the `FROM` share an object name, resolve in
+/// the catalogue, and reach different tables, **1013** is raised.
+#[test]
+fn update_from_three_part_target_is_1013_when_both_exist_and_not_same_table() {
+    struct AppDbAndMaster;
+
+    impl CatalogView for AppDbAndMaster {
+        fn resolve_table(
+            &self,
+            name: &ObjectName,
+            database: &str,
+            default_schema: &str,
+        ) -> Option<ResolvedTable> {
+            if name.server.is_some() {
+                return None;
+            }
+            let part = |ident: Option<&Ident>, default: &str| {
+                ident.map_or_else(|| default.to_owned(), |ident| ident.value.clone())
+            };
+            if !part(name.schema.as_ref(), default_schema).eq_ignore_ascii_case("dbo") {
+                return None;
+            }
+            let db = part(name.database.as_ref(), database);
+            let (object, table, columns) = match (
+                db.to_ascii_lowercase().as_str(),
+                name.name.value.to_ascii_lowercase().as_str(),
+            ) {
+                ("appdb", "t") => (
+                    1,
+                    TableId(1),
+                    vec![
+                        column(1, 0, "k", SqlType::Int, false),
+                        column(2, 1, "a", SqlType::Int, true),
+                    ],
+                ),
+                ("appdb", "u") => (
+                    2,
+                    TableId(2),
+                    vec![
+                        column(1, 0, "k", SqlType::Int, false),
+                        column(2, 1, "b", SqlType::Int, true),
+                        column(3, 2, "c", SqlType::Int, true),
+                    ],
+                ),
+                ("master", "t") => (
+                    3,
+                    TableId(3),
+                    vec![
+                        column(1, 0, "k", SqlType::Int, false),
+                        column(2, 1, "a", SqlType::Int, true),
+                    ],
+                ),
+                _ => return None,
+            };
+            Some(ResolvedTable {
+                object: ObjectId(object),
+                table: Some(table),
+                columns,
+                kind: ResolvedTableKind::Table,
+            })
+        }
+    }
+
+    register_builtins();
+    let text = "UPDATE master.dbo.t SET a = 1 FROM dbo.t JOIN dbo.u AS y ON t.k = y.k;";
+    let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+    let catalog = AppDbAndMaster;
+    let ctx = BindContext {
+        text,
+        catalog: Some(&catalog),
+        database: "appdb",
+        default_schema: "dbo",
+        variables: &NoVariables,
+        options: SessionOptions::default(),
+    };
+    let error = bind(&batch.statements[0], &ctx).expect_err("target and source differ");
+    assert_eq!(error.number, 1013, "{}", error.message);
+    assert_eq!(error.line, 1);
+}
+
+/// When the target names a table the catalogue does not hold, 208 is raised and not 1013,
+/// even though an unaliased source of the `FROM` exposes one object name under another
+/// qualifier.
+#[test]
+fn update_from_missing_three_part_target_is_208_not_1013() {
+    struct LocalT;
+
+    impl CatalogView for LocalT {
+        fn resolve_table(
+            &self,
+            name: &ObjectName,
+            database: &str,
+            default_schema: &str,
+        ) -> Option<ResolvedTable> {
+            if name.server.is_some() {
+                return None;
+            }
+            let part = |ident: Option<&Ident>, default: &str| {
+                ident.map_or_else(|| default.to_owned(), |ident| ident.value.clone())
+            };
+            if !part(name.database.as_ref(), database).eq_ignore_ascii_case("appdb")
+                || !part(name.schema.as_ref(), default_schema).eq_ignore_ascii_case("dbo")
+            {
+                return None;
+            }
+            let (object, table, columns) = match name.name.value.to_ascii_lowercase().as_str() {
+                "t" => (
+                    1,
+                    TableId(1),
+                    vec![
+                        column(1, 0, "k", SqlType::Int, false),
+                        column(2, 1, "a", SqlType::Int, true),
+                    ],
+                ),
+                "u" => (
+                    2,
+                    TableId(2),
+                    vec![
+                        column(1, 0, "k", SqlType::Int, false),
+                        column(2, 1, "b", SqlType::Int, true),
+                        column(3, 2, "c", SqlType::Int, true),
+                    ],
+                ),
+                _ => return None,
+            };
+            Some(ResolvedTable {
+                object: ObjectId(object),
+                table: Some(table),
+                columns,
+                kind: ResolvedTableKind::Table,
+            })
+        }
+    }
+
+    register_builtins();
+    let text = "UPDATE master.dbo.t SET a = 1 FROM dbo.t JOIN dbo.u AS y ON t.k = y.k;";
+    let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+    let catalog = LocalT;
+    let ctx = BindContext {
+        text,
+        catalog: Some(&catalog),
+        database: "appdb",
+        default_schema: "dbo",
+        variables: &NoVariables,
+        options: SessionOptions::default(),
+    };
+    let error = bind(&batch.statements[0], &ctx).expect_err("master.dbo.t is absent from appdb");
+    assert_eq!(error.number, 208, "{}", error.message);
+    assert_eq!(
+        error.message, "Unknown object name 'master.dbo.t'.",
+        "the target, not a source of the FROM"
+    );
+    assert_eq!(error.line, 1);
 }
 
 /// Without a catalogue the sources of the `FROM` cannot be looked up: the refusal of the
