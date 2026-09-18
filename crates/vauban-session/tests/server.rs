@@ -25,7 +25,9 @@ use vauban_errors::{InternalError, SqlResult};
 use vauban_session::{
     Authenticator, EncryptPolicy, Engine, NoAuth, Principal, Server, ServerConfig,
 };
-use vauban_storage::MemoryStorage;
+use vauban_storage::{MemoryStorage, Row};
+use vauban_txn::IsolationLevel;
+use vauban_types::Value;
 
 /// Packet size in force before the login; also the `default_packet_size` of the servers
 /// started here.
@@ -50,9 +52,10 @@ impl Authenticator for NoLogin {
 }
 
 /// A server whose `Authenticator` is `authenticator`, over a fresh in-memory engine.
-fn new_server_with(authenticator: Arc<dyn Authenticator>) -> Server {
-    Server::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+fn new_server_with(authenticator: Arc<dyn Authenticator>) -> (Server, Arc<Engine>) {
+    let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+    let server = Server::new(
+        Arc::clone(&engine),
         ServerConfig {
             encrypt: EncryptPolicy::Off,
             tls: None,
@@ -63,10 +66,11 @@ fn new_server_with(authenticator: Arc<dyn Authenticator>) -> Server {
             version_banner: None,
             edition: None,
         },
-    )
+    );
+    (server, engine)
 }
 
-fn new_server() -> Server {
+fn new_server() -> (Server, Arc<Engine>) {
     new_server_with(Arc::new(NoLogin))
 }
 
@@ -198,6 +202,7 @@ struct Running {
     addr: SocketAddr,
     shutdown: CancellationToken,
     task: JoinHandle<Result<(), InternalError>>,
+    engine: Option<Arc<Engine>>,
 }
 
 impl Running {
@@ -221,11 +226,13 @@ async fn start() -> Running {
     install_tracing();
     let (listener, addr) = bind().await;
     let shutdown = CancellationToken::new();
-    let task = tokio::spawn(new_server().serve(listener, shutdown.clone()));
+    let (server, _) = new_server();
+    let task = tokio::spawn(server.serve(listener, shutdown.clone()));
     Running {
         addr,
         shutdown,
         task,
+        engine: None,
     }
 }
 
@@ -235,12 +242,13 @@ async fn start_accepting_logins() -> Running {
     install_tracing();
     let (listener, addr) = bind().await;
     let shutdown = CancellationToken::new();
-    let server = new_server_with(Arc::new(NoAuth));
+    let (server, engine) = new_server_with(Arc::new(NoAuth));
     let task = tokio::spawn(server.serve(listener, shutdown.clone()));
     Running {
         addr,
         shutdown,
         task,
+        engine: Some(engine),
     }
 }
 
@@ -251,15 +259,13 @@ async fn start_capturing_spids() -> (Running, Spids) {
     let (listener, addr) = bind().await;
     let shutdown = CancellationToken::new();
     let harness = info_span!("harness", port = addr.port());
-    let task = tokio::spawn(
-        new_server()
-            .serve(listener, shutdown.clone())
-            .instrument(harness),
-    );
+    let (server, _) = new_server();
+    let task = tokio::spawn(server.serve(listener, shutdown.clone()).instrument(harness));
     let running = Running {
         addr,
         shutdown,
         task,
+        engine: None,
     };
     let spids = Spids {
         log,
@@ -888,14 +894,14 @@ const RESPONSE_BUDGET: Duration = Duration::from_secs(5);
 /// Number the engine answers for a state it cannot serve.
 const INTERNAL_ERROR: u32 = 50000;
 
-/// Leaves a row whose non-nullable column holds `NULL`, through the write path that still
-/// accepts it, and checks that none of the three batches was refused: the read path has to
-/// cope with such a row, whichever way it got there.
-async fn trap_a_row(client: &mut TcpStream) {
+/// Leaves a row whose non-nullable column holds `NULL`, so the read path can be checked on
+/// a value the column metadata says cannot be `NULL`. The table is created and seeded
+/// through SQL; the corruption is written straight to the storage, because assignment now
+/// refuses `UPDATE … SET a = NULL` on a `NOT NULL` column.
+async fn trap_a_row(client: &mut TcpStream, engine: &Engine) {
     for text in [
         "CREATE TABLE dbo.t (a int NOT NULL)",
         "INSERT INTO dbo.t (a) VALUES (1)",
-        "UPDATE dbo.t SET a = NULL",
     ] {
         let response = run_batch(client, text, RESPONSE_BUDGET).await;
         assert_eq!(
@@ -908,6 +914,34 @@ async fn trap_a_row(client: &mut TcpStream) {
             "`{text}` was answered {response:?}"
         );
     }
+    seed_null_in_not_null_column(engine).expect("the trap row is written");
+}
+
+/// Writes `NULL` into the only column of `dbo.t`, whose metadata still refuses it.
+fn seed_null_in_not_null_column(engine: &Engine) -> SqlResult<()> {
+    let handle = engine.txn.begin(IsolationLevel::ReadCommitted);
+    let cat_snap = engine.catalog.snapshot(&handle);
+    let object = cat_snap
+        .resolve_object("master", Some("dbo"), "t", "dbo")
+        .ok_or_else(|| InternalError::Bug("trap table dbo.t is missing".into()))?;
+    let table = cat_snap
+        .table(object.id)
+        .ok_or_else(|| InternalError::Bug("trap table dbo.t is not a table".into()))?;
+    let snap = engine.txn.statement_snapshot(&handle);
+    let mut rows = engine
+        .storage
+        .scan(&snap, table.storage_id)?
+        .map(|item| item.expect("scan yields a row"));
+    let (row_id, row) = rows
+        .next()
+        .ok_or_else(|| InternalError::Bug("trap table dbo.t is empty".into()))?;
+    let mut corrupt = row.0;
+    corrupt[0] = Value::Null;
+    engine
+        .storage
+        .update(handle.id, table.storage_id, row_id, &Row(corrupt))?;
+    engine.txn.commit(handle)?;
+    Ok(())
 }
 
 /// The tokens `SELECT 1` produces: an unnamed non-nullable `int` column, a ROW with 1, a
@@ -928,7 +962,14 @@ fn select_1_tokens() -> Vec<Tok> {
 async fn a_row_the_codec_refuses_is_answered_with_an_error_and_a_done() {
     let running = start_accepting_logins().await;
     let mut client = connect_and_login(running.addr).await;
-    trap_a_row(&mut client).await;
+    trap_a_row(
+        &mut client,
+        running
+            .engine
+            .as_ref()
+            .expect("engine is kept for trap_a_row"),
+    )
+    .await;
 
     // The read announces its column, then says it cannot send the value. Both ways of
     // leaving the client unanswered fail here under the guard delay: a response that stops
@@ -966,7 +1007,14 @@ async fn a_row_the_codec_refuses_is_answered_with_an_error_and_a_done() {
 async fn the_refusal_comes_after_the_metadata_and_rows_already_sent() {
     let running = start_accepting_logins().await;
     let mut client = connect_and_login(running.addr).await;
-    trap_a_row(&mut client).await;
+    trap_a_row(
+        &mut client,
+        running
+            .engine
+            .as_ref()
+            .expect("engine is kept for trap_a_row"),
+    )
+    .await;
 
     // A first statement whose result set is complete, then the read that fails: the ERROR
     // lands after tokens the client has already taken in ([MS-TDS] 2.2.7.9), and the DONE

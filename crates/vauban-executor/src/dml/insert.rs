@@ -136,8 +136,8 @@ fn write_one(
         let ordinal = binding.index;
         let src = &row[i];
         let col_meta = &col_metas[ordinal];
-        let converted = assign_value(src.clone(), &binding.ty, col_meta).map_err(|e| at(e, 0))?;
-        refuse_null(&converted, col_meta, table_name)?;
+        let converted = assign_value(src.clone(), &binding.ty, col_meta, table_name, "INSERT")
+            .map_err(|e| at(e, 0))?;
         output[ordinal] = converted;
         covered.insert(ordinal);
     }
@@ -154,8 +154,8 @@ fn write_one(
             // The literal of the constraint follows the conversion an explicit value goes
             // through: `eval_default` gives its own type, `assign_value` writes the column's.
             let (value, from) = eval_default(default)?;
-            let converted = assign_value(value, &from, col_meta).map_err(|e| at(e, 0))?;
-            refuse_null(&converted, col_meta, table_name)?;
+            let converted =
+                assign_value(value, &from, col_meta, table_name, "INSERT").map_err(|e| at(e, 0))?;
             output[ordinal] = converted;
             continue;
         }
@@ -176,34 +176,6 @@ fn write_one(
             .expect("INSERT: table not found in the catalogue");
         crate::dml::constraints::translate_unique(err, meta, &snap, &stored.0, "INSERT")
     })
-}
-
-/// 515 for a `NULL` landing in a column that refuses it, whichever way the value reached
-/// the row: written in the `VALUES` row, produced by a source query or a variable, or
-/// taken from a `DEFAULT` constraint whose literal is `NULL`.
-///
-/// The column carrying a `DEFAULT` constraint changes nothing: a written `NULL` is
-/// refused instead of the default being applied
-/// (`tests/insert.rs::a_written_null_does_not_fall_back_to_the_default`), and a default
-/// that is itself `NULL` is refused on the column that omitted it
-/// (`tests/insert.rs::a_null_default_on_a_not_null_column_is_refused`). A column that
-/// accepts `NULL` takes it either way.
-///
-/// # Why the check is here rather than just before the write
-///
-/// Both call sites run before `storage.insert`, so the row a refusal concerns is never
-/// handed to the storage and no refusal the storage raises — a duplicate key among them —
-/// can be the answer instead. `tests/insert.rs::a_refused_null_leaves_nothing_to_read`
-/// reads the table after the refusal and finds it empty, which is also what keeps a later
-/// read from meeting a value its column metadata says cannot be `NULL`.
-fn refuse_null(value: &Value, col_meta: &ColumnMeta, table_name: &str) -> SqlResult<()> {
-    if matches!(value, Value::Null) && !col_meta.ty.nullable {
-        return Err(at(
-            SqlError::cannot_insert_null(&col_meta.name, table_name, "INSERT"),
-            0,
-        ));
-    }
-    Ok(())
 }
 
 /// Evaluates the literal of a `DEFAULT` constraint, with the type it is written with.

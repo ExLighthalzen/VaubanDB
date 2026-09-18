@@ -29,6 +29,14 @@ pub(crate) fn execute_update(
     let meta = cat_snap
         .table_by_storage(stmt.table)
         .ok_or_else(|| bug("UPDATE: table not found in the catalogue"))?;
+    let table_name = format!(
+        "{}.{}.{}",
+        cat_snap
+            .database_by_id(meta.database)
+            .map_or_else(|| "?".to_owned(), |db| db.name.clone()),
+        meta.schema,
+        meta.name
+    );
 
     let rows = collect_input_rows(&stmt.input, stmt.table, ctx)?;
     let materialized = rows;
@@ -39,7 +47,9 @@ pub(crate) fn execute_update(
         for (binding, expr) in &stmt.assignments {
             let expr_value = eval_expr(expr, Some(old_row), ctx)?;
             let col_meta = &meta.columns[binding.index];
-            new_row[binding.index] = assign_value(expr_value, &expr.ty, col_meta)?;
+            new_row[binding.index] =
+                assign_value(expr_value, &expr.ty, col_meta, &table_name, "UPDATE")
+                    .map_err(|e| at(e, expr.line))?;
         }
 
         locking::write_lock(ctx, stmt.table, *row_id)?;
@@ -64,7 +74,9 @@ pub(crate) fn execute_update(
                 for (binding, expr) in &stmt.assignments {
                     let expr_value = eval_expr(expr, Some(&re_row), ctx)?;
                     let col_meta = &meta.columns[binding.index];
-                    re_row[binding.index] = assign_value(expr_value, &expr.ty, col_meta)?;
+                    re_row[binding.index] =
+                        assign_value(expr_value, &expr.ty, col_meta, &table_name, "UPDATE")
+                            .map_err(|e| at(e, expr.line))?;
                 }
                 let stored = vauban_storage::Row(re_row);
                 storage

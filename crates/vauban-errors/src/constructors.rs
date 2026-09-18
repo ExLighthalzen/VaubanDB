@@ -1155,6 +1155,27 @@ impl SqlError {
         from_catalog(8152, 17, &[])
     }
 
+    /// Error 2628, severity 16, state 1: an `INSERT` or `UPDATE` assigns a value that
+    /// does not fit a fixed `varchar`, `nvarchar` or `varbinary` column.
+    ///
+    /// `table` is the three-part name; `column` the column name; `truncated_value` is the
+    /// portion of the value that would be stored (empty for `varbinary` sources).
+    ///
+    /// ```text
+    /// Data too long for table 'db.dbo.t', column 'a': the value 'ab' would be cut.
+    /// ```
+    pub fn string_or_binary_data_truncated(
+        table: &str,
+        column: &str,
+        truncated_value: &str,
+    ) -> Self {
+        from_catalog(
+            2628,
+            1,
+            &[Arg::Str(table), Arg::Str(column), Arg::Str(truncated_value)],
+        )
+    }
+
     /// Error 529, severity 16, state 1
     /// (`SELECT CAST(GETDATE() AS uniqueidentifier);`): the pair of types has no explicit
     /// conversion at all, so even `CAST` and `CONVERT` refuse it. For a conversion that is
@@ -5082,6 +5103,18 @@ mod tests {
     fn cannot_insert_null_515_update_statement() {
         let err = SqlError::cannot_insert_null("c", "db.dbo.t", "UPDATE");
         assert!(err.message.ends_with(" UPDATE fails."));
+    }
+
+    #[test]
+    fn string_or_binary_data_truncated_2628_message_and_state() {
+        let err = SqlError::string_or_binary_data_truncated("db.dbo.t", "code", "ABCDEFGHIJ");
+        assert_eq!(err.number, 2628);
+        assert_eq!(err.severity, 16);
+        assert_eq!(err.state, 1);
+        assert_eq!(
+            err.message,
+            "Data too long for table 'db.dbo.t', column 'code': the value 'ABCDEFGHIJ' would be cut."
+        );
     }
 
     #[test]

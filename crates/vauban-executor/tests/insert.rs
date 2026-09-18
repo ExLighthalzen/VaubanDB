@@ -28,6 +28,16 @@ fn varchar(len: u16, nullable: bool) -> TypeInfo {
     TypeInfo::new(SqlType::VarChar(Len::Fixed(len)), nullable)
 }
 
+/// Builds an `nvarchar(n)` type, nullable or not.
+fn nvarchar(len: u16, nullable: bool) -> TypeInfo {
+    TypeInfo::new(SqlType::NVarChar(Len::Fixed(len)), nullable)
+}
+
+/// Builds a `varbinary(n)` type, nullable or not.
+fn varbinary(len: u16, nullable: bool) -> TypeInfo {
+    TypeInfo::new(SqlType::VarBinary(Len::Fixed(len)), nullable)
+}
+
 /// A `BoundExpr` literal.
 fn lit(value: Value) -> BoundExpr {
     let ty = match &value {
@@ -616,79 +626,168 @@ fn identity_increments_per_row() {
 }
 
 #[test]
-fn string_too_long_truncates_silently() {
-    let storage = Arc::new(MemoryStorage::new());
-    let txn_mgr = Arc::new(TransactionManager::new(
-        storage.clone() as Arc<dyn vauban_storage::Storage>
-    ));
-    let catalog = Catalog::bootstrap(storage.clone(), txn_mgr.clone()).expect("bootstrap succeeds");
-    let handle = txn_mgr.begin(IsolationLevel::ReadCommitted);
-    let meta = catalog
-        .create_table(
-            &handle,
-            &TableDef {
-                name: tbl_name("insert_test_trunc"),
-                columns: vec![ColumnDef {
-                    name: "a".to_owned(),
-                    ty: varchar(3, false),
-                    default: None,
-                    identity: None,
-                    computed: None,
-                }],
-                constraints: Vec::new(),
-            },
-        )
-        .expect("create_table succeeds");
-
-    let long_val = Value::String(SqlString {
-        text: "abcd".to_owned(),
+fn string_too_long_for_a_varchar_column_is_2628() {
+    let mut f = Fixture::new();
+    let table = f.create(
+        "insert_trunc_varchar",
+        vec![column("code", varchar(10, false), None)],
+    );
+    let code = col_binding(0, "code", varchar(10, false));
+    let long = Value::String(SqlString {
+        text: "ABCDEFGHIJK".to_owned(),
     });
+
+    let err = f
+        .run(&insert_one(
+            table,
+            slice::from_ref(&code),
+            vec![long.clone()],
+        ))
+        .expect_err("eleven characters do not fit varchar(10)");
+    assert_eq!(err.number, 2628);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 1);
+    assert!(
+        err.message.contains("master.dbo.insert_trunc_varchar")
+            && err.message.contains("'code'")
+            && err.message.contains("'ABCDEFGHIJ'"),
+        "{}",
+        err.message
+    );
+    assert!(f.read(table, &[code]).is_empty(), "nothing was written");
+}
+
+#[test]
+fn string_too_long_for_an_nvarchar_column_is_2628() {
+    let mut f = Fixture::new();
+    let table = f.create(
+        "insert_trunc_nvarchar",
+        vec![column("nom", nvarchar(5, false), None)],
+    );
+    let nom = col_binding(0, "nom", nvarchar(5, false));
+    let long = Value::String(SqlString {
+        text: "aaaaaa".to_owned(),
+    });
+
+    let err = f
+        .run(&insert_one(table, slice::from_ref(&nom), vec![long]))
+        .expect_err("six characters do not fit nvarchar(5)");
+    assert_eq!(err.number, 2628);
+    assert_eq!(err.state, 1);
+    assert!(
+        err.message.contains("'nom'") && err.message.contains("'aaaaa'"),
+        "{}",
+        err.message
+    );
+}
+
+#[test]
+fn binary_too_long_for_a_varbinary_column_is_2628() {
+    let mut f = Fixture::new();
+    let table = f.create(
+        "insert_trunc_varbinary",
+        vec![column("b", varbinary(3, false), None)],
+    );
+    let b = col_binding(0, "b", varbinary(3, false));
+    let long = Value::Bytes(vec![1, 2, 3, 4]);
+
+    let err = f
+        .run(&insert_one(table, slice::from_ref(&b), vec![long]))
+        .expect_err("four bytes do not fit varbinary(3)");
+    assert_eq!(err.number, 2628);
+    assert_eq!(err.state, 1);
+    assert!(err.message.contains("'b'"), "{}", err.message);
+}
+
+#[test]
+fn a_default_literal_too_long_for_the_column_is_2628() {
+    let mut f = Fixture::new();
+    let table = f.create(
+        "insert_trunc_default",
+        vec![
+            column("k", int(false), None),
+            column(
+                "d",
+                varchar(2, false),
+                Some(default_of(Literal::Str {
+                    value: "abcd".to_owned(),
+                    unicode: false,
+                })),
+            ),
+        ],
+    );
+    let k = col_binding(0, "k", int(false));
+
+    let err = f
+        .run(&insert_one(table, slice::from_ref(&k), vec![Value::I32(1)]))
+        .expect_err("the default is too long for the column");
+    assert_eq!(err.number, 2628);
+    assert_eq!(err.state, 1);
+}
+
+#[test]
+fn a_value_that_fits_still_inserts() {
+    let mut f = Fixture::new();
+    let table = f.create(
+        "insert_trunc_fits",
+        vec![column("code", varchar(10, false), None)],
+    );
+    let code = col_binding(0, "code", varchar(10, false));
+    let val = Value::String(SqlString {
+        text: "ABCDEFGHIJ".to_owned(),
+    });
+
+    f.run(&insert_one(
+        table,
+        slice::from_ref(&code),
+        vec![val.clone()],
+    ))
+    .expect("ten characters fit varchar(10)");
+    assert_eq!(f.read(table, &[code]), vec![vec![val]]);
+}
+
+#[test]
+fn an_explicit_cast_still_truncates_without_error() {
+    let mut f = Fixture::new();
+    let table = f.create(
+        "insert_cast_trunc",
+        vec![column("a", varchar(2, false), None)],
+    );
+    let a = col_binding(0, "a", varchar(2, false));
+    let inner = BoundExpr {
+        kind: BoundExprKind::Literal(Value::String(SqlString {
+            text: "abcdef".to_owned(),
+        })),
+        ty: varchar(10, false),
+        line: 0,
+    };
+    let cast = BoundExpr {
+        kind: BoundExprKind::Convert {
+            expr: Box::new(inner),
+            style: None,
+            try_: false,
+        },
+        ty: varchar(2, false),
+        line: 0,
+    };
     let stmt = PhysicalStatement::Insert(PhysicalInsert {
-        table: meta.storage_id,
-        columns: vec![col_binding(0, "a", varchar(3, false))],
-        source: values_plan(vec![vec![long_val]], &[varchar(10, false)]),
+        table,
+        columns: vec![a.clone()],
+        source: PhysicalPlan::Values {
+            rows: vec![vec![cast]],
+            schema: OutputSchema {
+                columns: vec![out_col("a", varchar(2, false))],
+            },
+        },
         spool: false,
     });
 
-    let eval = StaticContext::default();
-    let snap = txn_mgr.statement_snapshot(&handle);
-    let mut session = ExecSession::default();
-    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default())
-        .with_engine(
-            storage.as_ref() as &dyn vauban_storage::Storage,
-            txn_mgr.as_ref(),
-            &snap,
-        )
-        .with_catalog(&catalog)
-        .with_handle(&handle)
-        .with_session(&mut session);
-    let (outcome, _) =
-        execute_collect(&stmt, &mut ctx).expect("INSERT succeeds with silent truncation");
-    assert!(matches!(outcome, vauban_executor::ExecOutcome::NoRows));
-
-    // Read back: the string was truncated to 3 characters.
-    let read_plan = PhysicalPlan::TableScan {
-        table: meta.storage_id,
-        columns: vec![col_binding(0, "a", varchar(3, false))],
-        schema: OutputSchema {
-            columns: vec![out_col("a", varchar(3, false))],
-        },
-        alias: "".to_owned(),
-        hints: LockHints::default(),
-    };
-    let read_stmt = PhysicalStatement::Query(read_plan);
-    let (_, set) = execute_collect(&read_stmt, &mut ctx).expect("readback works");
+    f.run(&stmt).expect("CAST already cut the string");
     assert_eq!(
-        set.rows.len(),
-        1,
-        "one row was inserted despite the truncation"
-    );
-    assert_eq!(
-        set.rows[0][0],
-        Value::String(SqlString {
-            text: "abc".to_owned(),
-        }),
-        "the value was truncated to 3 characters"
+        f.read(table, &[a]),
+        vec![vec![Value::String(SqlString {
+            text: "ab".to_owned(),
+        })]]
     );
 }
 
