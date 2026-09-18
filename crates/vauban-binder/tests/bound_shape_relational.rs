@@ -411,7 +411,7 @@ fn an_unimplemented_form_names_itself() {
         // `UPDATE a SET c = 1` and `DELETE FROM a` are bound (`tests/bind_update_delete.rs`).
         // `IF 1 = 1 SELECT 1 ELSE SELECT 2`, `WHILE 1 = 1 BEGIN … END`, `PRINT 'a'` and
         // `BEGIN … END` are bound (`tests/bind_control_flow.rs`).
-        ("ALTER TABLE a ADD d int", "ALTER TABLE"),
+        // `ALTER TABLE a ADD d int` is bound (`tests/bind_alter_table.rs`).
         ("ALTER DATABASE d SET READ_ONLY", "ALTER DATABASE"),
     ];
     for (text, form) in shapes {
@@ -423,7 +423,11 @@ fn an_unimplemented_form_names_itself() {
             error.message
         );
     }
-    for text in ["SELECT c INTO d FROM a", "TRUNCATE TABLE a"] {
+    for text in [
+        "SELECT c INTO d FROM a",
+        "TRUNCATE TABLE a",
+        "ALTER TABLE a ADD d int",
+    ] {
         let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
         let catalog = TwoTables;
         let variables = NoVariables;

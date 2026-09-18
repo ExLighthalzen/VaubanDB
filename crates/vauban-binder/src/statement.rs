@@ -195,7 +195,12 @@ mod tests {
     use vauban_parser::{Expr, Ident, Literal, ParseOptions, Span, Statement, parse_batch};
     use vauban_sysfn::register_builtins;
 
-    use crate::context::{BindContext, SessionOptions};
+    use vauban_catalog::ObjectId;
+    use vauban_parser::ObjectName;
+
+    use crate::context::{
+        BindContext, CatalogView, NoVariables, ResolvedTable, ResolvedTableKind, SessionOptions,
+    };
 
     /// The first binding error of a batch, statement by statement, as a session reports it.
     fn err(text: &str) -> (u32, u32) {
@@ -443,35 +448,69 @@ mod tests {
         );
     }
 
-    /// `ALTER TABLE` parses and is not bound, and the message names the statement;
-    /// `ALTER DATABASE … SET` is bound by `ddl.rs`, which refuses an option it does not
-    /// carry by naming the option, not the statement. `CREATE INDEX` and `DROP INDEX` do not
-    /// come through here at all — `ddl_index.rs` binds them, and the two assertions at the
-    /// end of this test are the counter-proof of the two above.
+    /// A form `alter.rs` leaves for V2 names itself; `ALTER DATABASE … SET` is bound by
+    /// `ddl.rs`, which refuses an option it does not carry by naming the option, not the
+    /// statement. `CREATE INDEX` and `DROP INDEX` do not come through here at all —
+    /// `ddl_index.rs` binds them, and the two assertions at the end of this test are the
+    /// counter-proof of the two above.
     #[test]
     fn the_alter_statements_name_themselves() {
+        struct OneTable;
+        impl CatalogView for OneTable {
+            fn resolve_table(
+                &self,
+                name: &ObjectName,
+                _database: &str,
+                _default_schema: &str,
+            ) -> Option<ResolvedTable> {
+                name.name
+                    .value
+                    .eq_ignore_ascii_case("t")
+                    .then(|| ResolvedTable {
+                        object: ObjectId(1),
+                        table: None,
+                        columns: Vec::new(),
+                        kind: ResolvedTableKind::Table,
+                    })
+            }
+        }
         let message = |text: &str| {
             let batch = parse_batch(text, &ParseOptions::default())
                 .unwrap_or_else(|e| unreachable!("{text} parses, got {e:?}"));
-            let ctx = BindContext::scalar(text, SessionOptions::default());
+            let catalog = OneTable;
+            let ctx = BindContext {
+                text,
+                catalog: Some(&catalog),
+                database: "master",
+                default_schema: "dbo",
+                variables: &NoVariables,
+                options: SessionOptions::default(),
+            };
             bind(&batch.statements[0], &ctx)
                 .expect_err("this statement is not bound")
                 .message
         };
         assert!(
-            message("ALTER TABLE t ADD c int;").ends_with("ALTER TABLE is not implemented yet"),
+            message("ALTER TABLE t ALTER COLUMN c int;").contains("ALTER COLUMN"),
             "{}",
-            message("ALTER TABLE t ADD c int;")
+            message("ALTER TABLE t ALTER COLUMN c int;")
         );
         assert!(
             message("ALTER DATABASE d SET READ_ONLY;").contains("SET READ_ONLY"),
             "{}",
             message("ALTER DATABASE d SET READ_ONLY;")
         );
+        let create_index = "CREATE INDEX ix ON t (a);";
+        let create_batch = parse_batch(create_index, &ParseOptions::default())
+            .unwrap_or_else(|e| unreachable!("{create_index} parses, got {e:?}"));
+        let create_ctx = BindContext::scalar(create_index, SessionOptions::default());
+        let create_error = bind(&create_batch.statements[0], &create_ctx)
+            .expect_err("CREATE INDEX without a catalogue is refused, not unsupported");
         assert!(
-            !message("CREATE INDEX ix ON t (a);").contains("is not implemented yet"),
+            !create_error.message.contains("is not implemented yet"),
             "CREATE INDEX is bound; without a catalogue it answers for want of one, \
-             which is `ddl_index::tests::create_index_without_a_catalogue_is_refused`"
+             which is `ddl_index::tests::create_index_without_a_catalogue_is_refused`: {}",
+            create_error.message
         );
         let batch = parse_batch("DROP INDEX ix ON t;", &ParseOptions::default())
             .unwrap_or_else(|e| unreachable!("{e:?}"));

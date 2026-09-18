@@ -799,6 +799,16 @@ const CATALOG: &[ErrorDef] = &[
         template: "A column added to a non-empty table has to be nullable, have a DEFAULT, or be an identity or timestamp column. Column '%.*ls' cannot be added to table '%.*ls'.",
     },
     ErrorDef {
+        number: 4902,
+        severity: 16,
+        template: "Object \"%.*ls\" was not found: it does not exist or this login lacks permissions.",
+    },
+    ErrorDef {
+        number: 4924,
+        severity: 16,
+        template: "ALTER TABLE DROP COLUMN could not run: column '%.*ls' is missing from table '%.*ls'.",
+    },
+    ErrorDef {
         number: 5074,
         severity: 16,
         template: "%S_MSG '%.*ls' still depends on %S_MSG '%.*ls'.",
@@ -1192,6 +1202,8 @@ mod tests {
         (4701, 16, &["%.*ls"]),
         (4712, 16, &["%.*ls"]),
         (4901, 16, &["%.*ls", "%.*ls"]),
+        (4902, 16, &["%.*ls"]),
+        (4924, 16, &["%.*ls", "%.*ls"]),
         (5074, 16, &["%S_MSG", "%.*ls", "%S_MSG", "%.*ls"]),
         (5701, 10, &["%.*ls"]),
         (5703, 10, &["%.*ls"]),

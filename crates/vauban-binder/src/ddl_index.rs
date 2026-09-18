@@ -875,8 +875,7 @@ mod tests {
         assert!(columns[1].descending);
     }
 
-    /// The statements this file binds are not the internal 50000 of `statement.rs`, and
-    /// `ALTER TABLE` still is.
+    /// The statements this file binds are not the internal 50000 of `statement.rs`.
     #[test]
     fn create_and_drop_index_are_bound() {
         assert!(matches!(
@@ -887,15 +886,10 @@ mod tests {
             bind_one("DROP INDEX ix ON dbo.t1;"),
             Ok(BoundStatement::Ddl(DdlStatement::DropIndex { .. }))
         ));
-        // `ALTER TABLE` is routed to `alter.rs`, which does not bind it yet.
-        let alter = err("ALTER TABLE dbo.t1 ADD c int;");
-        assert!(
-            alter
-                .message
-                .ends_with("ALTER TABLE is not implemented yet"),
-            "{}",
-            alter.message
-        );
+        assert!(matches!(
+            bind_one("ALTER TABLE dbo.t1 ADD c int;"),
+            Ok(BoundStatement::Ddl(DdlStatement::AlterTable { .. }))
+        ));
     }
 
     /// The `Statement` variants this file reads are the two the parser produces for them.

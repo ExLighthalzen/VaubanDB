@@ -2887,6 +2887,28 @@ impl SqlError {
         from_catalog(4901, 1, &[Arg::Str(column), Arg::Str(table)])
     }
 
+    /// Error 4902, severity 16, state 1 (`ALTER TABLE dbo.nosuch ADD c int NULL;` when
+    /// `nosuch` is not in the catalogue).
+    ///
+    /// `name` is the qualified name the server prints (`'dbo.nosuch'`).
+    ///
+    /// ```text
+    /// Object "dbo.nosuch" was not found: it does not exist or this login lacks permissions.
+    /// ```
+    pub fn cannot_find_object_to_alter_table(name: &str) -> Self {
+        from_catalog(4902, 1, &[Arg::Str(name)])
+    }
+
+    /// Error 4924, severity 16, state 1 (`ALTER TABLE dbo.t DROP COLUMN nosuch;` when
+    /// `nosuch` is not a column of `t`).
+    ///
+    /// ```text
+    /// ALTER TABLE DROP COLUMN could not run: column 'nosuch' is missing from table 't'.
+    /// ```
+    pub fn alter_table_drop_column_missing(column: &str, table: &str) -> Self {
+        from_catalog(4924, 1, &[Arg::Str(column), Arg::Str(table)])
+    }
+
     /// Error 5074, severity 16, state 1 (`ALTER TABLE dbo.ix_t DROP COLUMN b;` after
     /// `CREATE INDEX ix ON dbo.ix_t(b);`): an index or another object still references
     /// the column.
@@ -6923,6 +6945,22 @@ mod tests {
                 "'nosuch' is not the name of a constraint here.".to_owned(),
             ),
             (
+                // ALTER TABLE dbo.nosuch ADD c int NULL;
+                SqlError::cannot_find_object_to_alter_table("dbo.nosuch"),
+                4902,
+                16,
+                1,
+                "Object \"dbo.nosuch\" was not found: it does not exist or this login lacks permissions.".to_owned(),
+            ),
+            (
+                // ALTER TABLE dbo.t DROP COLUMN nosuch;
+                SqlError::alter_table_drop_column_missing("nosuch", "t"),
+                4924,
+                16,
+                1,
+                "ALTER TABLE DROP COLUMN could not run: column 'nosuch' is missing from table 't'.".to_owned(),
+            ),
+            (
                 // CREATE INDEX ix ON dbo.ix_t(b); ALTER TABLE dbo.ix_t DROP COLUMN b;
                 SqlError::object_depends_on_column("index", "ix", "b"),
                 5074,
@@ -7113,11 +7151,11 @@ mod tests {
             );
             assert_eq!(err.line, 0, "line of error {number}");
         }
-        assert_eq!(expected.len(), 37);
+        assert_eq!(expected.len(), 39);
         let mut numbers: Vec<u32> = expected.iter().map(|row| row.1).collect();
         numbers.sort_unstable();
         numbers.dedup();
-        assert_eq!(numbers.len(), 32);
+        assert_eq!(numbers.len(), 34);
     }
 
     /// Error 1909 sends two states, so it carries two constructors rather than a state

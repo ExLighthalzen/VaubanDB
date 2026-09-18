@@ -104,6 +104,82 @@ pub trait CatalogView {
         false
     }
 
+    /// Name of a non-key index on `column` of `table`, when the catalogue knows one
+    /// (`alter.rs`).
+    fn index_on_column(&self, table: ObjectId, column: &str) -> Option<String> {
+        let _ = (table, column);
+        None
+    }
+
+    /// Names of constraints on `table` (`alter.rs`).
+    fn constraint_names_on_table(&self, table: ObjectId) -> Vec<String> {
+        let _ = table;
+        Vec::new()
+    }
+
+    /// Whether an object named `name` already exists in the current database (`alter.rs`).
+    fn object_name_taken(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+
+    /// Key columns of the `PRIMARY KEY` of `table`, when one is declared (`alter.rs`).
+    fn primary_key_columns(&self, table: ObjectId) -> Option<Vec<String>> {
+        let _ = table;
+        None
+    }
+
+    /// Name of the `PRIMARY KEY` constraint on `table`, when one is declared (`alter.rs`).
+    fn primary_key_constraint_name(&self, table: ObjectId) -> Option<String> {
+        let _ = table;
+        None
+    }
+
+    /// Whether the named `FOREIGN KEY` on `table` references `column` (`alter.rs`).
+    fn foreign_key_constraint_on_column(
+        &self,
+        table: ObjectId,
+        constraint: &str,
+        column: &str,
+    ) -> bool {
+        let _ = (table, constraint, column);
+        false
+    }
+
+    /// Whether the named `UNIQUE` constraint on `table` includes `column` (`alter.rs`).
+    fn unique_constraint_on_column(&self, table: ObjectId, constraint: &str, column: &str) -> bool {
+        let _ = (table, constraint, column);
+        false
+    }
+
+    /// Whether `table` declares a `UNIQUE` key exactly on `columns`, in order (`alter.rs`).
+    fn unique_key_on(&self, table: ObjectId, columns: &[String]) -> bool {
+        let _ = (table, columns);
+        false
+    }
+
+    /// Whether the named `CHECK` on `table` mentions `column` (`alter.rs`).
+    fn check_constraint_mentions_column(
+        &self,
+        table: ObjectId,
+        constraint: &str,
+        column: &str,
+    ) -> bool {
+        let _ = (table, constraint, column);
+        false
+    }
+
+    /// Whether the named `DEFAULT` on `table` applies to `column` (`alter.rs`).
+    fn default_constraint_on_column(
+        &self,
+        table: ObjectId,
+        constraint: &str,
+        column: &str,
+    ) -> bool {
+        let _ = (table, constraint, column);
+        false
+    }
+
     /// Classifies the written name in the current database and default schema.
     /// `Unknown` means no classification is available, not that the object is absent.
     ///
