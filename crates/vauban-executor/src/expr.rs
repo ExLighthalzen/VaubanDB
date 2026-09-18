@@ -73,7 +73,7 @@ use vauban_types::{
     eval_binary,
 };
 
-use crate::context::ExecContext;
+use crate::context::{ExecContext, SLOT_COLUMN_ID};
 use crate::errors::at;
 use crate::row::Row;
 
@@ -147,10 +147,10 @@ pub fn eval_expr(
         }
         BoundExprKind::Compare { op, left, right } => {
             let collation = comparison_collation(left, right);
-            let left = eval_expr(left, row, ctx)?;
-            let right = eval_expr(right, row, ctx)?;
-            // `Ok(None)` means one side is `NULL`: the comparison is unknown, not false.
-            match compare(&left, &right, &collation).map_err(|e| at(e, expr.line))? {
+            let line = expr.line;
+            let left = eval_expr(left, row, ctx).map_err(|e| compare_operand_error(e, line))?;
+            let right = eval_expr(right, row, ctx).map_err(|e| compare_operand_error(e, line))?;
+            match compare(&left, &right, &collation).map_err(|e| at(e, line))? {
                 Some(ordering) => Ok(Value::Bit(holds(*op, ordering))),
                 None => Ok(Value::Null),
             }
@@ -197,14 +197,23 @@ pub fn eval_expr(
         // reference is to an outer row pushed by a correlated join, in which case the
         // outer rows of the context are consulted instead.
         BoundExprKind::ColumnRef(binding) => {
-            let row = if ctx.column_is_outer(binding.column) {
-                ctx.outer_rows().last().ok_or_else(|| {
-                    bug(&format!(
-                        "eval_expr: outer column `{}` is evaluated without an outer row",
-                        binding.name
-                    ))
-                })?
-            } else if let Some(row) = row {
+            if binding.column == SLOT_COLUMN_ID {
+                let row = if let Some(row) = row {
+                    row
+                } else {
+                    ctx.outer_rows().last().ok_or_else(|| {
+                        bug(&format!(
+                            "eval_expr: column `{}` is evaluated without a row",
+                            binding.name
+                        ))
+                    })?
+                };
+                return ctx.read_local_column(row, binding);
+            }
+            if ctx.column_is_outer(binding.column) {
+                return ctx.read_outer_column(binding.column, &binding.name);
+            }
+            let row = if let Some(row) = row {
                 row
             } else {
                 ctx.outer_rows().last().ok_or_else(|| {
@@ -214,14 +223,18 @@ pub fn eval_expr(
                     ))
                 })?
             };
-            row.get(binding.index).cloned().ok_or_else(|| {
-                bug(&format!(
-                    "eval_expr: column `{}` is at index {} of a row of {} value(s)",
-                    binding.name,
-                    binding.index,
-                    row.len()
-                ))
-            })
+            if let Some(value) = row.get(binding.index) {
+                return Ok(value.clone());
+            }
+            if ctx.subquery_locals().is_some() {
+                return ctx.read_local_column(row, binding);
+            }
+            Err(bug(&format!(
+                "eval_expr: column `{}` is at index {} of a row of {} value(s)",
+                binding.name,
+                binding.index,
+                row.len()
+            )))
         }
         BoundExprKind::Case {
             operand,
@@ -457,6 +470,14 @@ fn comparison_collation(left: &BoundExpr, right: &BoundExpr) -> Collation {
         .collation
         .or(right.ty.collation)
         .unwrap_or(Collation::DEFAULT)
+}
+
+fn compare_operand_error(err: SqlError, line: u32) -> SqlError {
+    if err.number == 512 {
+        err.with_line(line)
+    } else {
+        at(err, line)
+    }
 }
 
 /// `left op right`, with the `NULL` of the nine arithmetic operators.

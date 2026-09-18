@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use vauban_binder::{OutputSchema, SessionOptions};
+use vauban_binder::{ColumnBinding, OutputSchema, SessionOptions};
 use vauban_catalog::{Catalog, ColumnId};
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
 use vauban_planner::SubPlan;
@@ -18,6 +18,8 @@ use vauban_txn::{IsolationLevel, LockTimeout, LockWait, TransactionManager, TxnH
 use vauban_types::{Decimal, TypeInfo, Value};
 
 use crate::row::Row;
+
+pub(crate) const SLOT_COLUMN_ID: ColumnId = ColumnId(0);
 
 /// How many rows the driving loop of a query lets through between two reads of the
 /// cancellation token.
@@ -306,6 +308,9 @@ pub struct ExecContext<'a> {
     /// row through [`eval_expr`](crate::expr::eval_expr), which consults this stack when
     /// the current row is `None`.
     outer_rows: Vec<Row>,
+    /// Scan bindings for each [`ExecContext::outer_rows`] entry: position `i` in the row
+    /// holds the value of `outer_bindings[i]`.
+    outer_bindings: Vec<Vec<ColumnBinding>>,
     /// The subplans of the active [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval)
     /// row, in expression order.
     active_subplans: Option<Vec<SubPlan>>,
@@ -315,6 +320,7 @@ pub struct ExecContext<'a> {
     subquery_cache: Vec<Option<Value>>,
     /// Column identifiers exposed by the inner plan currently being evaluated.
     subquery_locals: Option<HashSet<ColumnId>>,
+    subquery_row_bindings: Option<Vec<ColumnBinding>>,
     /// When set, each `open` of a subquery inner plan increments this counter.
     subquery_open_count: Option<Rc<Cell<usize>>>,
     /// When set, each `next` of a subquery inner plan increments this counter.
@@ -341,10 +347,12 @@ impl<'a> ExecContext<'a> {
             session: None,
             infos: Vec::new(),
             outer_rows: Vec::new(),
+            outer_bindings: Vec::new(),
             active_subplans: None,
             subquery_slot: 0,
             subquery_cache: Vec::new(),
             subquery_locals: None,
+            subquery_row_bindings: None,
             subquery_open_count: None,
             subquery_next_count: None,
         }
@@ -409,12 +417,13 @@ impl<'a> ExecContext<'a> {
     }
 
     /// Pushes a row onto the outer-row stack for correlated joins: the row is visible
-    /// through [`eval_expr`](crate::expr::eval_expr) for any `ColumnRef` whose index is
-    /// within it.
+    /// through [`eval_expr`](crate::expr::eval_expr) for any `ColumnRef` whose
+    /// [`ColumnId`](vauban_catalog::ColumnId) appears in `bindings`.
     ///
     /// Popped by [`ExecContext::pop_outer`].
-    pub fn push_outer(&mut self, row: Row) {
+    pub fn push_outer(&mut self, row: Row, bindings: Vec<ColumnBinding>) {
         self.outer_rows.push(row);
+        self.outer_bindings.push(bindings);
     }
 
     /// Pops the outer row that [`ExecContext::push_outer`] pushed. The caller must match
@@ -422,7 +431,34 @@ impl<'a> ExecContext<'a> {
     /// clone it to keep it.
     #[must_use]
     pub fn pop_outer(&mut self) -> Option<Row> {
+        self.outer_bindings.pop();
         self.outer_rows.pop()
+    }
+
+    /// Reads one outer column from the stack, searching from the innermost frame outward.
+    ///
+    /// # Errors
+    ///
+    /// The internal error 50000 when no frame exposes `column`.
+    pub(crate) fn read_outer_column(
+        &self,
+        column: ColumnId,
+        name: &str,
+    ) -> SqlResult<vauban_types::Value> {
+        for (row, bindings) in self.outer_rows.iter().zip(self.outer_bindings.iter()).rev() {
+            let Some(pos) = bindings.iter().position(|b| b.column == column) else {
+                continue;
+            };
+            return row.get(pos).cloned().ok_or_else(|| {
+                bug(&format!(
+                    "read_outer_column: column `{name}` is at index {pos} of a row of {} value(s)",
+                    row.len()
+                ))
+            });
+        }
+        Err(bug(&format!(
+            "read_outer_column: column `{name}` is evaluated without an outer row"
+        )))
     }
 
     /// The outer row stack, for [`eval_expr`](crate::expr::eval_expr) to resolve a
@@ -487,17 +523,56 @@ impl<'a> ExecContext<'a> {
     }
 
     /// Marks which columns belong to the inner plan of a correlated subquery.
-    pub(crate) fn push_subquery_locals(&mut self, locals: HashSet<ColumnId>) {
+    pub(crate) fn push_subquery_locals(
+        &mut self,
+        locals: HashSet<ColumnId>,
+        bindings: Vec<ColumnBinding>,
+    ) {
         self.subquery_locals = Some(locals);
+        self.subquery_row_bindings = Some(bindings);
     }
 
     /// Clears [`ExecContext::push_subquery_locals`].
     pub(crate) fn pop_subquery_locals(&mut self) {
         self.subquery_locals = None;
+        self.subquery_row_bindings = None;
+    }
+
+    #[must_use]
+    pub(crate) fn subquery_locals(&self) -> Option<&HashSet<ColumnId>> {
+        self.subquery_locals.as_ref()
+    }
+
+    pub(crate) fn read_local_column(&self, row: &Row, binding: &ColumnBinding) -> SqlResult<Value> {
+        if binding.index < row.len()
+            && let Some(value) = row.get(binding.index)
+        {
+            return Ok(value.clone());
+        }
+        if let Some(bindings) = &self.subquery_row_bindings
+            && let Some(pos) = bindings
+                .iter()
+                .position(|item| item.column == binding.column)
+        {
+            return row.get(pos).cloned().ok_or_else(|| {
+                bug(&format!(
+                    "read_local_column: column `{}` is at index {pos} of a row of {} value(s)",
+                    binding.name,
+                    row.len()
+                ))
+            });
+        }
+        Err(bug(&format!(
+            "read_local_column: column `{}` is missing from the inner row",
+            binding.name
+        )))
     }
 
     /// Whether `column` is read from the outer row pushed by [`ExecContext::push_outer`].
     pub(crate) fn column_is_outer(&self, column: ColumnId) -> bool {
+        if column == SLOT_COLUMN_ID {
+            return false;
+        }
         self.subquery_locals
             .as_ref()
             .is_some_and(|local| !local.contains(&column))
@@ -534,7 +609,7 @@ impl<'a> ExecContext<'a> {
         &mut self,
         plan: &vauban_planner::PhysicalPlan,
     ) -> SqlResult<Value> {
-        crate::ops::subquery::eval_exists_plan(plan, self)
+        crate::ops::subquery::eval_exists_plan(plan, self, None, Some(plan))
     }
 
     /// Integration tests in `tests/subquery.rs` exercise the production path.

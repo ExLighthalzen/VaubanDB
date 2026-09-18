@@ -11,7 +11,7 @@
 //! reference the outer row, the join pushes the outer row into the context before opening
 //! the inner, so that `eval_expr` resolves the column references against it.
 
-use vauban_binder::{BoundExpr, OutputSchema};
+use vauban_binder::{BoundExpr, BoundExprKind, ColumnBinding, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{PhysicalJoinKind, PhysicalPlan};
 use vauban_types::Value;
@@ -19,6 +19,7 @@ use vauban_types::Value;
 use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
 use crate::expr::{as_condition, eval_expr};
 use crate::operator::{Operator, build_operator};
+use crate::ops::subquery::scan_column_bindings;
 use crate::row::Row;
 
 /// Where the join stands between two `next()` calls.
@@ -85,6 +86,8 @@ pub struct NestedLoopJoin<'a> {
     pub unmatched_outer: Vec<Row>,
     /// How many outer rows were pulled since the last cancellation check.
     pub rows_since_cancel: u64,
+    /// Scan bindings of the outer side, passed to [`ExecContext::push_outer`].
+    pub outer_bindings: Vec<ColumnBinding>,
 }
 
 /// Builds the operator of a [`PhysicalPlan::NestedLoopJoin`].
@@ -120,6 +123,7 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         matched: Vec::new(),
         unmatched_outer: Vec::new(),
         rows_since_cancel: 0,
+        outer_bindings: scan_column_bindings(outer),
     }))
 }
 
@@ -129,10 +133,18 @@ impl<'a> NestedLoopJoin<'a> {
         on: &Option<BoundExpr>,
         combined: &Row,
         ctx: &mut ExecContext<'a>,
+        outer_width: usize,
+        inner_width: usize,
+        semi: bool,
     ) -> SqlResult<Option<bool>> {
         match on {
             Some(predicate) => {
-                let value = eval_expr(predicate, Some(combined), ctx)?;
+                let predicate = if semi {
+                    remap_semi_on(predicate, outer_width, inner_width)
+                } else {
+                    predicate.clone()
+                };
+                let value = eval_expr(&predicate, Some(combined), ctx)?;
                 as_condition(&value)
             }
             None => Ok(Some(true)),
@@ -145,11 +157,14 @@ impl<'a> NestedLoopJoin<'a> {
         outer: &Row,
         inner: &Row,
         ctx: &mut ExecContext<'a>,
+        _outer_width: usize,
+        _inner_width: usize,
+        semi: bool,
     ) -> SqlResult<Option<Row>> {
         let mut combined = Row::with_capacity(outer.len() + inner.len());
         combined.extend_from_slice(outer);
         combined.extend_from_slice(inner);
-        match Self::check_on(on, &combined, ctx)? {
+        match Self::check_on(on, &combined, ctx, outer.len(), inner.len(), semi)? {
             None | Some(false) => Ok(None),
             Some(true) => Ok(Some(combined)),
         }
@@ -284,14 +299,26 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                     outer_row,
                     had_match,
                 } => {
+                    let outer_width = self.outer_width;
+                    let inner_width = self.inner_width;
+                    let semi = matches!(
+                        self.kind,
+                        PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi
+                    );
                     match inner.next(ctx)? {
                         Some(inner_row) => {
                             let holds = match self.kind {
                                 PhysicalJoinKind::Cross => true,
-                                PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi => {
-                                    Self::pair(&self.on, outer_row, &inner_row, ctx)?.is_some()
-                                }
-                                _ => Self::pair(&self.on, outer_row, &inner_row, ctx)?.is_some(),
+                                _ => Self::pair(
+                                    &self.on,
+                                    outer_row,
+                                    &inner_row,
+                                    ctx,
+                                    outer_width,
+                                    inner_width,
+                                    semi,
+                                )?
+                                .is_some(),
                             };
                             if holds {
                                 *had_match = true;
@@ -308,9 +335,15 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                     self.phase = Phase::NeedOuter;
                                     continue;
                                 }
-                                if let Some(combined) =
-                                    Self::pair(&self.on, outer_row, &inner_row, ctx)?
-                                {
+                                if let Some(combined) = Self::pair(
+                                    &self.on,
+                                    outer_row,
+                                    &inner_row,
+                                    ctx,
+                                    outer_width,
+                                    inner_width,
+                                    semi,
+                                )? {
                                     return Ok(Some(combined));
                                 }
                             }
@@ -353,12 +386,24 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                     pos,
                     had_match,
                 } => {
+                    let outer_width = self.outer_width;
+                    let inner_width = self.inner_width;
+                    let semi = matches!(
+                        self.kind,
+                        PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi
+                    );
                     while *pos < self.inner_rows.len() {
                         let p = *pos;
                         *pos += 1;
-                        if let Some(combined) =
-                            Self::pair(&self.on, outer_row, &self.inner_rows[p], ctx)?
-                        {
+                        if let Some(combined) = Self::pair(
+                            &self.on,
+                            outer_row,
+                            &self.inner_rows[p],
+                            ctx,
+                            outer_width,
+                            inner_width,
+                            semi,
+                        )? {
                             self.matched[p] = true;
                             *had_match = true;
                             return Ok(Some(combined));
@@ -387,7 +432,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 | PhysicalJoinKind::Cross
                                 | PhysicalJoinKind::Inner
                                 | PhysicalJoinKind::Left => {
-                                    ctx.push_outer(row.clone());
+                                    ctx.push_outer(row.clone(), self.outer_bindings.clone());
                                     let mut inner = build_operator(&self.inner_plan)?;
                                     inner.open(ctx)?;
                                     self.phase = Phase::Scanning {
@@ -432,5 +477,42 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
 
     fn schema(&self) -> &OutputSchema {
         &self.schema
+    }
+}
+
+fn remap_semi_on(expr: &BoundExpr, outer_width: usize, inner_width: usize) -> BoundExpr {
+    BoundExpr {
+        kind: remap_semi_on_kind(expr.kind.clone(), outer_width, inner_width),
+        ty: expr.ty.clone(),
+        line: expr.line,
+    }
+}
+
+fn remap_semi_on_kind(
+    kind: BoundExprKind,
+    outer_width: usize,
+    inner_width: usize,
+) -> BoundExprKind {
+    match kind {
+        BoundExprKind::ColumnRef(mut binding) => {
+            if binding.index >= outer_width && inner_width > 0 {
+                binding.index = outer_width + (binding.index - outer_width) % inner_width;
+            }
+            BoundExprKind::ColumnRef(binding)
+        }
+        BoundExprKind::Compare { op, left, right } => BoundExprKind::Compare {
+            op,
+            left: Box::new(remap_semi_on(&left, outer_width, inner_width)),
+            right: Box::new(remap_semi_on(&right, outer_width, inner_width)),
+        },
+        BoundExprKind::Logical { op, left, right } => BoundExprKind::Logical {
+            op,
+            left: Box::new(remap_semi_on(&left, outer_width, inner_width)),
+            right: Box::new(remap_semi_on(&right, outer_width, inner_width)),
+        },
+        BoundExprKind::Not(inner) => {
+            BoundExprKind::Not(Box::new(remap_semi_on(&inner, outer_width, inner_width)))
+        }
+        other => other,
     }
 }

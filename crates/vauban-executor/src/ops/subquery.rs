@@ -3,8 +3,10 @@
 
 use std::collections::HashSet;
 
-use vauban_binder::{BoundExpr, BoundExprKind, OutputSchema};
+use vauban_binder::{AggregateCall, BoundExpr, BoundExprKind, ColumnBinding, OutputSchema};
 use vauban_catalog::ColumnId;
+
+use crate::context::SLOT_COLUMN_ID;
 use vauban_errors::{SqlError, SqlResult};
 use vauban_planner::{PhysicalPlan, SubPlan};
 use vauban_types::{Value, compare};
@@ -20,6 +22,7 @@ pub struct SubqueryEval<'a> {
     input: Box<dyn Operator<'a> + 'a>,
     subplans: Vec<SubPlan>,
     schema: OutputSchema,
+    input_bindings: Vec<ColumnBinding>,
     rows_since_cancel: u64,
     outer_pushed: bool,
 }
@@ -42,6 +45,7 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         input: build_operator(input)?,
         subplans: subplans.clone(),
         schema: schema.clone(),
+        input_bindings: scan_column_bindings(input),
         rows_since_cancel: 0,
         outer_pushed: false,
     }))
@@ -74,7 +78,7 @@ impl<'a> Operator<'a> for SubqueryEval<'a> {
             return Ok(None);
         }
         ctx.begin_subquery_row(&self.subplans);
-        ctx.push_outer(row.clone());
+        ctx.push_outer(row.clone(), self.input_bindings.clone());
         self.outer_pushed = true;
         Ok(Some(row))
     }
@@ -102,17 +106,17 @@ pub(crate) fn eval_subplan_slot(
             return Ok(cached);
         }
         let value = if exists {
-            eval_exists_plan(&subplan.plan, ctx)?
+            eval_exists_plan(&subplan.plan, ctx, row, None)?
         } else {
-            eval_scalar_plan(&subplan.plan, row, ctx, Some(line))?
+            eval_scalar_plan(&subplan.plan, row, ctx, Some(line), None)?
         };
         ctx.store_subquery_cache(slot, value.clone());
         return Ok(value);
     }
     if exists {
-        eval_exists_plan(&subplan.plan, ctx)
+        eval_exists_plan(&subplan.plan, ctx, row, None)
     } else {
-        eval_scalar_plan(&subplan.plan, row, ctx, Some(line))
+        eval_scalar_plan(&subplan.plan, row, ctx, Some(line), None)
     }
 }
 
@@ -122,11 +126,16 @@ pub(crate) fn eval_scalar_plan(
     row: Option<&Row>,
     ctx: &mut ExecContext<'_>,
     line: Option<u32>,
+    source_plan: Option<&PhysicalPlan>,
 ) -> SqlResult<Value> {
-    let _ = row;
     let locals = local_column_ids(plan);
-    ctx.push_subquery_locals(locals);
+    let bindings = scan_column_bindings(plan);
+    ctx.push_subquery_locals(locals, bindings);
+    let pushed = push_enclosing_outer(ctx, row, source_plan.or(Some(plan)));
     let result = eval_scalar_plan_inner(plan, ctx, line);
+    if pushed {
+        let _ = ctx.pop_outer();
+    }
     ctx.pop_subquery_locals();
     result
 }
@@ -160,10 +169,20 @@ fn eval_scalar_plan_inner(
 }
 
 /// `EXISTS`: true on the first row, false on an empty input.
-pub(crate) fn eval_exists_plan(plan: &PhysicalPlan, ctx: &mut ExecContext<'_>) -> SqlResult<Value> {
+pub(crate) fn eval_exists_plan(
+    plan: &PhysicalPlan,
+    ctx: &mut ExecContext<'_>,
+    enclosing: Option<&Row>,
+    source_plan: Option<&PhysicalPlan>,
+) -> SqlResult<Value> {
     let locals = local_column_ids(plan);
-    ctx.push_subquery_locals(locals);
+    let bindings = scan_column_bindings(plan);
+    ctx.push_subquery_locals(locals, bindings);
+    let pushed = push_enclosing_outer(ctx, enclosing, source_plan.or(Some(plan)));
     let result = eval_exists_plan_inner(plan, ctx);
+    if pushed {
+        let _ = ctx.pop_outer();
+    }
     ctx.pop_subquery_locals();
     result
 }
@@ -187,8 +206,13 @@ pub(crate) fn eval_in_subquery_plan(
     line: u32,
 ) -> SqlResult<Value> {
     let locals = local_column_ids(plan);
-    ctx.push_subquery_locals(locals);
+    let bindings = scan_column_bindings(plan);
+    ctx.push_subquery_locals(locals, bindings);
+    let pushed = push_enclosing_outer(ctx, row, None);
     let result = eval_in_subquery_plan_inner(plan, tested, row, ctx, line);
+    if pushed {
+        let _ = ctx.pop_outer();
+    }
     ctx.pop_subquery_locals();
     result
 }
@@ -270,6 +294,68 @@ pub(crate) fn eval_subquery_expr(
     }
 }
 
+/// Pushes `row` when it carries columns an nested correlated plan must read.
+fn push_enclosing_outer(
+    ctx: &mut ExecContext<'_>,
+    row: Option<&Row>,
+    source_plan: Option<&PhysicalPlan>,
+) -> bool {
+    let Some(row) = row else {
+        return false;
+    };
+    if ctx
+        .outer_rows()
+        .last()
+        .is_some_and(|top| top.as_slice() == row)
+    {
+        return false;
+    }
+    let bindings = source_plan.map_or_else(Vec::new, scan_column_bindings);
+    if bindings.is_empty() {
+        return false;
+    }
+    ctx.push_outer(row.clone(), bindings);
+    true
+}
+
+/// Scan bindings describing how each position of a plan's row is laid out.
+pub(crate) fn scan_column_bindings(plan: &PhysicalPlan) -> Vec<ColumnBinding> {
+    match plan {
+        PhysicalPlan::TableScan { columns, .. } | PhysicalPlan::IndexSeek { columns, .. } => {
+            columns.clone()
+        }
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Top { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::TopN { input, .. }
+        | PhysicalPlan::SubqueryEval { input, .. } => scan_column_bindings(input),
+        PhysicalPlan::HashAggregate {
+            input,
+            group_by,
+            aggregates,
+            schema,
+            ..
+        }
+        | PhysicalPlan::StreamAggregate {
+            input,
+            group_by,
+            aggregates,
+            schema,
+            ..
+        } => aggregate_row_bindings(input, group_by, aggregates, schema),
+        PhysicalPlan::Distinct(input) => scan_column_bindings(input),
+        PhysicalPlan::NestedLoopJoin { outer, inner, .. } => join_row_bindings(outer, inner),
+        PhysicalPlan::HashJoin { build, probe, .. } => join_row_bindings(build, probe),
+        PhysicalPlan::Union { inputs, .. }
+        | PhysicalPlan::Except { inputs, .. }
+        | PhysicalPlan::Intersect { inputs, .. } => {
+            inputs.first().map_or_else(Vec::new, scan_column_bindings)
+        }
+        PhysicalPlan::OneRow | PhysicalPlan::Values { .. } => Vec::new(),
+    }
+}
+
 fn local_column_ids(plan: &PhysicalPlan) -> HashSet<ColumnId> {
     let mut ids = HashSet::new();
     collect_local_column_ids(plan, &mut ids);
@@ -303,7 +389,10 @@ fn collect_local_column_ids(plan: &PhysicalPlan, ids: &mut HashSet<ColumnId>) {
         | PhysicalPlan::TopN { input, .. }
         | PhysicalPlan::SubqueryEval { input, .. }
         | PhysicalPlan::HashAggregate { input, .. }
-        | PhysicalPlan::StreamAggregate { input, .. } => collect_local_column_ids(input, ids),
+        | PhysicalPlan::StreamAggregate { input, .. } => {
+            collect_local_column_ids(input, ids);
+            ids.insert(SLOT_COLUMN_ID);
+        }
         PhysicalPlan::Distinct(input) => collect_local_column_ids(input, ids),
         PhysicalPlan::Union { inputs, .. }
         | PhysicalPlan::Except { inputs, .. }
@@ -314,6 +403,36 @@ fn collect_local_column_ids(plan: &PhysicalPlan, ids: &mut HashSet<ColumnId>) {
         }
         PhysicalPlan::OneRow | PhysicalPlan::Values { .. } => {}
     }
+}
+
+fn join_row_bindings(left: &PhysicalPlan, right: &PhysicalPlan) -> Vec<ColumnBinding> {
+    let mut bindings = scan_column_bindings(left);
+    let left_width = bindings.len();
+    for mut binding in scan_column_bindings(right) {
+        binding.index += left_width;
+        bindings.push(binding);
+    }
+    bindings
+}
+
+fn aggregate_row_bindings(
+    input: &PhysicalPlan,
+    group_by: &[BoundExpr],
+    aggregates: &[AggregateCall],
+    schema: &OutputSchema,
+) -> Vec<ColumnBinding> {
+    let _ = (group_by, aggregates);
+    let mut bindings = scan_column_bindings(input);
+    let group_len = schema.columns.len().saturating_sub(aggregates.len());
+    for index in group_len..schema.columns.len() {
+        bindings.push(ColumnBinding {
+            column: SLOT_COLUMN_ID,
+            index,
+            name: schema.columns[index].name.clone(),
+            ty: schema.columns[index].ty.clone(),
+        });
+    }
+    bindings
 }
 
 fn bug(what: &str) -> SqlError {
