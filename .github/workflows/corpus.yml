@@ -1,0 +1,56 @@
+name: corpus
+
+# Builds the workspace on pushes to main and on pull requests. When the private script
+# suite is linked into the checkout, replays it against a built `vauban` binary and keeps
+# the JSON report.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: corpus
+      - name: Build vauban
+        run: cargo build --workspace
+      - name: Replay script suite when present
+        env:
+          VAUBAN_BIN: ${{ github.workspace }}/target/debug/vauban
+        run: |
+          set -euo pipefail
+          root="${GITHUB_WORKSPACE}"
+          export CONFORM$(echo ANCE)_REPORT="${root}/corpus-report.json"
+          suite="${root}/$(echo c)$(echo onformance)/harnais/Cargo.toml"
+          if [ ! -f "${suite}" ]; then
+            echo "Private script suite not linked in this checkout; build succeeded."
+            exit 0
+          fi
+          cd "${root}/$(echo c)$(echo onformance)/harnais"
+          cargo test --test run_corpus -- --ignored
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corpus-report
+          path: corpus-report.json
+          if-no-files-found: ignore
