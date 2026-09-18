@@ -171,6 +171,16 @@ impl Catalog {
     ) -> SqlResult<Option<Decimal>> {
         identity::identity_current(self, txn, table_id)
     }
+
+    /// Clears the identity counter of `table_id` so the next [`Self::next_identity`] starts
+    /// from the seed again. See `identity.rs`.
+    pub fn reset_identity_for_truncate(
+        &self,
+        txn: &TxnHandle,
+        table_id: ObjectId,
+    ) -> SqlResult<()> {
+        identity::reset_for_truncate(self, txn, table_id)
+    }
 }
 
 #[cfg(test)]

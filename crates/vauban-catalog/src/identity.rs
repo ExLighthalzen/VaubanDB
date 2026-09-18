@@ -87,10 +87,13 @@ const MARKER_OBJECT_ID: i32 = 0;
 /// column of `table`, open a transaction of the catalogue's own, read and write the counter
 /// row in it, commit it, and give the value back as a [`Decimal`].
 ///
-/// `caller` names the transaction the value is for. It is not written to: the value stays
-/// consumed after a `commit` and after a `rollback` of it (unit test
+/// `caller` names the transaction the value is for. The counter row is read through its
+/// snapshot so a `TRUNCATE TABLE` reset in that transaction is visible before it commits
+/// (unit test `truncate_rollback_restores_identity_counter` in `truncate_into.rs`). The
+/// write still commits in a transaction of the catalogue's own, so the value stays consumed
+/// after a `rollback` of `caller` on an `INSERT` alone (unit test
 /// `caller_rollback_does_not_rewind_identity`). The metadata is read from the in-memory
-/// [`TableStore`] and not from versioned rows, so no snapshot of `caller` is taken either.
+/// [`TableStore`] and not from versioned rows.
 ///
 /// # Errors
 ///
@@ -111,12 +114,11 @@ pub(crate) fn next_identity(
     caller: &TxnHandle,
     table: ObjectId,
 ) -> SqlResult<Decimal> {
-    let _ = caller;
     let mut store = table::store(catalog);
     table::refresh(catalog, &mut store)?;
     let spec = identity_spec(&store, table)?;
     let handle = catalog.txn.begin(IsolationLevel::ReadCommitted);
-    let value = match hand_out(catalog, &handle, table, spec) {
+    let value = match hand_out(catalog, &handle, caller, table, spec) {
         Ok(value) => {
             catalog.txn.commit(handle)?;
             value
@@ -185,15 +187,46 @@ fn identity_spec(store: &TableStore, table: ObjectId) -> SqlResult<IdentitySpec>
         })
 }
 
+/// Locates the counter row of `table` in [`COUNTERS_TABLE`] as `snapshot` sees it.
+fn find_counter_row(
+    catalog: &Catalog,
+    snapshot: &vauban_storage::Snapshot,
+    table: ObjectId,
+) -> SqlResult<Option<(TableId, vauban_storage::RowId, i64)>> {
+    let Some(counters) = counters_table_id(catalog, snapshot)? else {
+        return Ok(None);
+    };
+    for row in catalog.storage.scan(snapshot, counters)? {
+        let (id, values) = row?;
+        if values.0.get(counters_columns::OBJECT_ID) != Some(&Value::I32(table.0)) {
+            continue;
+        }
+        let Some(&Value::I64(last)) = values.0.get(counters_columns::LAST_VALUE) else {
+            return Err(bug(&format!(
+                "{COUNTERS_TABLE} holds a row whose last_value is not a bigint"
+            )));
+        };
+        return Ok(Some((counters, id, last)));
+    }
+    Ok(None)
+}
+
 /// The `last_value` stored for `table` in [`COUNTERS_TABLE`], if the table and a row exist.
 fn read_last_value(
     catalog: &Catalog,
     snapshot: &vauban_storage::Snapshot,
     table: ObjectId,
 ) -> SqlResult<Option<i64>> {
+    Ok(find_counter_row(catalog, snapshot, table)?.map(|(_, _, last)| last))
+}
+
+/// The [`TableId`] of [`COUNTERS_TABLE`] in `master` when `snapshot` sees its marker row.
+fn counters_table_id(
+    catalog: &Catalog,
+    snapshot: &vauban_storage::Snapshot,
+) -> SqlResult<Option<TableId>> {
     let master = master(catalog)?;
     let shape = counters_shape();
-    let mut counters_id = None;
     for (id, stored) in catalog.storage.tables(master)? {
         if stored != shape {
             continue;
@@ -205,28 +238,9 @@ fn read_last_value(
                     text: COUNTERS_TABLE.to_owned(),
                 }))
             {
-                counters_id = Some(id);
-                break;
+                return Ok(Some(id));
             }
         }
-        if counters_id.is_some() {
-            break;
-        }
-    }
-    let Some(counters) = counters_id else {
-        return Ok(None);
-    };
-    for row in catalog.storage.scan(snapshot, counters)? {
-        let (_, values) = row?;
-        if values.0.get(counters_columns::OBJECT_ID) != Some(&Value::I32(table.0)) {
-            continue;
-        }
-        let Some(&Value::I64(last)) = values.0.get(counters_columns::LAST_VALUE) else {
-            return Err(bug(&format!(
-                "{COUNTERS_TABLE} holds a row whose last_value is not a bigint"
-            )));
-        };
-        return Ok(Some(last));
     }
     Ok(None)
 }
@@ -246,26 +260,13 @@ fn read_last_value(
 fn hand_out(
     catalog: &Catalog,
     handle: &TxnHandle,
+    caller: &TxnHandle,
     table: ObjectId,
     spec: IdentitySpec,
 ) -> SqlResult<i64> {
-    let counters = counters_table(catalog, handle)?;
-    let snapshot = catalog.txn.statement_snapshot(handle);
-    let mut current = None;
-    for row in catalog.storage.scan(&snapshot, counters)? {
-        let (id, values) = row?;
-        if values.0.get(counters_columns::OBJECT_ID) != Some(&Value::I32(table.0)) {
-            continue;
-        }
-        let Some(&Value::I64(last)) = values.0.get(counters_columns::LAST_VALUE) else {
-            return Err(bug(&format!(
-                "{COUNTERS_TABLE} holds a row whose last_value is not a bigint"
-            )));
-        };
-        current = Some((id, last));
-        break;
-    }
-    let Some((row, last)) = current else {
+    let caller_snapshot = catalog.txn.statement_snapshot(caller);
+    let Some((counters, row, last)) = find_counter_row(catalog, &caller_snapshot, table)? else {
+        let counters = counters_table(catalog, handle)?;
         catalog
             .storage
             .insert(handle.id, counters, &counter_row(table, spec.seed))?;
@@ -362,6 +363,53 @@ fn master(catalog: &Catalog) -> SqlResult<DbId> {
         .find(|(_, name)| name.eq_ignore_ascii_case(SYSTEM_DATABASES[0]))
         .map(|(id, _)| id)
         .ok_or_else(|| bug("this storage holds no master database"))
+}
+
+/// Removes the counter row of `table` in `caller`, so the next [`next_identity`] hands out
+/// the seed again.
+///
+/// Called from `TRUNCATE TABLE` in the caller's transaction: a rollback of that statement
+/// restores the counter row with it, and the insert after it picks up where the sequence
+/// left off (unit test `truncate_rollback_restores_identity_counter` in
+/// `truncate_into.rs`).
+///
+/// # Errors
+///
+/// [`InternalError::Bug`] when `table` is unknown or has no `IDENTITY` column; the error of a
+/// `storage` call otherwise.
+pub(crate) fn reset_for_truncate(
+    catalog: &Catalog,
+    caller: &TxnHandle,
+    table: ObjectId,
+) -> SqlResult<()> {
+    let mut store = table::store(catalog);
+    table::refresh(catalog, &mut store)?;
+    if identity_spec(&store, table).is_err() {
+        return Ok(());
+    }
+    drop(store);
+    reset_counter_row(catalog, caller, table)
+}
+
+/// Deletes the counter row of `table` inside `handle`, which must be committed by the caller.
+fn reset_counter_row(catalog: &Catalog, handle: &TxnHandle, table: ObjectId) -> SqlResult<()> {
+    let counters = counters_table(catalog, handle)?;
+    let snapshot = catalog.txn.statement_snapshot(handle);
+    for row in catalog.storage.scan(&snapshot, counters)? {
+        let (id, values) = row?;
+        let Some(Value::String(name)) = values.0.get(counters_columns::NAME) else {
+            continue;
+        };
+        if name.text != COUNTERS_TABLE {
+            continue;
+        }
+        if values.0.get(counters_columns::OBJECT_ID) != Some(&Value::I32(table.0)) {
+            continue;
+        }
+        catalog.storage.delete(handle.id, counters, id)?;
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// The value as the caller reads it: `numeric(38, 0)`.
@@ -661,6 +709,22 @@ mod tests {
         let after = begin(&txn);
         let err = catalog.next_identity(&after, table).expect_err("dropped");
         assert!(err.message.contains("no table of object id"), "{err:?}");
+    }
+
+    #[test]
+    fn reset_for_truncate_rollback_restores_the_counter() {
+        let (catalog, txn) = instance();
+        let table = identity_table(&catalog, &txn, "t", 1, 1);
+        let handle = begin(&txn);
+        assert_eq!(next(&catalog, &handle, table), 1);
+        assert_eq!(next(&catalog, &handle, table), 2);
+        assert_eq!(next(&catalog, &handle, table), 3);
+        txn.commit(handle).expect("commit");
+        let trunc = begin(&txn);
+        super::reset_for_truncate(&catalog, &trunc, table).expect("reset");
+        txn.rollback(trunc).expect("rollback");
+        let after = begin(&txn);
+        assert_eq!(next(&catalog, &after, table), 4);
     }
 
     #[test]

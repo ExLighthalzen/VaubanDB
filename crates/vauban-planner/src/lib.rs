@@ -89,6 +89,6 @@ pub use context::{NoIndexes, PlanCatalog, PlanContext, StorageIndexes};
 pub use explain::explain;
 pub use physical::{
     KeyRangeExpr, PhysicalDelete, PhysicalInsert, PhysicalJoinKind, PhysicalPlan,
-    PhysicalStatement, PhysicalUpdate, SubPlan,
+    PhysicalSelectInto, PhysicalStatement, PhysicalUpdate, SubPlan,
 };
 pub use plan::plan;

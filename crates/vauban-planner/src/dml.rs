@@ -3,15 +3,29 @@
 //! the seek that reaches the target rows, and the `spool` flag that protects against the
 //! Halloween problem.
 
-use vauban_binder::{BoundExpr, ColumnBinding, DeletePlan, InsertPlan, UpdatePlan};
+use vauban_binder::{BoundExpr, ColumnBinding, DeletePlan, InsertPlan, SelectIntoPlan, UpdatePlan};
 use vauban_errors::SqlResult;
 use vauban_storage::TableId;
 
 use crate::context::PlanContext;
 use crate::physical::{
-    PhysicalDelete, PhysicalInsert, PhysicalPlan, PhysicalStatement, PhysicalUpdate,
+    PhysicalDelete, PhysicalInsert, PhysicalPlan, PhysicalSelectInto, PhysicalStatement,
+    PhysicalUpdate,
 };
 use crate::plan::plan_node;
+
+/// Plans a `SELECT … INTO` into [`PhysicalStatement::SelectInto`].
+pub(crate) fn plan_select_into(
+    stmt: &SelectIntoPlan,
+    ctx: &PlanContext<'_>,
+) -> SqlResult<PhysicalStatement> {
+    let source = plan_node(&stmt.source, ctx)?;
+    Ok(PhysicalStatement::SelectInto(PhysicalSelectInto {
+        def: stmt.def.clone(),
+        source,
+        spool: false,
+    }))
+}
 
 /// Plans an `INSERT` into [`PhysicalStatement::Insert`].
 pub(crate) fn plan_insert(

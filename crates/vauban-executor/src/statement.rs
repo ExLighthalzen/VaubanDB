@@ -24,6 +24,7 @@
 //! client after an empty result set, where the same 127 folded at compile time reaches
 //! it before any metadata (`compile.rs`).
 
+use vauban_binder::DdlStatement;
 use vauban_errors::SqlResult;
 use vauban_planner::{PhysicalPlan, PhysicalStatement};
 
@@ -110,13 +111,19 @@ fn dispatch<'a>(
     // than be silently reported as something else, exactly as `planner::plan` does.
     match stmt {
         PhysicalStatement::Query(plan) => run_query(plan, ctx, sink),
-        PhysicalStatement::Ddl(ddl) => execute_ddl(ddl, ctx),
+        PhysicalStatement::Ddl(ddl) => match ddl {
+            DdlStatement::TruncateTable { name } => crate::dml::truncate::execute(name, ctx),
+            _ => execute_ddl(ddl, ctx),
+        },
         // `USE` changes no metadata and reads no row: the executor accepts it and answers
         // `NoRows`, and `session` reads the target out of the statement to switch the
         // current database and send its ENVCHANGE. Nothing is done here, so nothing has to
         // be undone when the switch fails.
         PhysicalStatement::Use { .. } => Ok(ExecOutcome::NoRows),
         PhysicalStatement::Insert(insert) => dml::insert::execute(insert, ctx),
+        PhysicalStatement::SelectInto(select_into) => {
+            dml::insert::execute_select_into(select_into, ctx)
+        }
         PhysicalStatement::Update(update) => dml::update_delete::execute_update(update, ctx),
         PhysicalStatement::Delete(delete) => dml::update_delete::execute_delete(delete, ctx),
         PhysicalStatement::SetVariable { .. }

@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 
-use vauban_catalog::{Catalog, ColumnMeta, ObjectId};
+use vauban_binder::ColumnBinding;
+use vauban_catalog::{Catalog, ColumnId, ColumnMeta, ObjectId};
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{Expr, Literal, UnaryOp};
-use vauban_planner::PhysicalInsert;
+use vauban_planner::{PhysicalInsert, PhysicalSelectInto};
 use vauban_storage::{RowId, Storage, TableId, TxnId};
 use vauban_txn::TxnHandle;
 use vauban_types::{
@@ -299,4 +300,37 @@ fn identity_value(dec: &Decimal, col_meta: &ColumnMeta) -> SqlResult<Value> {
 
 fn bug(what: &str) -> SqlError {
     SqlError::from(vauban_errors::InternalError::Bug(what.to_owned()))
+}
+
+// -------------------------------------------------------------------------------------------
+// SELECT … INTO
+// -------------------------------------------------------------------------------------------
+
+/// Creates the table of `stmt` and writes the rows of its source into it.
+pub(crate) fn execute_select_into(
+    stmt: &PhysicalSelectInto,
+    ctx: &mut ExecContext<'_>,
+) -> SqlResult<ExecOutcome> {
+    let catalog: &Catalog = ctx.catalog()?;
+    let handle: &TxnHandle = ctx.handle()?;
+    let meta = catalog.create_table(handle, &stmt.def)?;
+    let columns: Vec<ColumnBinding> = stmt
+        .def
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, col)| ColumnBinding {
+            column: ColumnId(index as i32),
+            index,
+            name: col.name.clone(),
+            ty: col.ty.clone(),
+        })
+        .collect();
+    let insert = PhysicalInsert {
+        table: meta.storage_id,
+        columns,
+        source: stmt.source.clone(),
+        spool: stmt.spool,
+    };
+    execute(&insert, ctx)
 }

@@ -363,6 +363,7 @@ fn statement_reads_user_table(bound: &PhysicalStatement) -> bool {
     match bound {
         PhysicalStatement::Query(plan) => plan_reads_user_table(plan),
         PhysicalStatement::Insert(_)
+        | PhysicalStatement::SelectInto(_)
         | PhysicalStatement::Update(_)
         | PhysicalStatement::Delete(_) => true,
         PhysicalStatement::If { then_, else_, .. } => {

@@ -19,7 +19,7 @@ use vauban_binder::{
     AggregateCall, BoundExpr, BoundProjection, BoundTop, ColumnBinding, DdlStatement, JoinKind,
     LockHints, OutputSchema, SortKey, TxnStatement,
 };
-use vauban_catalog::TableId;
+use vauban_catalog::{TableDef, TableId};
 use vauban_storage::{Direction, IndexId};
 
 /// A statement, planned: what the `executor` runs.
@@ -44,6 +44,8 @@ pub enum PhysicalStatement {
     },
     /// `INSERT`. Not produced yet.
     Insert(PhysicalInsert),
+    /// `SELECT … INTO`.
+    SelectInto(PhysicalSelectInto),
     /// `UPDATE`. Not produced yet.
     Update(PhysicalUpdate),
     /// `DELETE`. Not produced yet.
@@ -348,6 +350,17 @@ pub enum KeyRangeExpr {
     Between(Bound<Vec<BoundExpr>>, Bound<Vec<BoundExpr>>),
     /// The whole index.
     Full,
+}
+
+/// A `SELECT … INTO`, planned.
+#[derive(Debug, Clone)]
+pub struct PhysicalSelectInto {
+    /// The table to create.
+    pub def: TableDef,
+    /// The rows to write into it.
+    pub source: PhysicalPlan,
+    /// True when the source must be read entirely before the first row is written.
+    pub spool: bool,
 }
 
 /// An `INSERT`, planned. Not produced yet.

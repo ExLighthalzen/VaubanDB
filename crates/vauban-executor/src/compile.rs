@@ -240,6 +240,7 @@ pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult
         // the statement runs.
         PhysicalStatement::Ddl(_) | PhysicalStatement::Use { .. } => Ok(()),
         PhysicalStatement::Insert(insert) => compile_plan(&insert.source, ctx),
+        PhysicalStatement::SelectInto(select_into) => compile_plan(&select_into.source, ctx),
         PhysicalStatement::Update(update) => {
             compile_plan(&update.input, ctx)?;
             for (_, expr) in &update.assignments {

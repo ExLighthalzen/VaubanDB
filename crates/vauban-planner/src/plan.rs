@@ -31,7 +31,7 @@ pub fn plan(stmt: BoundStatement, ctx: &PlanContext<'_>) -> SqlResult<PhysicalSt
         BoundStatement::Ddl(ddl) => Ok(PhysicalStatement::Ddl(ddl)),
         BoundStatement::Use { database } => Ok(PhysicalStatement::Use { database }),
         BoundStatement::Insert(insert) => dml::plan_insert(&insert, ctx),
-        BoundStatement::SelectInto(_) => Err(not_implemented("plan", "SELECT … INTO")),
+        BoundStatement::SelectInto(select_into) => dml::plan_select_into(&select_into, ctx),
         BoundStatement::Update(update) => dml::plan_update(&update, ctx),
         BoundStatement::Delete(delete) => dml::plan_delete(&delete, ctx),
         BoundStatement::SetVariable { name, value } => {
