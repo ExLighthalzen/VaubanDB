@@ -270,8 +270,6 @@ fn update_from_binds_a_target_written_as_the_name_of_a_source() {
         "UPDATE t SET a = y.b FROM dbo.t JOIN dbo.u AS y ON t.k = y.k;",
         "UPDATE dbo.t SET a = 1 FROM dbo.t AS x JOIN dbo.u AS y ON x.k = y.k;",
         "UPDATE t SET a = 1 FROM dbo.t AS x JOIN dbo.u AS y ON x.k = y.k;",
-        "UPDATE master.dbo.t SET a = 1 FROM dbo.t JOIN dbo.u AS y ON t.k = y.k;",
-        "UPDATE dbo.t SET a = 1 FROM master.dbo.t JOIN dbo.u AS y ON t.k = y.k;",
         "UPDATE DBO.T SET a = 1 FROM dbo.t AS x JOIN dbo.u AS y ON x.k = y.k;",
     ] {
         assert_eq!(update_of(text).table, TableId(1), "{text}");
@@ -830,6 +828,23 @@ fn the_forms_a_joined_statement_does_not_bind_name_themselves() {
             error.message
         );
     }
+}
+
+/// A target and an unaliased source that share an object name but reach different tables
+/// answer 1013; when the qualifiers name one table (`same_table`), the statement binds.
+#[test]
+fn update_from_three_part_target_and_exposed_names() {
+    for text in [
+        "UPDATE master.dbo.t SET a = y.b FROM dbo.t JOIN dbo.u AS y ON t.k = y.k;",
+        "UPDATE dbo.t SET a = 1 FROM master.dbo.t JOIN dbo.u AS y ON t.k = y.k;",
+    ] {
+        assert_eq!(update_of(text).table, TableId(1), "{text}");
+    }
+    assert_eq!(
+        error_of("UPDATE master.dbo.t SET a = 1 FROM dbo.t AS x JOIN dbo.t AS y ON x.k = y.k;")
+            .number,
+        8154
+    );
 }
 
 /// Without a catalogue the sources of the `FROM` cannot be looked up: the refusal of the

@@ -9,8 +9,8 @@
 //! Each `SET c = e` becomes one entry of `assignments`: the [`ColumnBinding`] of `c` as the
 //! catalogue holds it, and `e` under a [`BoundExprKind::Convert`] towards the type of `c`
 //! (`update_inserts_convert_to_column_type`). The columns of the target are in scope on the
-//! right side of a `SET` and in the `WHERE`: `SET a = a + 1` reads the old value of `a`
-//! (`update_set_reads_the_old_value`). A compound operator is desugared before binding, as
+//! right side of a `SET` and in the `WHERE`: `SET a = a + 1` reads the old value of `a`.
+//! A compound operator is desugared before binding, as
 //! `variables.rs` does for `SET @x += e`: `SET a += 1` binds as `SET a = a + 1`
 //! (`a_compound_assignment_reads_the_column`).
 //!
@@ -77,7 +77,7 @@ use crate::context::{BindContext, CatalogView, ResolvedTableKind};
 use crate::depth::at_statement;
 use crate::errors::{line_of, on_the_statement};
 use crate::expr::{Scope, bind_condition, bind_expr};
-use crate::names::{alias_of, bind_from, from_needs_the_catalogue};
+use crate::names::{alias_of, bind_from, from_needs_the_catalogue, resolve_table};
 use crate::query::{bug, dotted, not_implemented};
 use crate::star::{self, Lookup, Source};
 
@@ -505,7 +505,7 @@ fn dotted_column(column: &ColumnRef) -> String {
 // | `UPDATE dbo.t … FROM dbo.t JOIN dbo.u AS y ON …` | the source `dbo.t` |
 // | `UPDATE t … FROM dbo.t JOIN dbo.u AS y ON …` | the same, one part completed with `dbo` |
 // | `UPDATE dbo.t … FROM dbo.t AS x JOIN dbo.u AS y ON …` | `x`: its alias hides nothing here |
-// | `UPDATE dbo.t … FROM master.dbo.t JOIN dbo.u AS y ON …` | that source, from `master` |
+// | `UPDATE master.dbo.t … FROM dbo.t JOIN dbo.u AS y ON …` | the unaliased `dbo.t` |
 //
 // The fourth line is what tells this rule from a match on the exposed name: `UPDATE dbo.t
 // SET a = 99 FROM dbo.t AS x JOIN dbo.u AS y ON x.k = y.k` writes the rows the join keeps,
@@ -528,7 +528,7 @@ fn dotted_column(column: &ColumnRef) -> String {
 // A one-part target that names an alias of a source wins over a source of the same table
 // name (`update_from_target_t_when_x_and_u_as_t_set_b_binds_u`). When unaliased `dbo.t` and
 // `dbo.u AS t` would expose the same name, the `FROM` answers 1012 before the target is
-// read (`update_from_target_t_when_u_is_aliased_as_t_from_refuses_1012`).
+// read.
 //
 // A target no source names is looked up in the catalogue: 208 when it reaches nothing
 // (`UPDATE z … FROM dbo.t AS x JOIN dbo.u AS y ON …`), and otherwise the table the name
@@ -595,6 +595,8 @@ fn update_from(
     line: u32,
 ) -> SqlResult<BoundStatement> {
     let (sources, scope) = crate::join::bind_from(&stmt.from, line, ctx)?;
+    let target_name = target_name(&stmt.target)?;
+    check_update_target_exposed_names(target_name, &stmt.from, line, ctx)?;
     let target = joined_target(&stmt.target, &stmt.from, line, ctx)?;
     let input = filtered(sources, stmt.where_.as_ref(), &scope, ctx)?;
     let assignments = bind_assignments(
@@ -623,6 +625,8 @@ fn delete_from(
     line: u32,
 ) -> SqlResult<BoundStatement> {
     let (sources, scope) = crate::join::bind_from(&stmt.from, line, ctx)?;
+    let target_name = target_name(&stmt.target)?;
+    check_update_target_exposed_names(target_name, &stmt.from, line, ctx)?;
     let target = joined_target(&stmt.target, &stmt.from, line, ctx)?;
     let input = filtered(sources, stmt.where_.as_ref(), &scope, ctx)?;
     Ok(BoundStatement::Delete(DeletePlan {
@@ -745,6 +749,42 @@ fn pick_target_leaf<'a>(
     }
 }
 
+/// Refuses an `UPDATE`/`DELETE` whose target and an unaliased source of the `FROM` share an
+/// object name but were written with different qualifiers that reach **different** tables
+/// (`master.sys.objects` against `sys.objects`).
+///
+/// # Errors
+///
+/// 1013 on `line` when such a pair is found.
+fn check_update_target_exposed_names(
+    target: &ObjectName,
+    from: &[TableRef],
+    line: u32,
+    ctx: &BindContext<'_>,
+) -> SqlResult<()> {
+    let mut leaves = Vec::new();
+    collect_leaves(from, &mut leaves)?;
+    let target_written = dotted(target);
+    for leaf in leaves {
+        if leaf.alias.is_some() {
+            continue;
+        }
+        if leaf
+            .name
+            .name
+            .value
+            .eq_ignore_ascii_case(&target.name.value)
+            && !dotted(leaf.name).eq_ignore_ascii_case(&target_written)
+            && !same_table(target, leaf.name, ctx)
+        {
+            return Err(
+                SqlError::same_exposed_names(&target_written, &dotted(leaf.name)).with_line(line),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Builds the target from a source the `FROM` reads.
 fn joined_target_from_leaf(leaf: &Leaf<'_>, ctx: &BindContext<'_>) -> SqlResult<JoinedTarget> {
     let catalog = ctx.catalog.ok_or_else(from_needs_the_catalogue)?;
@@ -788,12 +828,10 @@ fn resolve_target_from_catalog(
     line: u32,
     ctx: &BindContext<'_>,
 ) -> SqlResult<JoinedTarget> {
-    let catalog = ctx.catalog.ok_or_else(from_needs_the_catalogue)?;
     if target.server.is_some() {
         return Err(SqlError::invalid_object_name(&dotted(target)).with_line(line));
     }
-    let resolved = catalog
-        .resolve_table(target, ctx.database, ctx.default_schema)
+    let resolved = resolve_table(target, ctx)?
         .ok_or_else(|| SqlError::invalid_object_name(&dotted(target)).with_line(line))?;
     if resolved.kind == ResolvedTableKind::View {
         return Err(not_implemented(

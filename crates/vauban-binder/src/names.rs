@@ -245,6 +245,13 @@ pub(crate) fn check_object_exists(
 /// # Errors
 ///
 /// [`from_needs_the_catalogue`] when the context carries no catalogue.
+pub(crate) fn resolve_table(
+    name: &ObjectName,
+    ctx: &BindContext<'_>,
+) -> SqlResult<Option<ResolvedTable>> {
+    resolve(name, ctx)
+}
+
 fn resolve(name: &ObjectName, ctx: &BindContext<'_>) -> SqlResult<Option<ResolvedTable>> {
     if name.server.is_some() {
         return Ok(None);
