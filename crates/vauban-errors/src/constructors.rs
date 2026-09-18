@@ -873,6 +873,16 @@ impl SqlError {
         from_catalog(8180, 1, &[])
     }
 
+    /// Error 8199, severity 16, state 1 (`DECLARE @t int; EXEC @t;`): `EXECUTE` names a
+    /// procedure by a variable that is not of a character type.
+    ///
+    /// ```text
+    /// The procedure name in EXECUTE must be a string literal or a char, varchar, nchar, or nvarchar variable.
+    /// ```
+    pub fn exec_procedure_name_not_character() -> Self {
+        from_catalog(8199, 1, &[])
+    }
+
     /// Error 15009, severity 16, state 1: `object` does not exist in `database`.
     ///
     /// ```text
@@ -3924,6 +3934,7 @@ mod tests {
             SqlError::parameter_not_supplied("(@x int)SELECT @x", "@x"),
             SqlError::prepared_statement_not_found(123456),
             SqlError::statement_could_not_be_prepared(),
+            SqlError::exec_procedure_name_not_character(),
             SqlError::object_missing_in_database("nosuchobj", "master"),
             SqlError::help_database_not_found("nosuchdb"),
             SqlError::conversion_failed("varchar", "abc", "int"),
@@ -4497,6 +4508,14 @@ mod tests {
                 16,
                 1,
                 "The statement could not be prepared.",
+            ),
+            (
+                // DECLARE @t int; EXEC @t;
+                SqlError::exec_procedure_name_not_character(),
+                8199,
+                16,
+                1,
+                "The procedure name in EXECUTE must be a string literal or a char, varchar, nchar, or nvarchar variable.",
             ),
             (
                 // EXEC sp_help 'nosuchobj';

@@ -108,8 +108,8 @@ pub(crate) fn bind_execute(
 ///
 /// The two variable forms are told apart: `EXEC @t` names a procedure by the variable's
 /// value ([`BoundExecTarget::ProcedureVariable`]), where `EXEC(@t)` runs that value as T-SQL
-/// ([`BoundExecTarget::Dynamic`]). The type of the variable and the 8199 SQL Server raises
-/// for a non-character one belong to the work that brings 8199 to the catalogue.
+/// ([`BoundExecTarget::Dynamic`]). A non-character variable in the first form is 8199; the
+/// parenthesised form is dynamic and answers 102 when its text is not T-SQL.
 fn bind_target(
     target: &ExecuteTarget,
     ctx: &BindContext<'_>,
@@ -122,6 +122,9 @@ fn bind_target(
         }),
         ExecuteTarget::Variable(name) => {
             let variable = bind_variable(name, ctx, line)?;
+            if !variable.ty.ty.is_string() {
+                return Err(SqlError::exec_procedure_name_not_character().with_line(line));
+            }
             Ok(BoundExecTarget::ProcedureVariable(variable))
         }
         ExecuteTarget::Literal(expr) => {

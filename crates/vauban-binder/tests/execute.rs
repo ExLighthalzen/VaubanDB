@@ -14,6 +14,7 @@ use vauban_binder::{
 use vauban_errors::SqlError;
 use vauban_parser::{ParseOptions, parse_batch};
 use vauban_sysfn::register_builtins;
+use vauban_types::{Len, SqlType, TypeInfo};
 
 /// Binds `text` statement by statement against a scope that starts empty, entering each
 /// bound `DECLARE` before the next statement, and stops at the first error.
@@ -201,6 +202,71 @@ fn a_declared_variable_target_is_a_procedure_variable() {
         }
         other => panic!("expected ProcedureVariable, got {other:?}"),
     }
+}
+
+#[test]
+fn an_int_procedure_variable_is_8199() {
+    let error = error_of("DECLARE @t int; EXEC @t;");
+    assert_eq!(error.number, 8199);
+    assert_eq!(error.severity, 16);
+    assert_eq!(error.state, 1);
+}
+
+#[test]
+fn character_procedure_variables_bind() {
+    for text in [
+        "DECLARE @t varchar(20); EXEC @t;",
+        "DECLARE @t nvarchar(20); EXEC @t;",
+    ] {
+        match execute_of(text).target {
+            BoundExecTarget::ProcedureVariable(_) => {}
+            other => panic!("{text} expected ProcedureVariable, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_sysname_procedure_variable_binds() {
+    // `sysname` is `nvarchar(128)` on the server; `DECLARE @t sysname` is not bound here yet.
+    register_builtins();
+    let text = "EXEC @t;";
+    let batch = parse_batch(text, &ParseOptions::default())
+        .unwrap_or_else(|e| unreachable!("{text} parses, got {e:?}"));
+    let mut scope = BatchVariables::new();
+    scope
+        .declare(
+            "@t",
+            TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), false),
+        )
+        .expect("@t is declared once");
+    let ctx = BindContext {
+        text,
+        catalog: None,
+        database: "master",
+        default_schema: "dbo",
+        variables: &scope,
+        options: SessionOptions::default(),
+    };
+    let BoundStatement::Execute(execute) = bind(&batch.statements[0], &ctx)
+        .unwrap_or_else(|error| panic!("{text} binds, got {error:?}"))
+    else {
+        panic!("expected an EXECUTE");
+    };
+    match execute.target {
+        BoundExecTarget::ProcedureVariable(_) => {}
+        other => panic!("expected ProcedureVariable, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_undeclared_procedure_variable_is_137_before_8199() {
+    assert_eq!(error_of("EXEC @t;").number, 137);
+}
+
+#[test]
+fn a_parenthesised_int_variable_is_102_not_8199() {
+    // `EXEC(@t)` is dynamic: the binder checks the text shape, not the procedure-name rule.
+    assert_eq!(error_of("DECLARE @t int = 1; EXEC(@t);").number, 102);
 }
 
 #[test]

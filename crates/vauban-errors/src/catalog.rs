@@ -984,6 +984,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "The statement could not be prepared.",
     },
     ErrorDef {
+        number: 8199,
+        severity: 16,
+        template: "The procedure name in EXECUTE must be a string literal or a char, varchar, nchar, or nvarchar variable.",
+    },
+    ErrorDef {
         number: 8631,
         severity: 17,
         template: "Internal error: the server ran out of stack; the query is probably nested too deeply and needs simplifying.",
@@ -1244,6 +1249,7 @@ mod tests {
         (8178, 16, &["%.*ls", "%.*ls"]),
         (8179, 16, &["%d"]),
         (8180, 16, &[]),
+        (8199, 16, &[]),
         (8631, 17, &[]),
         (9806, 16, &["%.*ls", "%.*ls"]),
         (9807, 16, &["%d"]),
