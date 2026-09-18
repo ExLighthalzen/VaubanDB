@@ -67,6 +67,7 @@
 //! | `ddl_options.rs`, `ddl_alter.rs` | `ALTER DATABASE ... SET`, `ALTER TABLE` |
 //! | `dml/` | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE TABLE` (`dml/mod.rs`) |
 //! | `control.rs` | variables and the control of flow |
+//! | `execute.rs` | `EXECUTE`: arguments evaluated, hand-off to the session |
 //! | `txn_exec.rs` | the transaction statements and the frame around each statement |
 //! | `locking.rs` | reading and writing under locks |
 //! | `tests/exec_shape.rs` | the names `session` compiles against |
@@ -81,6 +82,7 @@ mod ddl_index;
 mod ddl_options;
 mod dml;
 mod errors;
+mod execute;
 mod expr;
 mod locking;
 mod operator;
@@ -95,5 +97,27 @@ pub use compile::compile;
 pub use context::{CancelToken, CollectSink, ExecContext, ExecSession, RowSink};
 pub use expr::eval_expr;
 pub use operator::{Operator, bucket_hash, build_operator, keys_equal};
-pub use row::{ExecOutcome, Row, RowSet};
+pub use row::{EvaluatedExecArg, ExecOutcome, Row, RowSet};
 pub use statement::{execute, execute_collect};
+
+use vauban_binder::BoundExecute;
+use vauban_errors::SqlResult;
+
+/// Evaluates one bound `EXECUTE` and answers what the session runs next.
+///
+/// The entry point until the planner carries `Execute` on [`PhysicalStatement`]: nothing
+/// is handed to `sink`.
+///
+/// # Errors
+///
+/// As [`execute`].
+pub fn execute_bound(
+    stmt: &BoundExecute,
+    ctx: &mut ExecContext<'_>,
+    _sink: &mut dyn RowSink,
+) -> SqlResult<ExecOutcome> {
+    txn_exec::begin_statement(ctx)?;
+    let result = execute::execute(stmt, ctx);
+    txn_exec::end_statement(ctx, &result)?;
+    result
+}

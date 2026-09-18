@@ -89,6 +89,9 @@ pub(crate) fn execute(
                 match run_nested(body, ctx, sink)? {
                     ExecOutcome::Break => break,
                     ExecOutcome::Return(code) => return Ok(ExecOutcome::Return(code)),
+                    flow @ (ExecOutcome::CallProcedure { .. } | ExecOutcome::RunDynamic { .. }) => {
+                        return Ok(flow);
+                    }
                     ExecOutcome::Cancelled => return Ok(ExecOutcome::Cancelled),
                     ExecOutcome::BatchAbort(err) => return Ok(ExecOutcome::BatchAbort(err)),
                     ExecOutcome::NoRows | ExecOutcome::Rows(_) | ExecOutcome::Continue => {}
@@ -103,6 +106,8 @@ pub(crate) fn execute(
                     flow @ (ExecOutcome::Continue
                     | ExecOutcome::Break
                     | ExecOutcome::Return(_)
+                    | ExecOutcome::CallProcedure { .. }
+                    | ExecOutcome::RunDynamic { .. }
                     | ExecOutcome::Cancelled
                     | ExecOutcome::BatchAbort(_)) => return Ok(flow),
                 }

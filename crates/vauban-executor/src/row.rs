@@ -2,7 +2,20 @@
 
 use vauban_binder::OutputSchema;
 use vauban_errors::SqlError;
-use vauban_types::Value;
+use vauban_types::{TypeInfo, Value};
+
+/// One argument of an `EXECUTE`, evaluated and ready for the session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluatedExecArg {
+    /// The parameter name for a named argument; `None` for a positional one.
+    pub name: Option<String>,
+    /// The value and its type, or `None` for `DEFAULT`.
+    pub value: Option<(Value, TypeInfo)>,
+    /// `OUTPUT` was written on this argument.
+    pub output: bool,
+    /// For an `OUTPUT` argument, the caller's variable (`@o` in `@o OUTPUT`).
+    pub output_variable: Option<String>,
+}
 
 /// One row: one [`Value`] per column of the [`OutputSchema`] that describes it.
 ///
@@ -47,4 +60,23 @@ pub enum ExecOutcome {
     Cancelled,
     /// An error whose scope is the whole batch.
     BatchAbort(SqlError),
+    /// A stored procedure call, with its arguments evaluated. The session resolves the
+    /// name and runs the call.
+    CallProcedure {
+        /// Normalised procedure name, or the value of a procedure variable, lower-cased.
+        name: String,
+        /// Arguments in written order.
+        args: Vec<EvaluatedExecArg>,
+        /// The `@rc =` variable receiving the return status, when the form was written.
+        return_into: Option<String>,
+        /// Line of the statement.
+        line: u32,
+    },
+    /// T-SQL text to run dynamically. The session parses and executes it.
+    RunDynamic {
+        /// The text to run.
+        text: String,
+        /// Line of the statement.
+        line: u32,
+    },
 }

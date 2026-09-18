@@ -633,7 +633,12 @@ impl Session {
             Ok(ExecOutcome::Cancelled) => Err(SqlError::from(InternalError::Bug(
                 crate::cancel::CANCELLED.to_owned(),
             ))),
-            Ok(outcome @ (ExecOutcome::Break | ExecOutcome::Continue)) => {
+            Ok(
+                outcome @ (ExecOutcome::Break
+                | ExecOutcome::Continue
+                | ExecOutcome::CallProcedure { .. }
+                | ExecOutcome::RunDynamic { .. }),
+            ) => {
                 let err = SqlError::from(InternalError::Bug(format!(
                     "run_prepared: the executor answered {outcome:?}, which this layer does \
                      not handle"
