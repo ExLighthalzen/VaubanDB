@@ -568,6 +568,21 @@ impl EvalContext for SessionEvalContext<'_> {
         non_empty(&self.state.login)
     }
 
+    fn session_property(&self, name: &str) -> Option<i32> {
+        let on = |enabled: bool| i32::from(enabled);
+        let opts = &self.state.options;
+        match name.to_ascii_uppercase().as_str() {
+            "ANSI_NULLS" => Some(on(opts.ansi_nulls)),
+            "ANSI_PADDING" => Some(on(opts.ansi_padding)),
+            "ANSI_WARNINGS" => Some(on(opts.ansi_warnings)),
+            "ARITHABORT" => Some(on(opts.arithabort)),
+            "CONCAT_NULL_YIELDS_NULL" => Some(on(opts.concat_null_yields_null)),
+            "QUOTED_IDENTIFIER" => Some(on(opts.quoted_identifier)),
+            "NUMERIC_ROUNDABORT" => Some(on(opts.numeric_roundabort)),
+            _ => None,
+        }
+    }
+
     /// The identifier of the database `name`, or of the current one when `name` is `None`
     /// (`DB_ID`), `None` without a catalogue and for a name no database of the snapshot
     /// carries (`db_id_master_is_some`).

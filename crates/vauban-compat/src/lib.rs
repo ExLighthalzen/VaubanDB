@@ -7,6 +7,7 @@
 //! `sysfn` registry and the procedure dispatcher into `session`.
 
 mod database_properties;
+mod server_functions;
 mod server_properties;
 mod sp_datatype_info;
 mod version;
@@ -207,7 +208,8 @@ const DATABASE_PROPERTY_DEF: FunctionDef = FunctionDef {
 };
 
 /// Registers the server functions of this crate (`@@VERSION`, `SERVERPROPERTY`,
-/// `DATABASEPROPERTYEX`) in the `sysfn` registry.
+/// `DATABASEPROPERTYEX`, `CONNECTIONPROPERTY`, `SESSIONPROPERTY`, …) in the `sysfn`
+/// registry.
 ///
 /// Idempotent: the registration happens once per process, later calls are no-ops. Meant
 /// to be called at start-up, before any query is bound.
@@ -222,6 +224,7 @@ pub fn register_functions() {
         vauban_sysfn::register(VERSION_DEF);
         vauban_sysfn::register(SERVER_PROPERTY_DEF);
         vauban_sysfn::register(DATABASE_PROPERTY_DEF);
+        server_functions::register_server_functions();
         vauban_session::register_system_procedure_dispatcher(dispatch_system_procedure);
     });
 }

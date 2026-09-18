@@ -165,6 +165,31 @@ pub trait EvalContext {
     fn edition(&self) -> Option<&str> {
         None
     }
+
+    /// Value of `SESSIONPROPERTY(name)`: `1` or `0` for a known option, `None` for an
+    /// unknown name.
+    fn session_property(&self, name: &str) -> Option<i32> {
+        let _ = name;
+        None
+    }
+
+    /// Local network address of the server endpoint
+    /// (`CONNECTIONPROPERTY('local_net_address')`), when the session knows it.
+    fn local_net_address(&self) -> Option<&str> {
+        None
+    }
+
+    /// TCP port of the local server endpoint (`CONNECTIONPROPERTY('local_tcp_port')`),
+    /// when the session knows it.
+    fn local_tcp_port(&self) -> Option<i32> {
+        None
+    }
+
+    /// Client network address (`CONNECTIONPROPERTY('client_net_address')`), when the
+    /// session knows it.
+    fn client_net_address(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// An [`EvalContext`] made of fixed values, without any session.
@@ -316,6 +341,26 @@ impl EvalContext for StaticContext {
 
     fn edition(&self) -> Option<&str> {
         self.edition.as_deref()
+    }
+
+    fn session_property(&self, name: &str) -> Option<i32> {
+        session_property_defaults(name)
+    }
+}
+
+/// Default `SESSIONPROPERTY` answers of a client connection, aligned with
+/// [`SetOptions::default`] in `session` without importing that crate here.
+fn session_property_defaults(name: &str) -> Option<i32> {
+    let on = |enabled: bool| i32::from(enabled);
+    match name.to_ascii_uppercase().as_str() {
+        "ANSI_NULLS" => Some(on(true)),
+        "ANSI_PADDING" => Some(on(true)),
+        "ANSI_WARNINGS" => Some(on(true)),
+        "ARITHABORT" => Some(on(false)),
+        "CONCAT_NULL_YIELDS_NULL" => Some(on(true)),
+        "QUOTED_IDENTIFIER" => Some(on(true)),
+        "NUMERIC_ROUNDABORT" => Some(on(false)),
+        _ => None,
     }
 }
 
