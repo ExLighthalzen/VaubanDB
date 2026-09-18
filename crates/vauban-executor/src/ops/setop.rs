@@ -40,10 +40,20 @@ impl<'a> UnionAll<'a> {
     }
 }
 
+/// Drops outer-row and inner-scan correlation state an operand may have left on the context.
+///
+/// Each operand owns its own operator tree; when one is exhausted the next one must not
+/// inherit stale frames from a nested-loop join that closed mid-scan.
+fn clear_operand_correlation(ctx: &mut ExecContext<'_>) {
+    ctx.pop_subquery_locals();
+    while ctx.pop_outer().is_some() {}
+}
+
 impl<'a> Operator<'a> for UnionAll<'a> {
-    fn open(&mut self, _ctx: &mut ExecContext<'a>) -> SqlResult<()> {
+    fn open(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<()> {
         self.current = 0;
         self.current_open = false;
+        clear_operand_correlation(ctx);
         Ok(())
     }
 
@@ -60,6 +70,7 @@ impl<'a> Operator<'a> for UnionAll<'a> {
                 Some(row) => return Ok(Some(row)),
                 None => {
                     self.inputs[self.current].close();
+                    clear_operand_correlation(ctx);
                     self.current_open = false;
                     self.current += 1;
                 }

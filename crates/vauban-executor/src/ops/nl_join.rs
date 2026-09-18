@@ -456,7 +456,17 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 | PhysicalJoinKind::Inner
                                 | PhysicalJoinKind::Left => {
                                     ctx.push_outer(row.clone(), self.outer_bindings.clone());
-                                    let inner_correlation = if self.on.is_none() {
+                                    // `on` is absent for a cross join and when the planner folds
+                                    // the predicate into an inner [`IndexSeek`]. Cross and semi
+                                    // joins push inner scan bindings; inner/left filters still
+                                    // index the concatenated join row.
+                                    let inner_correlation = if self.on.is_none()
+                                        && matches!(
+                                            self.kind,
+                                            PhysicalJoinKind::Cross
+                                                | PhysicalJoinKind::Semi
+                                                | PhysicalJoinKind::AntiSemi
+                                        ) {
                                         Self::push_inner_correlation(ctx, &self.inner_plan)
                                     } else {
                                         false
