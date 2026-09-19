@@ -383,7 +383,8 @@ fn statement_reads_user_table(bound: &PhysicalStatement) -> bool {
         | PhysicalStatement::Continue
         | PhysicalStatement::Return(_)
         | PhysicalStatement::Print(_)
-        | PhysicalStatement::Transaction(_) => false,
+        | PhysicalStatement::Transaction(_)
+        | PhysicalStatement::Execute(_) => false,
     }
 }
 

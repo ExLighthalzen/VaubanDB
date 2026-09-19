@@ -283,7 +283,8 @@ pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult
         PhysicalStatement::Break
         | PhysicalStatement::Continue
         | PhysicalStatement::Return(None)
-        | PhysicalStatement::Transaction(_) => Ok(()),
+        | PhysicalStatement::Transaction(_)
+        | PhysicalStatement::Execute(_) => Ok(()),
         PhysicalStatement::Return(Some(expr)) | PhysicalStatement::Print(expr) => {
             compile_expr(expr, ctx)
         }

@@ -8,14 +8,15 @@ use vauban_planner::{KeyRangeExpr, PhysicalJoinKind, explain, testing::FakeCatal
 use vauban_planner::{NoIndexes, PhysicalPlan, PhysicalStatement, PlanCatalog, PlanContext, plan};
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundProjection, BoundStatement, BoundTop, ColumnBinding, CompareOp,
-    DeletePlan, InsertPlan, JoinKind, LockHints, LogicalPlan, OutputColumn, OutputSchema,
-    SetOpKind, UpdatePlan,
+    BoundExecArg, BoundExecTarget, BoundExecute, BoundExpr, BoundExprKind, BoundProjection,
+    BoundStatement, BoundTop, ColumnBinding, CompareOp, DeletePlan, InsertPlan, JoinKind,
+    LockHints, LogicalPlan, OutputColumn, OutputSchema, SetOpKind, UpdatePlan,
 };
 use vauban_catalog::ColumnId;
 use vauban_errors::SqlError;
+use vauban_parser::{Ident, ObjectName, Span};
 use vauban_storage::{IndexShape, KeyColumn, MemoryStorage, Storage, TableId, TableShape};
-use vauban_types::{SqlType, TypeInfo, Value};
+use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
 /// The context every test plans against, over the catalogue it is handed.
 fn context<'a>(catalog: &'a dyn PlanCatalog) -> PlanContext<'a> {
@@ -615,6 +616,82 @@ fn storage_indexes_falls_back_to_a_scan_on_error() {
     assert_eq!(indexes.indexes_of(table).len(), 1);
     assert!(storage.indexes(TableId(4_242)).is_err());
     assert!(indexes.indexes_of(TableId(4_242)).is_empty());
+}
+
+fn varchar_ty(n: u16) -> TypeInfo {
+    TypeInfo::new(SqlType::VarChar(Len::Fixed(n)), true)
+}
+
+fn str_lit(s: &str) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Literal(Value::String(SqlString { text: s.to_owned() })),
+        ty: varchar_ty(u16::try_from(s.len()).unwrap_or(u16::MAX).max(1)),
+        line: 1,
+    }
+}
+
+fn procedure_target(name: &str) -> BoundExecTarget {
+    BoundExecTarget::Procedure {
+        name: name.to_owned(),
+        raw: ObjectName {
+            server: None,
+            database: None,
+            schema: None,
+            name: Ident {
+                value: name.to_owned(),
+                quoted: false,
+            },
+            span: Span::EMPTY,
+        },
+    }
+}
+
+fn plan_execute(execute: BoundExecute) -> PhysicalStatement {
+    let catalog = NoIndexes;
+    plan(BoundStatement::Execute(execute), &context(&catalog)).expect("EXECUTE plans")
+}
+
+#[test]
+fn execute_dynamic_is_planned() {
+    let execute = BoundExecute {
+        target: BoundExecTarget::Dynamic(str_lit("SELECT 1")),
+        args: Vec::new(),
+        return_into: None,
+        line: 1,
+    };
+    let planned = plan_execute(execute);
+    let PhysicalStatement::Execute(carried) = planned else {
+        panic!("expected PhysicalStatement::Execute, got {planned:?}");
+    };
+    assert!(
+        matches!(carried.target, BoundExecTarget::Dynamic(_)),
+        "expected a dynamic target, got {:?}",
+        carried.target
+    );
+}
+
+#[test]
+fn execute_procedure_is_planned() {
+    let execute = BoundExecute {
+        target: procedure_target("sp_executesql"),
+        args: vec![BoundExecArg {
+            name: None,
+            value: Some(BoundExprKind::Literal(Value::String(SqlString {
+                text: "SELECT 1".to_owned(),
+            }))),
+            output: false,
+        }],
+        return_into: None,
+        line: 1,
+    };
+    let planned = plan_execute(execute);
+    let PhysicalStatement::Execute(carried) = planned else {
+        panic!("expected PhysicalStatement::Execute, got {planned:?}");
+    };
+    match carried.target {
+        BoundExecTarget::Procedure { name, .. } => assert_eq!(name, "sp_executesql"),
+        other => panic!("expected a procedure target, got {other:?}"),
+    }
 }
 
 #[test]

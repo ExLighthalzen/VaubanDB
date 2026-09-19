@@ -16,8 +16,8 @@ use std::ops::Bound;
 
 use vauban_binder::BoundDeclaration;
 use vauban_binder::{
-    AggregateCall, BoundExpr, BoundProjection, BoundTop, ColumnBinding, DdlStatement, JoinKind,
-    LockHints, OutputSchema, SortKey, TxnStatement,
+    AggregateCall, BoundExecute, BoundExpr, BoundProjection, BoundTop, ColumnBinding, DdlStatement,
+    JoinKind, LockHints, OutputSchema, SortKey, TxnStatement,
 };
 use vauban_catalog::{TableDef, TableId};
 use vauban_storage::{Direction, IndexId};
@@ -89,6 +89,8 @@ pub enum PhysicalStatement {
     Print(BoundExpr),
     /// `BEGIN`, `COMMIT`, `ROLLBACK` and `SAVE TRANSACTION`.
     Transaction(TxnStatement),
+    /// `EXECUTE`, carried across from the bound statement.
+    Execute(BoundExecute),
 }
 
 /// A node of the physical plan: how the rows are produced.
