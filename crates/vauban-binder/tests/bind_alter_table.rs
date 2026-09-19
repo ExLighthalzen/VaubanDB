@@ -264,6 +264,16 @@ fn add_foreign_key_without_matching_key_is_1776() {
 }
 
 #[test]
+fn add_foreign_key_to_a_missing_table_is_1767() {
+    let error = err(
+        "ALTER TABLE dbo.t ADD CONSTRAINT fk_missing FOREIGN KEY (a) REFERENCES dbo.nosuch (id);",
+        &catalog(),
+    );
+    assert_eq!((error.number, error.severity, error.state), (1767, 16, 0));
+    assert!(error.message.contains("dbo.nosuch"), "{}", error.message);
+}
+
+#[test]
 fn drop_constraint_binds() {
     let action = alter("ALTER TABLE dbo.t DROP CONSTRAINT pk_t;", &catalog());
     assert_eq!(

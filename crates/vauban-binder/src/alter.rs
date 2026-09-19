@@ -292,10 +292,7 @@ fn bind_foreign_key_reference(input: ForeignKeyBind<'_, '_>) -> SqlResult<()> {
         }
     }
     let Some(resolved) = catalog.resolve_table(&reference, ctx.database, ctx.default_schema) else {
-        return Err(
-            SqlError::no_matching_key_in_referenced_table(&table_part, constraint)
-                .with_line(span.line),
-        );
+        return Err(foreign_key_invalid_table(constraint, &table_part).with_line(span.line));
     };
     for column in referenced_columns {
         if !resolved
@@ -341,36 +338,38 @@ fn table_constraint_def(
     span: &Span,
 ) -> SqlResult<ConstraintDef> {
     let name = constraint.name.as_ref().map(|ident| ident.value.clone());
-    Ok(match &constraint.kind {
+    match &constraint.kind {
         TableConstraintKind::PrimaryKey {
             columns,
             clustering,
-        } => ConstraintDef::PrimaryKey {
+        } => Ok(ConstraintDef::PrimaryKey {
             name,
             columns: columns.iter().map(sorted_column).collect(),
             clustered: is_clustered(*clustering, true),
-        },
+        }),
         TableConstraintKind::Unique {
             columns,
             clustering,
-        } => ConstraintDef::Unique {
+        } => Ok(ConstraintDef::Unique {
             name,
             columns: columns.iter().map(sorted_column).collect(),
             clustered: is_clustered(*clustering, false),
-        },
+        }),
         TableConstraintKind::ForeignKey { columns, reference } => foreign_key(
             name,
             columns.iter().map(|ident| ident.value.clone()).collect(),
             reference,
+            ctx,
+            span,
         ),
         TableConstraintKind::Check { expr, .. } => {
             bind_condition(expr, ctx, scope).map_err(|err| on_statement(err, span))?;
-            ConstraintDef::Check {
+            Ok(ConstraintDef::Check {
                 name,
                 expr: expr.clone(),
-            }
+            })
         }
-    })
+    }
 }
 
 fn column_def(column: &AstColumnDef, position: u32, span: &Span) -> SqlResult<ColumnDef> {
@@ -420,19 +419,36 @@ fn column_def(column: &AstColumnDef, position: u32, span: &Span) -> SqlResult<Co
     })
 }
 
+/// The referenced table is resolved like a `FROM` table: the current database and the
+/// default schema of the session fill the parts the statement left out. A reference that
+/// names another database answers 1763 on the line of the statement.
 fn foreign_key(
     name: Option<String>,
     columns: Vec<String>,
     reference: &vauban_parser::ForeignKeyRef,
-) -> ConstraintDef {
-    ConstraintDef::ForeignKey {
+    ctx: &BindContext<'_>,
+    span: &Span,
+) -> SqlResult<ConstraintDef> {
+    let referenced = table_name(&reference.table, ctx).map_err(|err| on_statement(err, span))?;
+    if !referenced.database.eq_ignore_ascii_case(ctx.database) {
+        let printed = format!(
+            "{}.{}.{}",
+            referenced.database, referenced.schema, referenced.name
+        );
+        return Err(SqlError::new(
+            1763,
+            16,
+            0,
+            format!(
+                "Cross-database foreign key references are not supported. Foreign key '{printed}'."
+            ),
+        )
+        .with_line(span.line));
+    }
+    Ok(ConstraintDef::ForeignKey {
         name,
         columns,
-        referenced: QualifiedName {
-            database: part(reference.table.database.as_ref(), ""),
-            schema: part(reference.table.schema.as_ref(), ""),
-            name: reference.table.name.value.clone(),
-        },
+        referenced,
         referenced_columns: reference
             .columns
             .iter()
@@ -440,7 +456,16 @@ fn foreign_key(
             .collect(),
         on_delete: reference.on_delete.unwrap_or(RefAction::NoAction),
         on_update: reference.on_update.unwrap_or(RefAction::NoAction),
-    }
+    })
+}
+
+fn foreign_key_invalid_table(constraint: &str, referenced: &str) -> SqlError {
+    SqlError::new(
+        1767,
+        16,
+        0,
+        format!("Foreign key '{constraint}' references invalid table '{referenced}'."),
+    )
 }
 
 fn refuse_constraint_name(name: &str, catalog: &dyn CatalogView, span: &Span) -> SqlResult<()> {
@@ -503,10 +528,6 @@ fn is_clustered(clustering: Option<Clustering>, default: bool) -> bool {
         Some(Clustering::NonClustered) => false,
         None => default,
     }
-}
-
-fn part(part: Option<&Ident>, default: &str) -> String {
-    part.map_or_else(|| default.to_owned(), |ident| ident.value.clone())
 }
 
 fn qualified(name: &QualifiedName) -> String {

@@ -195,7 +195,9 @@ impl Session {
             {
                 break;
             }
-            if catalog_changed(current) && index + 1 < batch.statements.len() {
+            if catalog_changed(current, &batch.statements[index + 1..])
+                && index + 1 < batch.statements.len()
+            {
                 let tail = self.reprepare_nested_tail(
                     text,
                     &batch.statements[index + 1..],
@@ -229,6 +231,7 @@ impl Session {
             &snapshot,
             &mut state,
             &mut batch_variables,
+            crate::batch::bind_limit_for(statements),
         );
         let closed = self.engine().txn.commit(binding);
         match (prepared, closed) {
@@ -248,7 +251,14 @@ impl Session {
     ) -> SqlResult<Vec<PreparedStatement>> {
         let binding = self.engine().txn.begin(IsolationLevel::ReadCommitted);
         let snapshot = self.engine().catalog.snapshot(&binding);
-        let prepared = self.bind_nested(text, statements, &snapshot, state, batch_variables);
+        let prepared = self.bind_nested(
+            text,
+            statements,
+            &snapshot,
+            state,
+            batch_variables,
+            crate::batch::bind_limit_for(statements),
+        );
         self.engine().txn.commit(binding)?;
         let _ = params;
         prepared
@@ -261,10 +271,14 @@ impl Session {
         snapshot: &CatalogSnapshot,
         state: &mut SessionState,
         batch_variables: &mut BatchVariables,
+        mut limit: Option<usize>,
     ) -> SqlResult<Vec<PreparedStatement>> {
         let mut prepared = Vec::with_capacity(statements.len());
 
         for (index, original) in statements.iter().enumerate() {
+            if limit == Some(0) {
+                break;
+            }
             self.cancel_handle().check()?;
             let raw = statement_text(text, original);
             if matches!(original, Statement::SetOption(_)) {
@@ -342,6 +356,12 @@ impl Session {
                 statement: physical,
                 line: statement_line(statement),
             });
+            if let Some(remaining) = &mut limit {
+                *remaining = remaining.saturating_sub(1);
+                if *remaining == 0 {
+                    break;
+                }
+            }
         }
         Ok(prepared)
     }
@@ -1007,14 +1027,18 @@ fn collect_outputs(params: &[NestedParam], exec: &ExecSession) -> Vec<(String, V
         .collect()
 }
 
-fn catalog_changed(prepared: &PreparedStatement) -> bool {
-    matches!(
-        prepared,
+fn catalog_changed(prepared: &PreparedStatement, tail: &[Statement]) -> bool {
+    match prepared {
         PreparedStatement::Bound {
             statement: PhysicalStatement::Ddl(DdlStatement::AlterTable { .. }),
             ..
-        }
-    )
+        } => true,
+        PreparedStatement::Bound {
+            statement: PhysicalStatement::Ddl(DdlStatement::CreateTable { .. }),
+            ..
+        } => crate::batch::batch_has_alter_table(tail),
+        _ => false,
+    }
 }
 
 fn statement_clears_last_error(stmt: &PhysicalStatement) -> bool {

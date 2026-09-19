@@ -61,7 +61,18 @@
 //! No client error reaches `serve`: a `TdsError` is logged at `warn` and closes its own
 //! connection only. The password of a LOGIN7 is never logged: only named fields of the
 //! login appear in the journal, never the whole message.
+//!
+//! # A panicked request task
+//!
+//! A panic in the blocking run is caught, logged with the connection SPID and the request
+//! sequence number, and turned into error 50000 (severity 16, state 1) followed by a DONE
+//! carrying `DoneStatus::ERROR`, like other internal failures once the token relay has
+//! finished. The session stays open when the panic is caught inside the guarded run. A
+//! panic that escapes that guard is logged and, when the relay completed, gets the
+//! error on the wire before the connection closes.
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI16, Ordering};
 use std::time::Duration;
@@ -70,15 +81,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 use vauban_catalog::Catalog;
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::Storage;
 use vauban_tds::{
-    ClientMessage, DoneStatus, EncryptPolicy, Login7, TdsError, TdsReader, TdsStream, TdsWriter,
-    Token,
+    ClientMessage, DoneStatus, EncryptPolicy, Login7, Rpc, RpcParam, RpcProc, TdsError, TdsReader,
+    TdsStream, TdsWriter, Token,
 };
 use vauban_txn::TransactionManager;
+use vauban_types::{SqlType, TypeInfo, Value, default_display};
 
 use crate::auth::Authenticator;
 use crate::batch::Session;
@@ -88,6 +100,12 @@ use crate::login::{self, EDITION, MASTER, VERSION_BANNER};
 use crate::sink::{CHANNEL_CAPACITY, ResultSink, TdsSink};
 use crate::state::SessionState;
 use crate::txn_request;
+
+/// SQL batch text read by [`should_inject_panic`] in debug and test builds.
+const TEST_PANIC_BATCH: &str = "/* vauban:test-panic */";
+
+/// Client-visible text when a request task panics; the server journal carries the payload.
+const REQUEST_PANICKED: &str = "request execution stopped unexpectedly";
 
 /// First SPID handed out: SQL Server reserves the lower values for system tasks.
 const SPID_FIRST: i16 = 51;
@@ -420,6 +438,7 @@ async fn run_connection(
     let transaction_engine = Arc::clone(&engine);
     let login_database = state.database.clone();
     let mut session = Session::new(engine, state);
+    let mut request_seq = 0u64;
     loop {
         // `None`: the reader task is gone, which only happens once its message reached us.
         let Some(message) = client_rx.recv().await else {
@@ -431,6 +450,9 @@ async fn run_connection(
                 let descriptor = batch.transaction_descriptor;
                 let text = batch.text;
                 let reset = batch.reset;
+                request_seq += 1;
+                let seq = request_seq;
+                log_received_sql_batch(spid, seq, &text);
                 let login_db = login_database.clone();
                 let engine_for_reset = Arc::clone(&transaction_engine);
                 let text_len = i32::try_from(text.len()).unwrap_or(i32::MAX);
@@ -441,6 +463,8 @@ async fn run_connection(
                     false,
                     None,
                     text_len,
+                    spid,
+                    seq,
                     move |session, sink| {
                         crate::reset::apply_reset(
                             session,
@@ -455,6 +479,9 @@ async fn run_connection(
                             session.replace_state(state);
                             return Ok(());
                         }
+                        if should_inject_panic(&text) {
+                            panic!("injected test panic");
+                        }
                         session.run_batch(&text, sink)
                     },
                 )
@@ -467,6 +494,9 @@ async fn run_connection(
             ClientMessage::Rpc(rpc) => {
                 let descriptor = rpc.transaction_descriptor;
                 let reset = rpc.reset;
+                request_seq += 1;
+                let seq = request_seq;
+                log_received_rpc(spid, seq, &rpc);
                 let login_db = login_database.clone();
                 let engine_for_reset = Arc::clone(&transaction_engine);
                 let outcome = run_request(
@@ -476,6 +506,8 @@ async fn run_connection(
                     true,
                     None,
                     0,
+                    spid,
+                    seq,
                     move |session, sink| {
                         crate::reset::apply_reset(
                             session,
@@ -508,6 +540,8 @@ async fn run_connection(
             }
             ClientMessage::TransactionManager(request) => {
                 let engine = Arc::clone(&transaction_engine);
+                request_seq += 1;
+                let seq = request_seq;
                 let outcome = run_request(
                     &mut writer,
                     &mut client_rx,
@@ -515,6 +549,8 @@ async fn run_connection(
                     false,
                     Some(CUR_CMD_TRANSACTION_MANAGER),
                     0,
+                    spid,
+                    seq,
                     move |session, sink| {
                         let mut state = session.state().clone();
                         let result = txn_request::handle(&request, &engine, &mut state, sink);
@@ -607,6 +643,7 @@ enum Relayed {
 /// session back — a pool thread cannot be killed, it is asked to stop and awaited. A token
 /// the codec refused ends the response the same way as an internal error, by
 /// [`report_unencodable`], and the connection is kept.
+#[allow(clippy::too_many_arguments)] // relay needs SPID and seq alongside the existing request parameters.
 async fn run_request<F>(
     writer: &mut TdsWriter,
     client_rx: &mut mpsc::Receiver<Result<ClientMessage, TdsError>>,
@@ -614,6 +651,8 @@ async fn run_request<F>(
     rpc: bool,
     done_cur_cmd: Option<u16>,
     sql_text_len: i32,
+    spid: i16,
+    seq: u64,
     run: F,
 ) -> Result<RequestOutcome, TdsError>
 where
@@ -624,7 +663,6 @@ where
     let cancel = session.cancel_handle();
     cancel.reset();
     let engine = Arc::clone(session.engine());
-    let spid = session.state().spid;
     let database = session.state().database.clone();
     let handle = spawn_blocking(move || {
         let mut sink = if rpc {
@@ -638,7 +676,11 @@ where
             crate::registry::SessionStatus::Running,
             &database,
         );
-        let result = run(&mut session, &mut sink);
+        let (result, panic_detail) =
+            match catch_unwind(AssertUnwindSafe(|| run(&mut session, &mut sink))) {
+                Ok(result) => (result, None),
+                Err(payload) => (Err(panic_sql_error()), Some(panic_payload_message(payload))),
+            };
         let database = session.state().database.clone();
         let _ = engine.touch_session(
             spid,
@@ -646,20 +688,35 @@ where
             crate::registry::SessionStatus::Sleeping,
             &database,
         );
-        (session, result)
+        (session, result, panic_detail)
     });
 
-    let relayed = relay(writer, &mut rx, client_rx, &cancel, done_cur_cmd).await;
+    let relayed = relay(writer, &mut rx, client_rx, &cancel, done_cur_cmd, spid, seq).await;
     // The relay left the channel empty and closed: whatever happens next, no `blocking_send`
     // is holding a pool thread and the request task is on its way out.
     drop(rx);
-    let (mut session, result) = match handle.await {
+    let (mut session, result, panic_detail) = match handle.await {
         Ok(outcome) => outcome,
+        Err(err) if err.is_panic() => {
+            error!(
+                spid,
+                seq,
+                error = %err,
+                "request task panicked outside the guarded run"
+            );
+            if matches!(relayed, Relayed::Complete) {
+                report_request_panic(writer, spid, seq).await?;
+            }
+            return Ok(RequestOutcome::Close);
+        }
         Err(err) => {
-            error!(error = %err, "request task panicked, closing the connection");
+            error!(spid, seq, error = %err, "request blocking task failed");
             return Ok(RequestOutcome::Close);
         }
     };
+    if let Some(ref detail) = panic_detail {
+        error!(spid, seq, panic = %detail, "request task panicked");
+    }
 
     match relayed {
         Relayed::Complete => {}
@@ -684,11 +741,15 @@ where
     match result {
         Ok(()) => writer.flush().await?,
         Err(err) => {
-            warn!(
-                error = err.number,
-                message = %err.message,
-                "internal error during the request, response incomplete"
-            );
+            if panic_detail.is_some() {
+                log_rendered_client_error(spid, seq, &err);
+            } else {
+                warn!(
+                    error = err.number,
+                    message = %err.message,
+                    "internal error during the request, response incomplete"
+                );
+            }
             writer
                 .write_tokens(&[
                     Token::Error(err),
@@ -705,6 +766,42 @@ where
     Ok(RequestOutcome::Served(session))
 }
 
+/// Whether a batch text is the panic injection hook in debug and test builds.
+fn should_inject_panic(text: &str) -> bool {
+    cfg!(any(test, debug_assertions)) && text == TEST_PANIC_BATCH
+}
+
+/// The error a panicked request task sends to the client: number 50000, severity 16, state 1.
+fn panic_sql_error() -> SqlError {
+    SqlError::from(InternalError::Bug(REQUEST_PANICKED.into()))
+}
+
+/// Turns a panic payload into text for the server journal.
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".into())
+}
+
+/// Sends the panic error and a DONE `ERROR` when the session could not be recovered.
+async fn report_request_panic(writer: &mut TdsWriter, spid: i16, seq: u64) -> Result<(), TdsError> {
+    let reported = panic_sql_error();
+    log_rendered_client_error(spid, seq, &reported);
+    writer
+        .write_tokens(&[
+            Token::Error(reported),
+            Token::Done {
+                status: DoneStatus::ERROR,
+                cur_cmd: 0,
+                row_count: None,
+            },
+        ])
+        .await?;
+    writer.flush().await
+}
+
 /// Writes every token of the channel to the client until the sender is dropped, while
 /// serving the client channel: an ATTENTION cancels the request, anything else ends the
 /// connection (no MARS, see the module documentation).
@@ -718,11 +815,16 @@ async fn relay(
     client_rx: &mut mpsc::Receiver<Result<ClientMessage, TdsError>>,
     cancel: &CancelHandle,
     done_cur_cmd: Option<u16>,
+    spid: i16,
+    seq: u64,
 ) -> Relayed {
     loop {
         tokio::select! {
             token = rx.recv() => match token {
                 Some(mut token) => {
+                    if let Token::Error(ref err) = token {
+                        log_rendered_client_error(spid, seq, err);
+                    }
                     if let (
                         Some(cur_cmd_override),
                         Token::Done {
@@ -958,6 +1060,188 @@ fn resolve_login_database(engine: &Engine, requested: &str) -> Option<String> {
         warn!(error = %err, "the transaction that read the catalogue at login did not commit");
     }
     found
+}
+
+/// Placeholder written instead of a password literal in journal text.
+const LOGGED_SECRET_REDACTED: &str = "<redacted>";
+
+/// Replaces `PASSWORD = '…'` literals before SQL text is written to the journal.
+fn mask_logged_sql_text(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(keyword_end) = password_keyword_end(bytes, i) {
+            let mut j = keyword_end;
+            if skip_ascii_whitespace(bytes, &mut j) && j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                if skip_ascii_whitespace(bytes, &mut j) {
+                    if matches!(bytes.get(j), Some(b'N' | b'n')) && bytes.get(j + 1) == Some(&b'\'')
+                    {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'\'') {
+                        out.push_str(&text[i..=j]);
+                        let literal_end =
+                            find_sql_string_literal_end(bytes, j).unwrap_or(bytes.len());
+                        out.push_str(LOGGED_SECRET_REDACTED);
+                        i = literal_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = text[i..]
+            .chars()
+            .next()
+            .expect("byte index on a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Whether `bytes[start..]` begins with `password` as its own keyword.
+fn password_keyword_end(bytes: &[u8], start: usize) -> Option<usize> {
+    const KEYWORD: &[u8] = b"password";
+    if start + KEYWORD.len() > bytes.len() || !is_password_keyword_boundary_before(bytes, start) {
+        return None;
+    }
+    for (offset, &expected) in KEYWORD.iter().enumerate() {
+        if bytes[start + offset].to_ascii_lowercase() != expected {
+            return None;
+        }
+    }
+    let end = start + KEYWORD.len();
+    if is_password_keyword_boundary_after(bytes, end) {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+fn is_password_keyword_boundary_before(bytes: &[u8], start: usize) -> bool {
+    start == 0 || (!bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_')
+}
+
+fn is_password_keyword_boundary_after(bytes: &[u8], end: usize) -> bool {
+    match bytes.get(end) {
+        None => true,
+        Some(byte) => byte.is_ascii_whitespace() || *byte == b'=',
+    }
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], index: &mut usize) -> bool {
+    while *index < bytes.len() && bytes[*index].is_ascii_whitespace() {
+        *index += 1;
+    }
+    true
+}
+
+/// Index after the closing quote of a single-quoted literal that starts at `quote_start`.
+fn find_sql_string_literal_end(bytes: &[u8], quote_start: usize) -> Option<usize> {
+    debug_assert_eq!(bytes.get(quote_start), Some(&b'\''));
+    let mut index = quote_start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' => {
+                if bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                } else {
+                    return Some(index + 1);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Writes the text of a SQL batch at `debug`, with the connection SPID and the request
+/// sequence number of this connection.
+fn log_received_sql_batch(spid: i16, seq: u64, text: &str) {
+    debug!(
+        spid,
+        seq,
+        text = mask_logged_sql_text(text),
+        "SQL batch received"
+    );
+}
+
+/// Writes an RPC at `debug`, with enough detail to replay it as a T-SQL `EXEC`.
+fn log_received_rpc(spid: i16, seq: u64, rpc: &Rpc) {
+    debug!(
+        spid,
+        seq,
+        text = mask_logged_sql_text(&format_received_rpc(rpc)),
+        "RPC received"
+    );
+}
+
+/// Writes a client-visible error at `debug`, tied to the request that raised it.
+fn log_rendered_client_error(spid: i16, seq: u64, err: &SqlError) {
+    debug!(
+        spid,
+        seq,
+        error = err.number,
+        severity = err.severity,
+        state = err.state,
+        line = err.line,
+        procedure = err.procedure.as_deref().unwrap_or(""),
+        message = %err.message,
+        "client error rendered"
+    );
+}
+
+/// Rebuilds an RPC as a T-SQL `EXEC` line, for replay in a script.
+fn format_received_rpc(rpc: &Rpc) -> String {
+    let proc_name = match &rpc.proc {
+        RpcProc::Name(name) => name.clone(),
+        RpcProc::Id(id) => rpc
+            .proc
+            .well_known_name()
+            .map_or_else(|| id.to_string(), str::to_owned),
+    };
+    let args: Vec<String> = rpc.params.iter().map(format_rpc_argument).collect();
+    if args.is_empty() {
+        format!("EXEC {proc_name}")
+    } else {
+        format!("EXEC {proc_name} {}", args.join(", "))
+    }
+}
+
+/// One argument of an RPC in replay form.
+fn format_rpc_argument(param: &RpcParam) -> String {
+    let value = format_rpc_param_value(&param.ty, &param.value);
+    if param.name.is_empty() || param.name == "stmt" || param.name == "params" {
+        return value;
+    }
+    let name = if param.name.starts_with('@') {
+        param.name.clone()
+    } else {
+        format!("@{}", param.name)
+    };
+    if param.output {
+        format!("{name} = {value} OUTPUT")
+    } else {
+        format!("{name} = {value}")
+    }
+}
+
+/// Literal form of one RPC parameter value.
+fn format_rpc_param_value(ty: &TypeInfo, value: &Value) -> String {
+    if matches!(value, Value::Null) {
+        return "NULL".to_owned();
+    }
+    if let Value::String(s) = value {
+        let escaped = mask_logged_sql_text(&s.text).replace('\'', "''");
+        return if matches!(ty.ty, SqlType::NVarChar(_) | SqlType::NChar(_)) {
+            format!("N'{escaped}'")
+        } else {
+            format!("'{escaped}'")
+        };
+    }
+    default_display(value, ty)
 }
 
 /// Name of a client message for the log ([MS-TDS] 2.2.3.1.1 packet types).
@@ -1389,6 +1673,21 @@ mod tests {
         );
     }
 
+    /// The message the client gets when a request task panics: number 50000, severity 16,
+    /// state 1, and a stable text that does not carry the panic payload.
+    #[test]
+    fn the_reported_panic_is_the_internal_error_number() {
+        let reported = panic_sql_error();
+        assert_eq!(
+            (reported.number, reported.severity, reported.state),
+            (50000, 16, 1)
+        );
+        assert_eq!(
+            reported.message,
+            "Internal error: internal bug: request execution stopped unexpectedly"
+        );
+    }
+
     #[test]
     fn spids_wrap_to_51_after_32767() {
         let server = server();
@@ -1396,5 +1695,566 @@ mod tests {
         assert_eq!(server.next_spid(), 32766);
         assert_eq!(server.next_spid(), 32767);
         assert_eq!(server.next_spid(), 51);
+    }
+
+    #[test]
+    fn debug_logs_sql_batch_text_with_spid_and_sequence() {
+        let lines = collect_logs("debug", || {
+            log_received_sql_batch(51, 1, "SELECT 1");
+            log_received_sql_batch(51, 2, "SELECT 2");
+        });
+        assert!(lines[0].contains("text=\"SELECT 1\""));
+        assert!(lines[0].contains("spid=51"));
+        assert!(lines[0].contains("seq=1"));
+        assert!(lines[1].contains("text=\"SELECT 2\""));
+        assert!(lines[1].contains("seq=2"));
+    }
+
+    #[test]
+    fn debug_logs_batch_text_and_client_error_on_the_same_request() {
+        let err = SqlError::incorrect_syntax_near("SELEC", 1);
+        let lines = collect_logs("debug", || {
+            log_received_sql_batch(52, 3, "SELECT 1; SELEC 1");
+            log_rendered_client_error(52, 3, &err);
+        });
+        assert!(lines[0].contains("text=\"SELECT 1; SELEC 1\""));
+        assert!(lines[1].contains("error=102"));
+        assert!(lines[0].contains("spid=52"));
+        assert!(lines[1].contains("spid=52"));
+        assert!(lines[0].contains("seq=3"));
+        assert!(lines[1].contains("seq=3"));
+    }
+
+    #[test]
+    fn debug_logs_rpc_text_for_replay() {
+        use vauban_tds::{ResetConnection, Rpc, RpcParam, RpcProc};
+        use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+
+        let nvarchar = |text: &str| Value::String(SqlString { text: text.into() });
+        let rpc = Rpc {
+            proc: RpcProc::SP_EXECUTESQL,
+            options: 0,
+            transaction_descriptor: 0,
+            reset: ResetConnection::None,
+            params: vec![RpcParam {
+                name: String::new(),
+                output: false,
+                default: false,
+                ty: TypeInfo::new(SqlType::NVarChar(Len::Max), false),
+                value: nvarchar("SELECT 1"),
+            }],
+        };
+        let lines = collect_logs("debug", || log_received_rpc(53, 1, &rpc));
+        assert!(lines[0].contains("spid=53"));
+        assert!(lines[0].contains("seq=1"));
+        assert!(lines[0].contains("EXEC sp_executesql"));
+        assert!(lines[0].contains("SELECT 1"));
+    }
+
+    #[test]
+    fn debug_logs_password_literals_redacted_in_sql_batches() {
+        for batch in [
+            "CREATE LOGIN u WITH PASSWORD = 'Secret1!'",
+            "create login u with password='Secret1!'",
+            "ALTER LOGIN u WITH PASSWORD  =  N'Secret1!'",
+            "CREATE USER u WITH PASSWORD = 'Secret1!'",
+        ] {
+            let lines = collect_logs("debug", || log_received_sql_batch(55, 1, batch));
+            assert!(
+                lines[0].to_ascii_lowercase().contains("password"),
+                "{batch}: {lines:?}"
+            );
+            assert!(
+                lines[0].contains(LOGGED_SECRET_REDACTED),
+                "{batch}: {lines:?}"
+            );
+            assert!(!lines[0].contains("Secret1!"), "{batch}: {lines:?}");
+        }
+    }
+
+    #[test]
+    fn debug_logs_password_literals_redacted_in_rpc_replay() {
+        use vauban_tds::{ResetConnection, Rpc, RpcParam, RpcProc};
+        use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+
+        let nvarchar = |text: &str| Value::String(SqlString { text: text.into() });
+        let stmt = "CREATE LOGIN u WITH PASSWORD = 'RpcSecret'";
+        let rpc = Rpc {
+            proc: RpcProc::SP_EXECUTESQL,
+            options: 0,
+            transaction_descriptor: 0,
+            reset: ResetConnection::None,
+            params: vec![RpcParam {
+                name: "stmt".into(),
+                output: false,
+                default: false,
+                ty: TypeInfo::new(SqlType::NVarChar(Len::Max), false),
+                value: nvarchar(stmt),
+            }],
+        };
+        let lines = collect_logs("debug", || log_received_rpc(56, 1, &rpc));
+        assert!(lines[0].contains(LOGGED_SECRET_REDACTED), "{lines:?}");
+        assert!(!lines[0].contains("RpcSecret"), "{lines:?}");
+        assert_eq!(
+            match &rpc.params[0].value {
+                Value::String(s) => s.text.as_str(),
+                _ => panic!("expected a string parameter"),
+            },
+            stmt
+        );
+    }
+
+    #[test]
+    fn logging_a_password_batch_leaves_the_source_text_unchanged() {
+        let batch = "CREATE LOGIN u WITH PASSWORD = 'ExecSecret'";
+        let mut source = batch.to_owned();
+        let lines = collect_logs("debug", || log_received_sql_batch(57, 1, &source));
+        assert!(lines[0].contains(LOGGED_SECRET_REDACTED));
+        assert_eq!(source, batch);
+        source.push(';');
+        assert_ne!(source, batch);
+    }
+
+    #[test]
+    fn batch_with_a_password_literal_still_executes_the_original_text() {
+        use vauban_storage::MemoryStorage;
+        use vauban_tds::ColumnMeta;
+
+        let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+        let mut session = Session::new(engine, SessionState::new(58));
+        let batch = "SELECT 'ExecSecret' AS pwd; /* note PASSWORD = 'Hidden' */";
+        struct RowSink {
+            rows: Vec<Value>,
+            errors: Vec<SqlError>,
+        }
+        impl ResultSink for RowSink {
+            fn columns(&mut self, _cols: &[ColumnMeta]) -> SqlResult<()> {
+                Ok(())
+            }
+            fn row(&mut self, row: &[Value]) -> SqlResult<()> {
+                self.rows.push(row[0].clone());
+                Ok(())
+            }
+            fn done(&mut self, _rowcount: Option<u64>, _more: bool) -> SqlResult<()> {
+                Ok(())
+            }
+            fn info(&mut self, _msg: &vauban_errors::InfoMessage) -> SqlResult<()> {
+                Ok(())
+            }
+            fn error(&mut self, err: &SqlError) -> SqlResult<()> {
+                self.errors.push(err.clone());
+                Ok(())
+            }
+            fn env_change(&mut self, _change: &vauban_tds::EnvChange) -> SqlResult<()> {
+                Ok(())
+            }
+            fn return_value(
+                &mut self,
+                _name: &str,
+                _ty: &TypeInfo,
+                _value: &Value,
+            ) -> SqlResult<()> {
+                Ok(())
+            }
+            fn return_status(&mut self, _status: i32) -> SqlResult<()> {
+                Ok(())
+            }
+        }
+        let mut sink = RowSink {
+            rows: Vec::new(),
+            errors: Vec::new(),
+        };
+        session.run_batch(batch, &mut sink).expect("batch runs");
+        assert!(sink.errors.is_empty(), "{:?}", sink.errors);
+        assert_eq!(
+            sink.rows,
+            vec![Value::String(vauban_types::SqlString {
+                text: "ExecSecret".into()
+            })]
+        );
+        let lines = collect_logs("debug", || log_received_sql_batch(58, 1, batch));
+        assert!(lines[0].contains(LOGGED_SECRET_REDACTED));
+        assert!(!lines[0].contains("Hidden"));
+    }
+
+    #[test]
+    fn batches_without_secrets_are_logged_unchanged() {
+        let batch = "SELECT 1; INSERT INTO t VALUES ('public')";
+        let lines = collect_logs("debug", || log_received_sql_batch(59, 1, batch));
+        assert!(lines[0].contains("text=\"SELECT 1; INSERT INTO t VALUES ('public')\""));
+    }
+
+    #[test]
+    fn info_level_leaves_request_logs_silent() {
+        use vauban_tds::{ResetConnection, Rpc, RpcProc};
+
+        let lines = collect_logs("info", || {
+            log_received_sql_batch(54, 1, "SELECT 1");
+            log_received_rpc(
+                54,
+                1,
+                &Rpc {
+                    proc: RpcProc::Name("sp_help".into()),
+                    options: 0,
+                    transaction_descriptor: 0,
+                    reset: ResetConnection::None,
+                    params: Vec::new(),
+                },
+            );
+            log_rendered_client_error(54, 1, &SqlError::incorrect_syntax_near("x", 1));
+        });
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    fn collect_logs(level: &str, emit: impl FnOnce()) -> Vec<String> {
+        use std::fmt::Write as _;
+        use std::sync::{Arc, Mutex};
+
+        use tracing::Subscriber;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Default)]
+        struct Fields {
+            text: String,
+        }
+
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if !self.text.is_empty() {
+                    self.text.push(' ');
+                }
+                let _ = write!(self.text, "{}={value:?}", field.name());
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if !self.text.is_empty() {
+                    self.text.push(' ');
+                }
+                let _ = write!(self.text, "{}={value:?}", field.name());
+            }
+        }
+
+        struct LogCollector {
+            lines: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl<S> Layer<S> for LogCollector
+        where
+            S: Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.lines.lock().unwrap().push(format!(
+                    "{} {}",
+                    event.metadata().name(),
+                    fields.text
+                ));
+            }
+        }
+
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(format!("vauban_session={level}")))
+            .with(LogCollector {
+                lines: Arc::clone(&lines),
+            });
+        tracing::subscriber::with_default(subscriber, emit);
+        Arc::try_unwrap(lines)
+            .expect("no stray collector handles")
+            .into_inner()
+            .unwrap()
+    }
+
+    #[test]
+    fn format_received_rpc_replays_sp_executesql() {
+        use vauban_tds::{ResetConnection, Rpc, RpcParam, RpcProc};
+        use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+
+        let nvarchar = |text: &str| Value::String(SqlString { text: text.into() });
+        let rpc = Rpc {
+            proc: RpcProc::SP_EXECUTESQL,
+            options: 0,
+            transaction_descriptor: 0,
+            reset: ResetConnection::None,
+            params: vec![
+                RpcParam {
+                    name: "stmt".into(),
+                    output: false,
+                    default: false,
+                    ty: TypeInfo::new(SqlType::NVarChar(Len::Max), false),
+                    value: nvarchar("SELECT @p"),
+                },
+                RpcParam {
+                    name: "params".into(),
+                    output: false,
+                    default: false,
+                    ty: TypeInfo::new(SqlType::NVarChar(Len::Max), false),
+                    value: nvarchar("@p int"),
+                },
+                RpcParam {
+                    name: "@p".into(),
+                    output: false,
+                    default: false,
+                    ty: TypeInfo::new(SqlType::Int, false),
+                    value: Value::I32(1),
+                },
+            ],
+        };
+        assert_eq!(
+            format_received_rpc(&rpc),
+            "EXEC sp_executesql N'SELECT @p', N'@p int', @p = 1"
+        );
+    }
+
+    /// Wire-level check that a panicked request yields ERROR 50000 then DONE `ERROR` on the
+    /// client (`a_panicked_request_reaches_the_client_as_an_error_then_done`).
+    mod panic_wire {
+        use super::*;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::time::timeout;
+        use tokio_util::sync::CancellationToken;
+        use vauban_storage::MemoryStorage;
+
+        use crate::{NoAuth, Server, ServerConfig};
+
+        const DEFAULT_PACKET_SIZE: u16 = 4096;
+        const PACKET_SQL_BATCH: u8 = 0x01;
+        const PACKET_TABULAR_RESULT: u8 = 0x04;
+        const PACKET_LOGIN7: u8 = 0x10;
+        const PACKET_PRELOGIN: u8 = 0x12;
+        const STATUS_EOM: u8 = 0x01;
+        const OPTION_VERSION: u8 = 0x00;
+        const OPTION_ENCRYPTION: u8 = 0x01;
+        const OPTION_TERMINATOR: u8 = 0xFF;
+        const ENCRYPT_NOT_SUP: u8 = 0x02;
+        const TDS_7_4: u32 = 0x7400_0004;
+        const HEADER_TRANSACTION_DESCRIPTOR: u16 = 0x0002;
+        const TOKEN_ERROR: u8 = 0xAA;
+        const TOKEN_DONE: u8 = 0xFD;
+        const DONE_ERROR: u16 = 0x0002;
+        const RESPONSE_BUDGET: Duration = Duration::from_secs(5);
+        const INTERNAL_ERROR: u32 = 50000;
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Tok {
+            Error(u32),
+            Done {
+                status: u16,
+                cur_cmd: u16,
+                row_count: u64,
+            },
+        }
+
+        fn packet(kind: u8, payload: &[u8]) -> Vec<u8> {
+            let mut packet = vec![kind, STATUS_EOM];
+            packet.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+            packet.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+            packet.extend_from_slice(payload);
+            packet
+        }
+
+        fn utf16le(s: &str) -> Vec<u8> {
+            s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+        }
+
+        fn prelogin_packet() -> Vec<u8> {
+            let version: [u8; 6] = [0x0F, 0x00, 0x07, 0xD0, 0x00, 0x00];
+            let data_start = 11u16;
+            let mut payload = Vec::new();
+            payload.push(OPTION_VERSION);
+            payload.extend_from_slice(&data_start.to_be_bytes());
+            payload.extend_from_slice(&(version.len() as u16).to_be_bytes());
+            payload.push(OPTION_ENCRYPTION);
+            payload.extend_from_slice(&(data_start + version.len() as u16).to_be_bytes());
+            payload.extend_from_slice(&1u16.to_be_bytes());
+            payload.push(OPTION_TERMINATOR);
+            payload.extend_from_slice(&version);
+            payload.push(ENCRYPT_NOT_SUP);
+            packet(PACKET_PRELOGIN, &payload)
+        }
+
+        fn login7_packet() -> Vec<u8> {
+            const FIXED_LEN: usize = 94;
+            let mut data = Vec::new();
+            let mut pairs = Vec::new();
+            for field in [
+                "testhost",
+                "sa",
+                "",
+                "vauban-server-test",
+                "localhost",
+                "",
+                "hand-made",
+                "",
+                "",
+            ] {
+                pairs.push(((FIXED_LEN + data.len()) as u16, field.len() as u16));
+                data.extend_from_slice(&utf16le(field));
+            }
+            let mut fixed = Vec::with_capacity(FIXED_LEN);
+            fixed.extend_from_slice(&((FIXED_LEN + data.len()) as u32).to_le_bytes());
+            fixed.extend_from_slice(&TDS_7_4.to_le_bytes());
+            fixed.extend_from_slice(&u32::from(DEFAULT_PACKET_SIZE).to_le_bytes());
+            fixed.extend_from_slice(&0u32.to_le_bytes());
+            fixed.extend_from_slice(&4242u32.to_le_bytes());
+            fixed.extend_from_slice(&0u32.to_le_bytes());
+            fixed.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            fixed.extend_from_slice(&0i32.to_le_bytes());
+            fixed.extend_from_slice(&0x0409u32.to_le_bytes());
+            for (ib, cch) in &pairs {
+                fixed.extend_from_slice(&ib.to_le_bytes());
+                fixed.extend_from_slice(&cch.to_le_bytes());
+            }
+            fixed.extend_from_slice(&[0u8; 6]);
+            fixed.extend_from_slice(&[0u8; 4]);
+            fixed.extend_from_slice(&[0u8; 4]);
+            fixed.extend_from_slice(&[0u8; 4]);
+            fixed.extend_from_slice(&0u32.to_le_bytes());
+            assert_eq!(fixed.len(), FIXED_LEN);
+            fixed.extend_from_slice(&data);
+            packet(PACKET_LOGIN7, &fixed)
+        }
+
+        fn sql_batch_packet(text: &str) -> Vec<u8> {
+            let mut payload = Vec::with_capacity(22 + 2 * text.len());
+            payload.extend_from_slice(&22u32.to_le_bytes());
+            payload.extend_from_slice(&18u32.to_le_bytes());
+            payload.extend_from_slice(&HEADER_TRANSACTION_DESCRIPTOR.to_le_bytes());
+            payload.extend_from_slice(&0u64.to_le_bytes());
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            payload.extend_from_slice(&utf16le(text));
+            packet(PACKET_SQL_BATCH, &payload)
+        }
+
+        async fn read_packet(client: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 8];
+            client.read_exact(&mut header).await.unwrap();
+            let len = usize::from(u16::from_be_bytes([header[2], header[3]]));
+            let mut packet = header.to_vec();
+            packet.resize(len, 0);
+            client.read_exact(&mut packet[8..]).await.unwrap();
+            packet
+        }
+
+        async fn read_response(client: &mut TcpStream, budget: Duration) -> Vec<u8> {
+            let deadline = tokio::time::Instant::now() + budget;
+            let mut payload = Vec::new();
+            loop {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let packet = timeout(left, read_packet(client))
+                    .await
+                    .expect("response packet within budget");
+                assert_eq!(packet[0], PACKET_TABULAR_RESULT);
+                payload.extend_from_slice(&packet[8..]);
+                if packet[1] & STATUS_EOM == STATUS_EOM {
+                    return payload;
+                }
+            }
+        }
+
+        fn tokens(payload: &[u8]) -> Vec<Tok> {
+            let mut pos = 0;
+            let mut out = Vec::new();
+            while pos < payload.len() {
+                match payload[pos] {
+                    TOKEN_ERROR => {
+                        let len =
+                            usize::from(u16::from_le_bytes([payload[pos + 1], payload[pos + 2]]));
+                        let number =
+                            u32::from_le_bytes(payload[pos + 3..pos + 7].try_into().unwrap());
+                        pos += 3 + len;
+                        out.push(Tok::Error(number));
+                    }
+                    TOKEN_DONE => {
+                        out.push(Tok::Done {
+                            status: u16::from_le_bytes([payload[pos + 1], payload[pos + 2]]),
+                            cur_cmd: u16::from_le_bytes([payload[pos + 3], payload[pos + 4]]),
+                            row_count: u64::from_le_bytes(
+                                payload[pos + 5..pos + 13].try_into().unwrap(),
+                            ),
+                        });
+                        pos += 13;
+                    }
+                    other => panic!("unexpected token 0x{other:02X} at {pos}"),
+                }
+            }
+            out
+        }
+
+        async fn connect_and_login(addr: SocketAddr) -> TcpStream {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(&prelogin_packet()).await.unwrap();
+            let _ = read_packet(&mut client).await;
+            client.write_all(&login7_packet()).await.unwrap();
+            let _ = read_response(&mut client, RESPONSE_BUDGET).await;
+            client
+        }
+
+        async fn run_batch(client: &mut TcpStream, text: &str) -> Vec<Tok> {
+            client.write_all(&sql_batch_packet(text)).await.unwrap();
+            tokens(&read_response(client, RESPONSE_BUDGET).await)
+        }
+
+        #[tokio::test]
+        async fn a_panicked_request_reaches_the_client_as_an_error_then_done() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let shutdown = CancellationToken::new();
+            let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+            let server = Server::new(
+                Arc::clone(&engine),
+                ServerConfig {
+                    encrypt: EncryptPolicy::Off,
+                    tls: None,
+                    authenticator: Arc::new(NoAuth),
+                    server_name: "vauban-test".into(),
+                    default_packet_size: DEFAULT_PACKET_SIZE,
+                    program_name: None,
+                    version_banner: None,
+                    edition: None,
+                },
+            );
+            let task = tokio::spawn(server.serve(listener, shutdown.clone()));
+            let mut client = connect_and_login(addr).await;
+            let response = run_batch(&mut client, TEST_PANIC_BATCH).await;
+            assert_eq!(
+                response,
+                vec![
+                    Tok::Error(INTERNAL_ERROR),
+                    Tok::Done {
+                        status: DONE_ERROR,
+                        cur_cmd: 0,
+                        row_count: 0,
+                    },
+                ]
+            );
+            client
+                .write_all(&sql_batch_packet("SELECT 1"))
+                .await
+                .unwrap();
+            let after = read_response(&mut client, RESPONSE_BUDGET).await;
+            assert!(
+                after.contains(&TOKEN_DONE),
+                "session still serves after a reported panic"
+            );
+            drop(client);
+            shutdown.cancel();
+            timeout(Duration::from_secs(6), task)
+                .await
+                .expect("serve returns after shutdown")
+                .expect("serve task finished")
+                .expect("serve succeeded");
+        }
     }
 }
