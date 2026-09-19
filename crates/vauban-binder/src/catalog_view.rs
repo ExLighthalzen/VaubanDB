@@ -12,9 +12,7 @@
 //! [`CatalogSnapshot::view_definition`]) and converts the result into the types of the
 //! binder.
 
-use vauban_catalog::{
-    CatalogSnapshot, ColumnId, ColumnMeta, ConstraintMeta, IndexMeta, ObjectId, ObjectKind,
-};
+use vauban_catalog::{CatalogSnapshot, ColumnId, ColumnMeta, ConstraintMeta, ObjectId, ObjectKind};
 use vauban_parser::ObjectName;
 
 use crate::bound::ColumnBinding;
@@ -121,68 +119,6 @@ impl CatalogView for CatalogSnapshot {
         }
         names
     }
-
-    /// Key columns of the `PRIMARY KEY` of `table`, read from [`CatalogSnapshot::indexes_of`]
-    /// and the `PRIMARY KEY` entry of the table constraints.
-    fn primary_key_columns(&self, table: ObjectId) -> Option<Vec<String>> {
-        let meta = self.table(table)?;
-        let pk_id = meta
-            .constraints
-            .iter()
-            .find_map(|constraint| match constraint {
-                ConstraintMeta::PrimaryKey(id) => Some(*id),
-                _ => None,
-            })?;
-        let pk_index = self
-            .indexes_of(table)
-            .iter()
-            .find(|index| index.id == pk_id)?;
-        key_column_names(meta, pk_index)
-    }
-
-    /// Whether `table` declares a `UNIQUE` key exactly on `columns`, in order.
-    fn unique_key_on(&self, table: ObjectId, columns: &[String]) -> bool {
-        let Some(meta) = self.table(table) else {
-            return false;
-        };
-        if columns.is_empty() {
-            return false;
-        }
-        self.indexes_of(table).iter().any(|index| {
-            index.unique
-                && index.columns.len() == columns.len()
-                && key_matches_names(meta, index, columns)
-        })
-    }
-}
-
-/// The names of the key columns of `index` on `table`, in key order.
-fn key_column_names(meta: &vauban_catalog::TableMeta, index: &IndexMeta) -> Option<Vec<String>> {
-    index
-        .columns
-        .iter()
-        .map(|key| {
-            meta.columns
-                .iter()
-                .find(|column| column.ordinal == key.column)
-                .map(|column| column.name.clone())
-        })
-        .collect()
-}
-
-/// Whether the key columns of `index` match `names`, in order, case-insensitively.
-fn key_matches_names(
-    meta: &vauban_catalog::TableMeta,
-    index: &IndexMeta,
-    names: &[String],
-) -> bool {
-    index.columns.len() == names.len()
-        && index.columns.iter().zip(names.iter()).all(|(key, name)| {
-            meta.columns
-                .iter()
-                .find(|column| column.ordinal == key.column)
-                .is_some_and(|column| column.name.eq_ignore_ascii_case(name))
-        })
 }
 
 /// The columns of a table as the binder names them, in the order of the row of `storage`.

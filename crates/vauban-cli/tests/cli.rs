@@ -198,6 +198,80 @@ fn serve_with_unknown_key_in_config_file_exits_2() {
     assert!(stderr(&output).contains("error: invalid configuration file"));
 }
 
+/// Arguments that log startup warnings then fail while opening TLS material, so the
+/// process exits without listening.
+fn args_after_warnings(extra: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "serve".into(),
+        "--in-memory".into(),
+        "--sa-password".into(),
+        "Secret1!".into(),
+        "--encrypt".into(),
+        "required".into(),
+        "--cert".into(),
+        "/nonexistent/vauban-cli-cert.pem".into(),
+        "--key".into(),
+        "/nonexistent/vauban-cli-key.pem".into(),
+    ];
+    args.extend(extra.iter().map(|s| (*s).to_owned()));
+    args
+}
+
+#[test]
+fn text_log_piped_to_a_file_has_no_ansi_escapes() {
+    let owned = args_after_warnings(&[]);
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let output = run(&args);
+    assert_eq!(output.status.code(), Some(2));
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        !combined.contains("\x1b["),
+        "piped output must not contain ANSI escapes:\n{combined}"
+    );
+}
+
+#[test]
+fn plain_log_format_has_no_ansi_escapes() {
+    let owned = args_after_warnings(&["--log-format", "plain"]);
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let output = run(&args);
+    assert_eq!(output.status.code(), Some(2));
+    let out = stdout(&output);
+    assert!(
+        !out.contains("\x1b["),
+        "plain format must not contain ANSI escapes:\n{out}"
+    );
+    assert!(
+        out.contains("sa password passed on the command line is visible in the process list"),
+        "warning missing:\n{out}"
+    );
+    assert!(out.contains("! WARN"), "level marker missing:\n{out}");
+}
+
+#[test]
+fn json_log_format_startup_line_shape_is_unchanged() {
+    let owned = args_after_warnings(&["--log-format", "json"]);
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let output = run(&args);
+    assert_eq!(output.status.code(), Some(2));
+    let out = stdout(&output);
+    let warning_line = out
+        .lines()
+        .find(|line| line.contains("visible in the process list"))
+        .expect("warning line");
+    let value: serde_json::Value = serde_json::from_str(warning_line).expect("json warning line");
+    assert_eq!(
+        value.pointer("/fields/message").and_then(|v| v.as_str()),
+        Some(
+            "sa password passed on the command line is visible in the process list; prefer VAUBAN_SA_PASSWORD"
+        )
+    );
+    assert!(
+        value.get("timestamp").is_some(),
+        "json line must keep a timestamp field: {warning_line}"
+    );
+}
+
 #[cfg(unix)]
 mod unix {
     use super::*;

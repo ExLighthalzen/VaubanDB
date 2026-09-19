@@ -486,11 +486,7 @@ pub(crate) fn add_table_constraint(
     })?;
     let mut meta = before.clone();
     let count = meta.constraints.len();
-    apply_table_constraints(
-        store,
-        &constraint_table_def(catalog, &before, constraint)?,
-        &mut meta,
-    )?;
+    apply_table_constraints(store, &constraint_table_def(&before, constraint), &mut meta)?;
     let added: Vec<ObjectId> = meta
         .constraints
         .iter()
@@ -743,14 +739,10 @@ fn live_storage_tables(catalog: &Catalog) -> SqlResult<BTreeSet<TableId>> {
     Ok(live)
 }
 
-fn constraint_table_def(
-    catalog: &Catalog,
-    table: &TableMeta,
-    constraint: &ConstraintDef,
-) -> SqlResult<TableDef> {
-    Ok(TableDef {
+fn constraint_table_def(table: &TableMeta, constraint: &ConstraintDef) -> TableDef {
+    TableDef {
         name: QualifiedName {
-            database: database_name_of(catalog, table.database)?,
+            database: "master".to_owned(),
             schema: table.schema.clone(),
             name: table.name.clone(),
         },
@@ -766,22 +758,7 @@ fn constraint_table_def(
             })
             .collect(),
         constraints: vec![constraint.clone()],
-    })
-}
-
-fn database_name_of(catalog: &Catalog, id: DbId) -> SqlResult<String> {
-    catalog
-        .storage
-        .databases()?
-        .into_iter()
-        .find(|(db_id, _)| *db_id == id)
-        .map(|(_, name)| name)
-        .ok_or_else(|| {
-            InternalError::Bug(format!(
-                "Catalog::alter_table: database {id:?} vanished before a constraint alter"
-            ))
-            .into()
-        })
+    }
 }
 
 fn constraint_id_on_table(store: &TableStore, table: &TableMeta, name: &str) -> Option<ObjectId> {
@@ -955,10 +932,11 @@ fn resolve_foreign_key(
         .into());
     }
     let target = referenced_table(store, meta, referenced).ok_or_else(|| {
-        foreign_key_invalid_table(
-            &format!("{}.{}", referenced.schema, referenced.name),
-            constraint,
-        )
+        InternalError::Bug(format!(
+            "Catalog::create_table: the foreign key {constraint} points at the unknown table \
+             {}.{}; SQL Server answers 1767, which vauban-errors does not catalogue",
+            referenced.schema, referenced.name
+        ))
     })?;
     let mut child_columns = Vec::with_capacity(columns.len());
     for column in columns {
@@ -1083,34 +1061,20 @@ fn primary_key_columns(store: &TableStore, table: &TableMeta) -> Option<Vec<Colu
 /// is refused with 1776, and a unique index built by `CREATE UNIQUE INDEX` is taken as
 /// readily as a `PRIMARY KEY` (module documentation).
 fn candidate_key(store: &TableStore, table: &TableMeta, columns: &[ColumnId]) -> Option<IndexId> {
-    matching_unique_index(store, table, columns).map(|index| index.id)
-}
-
-/// The unique index of `table` whose key is `columns`, in that order.
-fn matching_unique_index<'a>(
-    store: &'a TableStore,
-    table: &'a TableMeta,
-    columns: &[ColumnId],
-) -> Option<&'a IndexMeta> {
-    store.indexes.of_table(table.id).into_iter().find(|index| {
-        index.unique
-            && index.columns.len() == columns.len()
-            && index
-                .columns
-                .iter()
-                .zip(columns.iter())
-                .all(|(key, column)| column_at(table, key.column) == Some(*column))
-    })
-}
-
-/// Error 1767: the referenced table does not exist or is not visible yet.
-fn foreign_key_invalid_table(referenced: &str, constraint: &str) -> SqlError {
-    SqlError::new(
-        1767,
-        16,
-        0,
-        format!("Foreign key '{constraint}' references invalid table '{referenced}'."),
-    )
+    store
+        .indexes
+        .of_table(table.id)
+        .into_iter()
+        .find(|index: &&IndexMeta| {
+            index.unique
+                && index.columns.len() == columns.len()
+                && index
+                    .columns
+                    .iter()
+                    .zip(columns.iter())
+                    .all(|(key, column)| column_at(table, key.column) == Some(*column))
+        })
+        .map(|index| index.id)
 }
 
 /// The identifier of the column of `table` called `name`, `None` when the table declares no

@@ -148,8 +148,10 @@ impl LogLevel {
 #[derive(ValueEnum, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum LogFormat {
-    /// Human-readable lines.
+    /// Human-readable lines; colour when the output stream supports it.
     Text,
+    /// Human-readable lines without ANSI styling.
+    Plain,
     /// One JSON object per line.
     Json,
 }

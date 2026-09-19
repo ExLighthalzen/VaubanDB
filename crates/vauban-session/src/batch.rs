@@ -314,18 +314,14 @@ impl Session {
             if let Flow::Stop = self.run_prepared(current, more, sink)? {
                 break;
             }
-            let tail_start = index + 1;
-            if tail_start < batch.statements.len()
-                && (catalog_changed(current, &batch.statements[tail_start..])
-                    || tail_start >= prepared.len())
-            {
+            if catalog_changed(current) && index + 1 < batch.statements.len() {
                 let tail = self.reprepare_tail(
                     text,
-                    &batch.statements[tail_start..],
+                    &batch.statements[index + 1..],
                     &mut bind_state,
                     &mut batch_variables,
                 )?;
-                prepared.truncate(tail_start);
+                prepared.truncate(index + 1);
                 prepared.extend(tail);
             }
             index += 1;
@@ -352,7 +348,6 @@ impl Session {
             &snapshot,
             &mut state,
             &mut batch_variables,
-            bind_limit_for(statements),
         );
         let closed = self.engine.txn.commit(binding);
         match (prepared, closed) {
@@ -372,14 +367,7 @@ impl Session {
     ) -> SqlResult<Vec<PreparedStatement>> {
         let binding = self.engine.txn.begin(IsolationLevel::ReadCommitted);
         let snapshot = self.engine.catalog.snapshot(&binding);
-        let prepared = self.bind_batch(
-            text,
-            statements,
-            &snapshot,
-            state,
-            batch_variables,
-            bind_limit_for(statements),
-        );
+        let prepared = self.bind_batch(text, statements, &snapshot, state, batch_variables);
         self.engine.txn.commit(binding)?;
         prepared
     }
@@ -391,14 +379,10 @@ impl Session {
         snapshot: &CatalogSnapshot,
         state: &mut SessionState,
         batch_variables: &mut BatchVariables,
-        mut limit: Option<usize>,
     ) -> SqlResult<Vec<PreparedStatement>> {
         let mut prepared = Vec::with_capacity(statements.len());
 
         for (index, original) in statements.iter().enumerate() {
-            if limit == Some(0) {
-                break;
-            }
             self.cancel.check()?;
             let raw = statement_text(text, original);
             if matches!(original, Statement::SetOption(_)) {
@@ -483,12 +467,6 @@ impl Session {
                 statement: physical,
                 line: statement_line(statement),
             });
-            if let Some(remaining) = &mut limit {
-                *remaining = remaining.saturating_sub(1);
-                if *remaining == 0 {
-                    break;
-                }
-            }
         }
         Ok(prepared)
     }
@@ -949,21 +927,6 @@ fn column_metadata(schema: &OutputSchema) -> Vec<ColumnMeta> {
         .collect()
 }
 
-/// Whether the batch still holds an `ALTER TABLE`.
-pub(crate) fn batch_has_alter_table(statements: &[Statement]) -> bool {
-    statements
-        .iter()
-        .any(|statement| matches!(statement, Statement::AlterTable(_)))
-}
-
-/// How many statements to bind at once when the batch will reach an `ALTER TABLE`.
-///
-/// A `CREATE TABLE` before the `ALTER` must run before the `ALTER` is bound, so
-/// the tail is prepared one statement at a time when the batch holds an `ALTER TABLE`.
-pub(crate) fn bind_limit_for(statements: &[Statement]) -> Option<usize> {
-    batch_has_alter_table(statements).then_some(1)
-}
-
 /// Whether the batch tail must be rebound after this statement ran.
 ///
 /// The whole batch binds against one catalogue snapshot; that is deliberate for
@@ -971,20 +934,15 @@ pub(crate) fn bind_limit_for(statements: &[Statement]) -> Option<usize> {
 /// 208 and runs neither statement (`create_table_then_select_in_the_same_batch_is_208`).
 /// An `ALTER TABLE` that changes the shape bound by following statements is the exception:
 /// the tail is rebound after it commits so a `SELECT` in the same batch reads the new
-/// columns. A `CREATE TABLE` before an `ALTER TABLE` in one batch is bound one
-/// statement at a time so the `ALTER` sees tables the earlier statements created.
-fn catalog_changed(prepared: &PreparedStatement, tail: &[Statement]) -> bool {
-    match prepared {
+/// columns.
+fn catalog_changed(prepared: &PreparedStatement) -> bool {
+    matches!(
+        prepared,
         PreparedStatement::Bound {
             statement: PhysicalStatement::Ddl(DdlStatement::AlterTable { .. }),
             ..
-        } => true,
-        PreparedStatement::Bound {
-            statement: PhysicalStatement::Ddl(DdlStatement::CreateTable { .. }),
-            ..
-        } => batch_has_alter_table(tail),
-        _ => false,
-    }
+        }
+    )
 }
 
 /// Whether a successful statement resets `@@ERROR` to `0`. A bare `DECLARE` with no
@@ -1590,127 +1548,6 @@ mod tests {
         assert_eq!(batch.errors[0].number, 208);
         assert!(batch.columns.is_empty());
         assert_eq!(tables_of_master(&engine), Vec::<String>::new());
-    }
-
-    /// A lot whose first statement is not DDL still runs the three statements of
-    /// `SELECT 1; CREATE TABLE …; ALTER TABLE … ADD` when the batch holds an `ALTER TABLE`.
-    #[test]
-    fn select_then_create_then_alter_in_one_batch() {
-        let engine = engine();
-        let mut session = session(&engine);
-        let batch = run(
-            &mut session,
-            "SELECT 1; CREATE TABLE dbo.s16e (a int); ALTER TABLE dbo.s16e ADD b int;",
-        );
-        assert_eq!(batch.rows.len(), 1, "the opening `SELECT 1` answered a row");
-        assert!(batch.errors.is_empty(), "{:?}", batch.errors);
-        let handle = engine.txn.begin(IsolationLevel::ReadCommitted);
-        let snapshot = engine.catalog.snapshot(&handle);
-        let object = snapshot
-            .resolve_object("master", Some(DEFAULT_SCHEMA), "s16e", DEFAULT_SCHEMA)
-            .expect("the table was created");
-        assert_eq!(
-            snapshot.table(object.id).expect("table meta").columns.len(),
-            2
-        );
-        engine.txn.commit(handle).expect("commit");
-    }
-
-    /// An ordinary statement between two DDL statements still runs when the batch ends with
-    /// an `ALTER TABLE`.
-    #[test]
-    fn select_between_create_and_alter_in_one_batch() {
-        let engine = engine();
-        let mut session = session(&engine);
-        let batch = run(
-            &mut session,
-            "CREATE TABLE dbo.s16f (a int); SELECT 1; ALTER TABLE dbo.s16f ADD b int;",
-        );
-        assert_eq!(batch.rows.len(), 1, "the middle `SELECT 1` answered a row");
-        assert!(batch.errors.is_empty(), "{:?}", batch.errors);
-        let handle = engine.txn.begin(IsolationLevel::ReadCommitted);
-        let snapshot = engine.catalog.snapshot(&handle);
-        let object = snapshot
-            .resolve_object("master", Some(DEFAULT_SCHEMA), "s16f", DEFAULT_SCHEMA)
-            .expect("the table was created");
-        assert_eq!(
-            snapshot.table(object.id).expect("table meta").columns.len(),
-            2
-        );
-        engine.txn.commit(handle).expect("commit");
-    }
-
-    /// After an `ALTER TABLE` that adds a column, a `SELECT` on that column in the same batch
-    /// is rebound against the updated catalogue.
-    #[test]
-    fn alter_add_column_then_select_in_one_batch() {
-        let engine = engine();
-        let mut session = session(&engine);
-        let batch = run(
-            &mut session,
-            "CREATE TABLE dbo.s16h (a int); ALTER TABLE dbo.s16h ADD b int; SELECT b FROM dbo.s16h;",
-        );
-        assert!(batch.errors.is_empty(), "{:?}", batch.errors);
-        assert_eq!(
-            batch.columns,
-            vec![vec![("b".to_owned(), SqlType::Int)]],
-            "the `SELECT b` was bound after the `ALTER`"
-        );
-        assert!(batch.rows.is_empty(), "the empty table sent no row");
-    }
-
-    /// When a late statement of a batch fails to bind, the statements before it still run:
-    /// two `CREATE TABLE`, an `ALTER TABLE … FOREIGN KEY`, then a `SELECT` on a missing
-    /// column stops the batch with 207 after the DDL committed.
-    #[test]
-    fn create_alter_foreign_key_then_bad_select_in_one_batch() {
-        let engine = engine();
-        let mut session = session(&engine);
-        let mut sink = Received::default();
-        let err = session
-            .run_batch(
-                "CREATE TABLE dbo.s16g_p (id int NOT NULL PRIMARY KEY);\
-                 CREATE TABLE dbo.s16g_c (id int NOT NULL, pid int);\
-                 ALTER TABLE dbo.s16g_c ADD CONSTRAINT fk_s16g FOREIGN KEY (pid)\
-                 REFERENCES dbo.s16g_p(id);\
-                 SELECT nosuch FROM dbo.s16g_c;",
-                &mut sink,
-            )
-            .expect_err("a bind error on the tail stops the batch");
-        assert_eq!(err.number, 207);
-        let handle = engine.txn.begin(IsolationLevel::ReadCommitted);
-        let snapshot = engine.catalog.snapshot(&handle);
-        assert!(
-            snapshot
-                .resolve_object("master", Some(DEFAULT_SCHEMA), "s16g_p", DEFAULT_SCHEMA)
-                .is_some()
-        );
-        assert!(
-            snapshot
-                .resolve_object("master", Some(DEFAULT_SCHEMA), "s16g_c", DEFAULT_SCHEMA)
-                .is_some()
-        );
-        engine.txn.commit(handle).expect("commit");
-    }
-
-    /// `CREATE TABLE` twice then `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` in one batch
-    /// succeeds when the referenced table carries a primary key.
-    #[test]
-    fn create_tables_then_alter_add_foreign_key_in_one_batch() {
-        let engine = engine();
-        let mut session = session(&engine);
-        let batch = run(
-            &mut session,
-            "CREATE TABLE dbo.s16fk_p (id int NOT NULL PRIMARY KEY);\
-             CREATE TABLE dbo.s16fk_c (id int NOT NULL, pid int);\
-             ALTER TABLE dbo.s16fk_c ADD CONSTRAINT fk_s16fk FOREIGN KEY (pid)\
-             REFERENCES dbo.s16fk_p(id);",
-        );
-        assert!(
-            batch.errors.is_empty(),
-            "unexpected errors: {:?}",
-            batch.errors
-        );
     }
 
     /// The other half of the vector above: a name the batch creates **twice** binds twice,

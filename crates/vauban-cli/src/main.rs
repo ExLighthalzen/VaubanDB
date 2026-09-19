@@ -10,6 +10,7 @@
 //! authentication mode.
 
 mod config;
+mod logging;
 mod shutdown;
 mod tls;
 
@@ -92,6 +93,7 @@ fn serve(args: &ServeArgs) -> ExitCode {
         return usage_error(err);
     }
 
+    logging::install_local_offset();
     init_tracing(&cfg);
     for warning in cfg.warnings() {
         warn!("{warning}");
@@ -151,17 +153,36 @@ fn nonempty_env(name: &str) -> Option<String> {
 }
 
 /// Installs the global `tracing` subscriber. `RUST_LOG`, when set, wins over
-/// `--log-level`. Colours only when stdout is a terminal: a pipe or a file gets plain
-/// text.
+/// `--log-level`. The default text layout is [`logging::HumanEventFormat`]; `--log-format
+/// json` keeps the previous JSON shape.
 fn init_tracing(cfg: &Config) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(cfg.log_level.as_directive()));
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(std::io::stdout().is_terminal());
     match cfg.log_format {
-        LogFormat::Text => builder.init(),
-        LogFormat::Json => builder.json().init(),
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(std::io::stdout().is_terminal())
+                .json()
+                .init();
+        }
+        LogFormat::Text | LogFormat::Plain => {
+            let ansi = logging::ansi_enabled(cfg);
+            let choice = logging::color_choice(cfg);
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(logging::AnstreamMakeWriter { choice })
+                .with_ansi(ansi)
+                .with_target(false)
+                .without_time()
+                .event_format(logging::HumanEventFormat {
+                    ansi,
+                    unicode_markers: matches!(cfg.log_format, LogFormat::Text)
+                        && logging::unicode_markers_enabled(),
+                })
+                .fmt_fields(logging::HumanFields::new())
+                .init();
+        }
     }
 }
 
