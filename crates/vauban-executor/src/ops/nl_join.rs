@@ -16,7 +16,7 @@ use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{PhysicalJoinKind, PhysicalPlan};
 use vauban_types::Value;
 
-use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
+use crate::context::{CANCEL_CHECK_ROWS, ExecContext, SubqueryLocalsSource};
 use crate::expr::{as_condition, eval_expr};
 use crate::operator::{Operator, build_operator};
 use crate::ops::subquery::{local_column_ids, scan_column_bindings};
@@ -135,6 +135,7 @@ impl<'a> NestedLoopJoin<'a> {
             return false;
         }
         ctx.push_subquery_locals(
+            SubqueryLocalsSource::JoinInnerScan,
             local_column_ids(inner_plan),
             scan_column_bindings(inner_plan),
         );

@@ -21,6 +21,15 @@ use crate::row::Row;
 
 pub(crate) const SLOT_COLUMN_ID: ColumnId = ColumnId(0);
 
+/// Who pushed the current [`ExecContext::subquery_locals`] frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubqueryLocalsSource {
+    /// EXISTS, IN or scalar evaluation over a correlated inner plan.
+    CorrelatedPlan,
+    /// Inner scan of a cross or semi join: row bindings are scan-local, not join-wide.
+    JoinInnerScan,
+}
+
 struct SubqueryFrame {
     subplans: Vec<SubPlan>,
     slot: usize,
@@ -352,6 +361,7 @@ pub struct ExecContext<'a> {
     /// Column identifiers exposed by the inner plan currently being evaluated.
     subquery_locals: Option<HashSet<ColumnId>>,
     subquery_row_bindings: Option<Vec<ColumnBinding>>,
+    subquery_locals_source: Option<SubqueryLocalsSource>,
     /// When set, each `open` of a subquery inner plan increments this counter.
     subquery_open_count: Option<Rc<Cell<usize>>>,
     /// When set, each `next` of a subquery inner plan increments this counter.
@@ -382,6 +392,7 @@ impl<'a> ExecContext<'a> {
             subquery_frames: Vec::new(),
             subquery_locals: None,
             subquery_row_bindings: None,
+            subquery_locals_source: None,
             subquery_open_count: None,
             subquery_next_count: None,
         }
@@ -576,20 +587,57 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    /// Marks which columns belong to the inner plan of a correlated subquery.
+    /// Marks which columns belong to the inner plan currently being evaluated.
     pub(crate) fn push_subquery_locals(
         &mut self,
+        source: SubqueryLocalsSource,
         locals: HashSet<ColumnId>,
         bindings: Vec<ColumnBinding>,
     ) {
         self.subquery_locals = Some(locals);
         self.subquery_row_bindings = Some(bindings);
+        self.subquery_locals_source = Some(source);
     }
 
     /// Clears [`ExecContext::push_subquery_locals`].
     pub(crate) fn pop_subquery_locals(&mut self) {
         self.subquery_locals = None;
         self.subquery_row_bindings = None;
+        self.subquery_locals_source = None;
+    }
+
+    #[must_use]
+    pub(crate) fn subquery_locals_source(&self) -> Option<SubqueryLocalsSource> {
+        self.subquery_locals_source
+    }
+
+    #[must_use]
+    pub(crate) fn subquery_row_binding_count(&self) -> usize {
+        self.subquery_row_bindings
+            .as_ref()
+            .map_or(0, |bindings| bindings.len())
+    }
+
+    /// Evaluates a predicate over a concatenated join row.
+    ///
+    /// When the inner scan of a cross join pushed scan-local bindings, suspend them for
+    /// one evaluation so [`ColumnRef`](vauban_binder::BoundExprKind::ColumnRef)s use
+    /// join-wide indices on `row`.
+    pub(crate) fn eval_over_concatenated_row<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> SqlResult<R>,
+    ) -> SqlResult<R> {
+        if self.subquery_locals_source != Some(SubqueryLocalsSource::JoinInnerScan) {
+            return f(self);
+        }
+        let saved_locals = self.subquery_locals.take();
+        let saved_bindings = self.subquery_row_bindings.take();
+        let saved_source = self.subquery_locals_source.take();
+        let result = f(self);
+        self.subquery_locals = saved_locals;
+        self.subquery_row_bindings = saved_bindings;
+        self.subquery_locals_source = saved_source;
+        result
     }
 
     #[must_use]

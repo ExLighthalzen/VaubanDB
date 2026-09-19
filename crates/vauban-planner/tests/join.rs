@@ -7,7 +7,7 @@
 
 use vauban_planner::{
     KeyRangeExpr, PhysicalJoinKind, PhysicalPlan, PhysicalStatement, PlanCatalog, PlanContext,
-    plan, testing::FakeCatalog,
+    explain, plan, testing::FakeCatalog,
 };
 
 use vauban_binder::{
@@ -16,6 +16,7 @@ use vauban_binder::{
 };
 use vauban_catalog::ColumnId;
 use vauban_storage::{Direction, IndexId, KeyColumn, TableId};
+use vauban_sysfn::register_builtins;
 use vauban_types::{SqlType, TypeInfo};
 
 // Table IDs for the two sides.
@@ -434,6 +435,115 @@ fn join_schema_is_left_then_right() {
     );
     let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["k", "c", "k", "c"]);
+}
+
+/// Comma-join equality in the `WHERE` stays `Filter` over `NestedLoopJoin` cross; writing
+/// that equality in an `ON` becomes a `HashJoin`.
+#[test]
+fn comma_join_equality_in_the_where_stays_filter_over_cross() {
+    register_builtins();
+    struct TwoTables;
+    impl PlanCatalog for TwoTables {
+        fn indexes_of(
+            &self,
+            _table: vauban_storage::TableId,
+        ) -> Vec<(vauban_storage::IndexId, vauban_storage::IndexShape)> {
+            Vec::new()
+        }
+    }
+    impl vauban_binder::CatalogView for TwoTables {
+        fn resolve_table(
+            &self,
+            name: &vauban_parser::ObjectName,
+            database: &str,
+            default_schema: &str,
+        ) -> Option<vauban_binder::ResolvedTable> {
+            let part = |ident: Option<&vauban_parser::Ident>, default: &str| {
+                ident.map_or_else(|| default.to_owned(), |ident| ident.value.clone())
+            };
+            if !part(name.database.as_ref(), database).eq_ignore_ascii_case("master")
+                || !part(name.schema.as_ref(), default_schema).eq_ignore_ascii_case("dbo")
+            {
+                return None;
+            }
+            let object = match name.name.value.to_ascii_lowercase().as_str() {
+                "clients" => 1,
+                "regions" => 2,
+                _ => return None,
+            };
+            let cols = if object == 1 {
+                vec![
+                    ("client_id", 0, false),
+                    ("nom", 1, false),
+                    ("region_id", 2, true),
+                    ("credit", 3, true),
+                ]
+            } else {
+                vec![
+                    ("region_id", 0, false),
+                    ("nom", 1, false),
+                    ("pays", 2, false),
+                ]
+            };
+            Some(vauban_binder::ResolvedTable {
+                object: vauban_catalog::ObjectId(object),
+                table: Some(vauban_storage::TableId(u32::try_from(object).unwrap())),
+                columns: cols
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ordinal, (name, storage_index, nullable))| ColumnBinding {
+                        column: ColumnId(i32::try_from(ordinal + 1).unwrap()),
+                        index: storage_index,
+                        name: name.to_owned(),
+                        ty: if nullable {
+                            TypeInfo::new(SqlType::Int, true)
+                        } else {
+                            int_type()
+                        },
+                    })
+                    .collect(),
+                kind: vauban_binder::ResolvedTableKind::Table,
+            })
+        }
+    }
+    let catalog = TwoTables;
+    let bind = |sql: &str| {
+        let batch = vauban_parser::parse_batch(sql, &vauban_parser::ParseOptions::default())
+            .expect("parses");
+        let ctx = vauban_binder::BindContext {
+            text: sql,
+            catalog: Some(&catalog),
+            database: "master",
+            default_schema: "dbo",
+            variables: &vauban_binder::NoVariables,
+            options: vauban_binder::SessionOptions::default(),
+        };
+        vauban_binder::bind(&batch.statements[0], &ctx).expect("binds")
+    };
+    let plan_ctx = PlanContext { catalog: &catalog };
+    let comma = plan(
+        bind("SELECT c.client_id, r.nom AS region FROM dbo.clients AS c, dbo.regions AS r WHERE c.region_id = r.region_id"),
+        &plan_ctx,
+    )
+    .expect("plans");
+    let inner = plan(
+        bind("SELECT c.client_id, r.nom AS region FROM dbo.clients AS c INNER JOIN dbo.regions AS r ON c.region_id = r.region_id"),
+        &plan_ctx,
+    )
+    .expect("plans");
+    let PhysicalStatement::Query(comma) = comma else {
+        panic!("expected a query");
+    };
+    let PhysicalStatement::Query(inner) = inner else {
+        panic!("expected a query");
+    };
+    let comma_text = explain(&comma);
+    let inner_text = explain(&inner);
+    assert!(
+        comma_text.contains("Filter") && comma_text.contains("NestedLoopJoin"),
+        "comma plan: {comma_text}"
+    );
+    assert!(inner_text.contains("HashJoin"), "inner plan: {inner_text}");
 }
 
 #[test]

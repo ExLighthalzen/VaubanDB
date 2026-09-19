@@ -6,12 +6,12 @@
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LockHints, OutputColumn, OutputSchema,
-    SessionOptions,
+    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, JoinKind, LockHints, LogicalOp,
+    OutputColumn, OutputSchema, SessionOptions,
 };
 use vauban_catalog::ColumnId;
 use vauban_executor::{ExecContext, ExecOutcome, Row, execute_collect};
-use vauban_planner::{KeyRangeExpr, PhysicalJoinKind, PhysicalPlan, PhysicalStatement};
+use vauban_planner::{KeyRangeExpr, PhysicalJoinKind, PhysicalPlan, PhysicalStatement, SubPlan};
 use vauban_storage::{
     Direction, IndexShape, KeyColumn, MemoryStorage, Row as StorageRow, Snapshot, Storage, TableId,
     TableShape,
@@ -462,5 +462,308 @@ fn inner_seek_uses_the_outer_row() {
     assert_eq!(
         set_seek.rows, set_ref.rows,
         "seek and scan produce the same rows"
+    );
+}
+
+/// A `WHERE` equality over a comma-style cross product reads both sides of the
+/// concatenated row, not the inner scan indices pushed for correlation.
+#[test]
+fn filter_over_a_cross_join_compares_both_sides() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let db = storage
+        .create_database("mydb")
+        .expect("the database is new");
+    let shape = TableShape {
+        columns: vec![int_ty(), int_ty()],
+        clustered_key: None,
+    };
+    let clients = storage.create_table(db, &shape).expect("clients");
+    let regions = storage.create_table(db, &shape).expect("regions");
+    let txn = TransactionManager::new(Arc::clone(&storage));
+
+    let insert = |table, a: i32, b: i32| {
+        let h = txn.begin(IsolationLevel::ReadCommitted);
+        storage
+            .insert(h.id, table, &StorageRow(vec![Value::I32(a), Value::I32(b)]))
+            .expect("insert");
+        txn.commit(h).expect("commit");
+    };
+    insert(clients, 1, 1);
+    insert(clients, 2, 1);
+    insert(clients, 3, 2);
+    insert(clients, 4, 99);
+    insert(regions, 1, 10);
+    insert(regions, 2, 20);
+    insert(regions, 3, 30);
+    insert(regions, 4, 40);
+
+    fn wide_binding(index: usize) -> ColumnBinding {
+        ColumnBinding {
+            column: ColumnId(i32::try_from(index).expect("small index") + 1),
+            index,
+            name: format!("c{index}"),
+            ty: int_ty(),
+        }
+    }
+
+    fn wide_scan(table: TableId) -> PhysicalPlan {
+        PhysicalPlan::TableScan {
+            table,
+            columns: vec![wide_binding(0), wide_binding(1)],
+            alias: "t".to_owned(),
+            schema: schema_of(&["k", "v"]),
+            hints: LockHints::default(),
+        }
+    }
+
+    let cross = PhysicalPlan::NestedLoopJoin {
+        outer: Box::new(wide_scan(clients)),
+        inner: Box::new(wide_scan(regions)),
+        kind: PhysicalJoinKind::Cross,
+        on: None,
+        schema: schema_of(&["client_k", "client_v", "region_k", "region_v"]),
+    };
+    let predicate = eq(col_ref(1), col_ref(2));
+    let plan = PhysicalPlan::Filter {
+        input: Box::new(cross),
+        predicate,
+    };
+
+    let eval = StaticContext::default();
+    let snap = txn.statement_snapshot(&txn.begin(IsolationLevel::ReadCommitted));
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_engine(
+        storage.as_ref(),
+        &txn,
+        &snap,
+    );
+    let stmt = PhysicalStatement::Query(plan);
+    let (_, set) = execute_collect(&stmt, &mut ctx).expect("the filter over cross runs");
+
+    let mut rows = set.rows;
+    rows.sort_by(|a, b| {
+        (
+            match a[0] {
+                Value::I32(v) => v,
+                _ => 0,
+            },
+            match a[2] {
+                Value::I32(v) => v,
+                _ => 0,
+            },
+        )
+            .cmp(&(
+                match b[0] {
+                    Value::I32(v) => v,
+                    _ => 0,
+                },
+                match b[2] {
+                    Value::I32(v) => v,
+                    _ => 0,
+                },
+            ))
+    });
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::I32(1), Value::I32(1), Value::I32(1), Value::I32(10)],
+            vec![Value::I32(2), Value::I32(1), Value::I32(1), Value::I32(10)],
+            vec![Value::I32(3), Value::I32(2), Value::I32(2), Value::I32(20)],
+        ],
+        "each client pairs with its region only"
+    );
+}
+
+fn column_binding(column: i32, index: usize) -> ColumnBinding {
+    ColumnBinding {
+        column: ColumnId(column),
+        index,
+        name: format!("c{index}"),
+        ty: int_ty(),
+    }
+}
+
+fn column_ref(column: i32, index: usize) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::ColumnRef(column_binding(column, index)),
+        ty: int_ty(),
+        line: 1,
+    }
+}
+
+fn join_column_ref(column: i32, index: usize) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            column: ColumnId(column),
+            index,
+            // Join-wide bindings keep the inner scan name; only the index shifts.
+            name: "c0".to_owned(),
+            ty: int_ty(),
+        }),
+        ty: int_ty(),
+        line: 1,
+    }
+}
+
+fn and(left: BoundExpr, right: BoundExpr) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Logical {
+            op: LogicalOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+        ty: TypeInfo::new(SqlType::Bit, true),
+        line: 1,
+    }
+}
+
+fn logical_plan_from_physical(plan: &PhysicalPlan) -> vauban_binder::LogicalPlan {
+    match plan {
+        PhysicalPlan::TableScan {
+            table,
+            columns,
+            alias,
+            schema,
+            hints,
+        } => vauban_binder::LogicalPlan::Scan {
+            table: *table,
+            columns: columns.clone(),
+            alias: alias.clone(),
+            schema: schema.clone(),
+            hints: *hints,
+        },
+        PhysicalPlan::Filter { input, predicate } => vauban_binder::LogicalPlan::Filter {
+            input: Box::new(logical_plan_from_physical(input)),
+            predicate: predicate.clone(),
+        },
+        PhysicalPlan::NestedLoopJoin {
+            outer,
+            inner,
+            kind,
+            on,
+            schema,
+        } => vauban_binder::LogicalPlan::Join {
+            left: Box::new(logical_plan_from_physical(outer)),
+            right: Box::new(logical_plan_from_physical(inner)),
+            kind: match kind {
+                PhysicalJoinKind::Cross => JoinKind::Cross,
+                PhysicalJoinKind::Inner => JoinKind::Inner,
+                PhysicalJoinKind::Left => JoinKind::Left,
+                PhysicalJoinKind::Right => JoinKind::Right,
+                PhysicalJoinKind::Full => JoinKind::Full,
+                PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi => {
+                    panic!("semi join shape not used in this test")
+                }
+            },
+            on: on.clone(),
+            schema: schema.clone(),
+        },
+        other => panic!("unsupported test plan shape: {other:?}"),
+    }
+}
+
+fn exists_expr(plan: &PhysicalPlan) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Exists(Box::new(logical_plan_from_physical(plan))),
+        ty: TypeInfo::new(SqlType::Bit, true),
+        line: 1,
+    }
+}
+
+fn subquery_eval(input: PhysicalPlan, subplans: Vec<SubPlan>) -> PhysicalPlan {
+    let schema = input.schema().clone();
+    PhysicalPlan::SubqueryEval {
+        input: Box::new(input),
+        subplans,
+        schema,
+    }
+}
+
+/// A cross product filtered inside a correlated `EXISTS` keeps both correlation paths.
+#[test]
+fn correlated_exists_with_a_cross_join_filter_inside() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let db = storage
+        .create_database("mydb")
+        .expect("the database is new");
+    let shape = TableShape {
+        columns: vec![int_ty()],
+        clustered_key: None,
+    };
+    let outer_table = storage.create_table(db, &shape).expect("outer");
+    let side_a = storage.create_table(db, &shape).expect("side a");
+    let side_b = storage.create_table(db, &shape).expect("side b");
+    let txn = TransactionManager::new(Arc::clone(&storage));
+
+    let insert = |table: TableId, value: i32| {
+        let h = txn.begin(IsolationLevel::ReadCommitted);
+        storage
+            .insert(h.id, table, &StorageRow(vec![Value::I32(value)]))
+            .expect("insert");
+        txn.commit(h).expect("commit");
+    };
+    for value in [10, 20, 30] {
+        insert(outer_table, value);
+    }
+    insert(side_a, 10);
+    insert(side_a, 20);
+    insert(side_a, 99);
+    insert(side_b, 10);
+    insert(side_b, 20);
+    insert(side_b, 88);
+
+    let scan_side = |table: TableId, column: i32| PhysicalPlan::TableScan {
+        table,
+        columns: vec![column_binding(column, 0)],
+        alias: "t".to_owned(),
+        schema: schema_of(&["c0"]),
+        hints: LockHints::default(),
+    };
+
+    let cross = PhysicalPlan::NestedLoopJoin {
+        outer: Box::new(scan_side(side_a, 10)),
+        inner: Box::new(scan_side(side_b, 11)),
+        kind: PhysicalJoinKind::Cross,
+        on: None,
+        schema: schema_of(&["a", "b"]),
+    };
+    let inner = PhysicalPlan::Filter {
+        input: Box::new(cross),
+        predicate: and(
+            eq(join_column_ref(10, 0), join_column_ref(11, 1)),
+            eq(join_column_ref(10, 0), column_ref(1, 0)),
+        ),
+    };
+    let outer_scan = PhysicalPlan::TableScan {
+        table: outer_table,
+        columns: vec![column_binding(1, 0)],
+        alias: "o".to_owned(),
+        schema: schema_of(&["c0"]),
+        hints: LockHints::default(),
+    };
+    let exists = exists_expr(&inner);
+    let plan = PhysicalPlan::Filter {
+        input: Box::new(subquery_eval(
+            outer_scan,
+            vec![SubPlan {
+                plan: inner.clone(),
+                correlated: true,
+            }],
+        )),
+        predicate: exists,
+    };
+
+    let eval = StaticContext::default();
+    let snap = txn.statement_snapshot(&txn.begin(IsolationLevel::ReadCommitted));
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_engine(
+        storage.as_ref(),
+        &txn,
+        &snap,
+    );
+    let (_, set) = execute_collect(&PhysicalStatement::Query(plan), &mut ctx)
+        .expect("correlated exists over cross runs");
+    assert_eq!(
+        set.rows,
+        vec![vec![Value::I32(10)], vec![Value::I32(20)]],
+        "only outer rows with a matching pair in the cross product stay"
     );
 }

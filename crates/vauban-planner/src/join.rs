@@ -11,6 +11,12 @@
 //! arbitrary here, not cost-based: it follows the written order, which makes the plans
 //! deterministic and the tests readable. A cost-based choice belongs to V3.
 //!
+//! # Comma join and the `WHERE`
+//!
+//! The binder keeps `FROM a, b WHERE a.k = b.k` as a cross join with a [`Filter`] above
+//! it. The physical shape is a [`NestedLoopJoin`] of kind [`PhysicalJoinKind::Cross`]
+//! under that filter, not a [`HashJoin`] built from the `WHERE` equalities.
+//!
 //! # Seek-on-inner
 //!
 //! When the inner side is (or resolves to) a [`TableScan`] and an equality of the `ON`

@@ -11,7 +11,7 @@ use vauban_errors::{SqlError, SqlResult};
 use vauban_planner::{PhysicalPlan, SubPlan};
 use vauban_types::{Value, compare};
 
-use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
+use crate::context::{CANCEL_CHECK_ROWS, ExecContext, SubqueryLocalsSource};
 use crate::errors::at;
 use crate::expr::{as_condition, eval_expr, from_condition};
 use crate::operator::{Operator, build_operator};
@@ -130,7 +130,7 @@ pub(crate) fn eval_scalar_plan(
 ) -> SqlResult<Value> {
     let locals = local_column_ids(plan);
     let bindings = scan_column_bindings(plan);
-    ctx.push_subquery_locals(locals, bindings);
+    ctx.push_subquery_locals(SubqueryLocalsSource::CorrelatedPlan, locals, bindings);
     let pushed = push_enclosing_outer(ctx, row, source_plan.or(Some(plan)));
     let result = eval_scalar_plan_inner(plan, ctx, line);
     if pushed {
@@ -177,7 +177,7 @@ pub(crate) fn eval_exists_plan(
 ) -> SqlResult<Value> {
     let locals = local_column_ids(plan);
     let bindings = scan_column_bindings(plan);
-    ctx.push_subquery_locals(locals, bindings);
+    ctx.push_subquery_locals(SubqueryLocalsSource::CorrelatedPlan, locals, bindings);
     let pushed = push_enclosing_outer(ctx, enclosing, source_plan.or(Some(plan)));
     let result = eval_exists_plan_inner(plan, ctx);
     if pushed {
@@ -212,7 +212,7 @@ pub(crate) fn eval_in_subquery_plan(
     let tested = eval_expr(tested, row, ctx)?;
     let locals = local_column_ids(plan);
     let bindings = scan_column_bindings(plan);
-    ctx.push_subquery_locals(locals, bindings);
+    ctx.push_subquery_locals(SubqueryLocalsSource::CorrelatedPlan, locals, bindings);
     let pushed = push_enclosing_outer(ctx, row, None);
     let result = eval_in_subquery_plan_inner(plan, tested, ctx, line, collation);
     if pushed {
