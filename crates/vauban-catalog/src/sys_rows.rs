@@ -32,14 +32,12 @@
 //!
 //! # Bound: what this file does not write
 //!
-//! The four tables of `views/sys_constraints.rs` are not in the list of [`rows_of`]: the
-//! objects of a `FOREIGN KEY`, a `CHECK` and a `DEFAULT` live in the store of
-//! `constraints.rs` and are not written into `storage`. The rows are not written again when
-//! the instance restarts either — the store of `table.rs` is in memory and is not reloaded —
-//! and `ALTER TABLE` is a stub, so no caller of this file changes the columns of a table that
-//! already has rows.
+//! The `CHECK` and `DEFAULT` tables of `views/sys_constraints.rs` are not in the list of
+//! [`rows_of`]. The rows are not written again when the instance restarts either — the store
+//! of `table.rs` is in memory and is not reloaded.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 
 use vauban_errors::{InternalError, SqlResult};
 use vauban_storage::{DbId, Row, RowId, TableId};
@@ -51,9 +49,10 @@ use crate::bootstrap::{
     transaction_datetime,
 };
 use crate::catalog::Catalog;
+use crate::ids::ObjectId;
 use crate::index::IndexStore;
-use crate::meta::TableMeta;
-use crate::views::{info_schema, sys_extra, sys_indexes, sys_tables};
+use crate::meta::{ObjectMeta, TableMeta};
+use crate::views::{info_schema, sys_constraints, sys_extra, sys_indexes, sys_tables};
 
 /// How a row of an internal table names the table it describes, which is what tells the rows
 /// to delete from the rows of the other tables of the instance.
@@ -122,6 +121,38 @@ struct Rows {
     rows: Vec<Row>,
 }
 
+// Constraint names passed from `constraints.rs` while the table store is already locked.
+thread_local! {
+    static STASHED_CONSTRAINT_NAMES: RefCell<BTreeMap<ObjectId, String>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Hands [`rows_of`] the names [`apply_table_constraints`] just registered, while the table
+/// store mutex is held and cannot be taken again.
+pub(crate) fn stash_constraint_names(names: BTreeMap<ObjectId, String>) {
+    STASHED_CONSTRAINT_NAMES.with(|cell| *cell.borrow_mut() = names);
+}
+
+fn stashed_constraint_names() -> BTreeMap<ObjectId, String> {
+    STASHED_CONSTRAINT_NAMES.with(|cell| {
+        let names = cell.borrow().clone();
+        cell.borrow_mut().clear();
+        names
+    })
+}
+
+fn constraint_names_for(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    table: &TableMeta,
+    stashed: &BTreeMap<ObjectId, String>,
+) -> SqlResult<BTreeMap<ObjectId, String>> {
+    if !stashed.is_empty() {
+        return Ok(stashed.clone());
+    }
+    stored_foreign_key_names(catalog, txn, table)
+}
+
 /// The rows each internal table carries about `table`, in the order of the files of `views/`.
 ///
 /// The list is the one both [`write`] and [`remove`] walk: a table added here is written at
@@ -133,10 +164,13 @@ struct Rows {
 ///
 /// The error of a row constructor of `views/`.
 fn rows_of(
+    _catalog: &Catalog,
+    _txn: &TxnHandle,
     table: &TableMeta,
     indexes: &IndexStore,
     create_date: &Value,
     modify_date: &Value,
+    constraint_names: &BTreeMap<ObjectId, String>,
 ) -> SqlResult<Vec<Rows>> {
     let one = std::slice::from_ref(table);
     Ok(vec![
@@ -242,6 +276,22 @@ fn rows_of(
             ),
             rows: sys_extra::allocation_unit_rows(one)?,
         },
+        Rows {
+            name: sys_constraints::FOREIGN_KEYS_TABLE,
+            owner: Owner::Object(
+                sys_constraints::foreign_keys_columns::DATABASE_ID,
+                sys_constraints::foreign_keys_columns::PARENT_OBJECT_ID,
+            ),
+            rows: sys_constraints::foreign_key_rows(one, indexes, constraint_names)?,
+        },
+        Rows {
+            name: sys_constraints::FOREIGN_KEY_COLUMNS_TABLE,
+            owner: Owner::Object(
+                sys_constraints::foreign_key_columns_columns::DATABASE_ID,
+                sys_constraints::foreign_key_columns_columns::PARENT_OBJECT_ID,
+            ),
+            rows: sys_constraints::foreign_key_column_rows(one)?,
+        },
     ])
 }
 
@@ -261,7 +311,9 @@ pub(crate) fn write(
     indexes: &IndexStore,
 ) -> SqlResult<()> {
     let instant = transaction_datetime(catalog, txn)?;
-    for described in rows_of(table, indexes, &instant, &instant)? {
+    let stashed = stashed_constraint_names();
+    let names = constraint_names_for(catalog, txn, table, &stashed)?;
+    for described in rows_of(catalog, txn, table, indexes, &instant, &instant, &names)? {
         let id = table_id(catalog, described.name)?;
         for row in &described.rows {
             catalog.storage.insert(txn.id, id, row)?;
@@ -291,7 +343,16 @@ pub(crate) fn remove(
         days: 0,
         ticks_300th: 0,
     });
-    for described in rows_of(table, indexes, &placeholder, &placeholder)? {
+    let names = stored_foreign_key_names(catalog, txn, table)?;
+    for described in rows_of(
+        catalog,
+        txn,
+        table,
+        indexes,
+        &placeholder,
+        &placeholder,
+        &names,
+    )? {
         let id = table_id(catalog, described.name)?;
         for (row_id, values) in scan(catalog, txn, id)? {
             if described
@@ -324,8 +385,10 @@ pub(crate) fn rewrite(
 ) -> SqlResult<()> {
     let modify = transaction_datetime(catalog, txn)?;
     let create = object_create_date(catalog, txn, table)?.unwrap_or_else(|| modify.clone());
+    let mut names = stored_foreign_key_names(catalog, txn, table)?;
+    names.extend(stashed_constraint_names());
     remove(catalog, txn, table, indexes)?;
-    for described in rows_of(table, indexes, &create, &modify)? {
+    for described in rows_of(catalog, txn, table, indexes, &create, &modify, &names)? {
         let id = table_id(catalog, described.name)?;
         for row in &described.rows {
             catalog.storage.insert(txn.id, id, row)?;
@@ -371,7 +434,7 @@ fn object_create_date(
 }
 
 /// Internal tables that carry a `database_id` column and the position of that column.
-const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 14] = [
+const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 16] = [
     (DATABASES_TABLE, databases_columns::DATABASE_ID),
     (SCHEMAS_TABLE, schemas_columns::DATABASE_ID),
     (
@@ -422,7 +485,58 @@ const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 14] = [
         sys_extra::ALLOCATION_UNITS_TABLE,
         sys_extra::allocation_units_columns::DATABASE_ID,
     ),
+    (
+        sys_constraints::FOREIGN_KEYS_TABLE,
+        sys_constraints::foreign_keys_columns::DATABASE_ID,
+    ),
+    (
+        sys_constraints::FOREIGN_KEY_COLUMNS_TABLE,
+        sys_constraints::foreign_key_columns_columns::DATABASE_ID,
+    ),
 ];
+
+/// The `name` each foreign key of `table` carries in [`sys_constraints::FOREIGN_KEYS_TABLE`].
+///
+/// Read before a [`rewrite`] removes those rows so a named constraint keeps its name when
+/// the table store cannot be locked again.
+fn stored_foreign_key_names(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    table: &TableMeta,
+) -> SqlResult<BTreeMap<ObjectId, String>> {
+    let id = table_id(catalog, sys_constraints::FOREIGN_KEYS_TABLE)?;
+    let database = database_id(table.database)?;
+    let owner = Owner::Object(
+        sys_constraints::foreign_keys_columns::DATABASE_ID,
+        sys_constraints::foreign_keys_columns::PARENT_OBJECT_ID,
+    );
+    let mut names = BTreeMap::new();
+    for (_, values) in scan(catalog, txn, id)? {
+        if !owner.matches(&values.0, table, database, &BTreeSet::new()) {
+            continue;
+        }
+        let Some(&Value::I32(object)) = values
+            .0
+            .get(sys_constraints::foreign_keys_columns::OBJECT_ID)
+        else {
+            continue;
+        };
+        let Some(Value::String(text)) = values.0.get(sys_constraints::foreign_keys_columns::NAME)
+        else {
+            continue;
+        };
+        names.insert(ObjectId(object), text.text.clone());
+    }
+    Ok(names)
+}
+
+/// Builds the name map [`stash_constraint_names`] expects from the objects of one table.
+pub(crate) fn constraint_names_of(objects: &[ObjectMeta]) -> BTreeMap<ObjectId, String> {
+    objects
+        .iter()
+        .map(|object| (object.id, object.name.name.clone()))
+        .collect()
+}
 
 /// The `container_id` of each partition row `txn` sees for `table`, which is what
 /// [`Owner::Container`] matches an allocation unit against.
@@ -535,15 +649,27 @@ mod tests {
             .into_iter()
             .map(|def| def.name)
             .collect();
-        let undated = Value::Null;
-        let listed =
-            rows_of(&one_table(), &IndexStore::default(), &undated, &undated).expect("the rows");
-        assert_eq!(listed.len(), 12, "the twelve tables of the module list");
-        for table in &listed {
+        let listed = [
+            sys_tables::OBJECTS_TABLE,
+            sys_tables::COLUMNS_TABLE,
+            sys_indexes::INDEXES_TABLE,
+            sys_indexes::INDEX_COLUMNS_TABLE,
+            sys_indexes::KEY_CONSTRAINTS_TABLE,
+            sys_indexes::IDENTITY_COLUMNS_TABLE,
+            info_schema::TABLES_TABLE,
+            info_schema::COLUMNS_TABLE,
+            sys_extra::ALL_OBJECTS_TABLE,
+            sys_extra::ALL_COLUMNS_TABLE,
+            sys_extra::PARTITIONS_TABLE,
+            sys_extra::ALLOCATION_UNITS_TABLE,
+            sys_constraints::FOREIGN_KEYS_TABLE,
+            sys_constraints::FOREIGN_KEY_COLUMNS_TABLE,
+        ];
+        assert_eq!(listed.len(), 14, "the fourteen tables of the module list");
+        for name in listed {
             assert!(
-                described.contains(&table.name.to_owned()),
-                "{} is not an internal table: {described:?}",
-                table.name
+                described.contains(&name.to_owned()),
+                "{name} is not an internal table: {described:?}"
             );
         }
     }

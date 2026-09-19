@@ -53,10 +53,8 @@
 //!   [`NO_OBJECT_ID`], `0`: a [`TableMeta`] `create_table` built carries a
 //!   [`ConstraintMeta::Default`] per column default, one built by hand does not (unit test
 //!   `a_column_default_without_its_constraint_has_no_object_id`);
-//! - `key_index_id` stays `CAST(NULL AS int)` in the view text. [`ConstraintMeta::ForeignKey`]
-//!   holds that index as an `IndexId`, but the number a client reads is the per-table
-//!   `index_id` of `views/sys_indexes.rs`; publishing it asks for a column in
-//!   [`FOREIGN_KEYS_TABLE`] and for that numbering.
+//! - [`ConstraintMeta::ForeignKey::referenced_index`] is turned into the per-table `index_id`
+//!   of `views/sys_indexes.rs` when a row is written ([`published_key_index_id`]).
 //!
 //! `parent_column_id` of a `CHECK` is `0`, the value of a table-level check. SQL Server
 //! resolves a check whose predicate names **one** column to that column: on `(a, b, c)`,
@@ -66,22 +64,24 @@
 //!
 //! # Execution
 //!
-//! The rows of the four functions below are not written into `storage`: the list
-//! `sys_rows::rows_of` walks holds twelve internal tables and not these four
-//! (`tests/sys_constraints.rs`,
+//! The rows of the foreign-key functions below are written into `storage` by `sys_rows.rs`;
+//! the three other kinds stay outside that list for now (`tests/sys_constraints.rs`,
 //! `a_created_table_with_a_default_leaves_the_internal_tables_untouched_for_now`). What this
 //! file produces is the shape of the four internal tables, the text of the four definitions
 //! and the four functions that turn a `*Meta` into rows.
 
+use std::collections::BTreeMap;
+
 use vauban_errors::{InternalError, SqlResult};
 use vauban_parser::{Expr, RefAction};
-use vauban_storage::{DbId, Row};
+use vauban_storage::{DbId, IndexId, Row};
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
 use crate::bootstrap::{SYSTEM_DATABASES, SYSTEM_SCHEMAS};
 use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
 use crate::ids::ColumnId;
 use crate::ids::ObjectId;
+use crate::index::IndexStore;
 use crate::meta::{ColumnMeta, ConstraintMeta, ObjectMeta, QualifiedName, TableMeta};
 
 /// Internal table of the foreign keys, read by `sys.foreign_keys`.
@@ -142,18 +142,20 @@ pub(crate) mod foreign_keys_columns {
     pub(crate) const PARENT_OBJECT_ID: usize = 4;
     /// `referenced_object_id int`: the table pointed at.
     pub(crate) const REFERENCED_OBJECT_ID: usize = 5;
+    /// `key_index_id int`: the `index_id` of the referenced key in `sys.indexes`.
+    pub(crate) const KEY_INDEX_ID: usize = 6;
     /// `delete_referential_action tinyint`: the code of the `ON DELETE` action.
-    pub(crate) const DELETE_REFERENTIAL_ACTION: usize = 6;
+    pub(crate) const DELETE_REFERENTIAL_ACTION: usize = 7;
     /// `delete_referential_action_desc nvarchar(60)`.
-    pub(crate) const DELETE_REFERENTIAL_ACTION_DESC: usize = 7;
+    pub(crate) const DELETE_REFERENTIAL_ACTION_DESC: usize = 8;
     /// `update_referential_action tinyint`: the code of the `ON UPDATE` action.
-    pub(crate) const UPDATE_REFERENTIAL_ACTION: usize = 8;
+    pub(crate) const UPDATE_REFERENTIAL_ACTION: usize = 9;
     /// `update_referential_action_desc nvarchar(60)`.
-    pub(crate) const UPDATE_REFERENTIAL_ACTION_DESC: usize = 9;
+    pub(crate) const UPDATE_REFERENTIAL_ACTION_DESC: usize = 10;
     /// `is_system_named bit`: `1` for a constraint no statement named.
-    pub(crate) const IS_SYSTEM_NAMED: usize = 10;
+    pub(crate) const IS_SYSTEM_NAMED: usize = 11;
     /// Width of a row of the table.
-    pub(crate) const WIDTH: usize = 11;
+    pub(crate) const WIDTH: usize = 12;
 }
 
 /// Where each column of [`FOREIGN_KEY_COLUMNS_TABLE`] sits in a [`Row`]. Same rule as
@@ -224,7 +226,7 @@ const FOREIGN_KEYS_VIEW: [(&str, &str); 22] = [
     ("is_published", "CAST(0 AS bit)"),
     ("is_schema_published", "CAST(0 AS bit)"),
     ("referenced_object_id", "referenced_object_id"),
-    ("key_index_id", "CAST(NULL AS int)"),
+    ("key_index_id", "key_index_id"),
     ("is_disabled", "CAST(0 AS bit)"),
     ("is_not_for_replication", "CAST(0 AS bit)"),
     ("is_not_trusted", "CAST(0 AS bit)"),
@@ -368,7 +370,8 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
 /// which is the check `bootstrap.rs` makes on the same value.
 pub(crate) fn foreign_key_rows(
     tables: &[TableMeta],
-    objects: &[ObjectMeta],
+    indexes: &IndexStore,
+    names: &BTreeMap<ObjectId, String>,
 ) -> SqlResult<Vec<Row>> {
     let mut rows = Vec::new();
     for table in tables {
@@ -379,6 +382,7 @@ pub(crate) fn foreign_key_rows(
                 system_named,
                 columns,
                 referenced_table,
+                referenced_index,
                 on_delete,
                 on_update,
                 ..
@@ -388,7 +392,11 @@ pub(crate) fn foreign_key_rows(
             };
             let generated =
                 generated_constraint_name("FK", table, single_column(table, columns), position);
-            let name = constraint_name(objects, *object).unwrap_or(&generated);
+            let name = names
+                .get(object)
+                .map(String::as_str)
+                .or_else(|| constraint_name(&[], *object))
+                .unwrap_or(&generated);
             rows.push(Row(vec![
                 Value::I32(database),
                 Value::I32(object.0),
@@ -396,6 +404,11 @@ pub(crate) fn foreign_key_rows(
                 Value::I32(schema_id(&table.schema)),
                 Value::I32(table.id.0),
                 Value::I32(referenced_table.0),
+                Value::I32(published_key_index_id(
+                    indexes,
+                    *referenced_table,
+                    *referenced_index,
+                )),
                 Value::I8(referential_action_code(*on_delete)),
                 text(referential_action_desc(*on_delete)),
                 Value::I8(referential_action_code(*on_update)),
@@ -776,6 +789,37 @@ fn database_id(id: DbId) -> SqlResult<i32> {
     })
 }
 
+/// `sys.indexes.index_id` of the clustered key of a table.
+const CLUSTERED_INDEX_ID: i32 = 1;
+
+/// `sys.indexes.index_id` of the first nonclustered index of a table.
+const FIRST_NONCLUSTERED_INDEX_ID: i32 = 2;
+
+/// The `index_id` `sys.foreign_keys.key_index_id` publishes for a referenced key.
+///
+/// Numbered like `views/sys_indexes.rs`: the clustered index is `1`, the nonclustered
+/// indexes take `2` and up in increasing [`IndexId`] order.
+fn published_key_index_id(
+    indexes: &IndexStore,
+    referenced_table: ObjectId,
+    referenced_index: IndexId,
+) -> i32 {
+    let mut next = FIRST_NONCLUSTERED_INDEX_ID;
+    for meta in indexes.of_table(referenced_table) {
+        if meta.id == referenced_index {
+            return if meta.clustered {
+                CLUSTERED_INDEX_ID
+            } else {
+                next
+            };
+        }
+        if !meta.clustered {
+            next += 1;
+        }
+    }
+    CLUSTERED_INDEX_ID
+}
+
 /// The `schema_id` of the schema named `name`, [`UNKNOWN_SCHEMA_ID`] when the bootstrap
 /// created no schema of that name.
 ///
@@ -797,6 +841,7 @@ fn foreign_keys_table_columns() -> Vec<InternalColumnDef> {
         column("schema_id", SqlType::Int, false),
         column("parent_object_id", SqlType::Int, false),
         column("referenced_object_id", SqlType::Int, false),
+        column("key_index_id", SqlType::Int, false),
         column("delete_referential_action", SqlType::TinyInt, false),
         column(
             "delete_referential_action_desc",
@@ -1342,8 +1387,8 @@ mod tests {
     #[test]
     fn the_columns_written_null_are_the_ones_with_no_datum_behind_them() {
         // `principal_id` (principals are not served), `create_date` and `modify_date` (no `*Meta`
-        // carries an instant) and `key_index_id` (`ConstraintMeta::ForeignKey` holds no
-        // index), which is 4 items of `sys.foreign_keys` and 3 of each of the two others.
+        // carries an instant), which is 3 items of `sys.foreign_keys` and 3 of each of the two
+        // others.
         // The list below holds no item of `sys.foreign_key_columns`, whose 6 columns are
         // read.
         let mut nulls: Vec<(String, String)> = Vec::new();
@@ -1366,7 +1411,6 @@ mod tests {
                 ("default_constraints".to_owned(), "modify_date".to_owned()),
                 ("default_constraints".to_owned(), "principal_id".to_owned()),
                 ("foreign_keys".to_owned(), "create_date".to_owned()),
-                ("foreign_keys".to_owned(), "key_index_id".to_owned()),
                 ("foreign_keys".to_owned(), "modify_date".to_owned()),
                 ("foreign_keys".to_owned(), "principal_id".to_owned()),
             ]
@@ -1601,7 +1645,7 @@ mod tests {
         }
         let plain = [table("tbl011_plain", &["id", "label"])];
         assert_eq!(
-            foreign_key_rows(&plain, &[]).expect("rows"),
+            foreign_key_rows(&plain, &IndexStore::default(), &BTreeMap::new()).expect("rows"),
             Vec::<Row>::new()
         );
         assert_eq!(
@@ -1633,7 +1677,8 @@ mod tests {
         });
         let tables = [child];
 
-        let rows = foreign_key_rows(&tables, &[]).expect("rows");
+        let rows =
+            foreign_key_rows(&tables, &IndexStore::default(), &BTreeMap::new()).expect("rows");
         assert_eq!(rows.len(), 1);
         let row = &rows[0].0;
         assert_eq!(row.len(), foreign_keys_columns::WIDTH);
@@ -1645,6 +1690,7 @@ mod tests {
             row[foreign_keys_columns::REFERENCED_OBJECT_ID],
             Value::I32(1_000_042)
         );
+        assert_eq!(row[foreign_keys_columns::KEY_INDEX_ID], Value::I32(1));
         assert_eq!(
             row[foreign_keys_columns::DELETE_REFERENTIAL_ACTION],
             Value::I8(1)

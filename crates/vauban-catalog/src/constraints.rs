@@ -10,8 +10,8 @@
 //! that table. The objects live in [`ConstraintStore`], the `constraints` field of the
 //! [`TableStore`] of `table.rs`, beside the [`IndexStore`](crate::index::IndexStore) and for
 //! the reason written there: the rows of the internal tables of `views/` are written by
-//! `sys_rows.rs`, which does not walk the four tables of `views/sys_constraints.rs`, so what
-//! a client reads through `sys.foreign_keys` and its three neighbours is empty.
+//! `sys_rows.rs`, which writes the foreign-key tables of `views/sys_constraints.rs` and not
+//! the three other kinds yet.
 //!
 //! The [`ConstraintMeta`] the table carries holds the identifier of that object
 //! ([`ConstraintMeta::ForeignKey`] and its two neighbours), so a reader goes from the table
@@ -453,6 +453,13 @@ pub(crate) fn apply_table_constraints(
             expr,
         });
     }
+    let objects: Vec<ObjectMeta> = store
+        .constraints
+        .of_table(meta.id)
+        .into_iter()
+        .cloned()
+        .collect();
+    crate::sys_rows::stash_constraint_names(crate::sys_rows::constraint_names_of(&objects));
     Ok(())
 }
 

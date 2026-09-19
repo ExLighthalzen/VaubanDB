@@ -10,7 +10,10 @@
 
 use std::sync::Arc;
 
-use vauban_catalog::{Catalog, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, TableDef};
+use vauban_catalog::{
+    AlterTable, Catalog, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, SortedColumn,
+    TableDef, TableMeta,
+};
 use vauban_parser::{Expr, Literal, Span};
 use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager};
@@ -76,12 +79,13 @@ fn integer(value: &str) -> Expr {
     Expr::Literal(Literal::Integer(value.to_owned()), Span::EMPTY)
 }
 
-/// The shape of the internal table `sys.foreign_keys` reads: 11 columns.
+/// The shape of the internal table `sys.foreign_keys` reads: 12 columns.
 fn foreign_keys_shape() -> Vec<TypeInfo> {
     vec![
         TypeInfo::new(SqlType::Int, false),
         TypeInfo::new(SqlType::Int, false),
         TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), false),
+        TypeInfo::new(SqlType::Int, false),
         TypeInfo::new(SqlType::Int, false),
         TypeInfo::new(SqlType::Int, false),
         TypeInfo::new(SqlType::Int, false),
@@ -471,4 +475,321 @@ fn identity_and_default_on_another_column_succeed() {
     assert!(meta.columns[0].identity.is_some());
     assert_eq!(meta.columns[0].default, None);
     assert_eq!(meta.columns[1].default, Some(integer("0")));
+}
+
+fn fk_table(storage: &Arc<dyn Storage>) -> TableId {
+    let tables = tables_shaped(storage, &foreign_keys_shape());
+    assert_eq!(tables.len(), 1);
+    tables[0]
+}
+
+fn fkc_table(storage: &Arc<dyn Storage>) -> TableId {
+    let tables = tables_shaped(storage, &foreign_key_columns_shape());
+    assert_eq!(tables.len(), 1);
+    tables[0]
+}
+
+fn parent_and_child_tables(
+    catalog: &Catalog,
+    txn: &Arc<TransactionManager>,
+    child_constraints: Vec<ConstraintDef>,
+) -> (TableMeta, TableMeta) {
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let parent = catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl_fk_parent",
+                vec![column("id", SqlType::Int, None)],
+                vec![ConstraintDef::PrimaryKey {
+                    name: None,
+                    columns: vec![SortedColumn {
+                        column: "id".to_owned(),
+                        descending: false,
+                    }],
+                    clustered: true,
+                }],
+            ),
+        )
+        .expect("parent");
+    let child = catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl_fk_enfant",
+                vec![
+                    column("id", SqlType::Int, None),
+                    column("pid", SqlType::Int, None),
+                ],
+                child_constraints,
+            ),
+        )
+        .expect("child");
+    txn.commit(handle).expect("commit");
+    (parent, child)
+}
+
+#[test]
+fn create_table_with_a_foreign_key_writes_one_row_in_each_internal_table() {
+    let (catalog, storage, txn) = instance();
+    let fk = fk_table(&storage);
+    let fkc = fkc_table(&storage);
+    let (parent, child) = parent_and_child_tables(
+        &catalog,
+        &txn,
+        vec![ConstraintDef::ForeignKey {
+            name: None,
+            columns: vec!["pid".to_owned()],
+            referenced: QualifiedName {
+                database: "master".to_owned(),
+                schema: "dbo".to_owned(),
+                name: "tbl_fk_parent".to_owned(),
+            },
+            referenced_columns: vec!["id".to_owned()],
+            on_delete: vauban_parser::RefAction::NoAction,
+            on_update: vauban_parser::RefAction::NoAction,
+        }],
+    );
+    assert_eq!(row_count(&storage, &txn, fk), 1);
+    assert_eq!(row_count(&storage, &txn, fkc), 1);
+    let fk_rows = rows_of_parent(&storage, &txn, fk, child.id, 4);
+    assert_eq!(int_at(&fk_rows[0], 5), parent.id.0);
+    assert_eq!(int_at(&fk_rows[0], 6), 1, "key_index_id of a primary key");
+    assert_eq!(
+        fk_rows[0].get(7),
+        Some(&vauban_types::Value::I8(0)),
+        "delete_referential_action NO_ACTION"
+    );
+    assert_eq!(text_at(&fk_rows[0], 8), "NO_ACTION");
+    let fkc_rows = rows_of_parent(&storage, &txn, fkc, child.id, 3);
+    assert_eq!(int_at(&fkc_rows[0], 2), 1, "constraint_column_id");
+    assert_eq!(int_at(&fkc_rows[0], 4), 2, "parent_column_id of pid");
+    assert_eq!(int_at(&fkc_rows[0], 6), 1, "referenced_column_id of id");
+}
+
+#[test]
+fn a_two_column_foreign_key_writes_two_column_rows_in_key_order() {
+    let (catalog, storage, txn) = instance();
+    let fk = fk_table(&storage);
+    let fkc = fkc_table(&storage);
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl_fk_parent2",
+                vec![
+                    column("a", SqlType::Int, None),
+                    column("b", SqlType::Int, None),
+                ],
+                vec![ConstraintDef::PrimaryKey {
+                    name: None,
+                    columns: vec![
+                        SortedColumn {
+                            column: "a".to_owned(),
+                            descending: false,
+                        },
+                        SortedColumn {
+                            column: "b".to_owned(),
+                            descending: false,
+                        },
+                    ],
+                    clustered: true,
+                }],
+            ),
+        )
+        .expect("parent");
+    let child = catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl_fk_enfant2",
+                vec![
+                    column("x", SqlType::Int, None),
+                    column("y", SqlType::Int, None),
+                    column("z", SqlType::Int, None),
+                ],
+                vec![ConstraintDef::ForeignKey {
+                    name: Some("fk_two".to_owned()),
+                    columns: vec!["x".to_owned(), "y".to_owned()],
+                    referenced: QualifiedName {
+                        database: "master".to_owned(),
+                        schema: "dbo".to_owned(),
+                        name: "tbl_fk_parent2".to_owned(),
+                    },
+                    referenced_columns: vec!["a".to_owned(), "b".to_owned()],
+                    on_delete: vauban_parser::RefAction::NoAction,
+                    on_update: vauban_parser::RefAction::NoAction,
+                }],
+            ),
+        )
+        .expect("child");
+    txn.commit(handle).expect("commit");
+    assert_eq!(row_count(&storage, &txn, fk), 1);
+    assert_eq!(row_count(&storage, &txn, fkc), 2);
+    let mut seq: Vec<i32> = rows_of_parent(&storage, &txn, fkc, child.id, 3)
+        .into_iter()
+        .map(|row| int_at(&row, 2))
+        .collect();
+    seq.sort();
+    assert_eq!(seq, vec![1, 2]);
+}
+
+#[test]
+fn drop_table_removes_foreign_key_rows() {
+    let (catalog, storage, txn) = instance();
+    let fk = fk_table(&storage);
+    let fkc = fkc_table(&storage);
+    let (_parent, child) = parent_and_child_tables(
+        &catalog,
+        &txn,
+        vec![ConstraintDef::ForeignKey {
+            name: None,
+            columns: vec!["pid".to_owned()],
+            referenced: QualifiedName {
+                database: "master".to_owned(),
+                schema: "dbo".to_owned(),
+                name: "tbl_fk_parent".to_owned(),
+            },
+            referenced_columns: vec!["id".to_owned()],
+            on_delete: vauban_parser::RefAction::NoAction,
+            on_update: vauban_parser::RefAction::NoAction,
+        }],
+    );
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    catalog.drop_table(&handle, child.id).expect("drop child");
+    txn.commit(handle).expect("commit");
+    assert_eq!(row_count(&storage, &txn, fk), 0);
+    assert_eq!(row_count(&storage, &txn, fkc), 0);
+}
+
+#[test]
+fn alter_drop_constraint_removes_foreign_key_rows() {
+    let (catalog, storage, txn) = instance();
+    let fk = fk_table(&storage);
+    let fkc = fkc_table(&storage);
+    let (_parent, child) = parent_and_child_tables(
+        &catalog,
+        &txn,
+        vec![ConstraintDef::ForeignKey {
+            name: Some("fk_drop".to_owned()),
+            columns: vec!["pid".to_owned()],
+            referenced: QualifiedName {
+                database: "master".to_owned(),
+                schema: "dbo".to_owned(),
+                name: "tbl_fk_parent".to_owned(),
+            },
+            referenced_columns: vec!["id".to_owned()],
+            on_delete: vauban_parser::RefAction::NoAction,
+            on_update: vauban_parser::RefAction::NoAction,
+        }],
+    );
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    catalog
+        .alter_table(
+            &handle,
+            child.id,
+            &AlterTable::DropConstraint {
+                name: "fk_drop".to_owned(),
+            },
+        )
+        .expect("drop constraint");
+    txn.commit(handle).expect("commit");
+    assert_eq!(row_count(&storage, &txn, fk), 0);
+    assert_eq!(row_count(&storage, &txn, fkc), 0);
+}
+
+#[test]
+fn a_rolled_back_create_table_with_a_foreign_key_leaves_no_row() {
+    let (catalog, storage, txn) = instance();
+    let fk = fk_table(&storage);
+    let fkc = fkc_table(&storage);
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl_fk_parent_rb",
+                vec![column("id", SqlType::Int, None)],
+                vec![ConstraintDef::PrimaryKey {
+                    name: None,
+                    columns: vec![SortedColumn {
+                        column: "id".to_owned(),
+                        descending: false,
+                    }],
+                    clustered: true,
+                }],
+            ),
+        )
+        .expect("parent");
+    catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl_fk_enfant_rb",
+                vec![
+                    column("id", SqlType::Int, None),
+                    column("pid", SqlType::Int, None),
+                ],
+                vec![ConstraintDef::ForeignKey {
+                    name: None,
+                    columns: vec!["pid".to_owned()],
+                    referenced: QualifiedName {
+                        database: "master".to_owned(),
+                        schema: "dbo".to_owned(),
+                        name: "tbl_fk_parent_rb".to_owned(),
+                    },
+                    referenced_columns: vec!["id".to_owned()],
+                    on_delete: vauban_parser::RefAction::NoAction,
+                    on_update: vauban_parser::RefAction::NoAction,
+                }],
+            ),
+        )
+        .expect("child");
+    txn.rollback(handle).expect("rollback");
+    assert_eq!(row_count(&storage, &txn, fk), 0);
+    assert_eq!(row_count(&storage, &txn, fkc), 0);
+}
+
+fn rows_of_parent(
+    storage: &Arc<dyn Storage>,
+    txn: &Arc<TransactionManager>,
+    table: TableId,
+    parent: vauban_catalog::ObjectId,
+    parent_object_id_column: usize,
+) -> Vec<Vec<vauban_types::Value>> {
+    rows(storage, txn, table)
+        .into_iter()
+        .filter(|row| int_at(row, parent_object_id_column) == parent.0)
+        .collect()
+}
+
+fn rows(
+    storage: &Arc<dyn Storage>,
+    txn: &Arc<TransactionManager>,
+    table: TableId,
+) -> Vec<Vec<vauban_types::Value>> {
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = txn.statement_snapshot(&handle);
+    let read: Vec<_> = storage
+        .scan(&snapshot, table)
+        .expect("scan")
+        .map(|row| row.expect("row").1.0)
+        .collect();
+    txn.commit(handle).expect("commit");
+    read
+}
+
+fn int_at(row: &[vauban_types::Value], position: usize) -> i32 {
+    match row.get(position) {
+        Some(vauban_types::Value::I32(value)) => *value,
+        other => panic!("column {position} is not an int: {other:?}"),
+    }
+}
+
+fn text_at(row: &[vauban_types::Value], position: usize) -> String {
+    match row.get(position) {
+        Some(vauban_types::Value::String(text)) => text.text.clone(),
+        other => panic!("column {position} is not text: {other:?}"),
+    }
 }
