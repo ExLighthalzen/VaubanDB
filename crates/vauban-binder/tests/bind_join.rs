@@ -736,6 +736,54 @@ fn a_hint_word_on_either_side_binds() {
     );
 }
 
+/// A derived table on one side of a join is bound through `subquery::bind_derived`, and its
+/// alias qualifies columns in the `ON`, the select list and the `WHERE`.
+#[test]
+fn a_derived_table_in_a_join_is_bound() {
+    let plan = plan_of(
+        "SELECT a.k, d.total FROM dbo.a JOIN (SELECT k, SUM(c) AS total FROM dbo.b GROUP BY k) AS d ON d.k = a.k",
+    );
+    let LogicalPlan::Project { input, exprs, .. } = &plan else {
+        panic!("not a Project: {plan:?}");
+    };
+    let LogicalPlan::Join {
+        left, right, on, ..
+    } = input.as_ref()
+    else {
+        panic!("not a Join: {input:?}");
+    };
+    assert!(matches!(&**left, LogicalPlan::Scan { .. }));
+    assert!(matches!(&**right, LogicalPlan::Subquery { .. }));
+    assert!(on.is_some());
+    assert_eq!(exprs.len(), 2);
+    assert!(matches!(exprs[0].expr.kind, BoundExprKind::ColumnRef(_)));
+    assert!(matches!(exprs[1].expr.kind, BoundExprKind::ColumnRef(_)));
+
+    let plan = plan_of(
+        "SELECT d.total FROM dbo.a LEFT JOIN (SELECT k, SUM(c) AS total FROM dbo.b GROUP BY k) AS d ON d.k = a.k WHERE d.total IS NULL",
+    );
+    let LogicalPlan::Project { input, .. } = &plan else {
+        panic!("not a Project: {plan:?}");
+    };
+    assert!(matches!(&**input, LogicalPlan::Filter { .. }));
+}
+
+/// Two derived tables joined to each other expose both aliases in scope.
+#[test]
+fn two_derived_tables_joined_to_each_other() {
+    let plan = plan_of(
+        "SELECT u.n FROM (SELECT k AS n FROM dbo.a) AS u JOIN (SELECT k AS n FROM dbo.b) AS v ON u.n = v.n",
+    );
+    let LogicalPlan::Project { input, .. } = &plan else {
+        panic!("not a Project: {plan:?}");
+    };
+    let LogicalPlan::Join { left, right, .. } = input.as_ref() else {
+        panic!("not a Join: {input:?}");
+    };
+    assert!(matches!(&**left, LogicalPlan::Subquery { .. }));
+    assert!(matches!(&**right, LogicalPlan::Subquery { .. }));
+}
+
 /// A `WHERE` over a join reads both sides, and a `TOP` reads neither: the row count of a
 /// `TOP` binds against no source.
 #[test]

@@ -71,12 +71,13 @@
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{Expr, JoinKind as WrittenJoinKind, TableRef};
 
-use crate::bound::{JoinKind, LogicalPlan, OutputColumn, OutputSchema};
+use crate::bound::{ColumnBinding, JoinKind, LogicalPlan, OutputColumn, OutputSchema};
 use crate::context::BindContext;
 use crate::expr::{Scope, bind_condition};
 use crate::names::{self, alias_of};
 use crate::query::{bug, dotted};
 use crate::star::Source;
+use crate::subquery;
 use crate::view;
 
 /// A bound reference of the `FROM`: its plan, and the sources it puts in scope, in
@@ -160,6 +161,22 @@ fn bind_reference(
                 statement_line,
                 ctx,
             )
+        }
+        TableRef::Derived { alias, .. } => {
+            let plan = subquery::bind_derived(reference, statement_line, ctx)?;
+            let source = derived_source(&plan, ctx)?;
+            let written = Written {
+                name: alias
+                    .as_ref()
+                    .map(|ident| ident.value.clone())
+                    .unwrap_or_default(),
+                aliased: alias.is_some(),
+            };
+            Ok(Bound {
+                plan,
+                sources: vec![source],
+                written: vec![written],
+            })
         }
         leaf => {
             let plan = names::bind_from(leaf, statement_line, ctx)?;
@@ -319,6 +336,32 @@ fn padded_columns(schema: &OutputSchema, padded: bool) -> impl Iterator<Item = O
     })
 }
 
+/// The source a derived table puts in scope: the alias and the schema of the `Subquery`
+/// node are the columns the outer query sees (`query.rs`, `subquery::bind_derived`).
+fn derived_source(plan: &LogicalPlan, ctx: &BindContext<'_>) -> SqlResult<Source> {
+    let LogicalPlan::Subquery { alias, schema, .. } = plan else {
+        return Err(bug("bind_from: bind_derived did not build a Subquery"));
+    };
+    let columns: Vec<ColumnBinding> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| ColumnBinding {
+            column: vauban_catalog::ColumnId(i as i32),
+            index: i,
+            name: col.name.clone(),
+            ty: col.ty.clone(),
+        })
+        .collect();
+    Ok(Source::new(
+        alias,
+        None,
+        &columns,
+        ctx.default_schema,
+        ctx.database,
+    ))
+}
+
 /// The source a leaf reference puts in scope, read off the plan `names::bind_from` built
 /// for it, by the rules `query.rs` applies to a single-table `FROM`: a `Scan` publishes its
 /// columns under its own `alias`, and an expanded view publishes the columns of its output
@@ -326,8 +369,8 @@ fn padded_columns(schema: &OutputSchema, padded: bool) -> impl Iterator<Item = O
 ///
 /// # Errors
 ///
-/// An internal error 50000 for a reference that is neither a table nor a `nom(…)`:
-/// `names::bind_from` refuses those before this point.
+/// An internal error 50000 for a reference that is neither a table nor a `nom(…)` nor a
+/// derived table: those are bound before this point.
 fn leaf_source(
     plan: &LogicalPlan,
     reference: &TableRef,

@@ -1018,6 +1018,17 @@ fn order_by_over_a_derived_table() {
     );
 }
 
+/// A derived table joined to a table publishes its columns in the sort scope of the join.
+#[test]
+fn order_by_a_derived_table_column_in_a_join() {
+    assert_eq!(
+        join_key(
+            "SELECT a.k, d.c FROM dbo.a JOIN (SELECT k, c FROM dbo.b) AS d ON a.k = d.k ORDER BY d.c"
+        ),
+        ("c".to_owned(), 3)
+    );
+}
+
 /// A column the derived table does not publish is 207 in the sort list.
 #[test]
 fn order_by_a_column_the_derived_table_does_not_publish_is_207() {
