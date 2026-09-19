@@ -12,6 +12,7 @@ vauban-session.workspace = true
 vauban-sysfn.workspace = true
 vauban-types.workspace = true
 vauban-errors.workspace = true
+vauban-parser.workspace = true
 
 # `tests/sp_datatype_info.rs` builds a `Session` over an in-memory `Storage` and a
 # `ResultSink` that keeps what it receives: `storage` for the trait, `tds` for `ColumnMeta`,

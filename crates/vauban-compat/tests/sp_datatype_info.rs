@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use vauban_compat::{call_system_procedure, register_functions, sp_datatype_info_100};
+use vauban_compat::{
+    ProcAction, ProcArg, call_system_procedure, register_functions, resolve_system_procedure,
+    sp_datatype_info_100,
+};
 use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_session::{Engine, ResultSink, Session, SessionState};
 use vauban_storage::MemoryStorage;
@@ -393,4 +396,37 @@ fn unknown_procedure_still_gives_2812() {
     assert!(sink.columns.is_empty());
     // `TdsSink::for_rpc` turns this `error` then `done` pair into DONEPROC|ERROR; that
     // token-state rule is covered in `vauban-session::sink`.
+}
+
+#[test]
+fn resolve_returns_static_rows_for_sp_datatype_info_100() {
+    let ty = TypeInfo::new(SqlType::Int, false);
+    let data_type = Value::I32(-9);
+    let odbc_ver = Value::I32(4);
+    let args = [
+        ProcArg {
+            name: None,
+            ty: &ty,
+            value: &data_type,
+            output: false,
+            default: false,
+        },
+        ProcArg {
+            name: Some("@ODBCVer"),
+            ty: &ty,
+            value: &odbc_ver,
+            output: false,
+            default: false,
+        },
+    ];
+    let action = resolve_system_procedure("sp_datatype_info_100", &args)
+        .expect("known")
+        .expect("ok");
+    match action {
+        ProcAction::Static { columns, rows } => {
+            assert_eq!(columns.len(), 20);
+            assert_eq!(rows.len(), 2);
+        }
+        other => panic!("expected Static, got {other:?}"),
+    }
 }

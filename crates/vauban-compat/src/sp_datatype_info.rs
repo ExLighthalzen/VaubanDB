@@ -262,6 +262,15 @@ fn rows(raw: &[&[RawValue]]) -> Vec<Vec<Value>> {
         .collect()
 }
 
+/// Builds the static [`ProcAction`] payload for `sp_datatype_info_100`.
+pub fn sp_datatype_info_100_static(
+    data_type: i32,
+    odbc_ver: i32,
+) -> (Vec<ResultColumn>, Vec<Vec<Value>>) {
+    let result = sp_datatype_info_100(data_type, odbc_ver);
+    (result.columns, result.rows)
+}
+
 /// Answers one ODBC data-type code with the rows SQL Server 2022 returns for it.
 ///
 /// ODBC 18 sends `odbc_ver = 4`. The procedure answers the same shape for its default

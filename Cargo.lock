@@ -1517,6 +1517,7 @@ name = "vauban-compat"
 version = "0.0.5"
 dependencies = [
  "vauban-errors",
+ "vauban-parser",
  "vauban-session",
  "vauban-storage",
  "vauban-sysfn",

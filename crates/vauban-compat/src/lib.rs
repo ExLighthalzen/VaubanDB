@@ -6,11 +6,17 @@
 //! `compat` depends on it; [`register_functions`] registers the server functions into the
 //! `sysfn` registry and the procedure dispatcher into `session`.
 
+mod catalog_keys;
+mod catalog_procs;
 mod database_properties;
+mod help_procs;
+mod procedures;
 mod server_functions;
 mod server_properties;
 mod sp_datatype_info;
+mod special_procs;
 mod version;
+mod who_procs;
 
 use std::sync::Once;
 
@@ -18,7 +24,9 @@ use vauban_errors::SqlResult;
 use vauban_sysfn::{Arity, EvalArgs, EvalContext, FunctionDef, FunctionKind};
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
+pub use procedures::{ProcAction, ProcParam, normalize_procedure_name, resolve_system_procedure};
 pub use sp_datatype_info::{ResultColumn, ResultSetData, sp_datatype_info_100};
+pub use special_procs::ProcArg;
 pub use version::{PRODUCT_VERSION, VERSION_BANNER};
 
 /// Result of a compatibility procedure, before `session` turns it into TDS tokens.
@@ -38,11 +46,7 @@ pub fn call_system_procedure(
     name: &str,
     params: &[(Option<&str>, &Value)],
 ) -> Option<SystemProcResult> {
-    let normalized = name.replace(['[', ']'], "").to_ascii_lowercase();
-    let normalized = normalized
-        .strip_prefix("sys.")
-        .unwrap_or(&normalized)
-        .to_owned();
+    let normalized = normalize_procedure_name(name);
     if normalized != "sp_datatype_info_100" {
         return None;
     }
