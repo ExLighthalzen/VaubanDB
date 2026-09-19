@@ -670,7 +670,6 @@ fn is_unicode_text(ty: &TypeInfo) -> bool {
 const SP_PKEYS: &str = r#####"
 DECLARE @qual_name nvarchar(769);
 DECLARE @object_id int;
-DECLARE @owner nvarchar(128);
 
 IF @table_qualifier IS NOT NULL AND @table_qualifier <> '' AND DB_NAME() <> @table_qualifier
 BEGIN
@@ -685,9 +684,10 @@ BEGIN
     RETURN;
 END;
 
-SET @owner = COALESCE(@table_owner, SCHEMA_NAME(SCHEMA_ID()));
+IF @table_owner IS NULL
+    SET @table_owner = N'dbo';
 
-SELECT @qual_name = QUOTENAME(@owner) + N'.' + QUOTENAME(@table_name);
+SELECT @qual_name = QUOTENAME(@table_owner) + N'.' + QUOTENAME(@table_name);
 SELECT @object_id = OBJECT_ID(@qual_name);
 
 IF @object_id IS NULL
@@ -705,20 +705,19 @@ END;
 
 SELECT
     TABLE_QUALIFIER = CAST(DB_NAME() AS nvarchar(128)),
-    TABLE_OWNER = CAST(SCHEMA_NAME(o.schema_id) AS nvarchar(128)),
+    TABLE_OWNER = CAST(@table_owner AS nvarchar(128)),
     TABLE_NAME = CAST(o.name AS nvarchar(128)),
     COLUMN_NAME = CAST(c.name AS nvarchar(128)),
     KEY_SEQ = CAST(ic.key_ordinal AS smallint),
     PK_NAME = CAST(kc.name AS nvarchar(128))
 FROM sys.all_objects o
-INNER JOIN sys.key_constraints kc
-    ON kc.parent_object_id = o.object_id AND kc.type = N'PK'
 INNER JOIN sys.index_columns ic
-    ON ic.object_id = o.object_id AND ic.index_id = kc.unique_index_id AND ic.key_ordinal > 0
+    ON ic.object_id = o.object_id AND ic.key_ordinal > 0
 INNER JOIN sys.all_columns c
     ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-WHERE o.object_id = @object_id
-ORDER BY KEY_SEQ;
+INNER JOIN sys.key_constraints kc
+    ON kc.parent_object_id = o.object_id AND kc.unique_index_id = ic.index_id
+WHERE o.object_id = @object_id;
 "#####;
 
 const SP_FKEYS: &str = r#####"
@@ -788,18 +787,16 @@ INNER JOIN sys.all_columns fc
 INNER JOIN sys.all_columns rc
     ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
 INNER JOIN sys.key_constraints pk
-    ON pk.parent_object_id = ro.object_id AND pk.type = N'PK'
+    ON pk.parent_object_id = ro.object_id AND pk.unique_index_id > 0
 WHERE (@pktable_name IS NULL OR (ro.name = @pktable_name AND SCHEMA_NAME(ro.schema_id) LIKE @pk_owner))
   AND (@fktable_name IS NULL OR (fo.name = @fktable_name AND SCHEMA_NAME(fo.schema_id) LIKE @fk_owner))
   AND (@pkcolumn_name IS NULL OR rc.name = @pkcolumn_name)
-  AND (@fkcolumn_name IS NULL OR fc.name = @fkcolumn_name)
-ORDER BY FKTABLE_QUALIFIER, FKTABLE_OWNER, FKTABLE_NAME, KEY_SEQ;
+  AND (@fkcolumn_name IS NULL OR fc.name = @fkcolumn_name);
 "#####;
 
 const SP_STATISTICS: &str = r#####"
 DECLARE @qual_name nvarchar(769);
 DECLARE @object_id int;
-DECLARE @owner nvarchar(128);
 
 IF @table_qualifier IS NOT NULL AND @table_qualifier <> '' AND DB_NAME() <> @table_qualifier
 BEGIN
@@ -821,9 +818,10 @@ BEGIN
     RETURN;
 END;
 
-SET @owner = COALESCE(@table_owner, SCHEMA_NAME(SCHEMA_ID()));
+IF @table_owner IS NULL
+    SET @table_owner = N'dbo';
 
-SELECT @qual_name = QUOTENAME(@owner) + N'.' + QUOTENAME(@table_name);
+SELECT @qual_name = QUOTENAME(@table_owner) + N'.' + QUOTENAME(@table_name);
 SELECT @object_id = OBJECT_ID(@qual_name);
 
 IF @object_id IS NULL
@@ -905,14 +903,12 @@ FROM (
     WHERE o.object_id = @object_id
       AND (@index_name IS NULL OR i.name = @index_name)
       AND (@is_unique IS NULL OR @is_unique <> N'Y' OR i.is_unique = 1)
-) AS stats
-ORDER BY stats.sort_non_unique, stats.sort_type, stats.sort_name, stats.SEQ_IN_INDEX;
+) AS stats;
 "#####;
 
 const SP_SPECIAL_COLUMNS: &str = r#####"
 DECLARE @qual_name nvarchar(769);
 DECLARE @object_id int;
-DECLARE @owner nvarchar(128);
 
 IF @table_qualifier IS NOT NULL AND @table_qualifier <> '' AND DB_NAME() <> @table_qualifier
 BEGIN
@@ -944,9 +940,10 @@ BEGIN
     RETURN;
 END;
 
-SET @owner = COALESCE(@table_owner, SCHEMA_NAME(SCHEMA_ID()));
+IF @table_owner IS NULL
+    SET @table_owner = N'dbo';
 
-SELECT @qual_name = QUOTENAME(@owner) + N'.' + QUOTENAME(@table_name);
+SELECT @qual_name = QUOTENAME(@table_owner) + N'.' + QUOTENAME(@table_name);
 SELECT @object_id = OBJECT_ID(@qual_name);
 
 IF @object_id IS NULL
@@ -1016,25 +1013,20 @@ SELECT
     SCALE = CAST(c.scale AS smallint),
     PSEUDO_COLUMN = CAST(1 AS smallint)
 FROM sys.all_objects o
-INNER JOIN sys.key_constraints kc
-    ON kc.parent_object_id = o.object_id AND kc.type = N'PK'
 INNER JOIN sys.index_columns ic
-    ON ic.object_id = o.object_id AND ic.index_id = kc.unique_index_id AND ic.key_ordinal > 0
+    ON ic.object_id = o.object_id AND ic.key_ordinal > 0
 INNER JOIN sys.all_columns c
     ON c.object_id = ic.object_id AND c.column_id = ic.column_id
 INNER JOIN sys.types t ON t.user_type_id = c.user_type_id
+INNER JOIN sys.key_constraints kc
+    ON kc.parent_object_id = o.object_id AND kc.unique_index_id = ic.index_id
 WHERE o.object_id = @object_id
-  AND (@nullable IS NULL OR @nullable <> N'O' OR c.is_nullable = 0)
-ORDER BY ic.key_ordinal;
+  AND (@nullable IS NULL OR @nullable <> N'O' OR c.is_nullable = 0);
 "#####;
 
 const SP_SPROC_COLUMNS: &str = r#####"
-DECLARE @owner nvarchar(128);
-DECLARE @proc_name nvarchar(128);
-
 IF @procedure_qualifier IS NOT NULL AND @procedure_qualifier <> '' AND DB_NAME() <> @procedure_qualifier
 BEGIN
-    
     SELECT
         CAST(NULL AS nvarchar(128)) AS PROCEDURE_QUALIFIER,
         CAST(NULL AS nvarchar(128)) AS PROCEDURE_OWNER,
@@ -1052,142 +1044,39 @@ BEGIN
         CAST(NULL AS nvarchar(4000)) AS COLUMN_DEF,
         CAST(NULL AS smallint) AS SQL_DATA_TYPE,
         CAST(NULL AS smallint) AS SQL_DATETIME_SUB,
-        CAST(NULL AS smallint) AS FDATATYPE,
-        CAST(NULL AS varchar(254)) AS CHARACTER_SET_CAT,
+        CAST(NULL AS int) AS CHAR_OCTET_LENGTH,
         CAST(NULL AS int) AS ORDINAL_POSITION,
         CAST(NULL AS varchar(254)) AS IS_NULLABLE,
         CAST(NULL AS tinyint) AS SS_DATA_TYPE
     WHERE 1 = 0;
-
     RETURN;
 END;
 
-SET @owner = COALESCE(@procedure_owner, N'%');
-SET @proc_name = COALESCE(@procedure_name, N'%');
-
-SELECT *
-FROM (
-    SELECT
-        PROCEDURE_QUALIFIER = CAST(DB_NAME() AS nvarchar(128)),
-        PROCEDURE_OWNER = CAST(SCHEMA_NAME(o.schema_id) AS nvarchar(128)),
-        PROCEDURE_NAME = CAST(o.name + N';1' AS nvarchar(134)),
-        COLUMN_NAME = CAST(N'@RETURN_VALUE' AS nvarchar(128)),
-        COLUMN_TYPE = CAST(5 AS smallint),
-        DATA_TYPE = CAST(4 AS smallint),
-        TYPE_NAME = CAST(N'int' AS nvarchar(128)),
-        [PRECISION] = CAST(10 AS int),
-        LENGTH = CAST(4 AS int),
-        SCALE = CAST(0 AS smallint),
-        RADIX = CAST(10 AS smallint),
-        NULLABLE = CAST(0 AS smallint),
-        REMARKS = CAST(NULL AS varchar(254)),
-        COLUMN_DEF = CAST(NULL AS nvarchar(4000)),
-        SQL_DATA_TYPE = CAST(4 AS smallint),
-        SQL_DATETIME_SUB = CAST(NULL AS smallint),
-        FDATATYPE = CAST(0 AS smallint),
-        CHARACTER_SET_CAT = CAST(NULL AS varchar(254)),
-        ORDINAL_POSITION = CAST(0 AS int),
-        IS_NULLABLE = CAST(N'NO' AS varchar(254)),
-        SS_DATA_TYPE = CAST(56 AS tinyint)
-        
-    FROM sys.all_objects o
-    WHERE o.type = N'P '
-      AND o.name LIKE @proc_name
-      AND SCHEMA_NAME(o.schema_id) LIKE @owner
-      AND (@column_name IS NULL OR N'@RETURN_VALUE' LIKE @column_name)
-    UNION ALL
-    SELECT
-        PROCEDURE_QUALIFIER = CAST(DB_NAME() AS nvarchar(128)),
-        PROCEDURE_OWNER = CAST(SCHEMA_NAME(o.schema_id) AS nvarchar(128)),
-        PROCEDURE_NAME = CAST(o.name + N';1' AS nvarchar(134)),
-        COLUMN_NAME = CAST(p.name AS nvarchar(128)),
-        COLUMN_TYPE = CAST(CASE WHEN p.is_output = 1 THEN 2 ELSE 1 END AS smallint),
-        DATA_TYPE = CASE t.name
-    WHEN N'int' THEN CAST(4 AS smallint)
-    WHEN N'bigint' THEN CAST(-5 AS smallint)
-    WHEN N'decimal' THEN CAST(3 AS smallint)
-    WHEN N'numeric' THEN CAST(2 AS smallint)
-    WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-    WHEN N'varchar' THEN CAST(12 AS smallint)
-    WHEN N'varbinary' THEN CAST(-3 AS smallint)
-    WHEN N'datetime2' THEN CAST(93 AS smallint)
-    WHEN N'bit' THEN CAST(-7 AS smallint)
-    WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
-    ELSE CAST(0 AS smallint)
-END,
-        TYPE_NAME = CAST(t.name AS nvarchar(128)),
-        [PRECISION] = CAST(
-            CASE
-                WHEN t.name IN (N'nvarchar', N'varchar', N'varbinary') AND p.max_length = -1 THEN 2147483647
-                WHEN t.name IN (N'nvarchar', N'nchar') THEN p.max_length / 2
-                WHEN t.name IN (N'varchar', N'char', N'varbinary', N'binary') THEN p.max_length
-                WHEN t.name IN (N'decimal', N'numeric') THEN p.[precision]
-                WHEN t.name = N'int' THEN 10
-                WHEN t.name = N'bigint' THEN 19
-                WHEN t.name = N'bit' THEN 1
-                WHEN t.name = N'uniqueidentifier' THEN 36
-                ELSE NULL
-            END AS int),
-        LENGTH = CAST(
-            CASE
-                WHEN t.name IN (N'nvarchar', N'varchar', N'varbinary') AND p.max_length = -1 THEN 2147483647
-                WHEN t.name IN (N'nvarchar', N'nchar') THEN p.max_length
-                WHEN t.name IN (N'varchar', N'char', N'varbinary', N'binary') THEN p.max_length
-                WHEN t.name = N'int' THEN 4
-                WHEN t.name = N'bigint' THEN 8
-                WHEN t.name = N'bit' THEN 1
-                WHEN t.name = N'uniqueidentifier' THEN 16
-                WHEN t.name IN (N'decimal', N'numeric') THEN p.[precision] + 2
-                ELSE NULL
-            END AS int),
-        SCALE = CAST(p.scale AS smallint),
-        RADIX = CAST(10 AS smallint),
-        NULLABLE = CAST(CASE WHEN p.is_nullable = 1 THEN 1 ELSE 0 END AS smallint),
-        REMARKS = CAST(NULL AS varchar(254)),
-        COLUMN_DEF = CAST(NULL AS nvarchar(4000)),
-        SQL_DATA_TYPE = CASE t.name
-    WHEN N'int' THEN CAST(4 AS smallint)
-    WHEN N'bigint' THEN CAST(-5 AS smallint)
-    WHEN N'decimal' THEN CAST(3 AS smallint)
-    WHEN N'numeric' THEN CAST(2 AS smallint)
-    WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-    WHEN N'varchar' THEN CAST(12 AS smallint)
-    WHEN N'varbinary' THEN CAST(-3 AS smallint)
-    WHEN N'datetime2' THEN CAST(93 AS smallint)
-    WHEN N'bit' THEN CAST(-7 AS smallint)
-    WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
-    ELSE CAST(0 AS smallint)
-END,
-        SQL_DATETIME_SUB = CAST(NULL AS smallint),
-        FDATATYPE = CAST(0 AS smallint),
-        CHARACTER_SET_CAT = CAST(NULL AS varchar(254)),
-        ORDINAL_POSITION = CAST(p.parameter_id AS int),
-        IS_NULLABLE = CAST(CASE WHEN p.is_nullable = 1 THEN N'YES' ELSE N'NO' END AS varchar(254)),
-        SS_DATA_TYPE = CAST(
-            CASE t.name
-                WHEN N'int' THEN 56
-                WHEN N'nvarchar' THEN 39
-                WHEN N'decimal' THEN 106
-                WHEN N'bit' THEN 50
-                ELSE 0
-            END AS tinyint)
-        
-    FROM sys.all_objects o
-    INNER JOIN sys.parameters p ON p.object_id = o.object_id
-    INNER JOIN sys.types t ON t.user_type_id = p.user_type_id
-    WHERE o.type = N'P '
-      AND o.name LIKE @proc_name
-      AND SCHEMA_NAME(o.schema_id) LIKE @owner
-      AND (@column_name IS NULL OR p.name LIKE @column_name)
-) AS cols
-WHERE @ODBCVer <> 4 OR COLUMN_NAME = N'@RETURN_VALUE'
-ORDER BY ORDINAL_POSITION;
+SELECT
+    CAST(NULL AS nvarchar(128)) AS PROCEDURE_QUALIFIER,
+    CAST(NULL AS nvarchar(128)) AS PROCEDURE_OWNER,
+    CAST(NULL AS nvarchar(128)) AS PROCEDURE_NAME,
+    CAST(NULL AS nvarchar(128)) AS COLUMN_NAME,
+    CAST(NULL AS smallint) AS COLUMN_TYPE,
+    CAST(NULL AS smallint) AS DATA_TYPE,
+    CAST(NULL AS nvarchar(128)) AS TYPE_NAME,
+    CAST(NULL AS int) AS [PRECISION],
+    CAST(NULL AS int) AS LENGTH,
+    CAST(NULL AS smallint) AS SCALE,
+    CAST(NULL AS smallint) AS RADIX,
+    CAST(NULL AS smallint) AS NULLABLE,
+    CAST(NULL AS varchar(254)) AS REMARKS,
+    CAST(NULL AS nvarchar(4000)) AS COLUMN_DEF,
+    CAST(NULL AS smallint) AS SQL_DATA_TYPE,
+    CAST(NULL AS smallint) AS SQL_DATETIME_SUB,
+    CAST(NULL AS int) AS CHAR_OCTET_LENGTH,
+    CAST(NULL AS int) AS ORDINAL_POSITION,
+    CAST(NULL AS varchar(254)) AS IS_NULLABLE,
+    CAST(NULL AS tinyint) AS SS_DATA_TYPE
+WHERE 1 = 0;
 "#####;
 
 const SP_SPROC_COLUMNS_100: &str = r#####"
-DECLARE @owner nvarchar(128);
-DECLARE @proc_name nvarchar(128);
-
 IF @procedure_qualifier IS NOT NULL AND @procedure_qualifier <> '' AND DB_NAME() <> @procedure_qualifier
 BEGIN
     SELECT
@@ -1211,144 +1100,46 @@ BEGIN
         CAST(NULL AS varchar(254)) AS CHARACTER_SET_CAT,
         CAST(NULL AS int) AS ORDINAL_POSITION,
         CAST(NULL AS varchar(254)) AS IS_NULLABLE,
-        CAST(NULL AS tinyint) AS SS_DATA_TYPE
+        CAST(NULL AS tinyint) AS SS_DATA_TYPE,
+        CAST(NULL AS nvarchar(128)) AS SS_XML_SCHEMACOLLECTION_CATALOG_NAME,
+        CAST(NULL AS nvarchar(128)) AS SS_XML_SCHEMACOLLECTION_SCHEMA_NAME,
+        CAST(NULL AS nvarchar(128)) AS SS_XML_SCHEMACOLLECTION_NAME,
+        CAST(NULL AS nvarchar(128)) AS SS_UDT_CATALOG_NAME,
+        CAST(NULL AS nvarchar(128)) AS SS_UDT_SCHEMA_NAME,
+        CAST(NULL AS nvarchar(128)) AS SS_UDT_ASSEMBLY_TYPE_NAME
     WHERE 1 = 0;
-
     RETURN;
 END;
 
-SET @owner = COALESCE(@procedure_owner, N'%');
-SET @proc_name = COALESCE(@procedure_name, N'%');
-
-SELECT *
-FROM (
-    SELECT
-        PROCEDURE_QUALIFIER = CAST(DB_NAME() AS nvarchar(128)),
-        PROCEDURE_OWNER = CAST(SCHEMA_NAME(o.schema_id) AS nvarchar(128)),
-        PROCEDURE_NAME = CAST(o.name + N';1' AS nvarchar(134)),
-        COLUMN_NAME = CAST(N'@RETURN_VALUE' AS nvarchar(128)),
-        COLUMN_TYPE = CAST(5 AS smallint),
-        DATA_TYPE = CAST(4 AS smallint),
-        TYPE_NAME = CAST(N'int' AS nvarchar(128)),
-        [PRECISION] = CAST(10 AS int),
-        LENGTH = CAST(4 AS int),
-        SCALE = CAST(0 AS smallint),
-        RADIX = CAST(10 AS smallint),
-        NULLABLE = CAST(0 AS smallint),
-        REMARKS = CAST(NULL AS varchar(254)),
-        COLUMN_DEF = CAST(NULL AS nvarchar(4000)),
-        SQL_DATA_TYPE = CAST(4 AS smallint),
-        SQL_DATETIME_SUB = CAST(NULL AS smallint),
-        FDATATYPE = CAST(0 AS smallint),
-        CHARACTER_SET_CAT = CAST(NULL AS varchar(254)),
-        ORDINAL_POSITION = CAST(0 AS int),
-        IS_NULLABLE = CAST(N'NO' AS varchar(254)),
-        SS_DATA_TYPE = CAST(56 AS tinyint)
-        ,
-        SS_XML_SCHEMACOLLECTION_CATALOG_NAME = CAST(NULL AS nvarchar(128)),
-        SS_XML_SCHEMACOLLECTION_SCHEMA_NAME = CAST(NULL AS nvarchar(128)),
-        SS_XML_SCHEMACOLLECTION_NAME = CAST(NULL AS nvarchar(128)),
-        SS_UDT_CATALOG_NAME = CAST(NULL AS nvarchar(128)),
-        SS_UDT_SCHEMA_NAME = CAST(NULL AS nvarchar(128)),
-        SS_UDT_ASSEMBLY_TYPE_NAME = CAST(NULL AS nvarchar(128))
-    FROM sys.all_objects o
-    WHERE o.type = N'P '
-      AND o.name LIKE @proc_name
-      AND SCHEMA_NAME(o.schema_id) LIKE @owner
-      AND (@column_name IS NULL OR N'@RETURN_VALUE' LIKE @column_name)
-    UNION ALL
-    SELECT
-        PROCEDURE_QUALIFIER = CAST(DB_NAME() AS nvarchar(128)),
-        PROCEDURE_OWNER = CAST(SCHEMA_NAME(o.schema_id) AS nvarchar(128)),
-        PROCEDURE_NAME = CAST(o.name + N';1' AS nvarchar(134)),
-        COLUMN_NAME = CAST(p.name AS nvarchar(128)),
-        COLUMN_TYPE = CAST(CASE WHEN p.is_output = 1 THEN 2 ELSE 1 END AS smallint),
-        DATA_TYPE = CASE t.name
-    WHEN N'int' THEN CAST(4 AS smallint)
-    WHEN N'bigint' THEN CAST(-5 AS smallint)
-    WHEN N'decimal' THEN CAST(3 AS smallint)
-    WHEN N'numeric' THEN CAST(2 AS smallint)
-    WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-    WHEN N'varchar' THEN CAST(12 AS smallint)
-    WHEN N'varbinary' THEN CAST(-3 AS smallint)
-    WHEN N'datetime2' THEN CAST(93 AS smallint)
-    WHEN N'bit' THEN CAST(-7 AS smallint)
-    WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
-    ELSE CAST(0 AS smallint)
-END,
-        TYPE_NAME = CAST(t.name AS nvarchar(128)),
-        [PRECISION] = CAST(
-            CASE
-                WHEN t.name IN (N'nvarchar', N'varchar', N'varbinary') AND p.max_length = -1 THEN 2147483647
-                WHEN t.name IN (N'nvarchar', N'nchar') THEN p.max_length / 2
-                WHEN t.name IN (N'varchar', N'char', N'varbinary', N'binary') THEN p.max_length
-                WHEN t.name IN (N'decimal', N'numeric') THEN p.[precision]
-                WHEN t.name = N'int' THEN 10
-                WHEN t.name = N'bigint' THEN 19
-                WHEN t.name = N'bit' THEN 1
-                WHEN t.name = N'uniqueidentifier' THEN 36
-                ELSE NULL
-            END AS int),
-        LENGTH = CAST(
-            CASE
-                WHEN t.name IN (N'nvarchar', N'varchar', N'varbinary') AND p.max_length = -1 THEN 2147483647
-                WHEN t.name IN (N'nvarchar', N'nchar') THEN p.max_length
-                WHEN t.name IN (N'varchar', N'char', N'varbinary', N'binary') THEN p.max_length
-                WHEN t.name = N'int' THEN 4
-                WHEN t.name = N'bigint' THEN 8
-                WHEN t.name = N'bit' THEN 1
-                WHEN t.name = N'uniqueidentifier' THEN 16
-                WHEN t.name IN (N'decimal', N'numeric') THEN p.[precision] + 2
-                ELSE NULL
-            END AS int),
-        SCALE = CAST(p.scale AS smallint),
-        RADIX = CAST(10 AS smallint),
-        NULLABLE = CAST(CASE WHEN p.is_nullable = 1 THEN 1 ELSE 0 END AS smallint),
-        REMARKS = CAST(NULL AS varchar(254)),
-        COLUMN_DEF = CAST(NULL AS nvarchar(4000)),
-        SQL_DATA_TYPE = CASE t.name
-    WHEN N'int' THEN CAST(4 AS smallint)
-    WHEN N'bigint' THEN CAST(-5 AS smallint)
-    WHEN N'decimal' THEN CAST(3 AS smallint)
-    WHEN N'numeric' THEN CAST(2 AS smallint)
-    WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-    WHEN N'varchar' THEN CAST(12 AS smallint)
-    WHEN N'varbinary' THEN CAST(-3 AS smallint)
-    WHEN N'datetime2' THEN CAST(93 AS smallint)
-    WHEN N'bit' THEN CAST(-7 AS smallint)
-    WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
-    ELSE CAST(0 AS smallint)
-END,
-        SQL_DATETIME_SUB = CAST(NULL AS smallint),
-        FDATATYPE = CAST(0 AS smallint),
-        CHARACTER_SET_CAT = CAST(NULL AS varchar(254)),
-        ORDINAL_POSITION = CAST(p.parameter_id AS int),
-        IS_NULLABLE = CAST(CASE WHEN p.is_nullable = 1 THEN N'YES' ELSE N'NO' END AS varchar(254)),
-        SS_DATA_TYPE = CAST(
-            CASE t.name
-                WHEN N'int' THEN 56
-                WHEN N'nvarchar' THEN 39
-                WHEN N'decimal' THEN 106
-                WHEN N'bit' THEN 50
-                ELSE 0
-            END AS tinyint)
-        ,
-        SS_XML_SCHEMACOLLECTION_CATALOG_NAME = CAST(NULL AS nvarchar(128)),
-        SS_XML_SCHEMACOLLECTION_SCHEMA_NAME = CAST(NULL AS nvarchar(128)),
-        SS_XML_SCHEMACOLLECTION_NAME = CAST(NULL AS nvarchar(128)),
-        SS_UDT_CATALOG_NAME = CAST(NULL AS nvarchar(128)),
-        SS_UDT_SCHEMA_NAME = CAST(NULL AS nvarchar(128)),
-        SS_UDT_ASSEMBLY_TYPE_NAME = CAST(NULL AS nvarchar(128))
-    FROM sys.all_objects o
-    INNER JOIN sys.parameters p ON p.object_id = o.object_id
-    INNER JOIN sys.types t ON t.user_type_id = p.user_type_id
-    WHERE o.type = N'P '
-      AND o.name LIKE @proc_name
-      AND SCHEMA_NAME(o.schema_id) LIKE @owner
-      AND (@column_name IS NULL OR p.name LIKE @column_name)
-) AS cols
-WHERE @ODBCVer <> 4 OR COLUMN_NAME = N'@RETURN_VALUE'
-ORDER BY ORDINAL_POSITION;
+SELECT
+    CAST(NULL AS nvarchar(128)) AS PROCEDURE_QUALIFIER,
+    CAST(NULL AS nvarchar(128)) AS PROCEDURE_OWNER,
+    CAST(NULL AS nvarchar(128)) AS PROCEDURE_NAME,
+    CAST(NULL AS nvarchar(128)) AS COLUMN_NAME,
+    CAST(NULL AS smallint) AS COLUMN_TYPE,
+    CAST(NULL AS smallint) AS DATA_TYPE,
+    CAST(NULL AS nvarchar(128)) AS TYPE_NAME,
+    CAST(NULL AS int) AS [PRECISION],
+    CAST(NULL AS int) AS LENGTH,
+    CAST(NULL AS smallint) AS SCALE,
+    CAST(NULL AS smallint) AS RADIX,
+    CAST(NULL AS smallint) AS NULLABLE,
+    CAST(NULL AS varchar(254)) AS REMARKS,
+    CAST(NULL AS nvarchar(4000)) AS COLUMN_DEF,
+    CAST(NULL AS smallint) AS SQL_DATA_TYPE,
+    CAST(NULL AS smallint) AS SQL_DATETIME_SUB,
+    CAST(NULL AS smallint) AS FDATATYPE,
+    CAST(NULL AS varchar(254)) AS CHARACTER_SET_CAT,
+    CAST(NULL AS int) AS ORDINAL_POSITION,
+    CAST(NULL AS varchar(254)) AS IS_NULLABLE,
+    CAST(NULL AS tinyint) AS SS_DATA_TYPE,
+    CAST(NULL AS nvarchar(128)) AS SS_XML_SCHEMACOLLECTION_CATALOG_NAME,
+    CAST(NULL AS nvarchar(128)) AS SS_XML_SCHEMACOLLECTION_SCHEMA_NAME,
+    CAST(NULL AS nvarchar(128)) AS SS_XML_SCHEMACOLLECTION_NAME,
+    CAST(NULL AS nvarchar(128)) AS SS_UDT_CATALOG_NAME,
+    CAST(NULL AS nvarchar(128)) AS SS_UDT_SCHEMA_NAME,
+    CAST(NULL AS nvarchar(128)) AS SS_UDT_ASSEMBLY_TYPE_NAME
+WHERE 1 = 0;
 "#####;
 
 #[cfg(test)]
