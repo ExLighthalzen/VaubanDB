@@ -140,9 +140,11 @@ fn resolve_sp_datatype_info_100(args: &[ProcArg<'_>]) -> SqlResult<ProcAction> {
     Ok(ProcAction::Static { columns, rows })
 }
 
-fn resolve_catalog_procedure(name: &str, _args: &[ProcArg<'_>]) -> Option<SqlResult<ProcAction>> {
+fn resolve_catalog_procedure(name: &str, args: &[ProcArg<'_>]) -> Option<SqlResult<ProcAction>> {
+    if let Some(result) = crate::catalog_procs::resolve(name, args) {
+        return Some(result);
+    }
     let all: &[&[SystemProc]] = &[
-        crate::catalog_procs::PROCS,
         crate::catalog_keys::PROCS,
         crate::help_procs::PROCS,
         crate::who_procs::PROCS,
