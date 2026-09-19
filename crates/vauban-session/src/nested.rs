@@ -55,6 +55,24 @@ pub struct NestedOutcome {
     pub rowcount: i64,
     /// `true` when an error stopped the text before it finished.
     pub failed: bool,
+    /// `true` when the nested text emitted at least one result set.
+    pub had_result_set: bool,
+}
+
+/// Row count for the closing DONEPROC of a nested batch or RPC when it is known.
+pub(crate) fn nested_done_proc_rowcount(
+    failed: bool,
+    had_result_set: bool,
+    rowcount: i64,
+) -> Option<u64> {
+    if failed || had_result_set {
+        return None;
+    }
+    if rowcount > 0 {
+        Some(rowcount as u64)
+    } else {
+        None
+    }
 }
 
 /// What one statement of a nested batch decided about the rest of it.
@@ -109,6 +127,7 @@ impl Session {
             return_status: 0,
             rowcount: 0,
             failed: false,
+            had_result_set: false,
         };
 
         let result = self.run_nested_body(text, params, &mut nested_state, sink, &mut outcome);
@@ -131,7 +150,11 @@ impl Session {
         if !outcome.failed {
             sink.return_status(outcome.return_status)?;
         }
-        sink.done_proc(None)?;
+        sink.done_proc(nested_done_proc_rowcount(
+            outcome.failed,
+            outcome.had_result_set,
+            outcome.rowcount,
+        ))?;
 
         *self.exec_mut() = saved_exec;
         result?;
@@ -395,6 +418,7 @@ impl Session {
         }
         match result {
             Ok(ExecOutcome::Rows(count)) => {
+                outcome.had_result_set = true;
                 let reported = if nested_state.options.nocount {
                     None
                 } else {

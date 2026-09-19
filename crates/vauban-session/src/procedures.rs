@@ -8,7 +8,7 @@ use vauban_types::{Len, SqlType, TypeInfo, Value};
 
 use crate::batch::{Flow, Session};
 use crate::eval_context::apply_exec_session;
-use crate::nested::{NestedOutcome, NestedParam};
+use crate::nested::{NestedOutcome, NestedParam, nested_done_proc_rowcount};
 use crate::sink::ResultSink;
 
 /// How a procedure call closes on the wire.
@@ -170,7 +170,11 @@ fn execute_nested_sql(
             emit_rpc_return_values(sink, rpc_params, &nested)?;
             sink.return_status(nested.return_status)?;
         }
-        sink.done_proc(None)?;
+        sink.done_proc(nested_done_proc_rowcount(
+            nested.failed,
+            nested.had_result_set,
+            nested.rowcount,
+        ))?;
     }
     let continues = match finish {
         ProcFinish::Batch { more } => batch_continues(session, more, nested.failed, last_error),

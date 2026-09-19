@@ -29,7 +29,7 @@ enum Event {
     Columns,
     Row,
     DoneInProc,
-    DoneProc,
+    DoneProc(Option<u64>),
     ReturnValue(String),
     ReturnStatus(i32),
     Error(u32),
@@ -54,8 +54,8 @@ impl ResultSink for Recording {
         self.0.push(Event::DoneInProc);
         Ok(())
     }
-    fn done_proc(&mut self, _rowcount: Option<u64>) -> SqlResult<()> {
-        self.0.push(Event::DoneProc);
+    fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
+        self.0.push(Event::DoneProc(rowcount));
         Ok(())
     }
     fn info(&mut self, _msg: &InfoMessage) -> SqlResult<()> {
@@ -210,8 +210,37 @@ fn output_parameter_comes_back_as_return_value() {
             Event::DoneInProc,
             Event::ReturnValue("@o".into()),
             Event::ReturnStatus(0),
-            Event::DoneProc,
+            Event::DoneProc(None),
         ]
+    );
+}
+
+#[test]
+fn executesql_insert_reports_done_proc_count() {
+    let mut session = session();
+    session
+        .run_batch(
+            "CREATE TABLE dbo.rpc_dml_ins (id int NOT NULL)",
+            &mut Recording::default(),
+        )
+        .expect("create table");
+
+    let rpc = sp_executesql_rpc(vec![RpcParam {
+        name: "stmt".into(),
+        output: false,
+        default: false,
+        ty: TypeInfo::new(SqlType::NVarChar(Len::Max), false),
+        value: nvarchar("INSERT INTO dbo.rpc_dml_ins (id) VALUES (1)"),
+    }]);
+
+    let mut sink = Recording::default();
+    session.run_rpc(&rpc, &mut sink).expect("rpc completes");
+    assert!(
+        sink.0
+            .iter()
+            .any(|event| matches!(event, Event::DoneProc(Some(1)))),
+        "expected done_proc(Some(1)), got {:?}",
+        sink.0
     );
 }
 
@@ -226,7 +255,7 @@ fn unknown_rpc_name_gets_2812_then_doneproc() {
     };
     let mut sink = Recording::default();
     session().run_rpc(&rpc, &mut sink).expect("rpc completes");
-    assert_eq!(sink.0, vec![Event::Error(2812), Event::DoneProc]);
+    assert_eq!(sink.0, vec![Event::Error(2812), Event::DoneProc(None)]);
 }
 
 fn minimal_login_tokens() -> Vec<Token> {
