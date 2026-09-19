@@ -346,3 +346,43 @@ fn escape_conversion_has_its_own_length() {
         }
     }
 }
+
+/// A bare `NULL` branch of a `CASE` takes the common type of the typed branches.
+#[test]
+fn case_with_a_bare_null_branch_takes_the_common_type() {
+    use vauban_binder::{BindContext, BoundStatement, SessionOptions, bind};
+    use vauban_parser::{ParseOptions, parse_batch};
+    use vauban_sysfn::register_builtins;
+
+    register_builtins();
+    let bind_scalar = |sql: &str| {
+        let batch = parse_batch(sql, &ParseOptions::default()).expect("parse");
+        let ctx = BindContext::scalar(sql, SessionOptions::default());
+        let BoundStatement::Query(plan) = bind(&batch.statements[0], &ctx).expect("bind") else {
+            panic!("query")
+        };
+        plan.schema().columns[0].ty.clone()
+    };
+
+    assert_eq!(
+        bind_scalar("SELECT CASE WHEN 1 = 1 THEN NULL ELSE 'a' END;").ty,
+        SqlType::VarChar(Len::Fixed(1))
+    );
+    assert_eq!(
+        bind_scalar("SELECT CASE WHEN 1 = 1 THEN NULL ELSE CAST(1 AS decimal(5,2)) END;").ty,
+        SqlType::Decimal {
+            precision: 5,
+            scale: 2
+        }
+    );
+    assert_eq!(
+        bind_scalar("SELECT CASE WHEN 1 = 1 THEN NULL WHEN 1 = 0 THEN NULL ELSE 'a' END;").ty,
+        SqlType::VarChar(Len::Fixed(1))
+    );
+    let without_else = bind_scalar("SELECT CASE WHEN 1 = 1 THEN NULL END;");
+    assert_eq!(without_else.ty, SqlType::Int);
+    assert!(without_else.nullable);
+    let all_null = bind_scalar("SELECT CASE WHEN 1 = 1 THEN NULL ELSE NULL END;");
+    assert_eq!(all_null.ty, SqlType::Int);
+    assert!(all_null.nullable);
+}

@@ -1382,10 +1382,13 @@ fn bind_between(
 /// repeating them. Its price is the same as [`bind_between`]'s: the operand is cloned into
 /// each arm, so a non-deterministic one would be evaluated once per arm.
 ///
-/// The type of the result is the common type of the `THEN` branches and of the `ELSE`,
-/// folded left to right by `implicit_result_type`; each branch that is not already of that
-/// type is wrapped in a `Convert`. An **absent** `ELSE` adds no type — it only makes the
-/// result nullable, since the `CASE` then answers `NULL` when no arm matches.
+/// The type of the result is the common type of the **typed** `THEN` branches and of the
+/// `ELSE`, folded left to right by `implicit_result_type`. A bare `NULL` branch does not
+/// enter that fold — it takes the common type once the typed branches have fixed it, through
+/// [`untyped_null_beside`] and then [`convert_to`]. When the branches are bare `NULL`
+/// constants alone, the fold runs on them and keeps the `int` reading of [`bind_literal`]
+/// (`case_result_type`). An **absent** `ELSE` does not enter that fold; it makes the result
+/// nullable when no arm matches (`case_is_nullable_by_its_branches_once_converted`).
 ///
 /// # Nullability
 ///
@@ -1465,14 +1468,24 @@ fn bind_case(
                 .into_iter()
                 .map(|arm| BoundCaseArm {
                     when: arm.when,
-                    then: convert_to(arm.then, &ty),
+                    then: prepare_case_branch(arm.then, &ty),
                 })
                 .collect(),
-            else_: else_.map(|e| Box::new(convert_to(e, &ty))),
+            else_: else_.map(|e| Box::new(prepare_case_branch(e, &ty))),
         },
         ty,
         line,
     })
+}
+
+/// A `CASE` branch once the common type is known: a bare `NULL` takes that type before a
+/// conversion is inserted.
+fn prepare_case_branch(expr: BoundExpr, common: &TypeInfo) -> BoundExpr {
+    let mut expr = expr;
+    if matches!(expr.kind, BoundExprKind::Literal(Value::Null)) {
+        expr.ty = untyped_null_beside(common);
+    }
+    convert_to(expr, common)
 }
 
 /// Binds `e COLLATE Latin1_General_CS_AS`.
@@ -1519,8 +1532,22 @@ fn bind_collate(
 
 /// The common type of a list of branches, folded left to right in the order they were
 /// written, or `None` when the list is empty.
+///
+/// Bare `NULL` branches are skipped while a typed branch remains unseen; when the list
+/// holds bare `NULL` constants alone, the fold runs on the full list and keeps the `int`
+/// reading of [`bind_literal`] (`case_result_type`).
 fn common_of(branches: &[&BoundExpr], line: u32) -> SqlResult<Option<TypeInfo>> {
-    let views = numeric_views(branches);
+    let typed: Vec<&BoundExpr> = branches
+        .iter()
+        .filter(|branch| !matches!(branch.kind, BoundExprKind::Literal(Value::Null)))
+        .copied()
+        .collect();
+    let pool = if typed.is_empty() {
+        branches
+    } else {
+        typed.as_slice()
+    };
+    let views = numeric_views(pool);
     let mut common: Option<TypeInfo> = None;
     for view in views {
         common = Some(match common {
@@ -2981,6 +3008,61 @@ mod tests {
         assert_eq!(without_else.ty.ty, SqlType::Int);
         assert!(without_else.ty.nullable);
         assert!(!b(&searched(Some(int("2")))).ty.nullable);
+
+        // A bare `NULL` branch takes the common type of the typed branches.
+        let null_else_string = b(&Expr::Case {
+            operand: None,
+            arms: vec![CaseArm {
+                when: binary(AstBinaryOp::Eq, int("1"), int("1")),
+                then: null(),
+            }],
+            else_: Some(Box::new(text("a"))),
+            span: any_span(),
+        });
+        assert_eq!(null_else_string.ty.ty, SqlType::VarChar(Len::Fixed(1)));
+        let null_else_decimal = b(&Expr::Case {
+            operand: None,
+            arms: vec![CaseArm {
+                when: binary(AstBinaryOp::Eq, int("1"), int("1")),
+                then: null(),
+            }],
+            else_: Some(Box::new(var("@dec"))),
+            span: any_span(),
+        });
+        assert_eq!(
+            null_else_decimal.ty.ty,
+            SqlType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
+        let two_nulls_one_string = b(&Expr::Case {
+            operand: None,
+            arms: vec![
+                CaseArm {
+                    when: binary(AstBinaryOp::Eq, int("1"), int("1")),
+                    then: null(),
+                },
+                CaseArm {
+                    when: binary(AstBinaryOp::Eq, int("2"), int("2")),
+                    then: null(),
+                },
+            ],
+            else_: Some(Box::new(text("a"))),
+            span: any_span(),
+        });
+        assert_eq!(two_nulls_one_string.ty.ty, SqlType::VarChar(Len::Fixed(1)));
+        let all_null = b(&Expr::Case {
+            operand: None,
+            arms: vec![CaseArm {
+                when: binary(AstBinaryOp::Eq, int("1"), int("1")),
+                then: null(),
+            }],
+            else_: Some(Box::new(null())),
+            span: any_span(),
+        });
+        assert_eq!(all_null.ty.ty, SqlType::Int);
+        assert!(all_null.ty.nullable);
     }
 
     #[test]
