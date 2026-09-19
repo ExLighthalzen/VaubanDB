@@ -726,4 +726,12 @@ impl Storage for DiskStorage {
     fn vacuum(&self, horizon: TxnId) -> SqlResult<()> {
         DiskStorage::vacuum(self, horizon)
     }
+
+    fn next_txn_id(&self) -> u64 {
+        DiskStorage::next_txn_id(self)
+    }
+
+    fn committed_txn_high_water(&self) -> u64 {
+        DiskStorage::next_txn_id(self).saturating_sub(1)
+    }
 }

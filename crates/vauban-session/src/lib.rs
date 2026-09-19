@@ -29,6 +29,7 @@ mod login;
 mod nested;
 mod prepared;
 mod procedures;
+mod registry;
 mod reset;
 mod rpc;
 mod server;

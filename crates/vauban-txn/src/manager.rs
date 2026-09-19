@@ -183,17 +183,27 @@ pub struct TransactionManager {
 }
 
 impl TransactionManager {
-    /// A manager over `storage`, with no transaction open, `1` as the next identifier and
-    /// an empty lock table.
+    /// A manager over `storage`, with an empty open-transaction list, the next identifier from
+    /// [`Storage::next_txn_id`] and an empty lock table.
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self {
-            storage,
+            storage: Arc::clone(&storage),
             state: Mutex::new(State {
-                next_id: 1,
+                next_id: storage.next_txn_id(),
                 open: Vec::new(),
             }),
             locks: LockManager::new(),
             versioning: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Raises the next identifier above [`Storage::committed_txn_high_water`] when a second
+    /// engine shares the storage and registry writes must not reuse a committed id.
+    pub fn bump_next_id_above_storage(&self) {
+        let floor = self.storage.committed_txn_high_water().saturating_add(1);
+        let mut state = self.state.lock().expect("transaction manager lock");
+        if state.next_id < floor {
+            state.next_id = floor;
         }
     }
 

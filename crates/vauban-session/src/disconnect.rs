@@ -37,6 +37,8 @@ pub(crate) fn release(session: &mut Session, cause: Release) -> SqlResult<()> {
 
 fn release_on_disconnect(session: &mut Session) -> SqlResult<()> {
     let engine = Arc::clone(session.engine());
+    let spid = session.state().spid;
+    engine.unregister_session(spid)?;
     let mut ids = Vec::new();
     if let Some(txn) = session.state().txn.as_ref() {
         ids.push(txn.handle.id);

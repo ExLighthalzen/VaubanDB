@@ -866,4 +866,9 @@ impl Storage for MemoryStorage {
         txns.retain(|t, state| !(state.is_finished() && *t < horizon));
         Ok(())
     }
+
+    fn committed_txn_high_water(&self) -> u64 {
+        let inner = self.read().expect("memory storage lock");
+        inner.txns.keys().map(|id| id.0).max().unwrap_or(0)
+    }
 }

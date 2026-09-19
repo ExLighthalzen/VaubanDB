@@ -1110,7 +1110,7 @@ mod tests {
             .map(|meta| (meta.id, meta.name.clone()))
             .collect();
         assert_eq!(held, expected);
-        assert_eq!(held.len(), 20, "{held:?}");
+        assert_eq!(held.len(), expected.len(), "{held:?}");
         // The ranges: the views below zero, a constraint at zero
         // (`views/sys_constraints.rs`), the internal tables from 100_000 and the user tables
         // from 1_000_000, which leaves 900_000 numbers between the two last ones.
@@ -1118,7 +1118,7 @@ mod tests {
         let first = held.first().map(|&(id, _)| id.0);
         assert_eq!(first, Some(100_000), "positive, as in SQL Server");
         let last = FIRST_INTERNAL_TABLE_OBJECT_ID
-            + i32::try_from(held.len()).expect("20 fits in an i32")
+            + i32::try_from(held.len()).expect("the table count fits in an i32")
             - 1;
         assert!(
             last < crate::table::FIRST_USER_OBJECT_ID,

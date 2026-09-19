@@ -117,6 +117,12 @@ pub(crate) const DATABASES_TABLE: &str = "vauban_sys_databases";
 /// internal tables live in `master`, so the database a schema belongs to is a column here.
 pub(crate) const SCHEMAS_TABLE: &str = "vauban_sys_schemas";
 
+/// Internal table of the live sessions, read by the `sys.dm_exec_*` views of `catalog`.
+pub(crate) const SESSIONS_TABLE: &str = "vauban_sys_sessions";
+
+/// Internal table of the live connections, one row per session.
+pub(crate) const CONNECTIONS_TABLE: &str = "vauban_sys_connections";
+
 /// The type of a `sysname` column, `nvarchar(128)`.
 const SYSNAME: SqlType = SqlType::NVarChar(Len::Fixed(128));
 
@@ -167,6 +173,54 @@ pub(crate) mod schemas_columns {
     pub(crate) const PRINCIPAL_ID: usize = 3;
     /// Width of a row of the table.
     pub(crate) const WIDTH: usize = 4;
+}
+
+/// Where each column of [`SESSIONS_TABLE`] sits in a [`Row`].
+#[allow(dead_code)]
+pub(crate) mod sessions_columns {
+    /// `session_id smallint`: the SPID of the connection.
+    pub(crate) const SESSION_ID: usize = 0;
+    /// `login_name nvarchar(128)`.
+    pub(crate) const LOGIN_NAME: usize = 1;
+    /// `host_name nvarchar(128)`.
+    pub(crate) const HOST_NAME: usize = 2;
+    /// `program_name nvarchar(128)`.
+    pub(crate) const PROGRAM_NAME: usize = 3;
+    /// `database_id int`: the current database of the session.
+    pub(crate) const DATABASE_ID: usize = 4;
+    /// `login_time datetime`.
+    pub(crate) const LOGIN_TIME: usize = 5;
+    /// `last_request_time datetime`.
+    pub(crate) const LAST_REQUEST_TIME: usize = 6;
+    /// `status nvarchar(30)`: `running` or `sleeping`.
+    pub(crate) const STATUS: usize = 7;
+    /// `last_sql_text_len int`: length of the last batch or RPC text.
+    pub(crate) const LAST_SQL_TEXT_LEN: usize = 8;
+    /// Width of a row of the table.
+    pub(crate) const WIDTH: usize = 9;
+}
+
+/// Where each column of [`CONNECTIONS_TABLE`] sits in a [`Row`].
+#[allow(dead_code)]
+pub(crate) mod connections_columns {
+    /// `session_id smallint`: the SPID of the connection.
+    pub(crate) const SESSION_ID: usize = 0;
+    /// `client_net_address nvarchar(48)`.
+    pub(crate) const CLIENT_NET_ADDRESS: usize = 1;
+    /// `client_tcp_port int`.
+    pub(crate) const CLIENT_TCP_PORT: usize = 2;
+    /// `protocol_version int`: the negotiated TDS version.
+    pub(crate) const PROTOCOL_VERSION: usize = 3;
+    /// `encrypt_option nvarchar(40)`.
+    pub(crate) const ENCRYPT_OPTION: usize = 4;
+    /// `net_transport nvarchar(40)`.
+    pub(crate) const NET_TRANSPORT: usize = 5;
+    /// `protocol_type nvarchar(40)`.
+    pub(crate) const PROTOCOL_TYPE: usize = 6;
+    /// `auth_scheme nvarchar(40)`.
+    pub(crate) const AUTH_SCHEME: usize = 7;
+    /// Width of a row of the table.
+    pub(crate) const WIDTH: usize = 8;
 }
 
 /// Opens the catalogue of `storage`, creating what a first start needs. See
@@ -391,6 +445,43 @@ fn bootstrap_tables(
             clustered_key: None,
             rows: schema_rows,
             views: views::sys_core::bootstrap_views(SCHEMAS_TABLE),
+        },
+        InternalTableDef {
+            name: SESSIONS_TABLE.to_owned(),
+            columns: vec![
+                column("session_id", SqlType::SmallInt, false),
+                column("login_name", SYSNAME, false),
+                column("host_name", SYSNAME, false),
+                column("program_name", SYSNAME, false),
+                column("database_id", SqlType::Int, false),
+                column("login_time", SqlType::DateTime, false),
+                column("last_request_time", SqlType::DateTime, false),
+                column("status", SqlType::NVarChar(Len::Fixed(30)), false),
+                column("last_sql_text_len", SqlType::Int, false),
+            ],
+            clustered_key: None,
+            rows: Vec::new(),
+            views: Vec::new(),
+        },
+        InternalTableDef {
+            name: CONNECTIONS_TABLE.to_owned(),
+            columns: vec![
+                column("session_id", SqlType::SmallInt, false),
+                column(
+                    "client_net_address",
+                    SqlType::NVarChar(Len::Fixed(48)),
+                    false,
+                ),
+                column("client_tcp_port", SqlType::Int, false),
+                column("protocol_version", SqlType::Int, false),
+                column("encrypt_option", SqlType::NVarChar(Len::Fixed(40)), false),
+                column("net_transport", SqlType::NVarChar(Len::Fixed(40)), false),
+                column("protocol_type", SqlType::NVarChar(Len::Fixed(40)), false),
+                column("auth_scheme", SqlType::NVarChar(Len::Fixed(40)), false),
+            ],
+            clustered_key: None,
+            rows: Vec::new(),
+            views: Vec::new(),
         },
     ])
 }
@@ -713,7 +804,12 @@ mod tests {
             expected.contains(&views::sys_core::TYPES_TABLE.to_owned()),
             "{expected:?}"
         );
-        expected.extend([DATABASES_TABLE.to_owned(), SCHEMAS_TABLE.to_owned()]);
+        expected.extend([
+            DATABASES_TABLE.to_owned(),
+            SCHEMAS_TABLE.to_owned(),
+            SESSIONS_TABLE.to_owned(),
+            CONNECTIONS_TABLE.to_owned(),
+        ]);
         let names: Vec<String> = internal_table_defs()
             .unwrap()
             .into_iter()
@@ -804,6 +900,36 @@ mod tests {
         assert_eq!(names[schemas_columns::SCHEMA_ID], "schema_id");
         assert_eq!(names[schemas_columns::NAME], "name");
         assert_eq!(names[schemas_columns::PRINCIPAL_ID], "principal_id");
+
+        let sessions = tables
+            .iter()
+            .find(|def| def.name == SESSIONS_TABLE)
+            .expect("the table of the sessions is described");
+        let names: Vec<&str> = sessions
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(names.len(), sessions_columns::WIDTH);
+        assert_eq!(names[sessions_columns::SESSION_ID], "session_id");
+        assert_eq!(names[sessions_columns::LOGIN_NAME], "login_name");
+        assert_eq!(names[sessions_columns::STATUS], "status");
+
+        let connections = tables
+            .iter()
+            .find(|def| def.name == CONNECTIONS_TABLE)
+            .expect("the table of the connections is described");
+        let names: Vec<&str> = connections
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(names.len(), connections_columns::WIDTH);
+        assert_eq!(names[connections_columns::SESSION_ID], "session_id");
+        assert_eq!(
+            names[connections_columns::CLIENT_NET_ADDRESS],
+            "client_net_address"
+        );
     }
 
     #[test]

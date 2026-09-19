@@ -3,11 +3,14 @@
 //! constants. Everything here is a pure function; `server.rs` drives the
 //! socket ([MS-TDS] 3.3.5.2).
 
-use vauban_errors::{InfoMessage, SqlError, message_template};
-use vauban_tds::{DoneStatus, EnvChange, Login7, Token};
+use std::net::SocketAddr;
+
+use vauban_errors::{InfoMessage, SqlError, SqlResult, message_template};
+use vauban_tds::{DoneStatus, EncryptPolicy, EnvChange, Login7, Token};
 use vauban_types::Collation;
 
-use crate::server::ServerConfig;
+use crate::registry::ConnectionInfo;
+use crate::server::{Engine, ServerConfig};
 use crate::state::SessionState;
 
 /// Product version announced in LOGINACK, `@@VERSION` and `SERVERPROPERTY('ProductVersion')`:
@@ -77,6 +80,32 @@ pub fn banner_with_edition(edition: &str) -> String {
 /// ENVCHANGE the login response carries whichever database it opens (see
 /// [`login_response`]).
 pub(crate) const MASTER: &str = "master";
+
+/// Builds the connection metadata written into `vauban_sys_connections` at login.
+pub(crate) fn connection_info(
+    login: &Login7,
+    peer: SocketAddr,
+    encrypt: EncryptPolicy,
+) -> ConnectionInfo {
+    ConnectionInfo {
+        client_address: peer.ip().to_string(),
+        client_port: peer.port(),
+        tds_version: login.tds_version,
+        encrypt_option: match encrypt {
+            EncryptPolicy::Required => "TRUE".to_owned(),
+            EncryptPolicy::Off | EncryptPolicy::Optional => "FALSE".to_owned(),
+        },
+    }
+}
+
+/// Inserts the session row after a successful login.
+pub(crate) fn register_live_session(
+    engine: &Engine,
+    state: &SessionState,
+    connection: &ConnectionInfo,
+) -> SqlResult<()> {
+    engine.register_session(state, connection)
+}
 /// `State` of the INFO 5701 of a **login**: 2, whether the LOGIN7 names a database or
 /// not. A `USE` sends [`DATABASE_CONTEXT_STATE_USE`] instead, which tells the two senders
 /// apart.

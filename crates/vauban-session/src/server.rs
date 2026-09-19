@@ -164,11 +164,16 @@ impl Engine {
             Ok(catalog) => Arc::new(catalog),
             Err(err) => panic!("{BOOTSTRAP_PANIC}: {err}"),
         };
-        Self {
+        let engine = Self {
             storage,
             txn,
             catalog,
+        };
+        engine.txn.bump_next_id_above_storage();
+        if let Err(err) = engine.clear_session_registry() {
+            panic!("{BOOTSTRAP_PANIC}: session registry clear failed: {err}");
         }
+        engine
     }
 }
 
@@ -244,6 +249,7 @@ impl Server {
                             Arc::clone(&self.cfg),
                             tcp,
                             spid,
+                            addr,
                             connections.child_token(),
                         );
                         tasks.spawn(task.instrument(span));
@@ -307,6 +313,7 @@ async fn handle_connection(
     cfg: Arc<ServerConfig>,
     tcp: TcpStream,
     spid: i16,
+    peer: std::net::SocketAddr,
     shutdown: CancellationToken,
 ) {
     let outcome = tokio::select! {
@@ -314,7 +321,7 @@ async fn handle_connection(
             info!("connection closed by server shutdown");
             return;
         }
-        outcome = run_connection(engine, &cfg, tcp, spid) => outcome,
+        outcome = run_connection(engine, &cfg, tcp, spid, peer) => outcome,
     };
     match outcome {
         Ok(()) => info!("connection closed"),
@@ -331,6 +338,7 @@ async fn run_connection(
     cfg: &ServerConfig,
     tcp: TcpStream,
     spid: i16,
+    peer: std::net::SocketAddr,
 ) -> Result<(), TdsError> {
     let mut stream = TdsStream::accept(tcp, cfg.tls.clone(), cfg.encrypt).await?;
     info!("PRELOGIN negotiated");
@@ -380,6 +388,13 @@ async fn run_connection(
         .write_tokens(&login::login_response(&login, &state, cfg))
         .await?;
     stream.flush().await?;
+    if let Err(err) = login::register_live_session(
+        &engine,
+        &state,
+        &login::connection_info(&login, peer, cfg.encrypt),
+    ) {
+        warn!(error = %err, spid, "session registry insert failed after login");
+    }
     // The response above still travelled at the previous size; the negotiated one
     // applies from the next packet ([MS-TDS] 2.2.6.4 PacketSize).
     stream.set_packet_size(state.packet_size);
@@ -418,12 +433,14 @@ async fn run_connection(
                 let reset = batch.reset;
                 let login_db = login_database.clone();
                 let engine_for_reset = Arc::clone(&transaction_engine);
+                let text_len = i32::try_from(text.len()).unwrap_or(i32::MAX);
                 let outcome = run_request(
                     &mut writer,
                     &mut client_rx,
                     session,
                     false,
                     None,
+                    text_len,
                     move |session, sink| {
                         crate::reset::apply_reset(
                             session,
@@ -458,6 +475,7 @@ async fn run_connection(
                     session,
                     true,
                     None,
+                    0,
                     move |session, sink| {
                         crate::reset::apply_reset(
                             session,
@@ -496,6 +514,7 @@ async fn run_connection(
                     session,
                     false,
                     Some(CUR_CMD_TRANSACTION_MANAGER),
+                    0,
                     move |session, sink| {
                         let mut state = session.state().clone();
                         let result = txn_request::handle(&request, &engine, &mut state, sink);
@@ -594,6 +613,7 @@ async fn run_request<F>(
     mut session: Session,
     rpc: bool,
     done_cur_cmd: Option<u16>,
+    sql_text_len: i32,
     run: F,
 ) -> Result<RequestOutcome, TdsError>
 where
@@ -603,13 +623,29 @@ where
     // A handle outlives the requests of its session: an ATTENTION cancels this one only.
     let cancel = session.cancel_handle();
     cancel.reset();
+    let engine = Arc::clone(session.engine());
+    let spid = session.state().spid;
+    let database = session.state().database.clone();
     let handle = spawn_blocking(move || {
         let mut sink = if rpc {
             TdsSink::for_rpc(tx)
         } else {
             TdsSink::new(tx)
         };
+        let _ = engine.touch_session(
+            spid,
+            sql_text_len,
+            crate::registry::SessionStatus::Running,
+            &database,
+        );
         let result = run(&mut session, &mut sink);
+        let database = session.state().database.clone();
+        let _ = engine.touch_session(
+            spid,
+            sql_text_len,
+            crate::registry::SessionStatus::Sleeping,
+            &database,
+        );
         (session, result)
     });
 
@@ -1155,12 +1191,11 @@ mod tests {
             tables
         );
 
-        // The second bootstrap left `TxnId(1)` unused: its manager hands that identifier
-        // out, while the manager of the first engine, whose bootstrap consumed it, hands out
-        // `TxnId(2)`. Two engines over one storage is a shape of this test; `cli` builds one
-        // engine per storage, so the two numberings do not meet there.
-        assert_eq!(second.txn.begin(IsolationLevel::ReadCommitted).id, TxnId(1));
-        assert_eq!(first.txn.begin(IsolationLevel::ReadCommitted).id, TxnId(2));
+        // Each `Engine::new` clears the session registry in its own transaction after
+        // bootstrap. The second manager starts at the storage high-water mark, then clears
+        // once; the first manager, already past bootstrap and clear, hands out the next id.
+        assert_eq!(second.txn.begin(IsolationLevel::ReadCommitted).id, TxnId(4));
+        assert_eq!(first.txn.begin(IsolationLevel::ReadCommitted).id, TxnId(3));
     }
 
     #[test]

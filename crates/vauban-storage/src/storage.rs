@@ -634,6 +634,22 @@ pub trait Storage: Send + Sync {
     /// `InternalError::Io` on disk. A `horizon` that violates the precondition is a caller
     /// bug that the implementation cannot detect: it is not reported.
     fn vacuum(&self, horizon: TxnId) -> SqlResult<()>;
+
+    /// Lowest transaction identifier a new [`vauban_txn::TransactionManager`] should hand out.
+    ///
+    /// On disk reopen, identifiers the journal already ended must not be reused. The default
+    /// suits memory and a fresh disk instance.
+    fn next_txn_id(&self) -> u64 {
+        1
+    }
+
+    /// Highest transaction identifier the storage already knows as finished or in progress.
+    ///
+    /// Memory managers may still hand out lower identifiers; start-up code uses this to
+    /// pick a registry transaction that does not collide with an earlier bootstrap.
+    fn committed_txn_high_water(&self) -> u64 {
+        0
+    }
 }
 
 #[cfg(test)]
