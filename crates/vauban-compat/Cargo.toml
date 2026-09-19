@@ -20,6 +20,10 @@ vauban-parser.workspace = true
 [dev-dependencies]
 vauban-storage.workspace = true
 vauban-tds.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tiberius.workspace = true
+futures-util.workspace = true
 
 [lints]
 workspace = true

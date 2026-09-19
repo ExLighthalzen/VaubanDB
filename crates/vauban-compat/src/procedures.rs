@@ -147,10 +147,10 @@ fn resolve_catalog_procedure(name: &str, args: &[ProcArg<'_>]) -> Option<SqlResu
     if let Some(result) = crate::catalog_keys::resolve(name, args) {
         return Some(result);
     }
-    let stub_tables: &[&[SystemProc]] = &[
-        crate::help_procs::PROCS,
-        crate::who_procs::PROCS,
-    ];
+    if let Some(result) = crate::who_procs::resolve(name, args) {
+        return Some(result);
+    }
+    let stub_tables: &[&[SystemProc]] = &[crate::help_procs::PROCS];
     for table in stub_tables {
         if table.iter().any(|proc| proc.name == name) {
             return Some(Err(SqlError::procedure_not_found(name)));

@@ -1516,6 +1516,10 @@ dependencies = [
 name = "vauban-compat"
 version = "0.0.5"
 dependencies = [
+ "futures-util",
+ "tiberius",
+ "tokio",
+ "tokio-util",
  "vauban-errors",
  "vauban-parser",
  "vauban-session",
