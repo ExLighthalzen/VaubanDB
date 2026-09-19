@@ -473,12 +473,12 @@ pub(crate) fn bind_create_table(
                     .with_line(stmt.span.line),
             );
         }
-        let (def, column_constraints) = column_of(column, position, &stmt.span, pk_clustered)?;
+        let (def, column_constraints) = column_of(column, position, &stmt.span, pk_clustered, ctx)?;
         columns.push(def);
         constraints.extend(column_constraints);
     }
     for constraint in &stmt.definition.constraints {
-        constraints.push(table_constraint(constraint, pk_clustered)?);
+        constraints.push(table_constraint(constraint, pk_clustered, ctx, &stmt.span)?);
     }
     // After the column list and before the nullability of the key (`ddl_index.rs`).
     refuse_duplicate_key_column(&constraints, stmt.span.line)?;
@@ -702,6 +702,7 @@ fn column_of(
     position: u32,
     statement: &Span,
     pk_clustered: bool,
+    ctx: &BindContext<'_>,
 ) -> SqlResult<(ColumnDef, Vec<ConstraintDef>)> {
     if column.computed.is_some() {
         // Before the type is resolved: `AS a + 1` writes no type, and `parse_column_def` fills
@@ -752,7 +753,9 @@ fn column_of(
                     name,
                     vec![column.name.value.clone()],
                     reference,
-                ));
+                    ctx,
+                    statement,
+                )?);
             }
             ColumnConstraintKind::Check { expr, .. } => constraints.push(ConstraintDef::Check {
                 name,
@@ -795,7 +798,12 @@ fn column_of(
 /// Nothing is refused here today: each variant of `parser::TableConstraintKind` has its
 /// counterpart in `catalog::ConstraintDef`. The signature keeps the `SqlResult` of its
 /// caller so that a check added here does not change it.
-fn table_constraint(constraint: &TableConstraint, pk_clustered: bool) -> SqlResult<ConstraintDef> {
+fn table_constraint(
+    constraint: &TableConstraint,
+    pk_clustered: bool,
+    ctx: &BindContext<'_>,
+    span: &Span,
+) -> SqlResult<ConstraintDef> {
     let name = constraint.name.as_ref().map(|ident| ident.value.clone());
     Ok(match &constraint.kind {
         TableConstraintKind::PrimaryKey {
@@ -818,7 +826,9 @@ fn table_constraint(constraint: &TableConstraint, pk_clustered: bool) -> SqlResu
             name,
             columns.iter().map(|ident| ident.value.clone()).collect(),
             reference,
-        ),
+            ctx,
+            span,
+        )?,
         TableConstraintKind::Check { expr, .. } => ConstraintDef::Check {
             name,
             expr: expr.clone(),
@@ -829,22 +839,41 @@ fn table_constraint(constraint: &TableConstraint, pk_clustered: bool) -> SqlResu
 /// A `FOREIGN KEY` / `REFERENCES`, with the actions the statement left out filled with the
 /// `NO ACTION` SQL Server applies to `ON DELETE` and `ON UPDATE`.
 ///
-/// The referenced name keeps the parts that were written and leaves the others empty: which
-/// database and which schema a `REFERENCES other (b)` reaches, and whether the table is
-/// there, is the catalogue's to decide when it creates the constraint.
+/// The referenced table is resolved like a `FROM` table: the current database and the
+/// default schema of the session fill the parts the statement left out. A reference that
+/// names another database answers 1763 on the line of the statement.
+///
+/// # Errors
+///
+/// - 1763 when the referenced table names a database other than the current one;
+/// - the internal 50000 for a temporary table or a four-part name on the reference.
 fn foreign_key(
     name: Option<String>,
     columns: Vec<String>,
     reference: &ForeignKeyRef,
-) -> ConstraintDef {
-    ConstraintDef::ForeignKey {
+    ctx: &BindContext<'_>,
+    span: &Span,
+) -> SqlResult<ConstraintDef> {
+    let referenced = table_name(&reference.table, ctx).map_err(|err| on_statement(err, span))?;
+    if !referenced.database.eq_ignore_ascii_case(ctx.database) {
+        let printed = format!(
+            "{}.{}.{}",
+            referenced.database, referenced.schema, referenced.name
+        );
+        return Err(SqlError::new(
+            1763,
+            16,
+            0,
+            format!(
+                "Cross-database foreign key references are not supported. Foreign key '{printed}'."
+            ),
+        )
+        .with_line(span.line));
+    }
+    Ok(ConstraintDef::ForeignKey {
         name,
         columns,
-        referenced: QualifiedName {
-            database: part(reference.table.database.as_ref(), ""),
-            schema: part(reference.table.schema.as_ref(), ""),
-            name: reference.table.name.value.clone(),
-        },
+        referenced,
         referenced_columns: reference
             .columns
             .iter()
@@ -852,7 +881,7 @@ fn foreign_key(
             .collect(),
         on_delete: reference.on_delete.unwrap_or(RefAction::NoAction),
         on_update: reference.on_update.unwrap_or(RefAction::NoAction),
-    }
+    })
 }
 
 /// The single key column of a column-level `PRIMARY KEY` or `UNIQUE`.
@@ -1422,7 +1451,7 @@ mod tests {
     }
 
     /// A `FOREIGN KEY` reaches the catalogue with the actions SQL Server applies when the
-    /// statement leaves them out.
+    /// statement leaves them out, and the referenced table is resolved like a `FROM` table.
     #[test]
     fn foreign_key_fills_the_actions_it_was_not_given() {
         let def = table_def("CREATE TABLE t (a int REFERENCES other (b));");
@@ -1438,6 +1467,8 @@ mod tests {
                 },
             ] => {
                 assert_eq!(columns, &["a".to_owned()]);
+                assert_eq!(referenced.database, "master");
+                assert_eq!(referenced.schema, "dbo");
                 assert_eq!(referenced.name, "other");
                 assert_eq!(referenced_columns, &["b".to_owned()]);
                 assert_eq!(*on_delete, RefAction::NoAction);
@@ -1445,6 +1476,34 @@ mod tests {
             }
             other => unreachable!("one FOREIGN KEY, got {other:?}"),
         }
+    }
+
+    /// `REFERENCES dbo.parent (id)` fills the current database before the constraint reaches
+    /// the catalogue.
+    #[test]
+    fn two_part_reference_fills_the_current_database() {
+        let def = table_def("CREATE TABLE t (a int REFERENCES dbo.parent (id));");
+        match def.constraints.as_slice() {
+            [ConstraintDef::ForeignKey { referenced, .. }] => {
+                assert_eq!(referenced.database, "master");
+                assert_eq!(referenced.schema, "dbo");
+                assert_eq!(referenced.name, "parent");
+            }
+            other => unreachable!("one FOREIGN KEY, got {other:?}"),
+        }
+    }
+
+    /// A reference that names another database answers 1763 on the line of the statement.
+    #[test]
+    fn cross_database_foreign_key_is_1763() {
+        let error = err("CREATE TABLE t (a int REFERENCES tempdb.dbo.parent (id));");
+        assert_eq!((error.number, error.severity, error.state), (1763, 16, 0));
+        assert_eq!(
+            error.message,
+            "Cross-database foreign key references are not supported. Foreign key \
+             'tempdb.dbo.parent'."
+        );
+        assert_eq!(error.line, 1);
     }
 
     /// A column written twice answers 2705, on the line of the statement.
