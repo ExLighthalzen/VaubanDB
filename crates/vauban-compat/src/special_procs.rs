@@ -412,6 +412,13 @@ fn resolve_decl_type(decl: &DataType) -> SqlResult<TypeInfo> {
         "datetime2" => SqlType::DateTime2(7),
         "time" => SqlType::Time(7),
         "uniqueidentifier" => SqlType::UniqueIdentifier,
+        // Plain `sysname` is `nvarchar(128)`; a length is refused in a declaration.
+        "sysname" => {
+            if !decl.args.is_empty() {
+                return Err(SqlError::cannot_find_data_type(1, &decl.name));
+            }
+            SqlType::NVarChar(Len::Fixed(128))
+        }
         _ => return Err(SqlError::cannot_find_data_type(1, &decl.name)),
     };
     Ok(TypeInfo::new(sql_type, true))
@@ -549,6 +556,30 @@ mod tests {
             value,
             output,
             default: false,
+        }
+    }
+
+    #[test]
+    fn sysname_param_resolves_to_nvarchar128() {
+        let stmt = nvarchar("SELECT @p AS p");
+        let params = nvarchar("@p sysname");
+        let value = nvarchar("x");
+        let sysname_ty = TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), false);
+        let action = resolve_sp_executesql(&[
+            arg(None, &nvarchar_ty(), &stmt, false),
+            arg(None, &nvarchar_ty(), &params, false),
+            arg(Some("@p"), &sysname_ty, &value, false),
+        ])
+        .expect("ok");
+        match action {
+            ProcAction::ExecuteSql { statement, params } => {
+                assert_eq!(statement, "SELECT @p AS p");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "@p");
+                assert_eq!(params[0].ty.ty, SqlType::NVarChar(Len::Fixed(128)));
+                assert_eq!(params[0].value, nvarchar("x"));
+            }
+            other => panic!("expected ExecuteSql, got {other:?}"),
         }
     }
 

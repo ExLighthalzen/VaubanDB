@@ -715,7 +715,9 @@ fn column_of(
     let ty = resolve_data_type(&column.ty, position)
         .map_err(|err| in_column_list(err, position, &column.ty.name))
         .map_err(|err| on_statement(err, statement))?;
-    let mut nullable = true;
+    // `sysname` is `NOT NULL` unless `NULL` is written explicitly, unlike the
+    // other types whose default is nullable.
+    let mut nullable = !column.ty.name.eq_ignore_ascii_case("sysname");
     let mut default = None;
     let mut constraints = Vec::new();
     for constraint in &column.constraints {

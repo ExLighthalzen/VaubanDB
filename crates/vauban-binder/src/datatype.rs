@@ -42,6 +42,11 @@ const MAX_TIME_SCALE: i64 = 7;
 /// Scale those three types get when they are written without arguments.
 const DEFAULT_TIME_SCALE: i64 = 7;
 
+/// Length of `sysname`, the alias of `nvarchar(128) NOT NULL` in a declaration.
+///
+/// `128` is also the length of a `sysname` column in `vauban-catalog`.
+const SYSNAME_LEN: u16 = 128;
+
 /// Resolves a data type as written into the engine type it denotes.
 ///
 /// The name is matched case-insensitively; the parser has already collapsed the
@@ -133,6 +138,9 @@ pub(crate) fn resolve_data_type(ty: &DataType, position: u32) -> SqlResult<SqlTy
         "time" => time_scale(ty, position, SqlType::Time),
         "datetime2" => time_scale(ty, position, SqlType::DateTime2),
         "datetimeoffset" => time_scale(ty, position, SqlType::DateTimeOffset),
+        // `sysname` is `nvarchar(128)`; a declaration does not take a length
+        // (`DECLARE @v sysname(10)` answers 2716 on SQL Server).
+        "sysname" => sysname(ty, position),
         // Types SQL Server has and VaubanDB does not. They are refused as
         // *unknown* for want of anything better to say; the difference is
         // deliberate (`SELECT CAST(1 AS sql_variant)` and `SELECT CAST('a' AS
@@ -243,6 +251,34 @@ fn float(ty: &DataType, position: u32) -> SqlResult<SqlType> {
     }
 }
 
+/// Resolves `sysname`: an unparameterised name means `nvarchar(128)`; a length
+/// is refused in a declaration.
+fn sysname(ty: &DataType, position: u32) -> SqlResult<SqlType> {
+    plain(ty, position, SqlType::NVarChar(Len::Fixed(SYSNAME_LEN)))
+}
+
+/// Whether `ty` names `sysname`, case-insensitively.
+pub(crate) fn is_sysname(ty: &DataType) -> bool {
+    ty.name.eq_ignore_ascii_case("sysname")
+}
+
+/// Resolves `sysname` as the target of a conversion: an unparameterised name
+/// means `nvarchar(128)`, `(n)` means `nvarchar(n)` for `1..=4000`.
+///
+/// A declaration refuses a length; a `CAST`/`CONVERT` accepts one, as
+/// `SELECT SQL_VARIANT_PROPERTY(CAST(N'x' AS sysname(10)), 'MaxLength')` answers
+/// `20` on SQL Server.
+pub(crate) fn resolve_sysname_cast(ty: &DataType, position: u32) -> SqlResult<SqlType> {
+    let len = match ty.args.as_slice() {
+        [] => SYSNAME_LEN,
+        [TypeArg::Number(n)] if (1..=MAX_CHAR_LEN).contains(n) => {
+            u16::try_from(*n).map_err(|_| out_of_range(ty, position))?
+        }
+        _ => return Err(out_of_range(ty, position)),
+    };
+    Ok(SqlType::NVarChar(Len::Fixed(len)))
+}
+
 /// Resolves `time`, `datetime2` and `datetimeoffset`: no argument means scale 7,
 /// `(s)` means `0..=7`.
 fn time_scale(ty: &DataType, position: u32, make: fn(u8) -> SqlType) -> SqlResult<SqlType> {
@@ -293,7 +329,7 @@ fn out_of_range(ty: &DataType, position: u32) -> SqlError {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_data_type;
+    use super::{SYSNAME_LEN, resolve_data_type, resolve_sysname_cast};
     use vauban_parser::{DataType, Span, TypeArg};
     use vauban_types::{Len, SqlType};
 
@@ -343,6 +379,14 @@ mod tests {
         assert_eq!(simple("smalldatetime"), Ok(SqlType::SmallDateTime));
         assert_eq!(simple("uniqueidentifier"), Ok(SqlType::UniqueIdentifier));
         assert_eq!(simple("real"), Ok(SqlType::Real));
+        assert_eq!(
+            simple("sysname"),
+            Ok(SqlType::NVarChar(Len::Fixed(SYSNAME_LEN)))
+        );
+        assert_eq!(
+            simple("SYSNAME"),
+            Ok(SqlType::NVarChar(Len::Fixed(SYSNAME_LEN)))
+        );
     }
 
     #[test]
@@ -485,6 +529,38 @@ mod tests {
         assert_eq!(
             ty("binary varying", &[TypeArg::Number(4)]),
             Ok(SqlType::VarBinary(Len::Fixed(4)))
+        );
+    }
+
+    #[test]
+    fn sysname_with_a_length_is_refused_in_a_declaration() {
+        let err = ty("sysname", &[TypeArg::Number(10)]).expect_err("no length in a declaration");
+        assert_eq!(err.number, 2715);
+    }
+
+    #[test]
+    fn sysname_cast_accepts_a_length() {
+        assert_eq!(
+            resolve_sysname_cast(
+                &DataType {
+                    name: "sysname".to_owned(),
+                    args: vec![TypeArg::Number(10)],
+                    span: span(),
+                },
+                1,
+            ),
+            Ok(SqlType::NVarChar(Len::Fixed(10)))
+        );
+        assert_eq!(
+            resolve_sysname_cast(
+                &DataType {
+                    name: "sysname".to_owned(),
+                    args: Vec::new(),
+                    span: span(),
+                },
+                1,
+            ),
+            Ok(SqlType::NVarChar(Len::Fixed(SYSNAME_LEN)))
         );
     }
 

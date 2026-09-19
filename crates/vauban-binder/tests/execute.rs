@@ -227,35 +227,25 @@ fn character_procedure_variables_bind() {
 
 #[test]
 fn a_sysname_procedure_variable_binds() {
-    // `sysname` is `nvarchar(128)` on the server; `DECLARE @t sysname` is not bound here yet.
-    register_builtins();
-    let text = "EXEC @t;";
-    let batch = parse_batch(text, &ParseOptions::default())
-        .unwrap_or_else(|e| unreachable!("{text} parses, got {e:?}"));
-    let mut scope = BatchVariables::new();
-    scope
-        .declare(
-            "@t",
-            TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), false),
-        )
-        .expect("@t is declared once");
-    let ctx = BindContext {
-        text,
-        catalog: None,
-        database: "master",
-        default_schema: "dbo",
-        variables: &scope,
-        options: SessionOptions::default(),
-    };
-    let BoundStatement::Execute(execute) = bind(&batch.statements[0], &ctx)
-        .unwrap_or_else(|error| panic!("{text} binds, got {error:?}"))
-    else {
-        panic!("expected an EXECUTE");
-    };
+    let declare = "DECLARE @t sysname; EXEC @t;";
+    let execute = execute_of(declare);
     match execute.target {
         BoundExecTarget::ProcedureVariable(_) => {}
         other => panic!("expected ProcedureVariable, got {other:?}"),
     }
+}
+
+#[test]
+fn declare_sysname_is_nvarchar_128() {
+    let (bound, error) = run("DECLARE @t sysname;");
+    assert!(error.is_none());
+    let BoundStatement::Declare(declarations) = &bound[0] else {
+        panic!("expected DECLARE");
+    };
+    assert_eq!(
+        declarations[0].ty,
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), true)
+    );
 }
 
 #[test]

@@ -53,7 +53,7 @@ use vauban_types::{Len, SqlString, SqlType, TypeFamily, TypeInfo, Value, implici
 
 use crate::bound::{AggregateCall, BoundExpr, BoundExprKind};
 use crate::context::BindContext;
-use crate::datatype::resolve_data_type;
+use crate::datatype::{is_sysname, resolve_data_type, resolve_sysname_cast};
 use crate::errors::{line_at, line_of};
 use crate::expr::{Scope, implicit_conversion_may_be_null};
 
@@ -257,6 +257,10 @@ fn is_conversion_null(e: &Expr) -> bool {
 /// the caller already computed: `SELECT CAST(1 AS foo);` reports the line of the `CAST`,
 /// not of the type name.
 fn target_type(ty: &DataType, line: u32) -> SqlResult<SqlType> {
+    if is_sysname(ty) {
+        return resolve_sysname_cast(ty, CONVERSION_TYPE_POSITION)
+            .map_err(|err| err.with_line(line));
+    }
     match resolve_data_type(ty, CONVERSION_TYPE_POSITION) {
         Ok(resolved) => Ok(cast_default_length(resolved, ty.args.is_empty())),
         Err(_) if !is_known_type_name(ty) => {
