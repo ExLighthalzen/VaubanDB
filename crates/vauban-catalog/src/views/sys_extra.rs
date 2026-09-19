@@ -101,7 +101,7 @@ use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 use crate::bootstrap::{DATABASES_TABLE, SCHEMAS_TABLE, SYSTEM_DATABASES, SYSTEM_SCHEMAS};
 use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
 use crate::meta::{QualifiedName, TableMeta};
-use crate::views::{info_schema, sys_constraints, sys_core, sys_indexes, sys_tables};
+use crate::views::{dm_exec, info_schema, sys_constraints, sys_core, sys_indexes, sys_tables};
 
 /// Internal table of the objects of a database, system views included, read by
 /// `sys.all_objects` and `sys.views`.
@@ -612,12 +612,14 @@ fn installed_system_views(own: &[SystemViewDef]) -> Vec<QualifiedName> {
         sys_core::bootstrap_views(DATABASES_TABLE),
         sys_core::bootstrap_views(SCHEMAS_TABLE),
     ];
+    let dm_exec = dm_exec::internal_tables();
     let installed = described
         .iter()
         .flatten()
         .flat_map(|table| table.views.iter())
         .chain(of_the_bootstrap.iter().flatten())
-        .chain(own.iter());
+        .chain(own.iter())
+        .chain(dm_exec.iter().flat_map(|table| table.views.iter()));
     let mut names: Vec<QualifiedName> = Vec::new();
     for view in installed {
         if !names.iter().any(|kept| {
@@ -1561,6 +1563,11 @@ mod tests {
             "allocation_units",
             "database_files",
             "master_files",
+            "dm_exec_sessions",
+            "dm_exec_connections",
+            "dm_exec_requests",
+            "configurations",
+            "dm_os_sys_info",
         ] {
             assert!(names.contains(&expected.to_owned()), "{names:?}");
         }

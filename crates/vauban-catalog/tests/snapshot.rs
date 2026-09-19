@@ -68,7 +68,7 @@ fn text(value: &str) -> Value {
 /// `the_internal_tables_are_numbered_from_their_position` of `src/snapshot.rs`, which is where
 /// `bootstrap::internal_table_defs` is reachable; here it is written out, so that a table
 /// added to `views/` is added to this list too.
-const INTERNAL_TABLES: [&str; 20] = [
+const INTERNAL_TABLES: [&str; 22] = [
     "vauban_sys_objects",
     "vauban_sys_columns",
     "vauban_sys_types",
@@ -87,6 +87,8 @@ const INTERNAL_TABLES: [&str; 20] = [
     "vauban_sys_partitions",
     "vauban_sys_allocation_units",
     "vauban_sys_files",
+    "vauban_sys_configurations",
+    "vauban_sys_os_info",
     "vauban_sys_databases",
     "vauban_sys_schemas",
 ];
@@ -1181,8 +1183,8 @@ fn vauban_sys_databases_resolves_to_a_table_with_its_columns() {
 
 #[test]
 fn every_described_internal_table_resolves() {
-    // The twenty tables of `INTERNAL_TABLES`, each resolved from `master`: twenty tables,
-    // twenty identifiers, numbered from 100_000 by the position of the description
+    // The twenty-two tables of `INTERNAL_TABLES`, each resolved from `master`: twenty-two tables,
+    // twenty-two identifiers, numbered from 100_000 by the position of the description
     // (`src/snapshot.rs`). A user table of the same catalogue carries none of those
     // identifiers.
     let (catalog, manager) = instance();
@@ -1215,16 +1217,16 @@ fn every_described_internal_table_resolves() {
         })
         .collect();
     assert_eq!(resolved, numbered, "numbered by the position of the table");
-    // Distinct from one another and from the two user tables: twenty-two identifiers for
-    // twenty-two tables.
+    // Distinct from one another and from the two user tables: twenty-four identifiers for
+    // twenty-four tables.
     let mut ids: Vec<i32> = resolved.iter().map(|&(id, _)| id.0).collect();
     ids.extend([user_in_d.id.0, user_in_master.id.0]);
     let mut once = ids.clone();
     once.sort_unstable();
     once.dedup();
-    assert_eq!(once.len(), 22, "{ids:?}");
+    assert_eq!(once.len(), 24, "{ids:?}");
     assert!(
-        ids.iter().take(20).all(|&id| id < user_in_master.id.0),
+        ids.iter().take(22).all(|&id| id < user_in_master.id.0),
         "{ids:?}"
     );
 }

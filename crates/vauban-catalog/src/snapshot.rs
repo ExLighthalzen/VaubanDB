@@ -579,6 +579,11 @@ fn described_views() -> Vec<SystemViewDef> {
             .into_iter()
             .flat_map(|table| table.views),
     );
+    described.extend(
+        views::dm_exec::internal_tables()
+            .into_iter()
+            .flat_map(|table| table.views),
+    );
     described
 }
 
@@ -1021,20 +1026,31 @@ mod tests {
             Some(["sys.databases".to_owned(), "sys.schemas".to_owned()].as_slice()),
             "-16 and -17, as the rows of `vauban_sys_all_objects` number them"
         );
-        let trailing: Vec<&String> = names.iter().rev().take(2).collect();
-        assert_eq!(trailing, vec!["sys.master_files", "sys.database_files"]);
-        // The six files of `views/` are filled, for 24 distinct names, each described once per
-        // system database, which is what the `views_of` of those files does: 96 descriptions.
+        let trailing: Vec<&String> = names.iter().rev().take(7).collect();
+        assert_eq!(
+            trailing,
+            vec![
+                "sys.dm_os_sys_info",
+                "sys.dm_exec_requests",
+                "sys.dm_exec_connections",
+                "sys.dm_exec_sessions",
+                "sys.configurations",
+                "sys.master_files",
+                "sys.database_files",
+            ]
+        );
+        // The seven files of `views/` are filled, for 29 distinct names, each described once per
+        // system database, which is what the `views_of` of those files does: 116 descriptions.
         assert_eq!(described.len(), names.len() * SYSTEM_DATABASES.len());
         assert_eq!(named_once(&names), names, "a name is described twice");
-        assert_eq!(names.len(), 24);
-        assert_eq!(described.len(), 96);
+        assert_eq!(names.len(), 29);
+        assert_eq!(described.len(), 116);
         // The identifiers are negative and run from -1 without a hole, so two views of the
-        // 24 do not share one: the rank rule numbers the distinct names (module
+        // 29 do not share one: the rank rule numbers the distinct names (module
         // documentation, section "The identifiers of the system views are the rows of
         // `sys.all_objects`").
         let ids: Vec<i32> = objects.iter().map(|object| object.id.0).collect();
-        let by_rank: Vec<i32> = (1..=i32::try_from(names.len()).expect("24 fits in an i32"))
+        let by_rank: Vec<i32> = (1..=i32::try_from(names.len()).expect("29 fits in an i32"))
             .map(|rank| -rank)
             .collect();
         assert_eq!(ids, by_rank);
@@ -1066,7 +1082,7 @@ mod tests {
             .collect();
         let of_the_rows = described_system_view_rows();
         assert_eq!(of_the_snapshot, of_the_rows);
-        assert_eq!(of_the_snapshot.len(), 24, "{of_the_snapshot:?}");
+        assert_eq!(of_the_snapshot.len(), 29, "{of_the_snapshot:?}");
         // Counter-proof that the comparison reads something: the rows are there, negative,
         // and the first of them is the one of `sys.objects`.
         assert_eq!(
@@ -1076,7 +1092,7 @@ mod tests {
         );
         assert_eq!(
             of_the_rows.last().map(|&(id, _, _)| id),
-            Some(-24),
+            Some(-29),
             "{of_the_rows:?}"
         );
     }

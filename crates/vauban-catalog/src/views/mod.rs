@@ -15,11 +15,14 @@
 //! | `info_schema.rs` | `INFORMATION_SCHEMA.TABLES`, `COLUMNS`, `SCHEMATA` |
 //! | `sys_constraints.rs` | `sys.foreign_keys`, `sys.foreign_key_columns`, `sys.check_constraints`, `sys.default_constraints` |
 //! | `sys_extra.rs` | `sys.all_objects`, `sys.views`, `sys.partitions`, `sys.allocation_units`, the file views |
+//! | `dm_exec.rs` | `sys.dm_exec_sessions`, `sys.dm_exec_connections`, `sys.dm_exec_requests`, `sys.configurations`, `sys.dm_os_sys_info` |
 
 use crate::def::InternalTableDef;
 
 // Each file carries the column positions of its tables; the ones no row writer reads yet
 // document the shape.
+#[allow(dead_code)]
+pub(crate) mod dm_exec;
 #[allow(dead_code)]
 pub(crate) mod info_schema;
 #[allow(dead_code)]
@@ -50,6 +53,7 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
         info_schema::internal_tables(),
         sys_constraints::internal_tables(),
         sys_extra::internal_tables(),
+        dm_exec::internal_tables(),
     ]
     .into_iter()
     .flatten()
