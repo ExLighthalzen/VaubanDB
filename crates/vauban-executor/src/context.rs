@@ -147,6 +147,35 @@ pub struct ExecSession {
     pub lock_timeout: LockTimeout,
 }
 
+impl ExecSession {
+    /// Reads a session variable; names match with `eq_ignore_ascii_case`.
+    pub(crate) fn variable_value(&self, name: &str) -> Option<Value> {
+        self.variables
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
+
+    /// The declared type of a session variable; names match with `eq_ignore_ascii_case`.
+    pub(crate) fn variable_type(&self, name: &str) -> Option<TypeInfo> {
+        self.variable_types
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, ty)| ty.clone())
+    }
+
+    /// Stores `value` under the spelling already in the session, or under `name` otherwise.
+    pub(crate) fn store_variable_value(&mut self, name: &str, value: Value) {
+        let key = self
+            .variables
+            .keys()
+            .find(|key| key.eq_ignore_ascii_case(name))
+            .cloned()
+            .unwrap_or_else(|| name.to_owned());
+        self.variables.insert(key, value);
+    }
+}
+
 impl Default for ExecSession {
     fn default() -> Self {
         Self {

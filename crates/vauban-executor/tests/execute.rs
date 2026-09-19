@@ -6,8 +6,11 @@ use vauban_binder::{
     BoundExecArg, BoundExecTarget, BoundExecute, BoundExpr, BoundExprKind, SessionOptions,
 };
 use vauban_errors::SqlResult;
-use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSink, execute_bound};
+use vauban_executor::{
+    ExecContext, ExecOutcome, ExecSession, RowSink, eval_expr, execute, execute_bound,
+};
 use vauban_parser::{Ident, ObjectName, Span};
+use vauban_planner::PhysicalStatement;
 use vauban_sysfn::StaticContext;
 use vauban_types::{BinaryOp, Len, SqlString, SqlType, TypeInfo, Value};
 
@@ -17,6 +20,10 @@ fn int_ty() -> TypeInfo {
 
 fn varchar_ty(n: u16) -> TypeInfo {
     TypeInfo::new(SqlType::VarChar(Len::Fixed(n)), true)
+}
+
+fn int_lit(n: i32) -> BoundExpr {
+    lit(Value::I32(n), int_ty())
 }
 
 fn lit(value: Value, ty: TypeInfo) -> BoundExpr {
@@ -105,6 +112,43 @@ fn run(session: &mut ExecSession, stmt: &BoundExecute) -> (ExecOutcome, Counting
     };
     let outcome = execute_bound(stmt, &mut ctx, &mut sink).expect("the EXECUTE evaluates");
     (outcome, sink)
+}
+
+/// Session `@Nom = 1`, read `@nom` — the value is 1.
+#[test]
+fn variable_lookup_ignores_ascii_case() {
+    let mut session = ExecSession::default();
+    session.variables.insert("@Nom".to_owned(), Value::I32(1));
+    session.variable_types.insert("@Nom".to_owned(), int_ty());
+    let eval = StaticContext::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_session(&mut session);
+    let value =
+        eval_expr(&var_ref("@nom", int_ty()), None, &mut ctx).expect("the variable is found");
+    assert_eq!(value, Value::I32(1));
+}
+
+/// `SET @NOM = 2` updates `@Nom` in place — one entry remains.
+#[test]
+fn variable_assignment_updates_the_declared_spelling() {
+    let mut session = ExecSession::default();
+    session.variables.insert("@Nom".to_owned(), Value::I32(1));
+    session.variable_types.insert("@Nom".to_owned(), int_ty());
+    let set = PhysicalStatement::SetVariable {
+        name: "@NOM".to_owned(),
+        value: int_lit(2),
+    };
+    let eval = StaticContext::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_session(&mut session);
+    let mut sink = CountingSink {
+        rows: 0,
+        columns: 0,
+        infos: 0,
+    };
+    let outcome = execute(&set, &mut ctx, &mut sink).expect("SET runs");
+    assert!(matches!(outcome, ExecOutcome::NoRows));
+    assert_eq!(session.variables.len(), 1);
+    assert_eq!(session.variables.get("@Nom"), Some(&Value::I32(2)));
+    assert!(!session.variables.contains_key("@NOM"));
 }
 
 #[test]

@@ -91,14 +91,10 @@ fn read_variable(
 ) -> SqlResult<(Value, TypeInfo)> {
     let session = ctx.session()?;
     let ty = session
-        .variable_types
-        .get(name)
-        .cloned()
+        .variable_type(name)
         .ok_or_else(|| bug(&format!("execute: variable `{name}` was not declared")))?;
     let value = session
-        .variables
-        .get(name)
-        .cloned()
+        .variable_value(name)
         .ok_or_else(|| bug(&format!("execute: variable `{name}` was not declared")))?;
     Ok((value, ty))
 }

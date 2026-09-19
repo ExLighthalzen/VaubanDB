@@ -184,13 +184,11 @@ pub fn eval_expr(
         }
         // A local variable is read from the session state `DECLARE` entered it in. A name
         // the binder did not declare is a bug of the binder, reported as such.
-        BoundExprKind::Variable { name } => {
-            ctx.session()?.variables.get(name).cloned().ok_or_else(|| {
-                bug(&format!(
-                    "eval_expr: the variable `{name}` was not declared"
-                ))
-            })
-        }
+        BoundExprKind::Variable { name } => ctx.session()?.variable_value(name).ok_or_else(|| {
+            bug(&format!(
+                "eval_expr: the variable `{name}` was not declared"
+            ))
+        }),
         // A column is read by position and consults nothing: `index` is where the value
         // sits in the row the node below produced, and the binder put the name and the
         // type in the binding while it resolved the column. A `row` of `None` means the

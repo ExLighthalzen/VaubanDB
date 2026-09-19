@@ -174,14 +174,14 @@ fn run_nested(
 /// when the binder did not already convert it.
 fn set_variable(name: &str, value: &BoundExpr, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
     let evaluated = eval_expr(value, None, ctx)?;
-    let declared = ctx.session()?.variable_types.get(name).cloned();
+    let declared = ctx.session()?.variable_type(name);
     let stored = match declared {
         Some(declared) => {
             convert(&evaluated, &value.ty, &declared, None).map_err(|err| at(err, value.line))?
         }
         None => evaluated,
     };
-    ctx.session()?.variables.insert(name.to_owned(), stored);
+    ctx.session()?.store_variable_value(name, stored);
     Ok(())
 }
 
