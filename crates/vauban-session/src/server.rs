@@ -61,7 +61,18 @@
 //! No client error reaches `serve`: a `TdsError` is logged at `warn` and closes its own
 //! connection only. The password of a LOGIN7 is never logged: only named fields of the
 //! login appear in the journal, never the whole message.
+//!
+//! # A panicked request task
+//!
+//! A panic in the blocking run is caught, logged with the connection SPID and the request
+//! sequence number, and turned into error 50000 (severity 16, state 1) followed by a DONE
+//! carrying `DoneStatus::ERROR`, like other internal failures once the token relay has
+//! finished. The session stays open when the panic is caught inside the guarded run. A
+//! panic that escapes that guard is logged and, when the relay completed, gets the
+//! error on the wire before the connection closes.
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI16, Ordering};
 use std::time::Duration;
@@ -89,6 +100,12 @@ use crate::login::{self, EDITION, MASTER, VERSION_BANNER};
 use crate::sink::{CHANNEL_CAPACITY, ResultSink, TdsSink};
 use crate::state::SessionState;
 use crate::txn_request;
+
+/// SQL batch text read by [`should_inject_panic`] in debug and test builds.
+const TEST_PANIC_BATCH: &str = "/* vauban:test-panic */";
+
+/// Client-visible text when a request task panics; the server journal carries the payload.
+const REQUEST_PANICKED: &str = "request execution stopped unexpectedly";
 
 /// First SPID handed out: SQL Server reserves the lower values for system tasks.
 const SPID_FIRST: i16 = 51;
@@ -462,6 +479,9 @@ async fn run_connection(
                             session.replace_state(state);
                             return Ok(());
                         }
+                        if should_inject_panic(&text) {
+                            panic!("injected test panic");
+                        }
                         session.run_batch(&text, sink)
                     },
                 )
@@ -656,7 +676,11 @@ where
             crate::registry::SessionStatus::Running,
             &database,
         );
-        let result = run(&mut session, &mut sink);
+        let (result, panic_detail) =
+            match catch_unwind(AssertUnwindSafe(|| run(&mut session, &mut sink))) {
+                Ok(result) => (result, None),
+                Err(payload) => (Err(panic_sql_error()), Some(panic_payload_message(payload))),
+            };
         let database = session.state().database.clone();
         let _ = engine.touch_session(
             spid,
@@ -664,20 +688,35 @@ where
             crate::registry::SessionStatus::Sleeping,
             &database,
         );
-        (session, result)
+        (session, result, panic_detail)
     });
 
     let relayed = relay(writer, &mut rx, client_rx, &cancel, done_cur_cmd, spid, seq).await;
     // The relay left the channel empty and closed: whatever happens next, no `blocking_send`
     // is holding a pool thread and the request task is on its way out.
     drop(rx);
-    let (mut session, result) = match handle.await {
+    let (mut session, result, panic_detail) = match handle.await {
         Ok(outcome) => outcome,
+        Err(err) if err.is_panic() => {
+            error!(
+                spid,
+                seq,
+                error = %err,
+                "request task panicked outside the guarded run"
+            );
+            if matches!(relayed, Relayed::Complete) {
+                report_request_panic(writer, spid, seq).await?;
+            }
+            return Ok(RequestOutcome::Close);
+        }
         Err(err) => {
-            error!(error = %err, "request task panicked, closing the connection");
+            error!(spid, seq, error = %err, "request blocking task failed");
             return Ok(RequestOutcome::Close);
         }
     };
+    if let Some(ref detail) = panic_detail {
+        error!(spid, seq, panic = %detail, "request task panicked");
+    }
 
     match relayed {
         Relayed::Complete => {}
@@ -702,11 +741,15 @@ where
     match result {
         Ok(()) => writer.flush().await?,
         Err(err) => {
-            warn!(
-                error = err.number,
-                message = %err.message,
-                "internal error during the request, response incomplete"
-            );
+            if panic_detail.is_some() {
+                log_rendered_client_error(spid, seq, &err);
+            } else {
+                warn!(
+                    error = err.number,
+                    message = %err.message,
+                    "internal error during the request, response incomplete"
+                );
+            }
             writer
                 .write_tokens(&[
                     Token::Error(err),
@@ -721,6 +764,42 @@ where
         }
     }
     Ok(RequestOutcome::Served(session))
+}
+
+/// Whether a batch text is the panic injection hook in debug and test builds.
+fn should_inject_panic(text: &str) -> bool {
+    cfg!(any(test, debug_assertions)) && text == TEST_PANIC_BATCH
+}
+
+/// The error a panicked request task sends to the client: number 50000, severity 16, state 1.
+fn panic_sql_error() -> SqlError {
+    SqlError::from(InternalError::Bug(REQUEST_PANICKED.into()))
+}
+
+/// Turns a panic payload into text for the server journal.
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".into())
+}
+
+/// Sends the panic error and a DONE `ERROR` when the session could not be recovered.
+async fn report_request_panic(writer: &mut TdsWriter, spid: i16, seq: u64) -> Result<(), TdsError> {
+    let reported = panic_sql_error();
+    log_rendered_client_error(spid, seq, &reported);
+    writer
+        .write_tokens(&[
+            Token::Error(reported),
+            Token::Done {
+                status: DoneStatus::ERROR,
+                cur_cmd: 0,
+                row_count: None,
+            },
+        ])
+        .await?;
+    writer.flush().await
 }
 
 /// Writes every token of the channel to the client until the sender is dropped, while
@@ -1489,6 +1568,21 @@ mod tests {
         );
     }
 
+    /// The message the client gets when a request task panics: number 50000, severity 16,
+    /// state 1, and a stable text that does not carry the panic payload.
+    #[test]
+    fn the_reported_panic_is_the_internal_error_number() {
+        let reported = panic_sql_error();
+        assert_eq!(
+            (reported.number, reported.severity, reported.state),
+            (50000, 16, 1)
+        );
+        assert_eq!(
+            reported.message,
+            "Internal error: internal bug: request execution stopped unexpectedly"
+        );
+    }
+
     #[test]
     fn spids_wrap_to_51_after_32767() {
         let server = server();
@@ -1678,5 +1772,251 @@ mod tests {
             format_received_rpc(&rpc),
             "EXEC sp_executesql N'SELECT @p', N'@p int', @p = 1"
         );
+    }
+
+    /// Wire-level check that a panicked request yields ERROR 50000 then DONE `ERROR` on the
+    /// client (`a_panicked_request_reaches_the_client_as_an_error_then_done`).
+    mod panic_wire {
+        use super::*;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::time::timeout;
+        use tokio_util::sync::CancellationToken;
+        use vauban_storage::MemoryStorage;
+
+        use crate::{NoAuth, Server, ServerConfig};
+
+        const DEFAULT_PACKET_SIZE: u16 = 4096;
+        const PACKET_SQL_BATCH: u8 = 0x01;
+        const PACKET_TABULAR_RESULT: u8 = 0x04;
+        const PACKET_LOGIN7: u8 = 0x10;
+        const PACKET_PRELOGIN: u8 = 0x12;
+        const STATUS_EOM: u8 = 0x01;
+        const OPTION_VERSION: u8 = 0x00;
+        const OPTION_ENCRYPTION: u8 = 0x01;
+        const OPTION_TERMINATOR: u8 = 0xFF;
+        const ENCRYPT_NOT_SUP: u8 = 0x02;
+        const TDS_7_4: u32 = 0x7400_0004;
+        const HEADER_TRANSACTION_DESCRIPTOR: u16 = 0x0002;
+        const TOKEN_ERROR: u8 = 0xAA;
+        const TOKEN_DONE: u8 = 0xFD;
+        const DONE_ERROR: u16 = 0x0002;
+        const RESPONSE_BUDGET: Duration = Duration::from_secs(5);
+        const INTERNAL_ERROR: u32 = 50000;
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Tok {
+            Error(u32),
+            Done {
+                status: u16,
+                cur_cmd: u16,
+                row_count: u64,
+            },
+        }
+
+        fn packet(kind: u8, payload: &[u8]) -> Vec<u8> {
+            let mut packet = vec![kind, STATUS_EOM];
+            packet.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+            packet.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+            packet.extend_from_slice(payload);
+            packet
+        }
+
+        fn utf16le(s: &str) -> Vec<u8> {
+            s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+        }
+
+        fn prelogin_packet() -> Vec<u8> {
+            let version: [u8; 6] = [0x0F, 0x00, 0x07, 0xD0, 0x00, 0x00];
+            let data_start = 11u16;
+            let mut payload = Vec::new();
+            payload.push(OPTION_VERSION);
+            payload.extend_from_slice(&data_start.to_be_bytes());
+            payload.extend_from_slice(&(version.len() as u16).to_be_bytes());
+            payload.push(OPTION_ENCRYPTION);
+            payload.extend_from_slice(&(data_start + version.len() as u16).to_be_bytes());
+            payload.extend_from_slice(&1u16.to_be_bytes());
+            payload.push(OPTION_TERMINATOR);
+            payload.extend_from_slice(&version);
+            payload.push(ENCRYPT_NOT_SUP);
+            packet(PACKET_PRELOGIN, &payload)
+        }
+
+        fn login7_packet() -> Vec<u8> {
+            const FIXED_LEN: usize = 94;
+            let mut data = Vec::new();
+            let mut pairs = Vec::new();
+            for field in [
+                "testhost",
+                "sa",
+                "",
+                "vauban-server-test",
+                "localhost",
+                "",
+                "hand-made",
+                "",
+                "",
+            ] {
+                pairs.push(((FIXED_LEN + data.len()) as u16, field.len() as u16));
+                data.extend_from_slice(&utf16le(field));
+            }
+            let mut fixed = Vec::with_capacity(FIXED_LEN);
+            fixed.extend_from_slice(&((FIXED_LEN + data.len()) as u32).to_le_bytes());
+            fixed.extend_from_slice(&TDS_7_4.to_le_bytes());
+            fixed.extend_from_slice(&u32::from(DEFAULT_PACKET_SIZE).to_le_bytes());
+            fixed.extend_from_slice(&0u32.to_le_bytes());
+            fixed.extend_from_slice(&4242u32.to_le_bytes());
+            fixed.extend_from_slice(&0u32.to_le_bytes());
+            fixed.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            fixed.extend_from_slice(&0i32.to_le_bytes());
+            fixed.extend_from_slice(&0x0409u32.to_le_bytes());
+            for (ib, cch) in &pairs {
+                fixed.extend_from_slice(&ib.to_le_bytes());
+                fixed.extend_from_slice(&cch.to_le_bytes());
+            }
+            fixed.extend_from_slice(&[0u8; 6]);
+            fixed.extend_from_slice(&[0u8; 4]);
+            fixed.extend_from_slice(&[0u8; 4]);
+            fixed.extend_from_slice(&[0u8; 4]);
+            fixed.extend_from_slice(&0u32.to_le_bytes());
+            assert_eq!(fixed.len(), FIXED_LEN);
+            fixed.extend_from_slice(&data);
+            packet(PACKET_LOGIN7, &fixed)
+        }
+
+        fn sql_batch_packet(text: &str) -> Vec<u8> {
+            let mut payload = Vec::with_capacity(22 + 2 * text.len());
+            payload.extend_from_slice(&22u32.to_le_bytes());
+            payload.extend_from_slice(&18u32.to_le_bytes());
+            payload.extend_from_slice(&HEADER_TRANSACTION_DESCRIPTOR.to_le_bytes());
+            payload.extend_from_slice(&0u64.to_le_bytes());
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            payload.extend_from_slice(&utf16le(text));
+            packet(PACKET_SQL_BATCH, &payload)
+        }
+
+        async fn read_packet(client: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 8];
+            client.read_exact(&mut header).await.unwrap();
+            let len = usize::from(u16::from_be_bytes([header[2], header[3]]));
+            let mut packet = header.to_vec();
+            packet.resize(len, 0);
+            client.read_exact(&mut packet[8..]).await.unwrap();
+            packet
+        }
+
+        async fn read_response(client: &mut TcpStream, budget: Duration) -> Vec<u8> {
+            let deadline = tokio::time::Instant::now() + budget;
+            let mut payload = Vec::new();
+            loop {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let packet = timeout(left, read_packet(client))
+                    .await
+                    .expect("response packet within budget");
+                assert_eq!(packet[0], PACKET_TABULAR_RESULT);
+                payload.extend_from_slice(&packet[8..]);
+                if packet[1] & STATUS_EOM == STATUS_EOM {
+                    return payload;
+                }
+            }
+        }
+
+        fn tokens(payload: &[u8]) -> Vec<Tok> {
+            let mut pos = 0;
+            let mut out = Vec::new();
+            while pos < payload.len() {
+                match payload[pos] {
+                    TOKEN_ERROR => {
+                        let len =
+                            usize::from(u16::from_le_bytes([payload[pos + 1], payload[pos + 2]]));
+                        let number =
+                            u32::from_le_bytes(payload[pos + 3..pos + 7].try_into().unwrap());
+                        pos += 3 + len;
+                        out.push(Tok::Error(number));
+                    }
+                    TOKEN_DONE => {
+                        out.push(Tok::Done {
+                            status: u16::from_le_bytes([payload[pos + 1], payload[pos + 2]]),
+                            cur_cmd: u16::from_le_bytes([payload[pos + 3], payload[pos + 4]]),
+                            row_count: u64::from_le_bytes(
+                                payload[pos + 5..pos + 13].try_into().unwrap(),
+                            ),
+                        });
+                        pos += 13;
+                    }
+                    other => panic!("unexpected token 0x{other:02X} at {pos}"),
+                }
+            }
+            out
+        }
+
+        async fn connect_and_login(addr: SocketAddr) -> TcpStream {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(&prelogin_packet()).await.unwrap();
+            let _ = read_packet(&mut client).await;
+            client.write_all(&login7_packet()).await.unwrap();
+            let _ = read_response(&mut client, RESPONSE_BUDGET).await;
+            client
+        }
+
+        async fn run_batch(client: &mut TcpStream, text: &str) -> Vec<Tok> {
+            client.write_all(&sql_batch_packet(text)).await.unwrap();
+            tokens(&read_response(client, RESPONSE_BUDGET).await)
+        }
+
+        #[tokio::test]
+        async fn a_panicked_request_reaches_the_client_as_an_error_then_done() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let shutdown = CancellationToken::new();
+            let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+            let server = Server::new(
+                Arc::clone(&engine),
+                ServerConfig {
+                    encrypt: EncryptPolicy::Off,
+                    tls: None,
+                    authenticator: Arc::new(NoAuth),
+                    server_name: "vauban-test".into(),
+                    default_packet_size: DEFAULT_PACKET_SIZE,
+                    program_name: None,
+                    version_banner: None,
+                    edition: None,
+                },
+            );
+            let task = tokio::spawn(server.serve(listener, shutdown.clone()));
+            let mut client = connect_and_login(addr).await;
+            let response = run_batch(&mut client, TEST_PANIC_BATCH).await;
+            assert_eq!(
+                response,
+                vec![
+                    Tok::Error(INTERNAL_ERROR),
+                    Tok::Done {
+                        status: DONE_ERROR,
+                        cur_cmd: 0,
+                        row_count: 0,
+                    },
+                ]
+            );
+            client
+                .write_all(&sql_batch_packet("SELECT 1"))
+                .await
+                .unwrap();
+            let after = read_response(&mut client, RESPONSE_BUDGET).await;
+            assert!(
+                after.contains(&TOKEN_DONE),
+                "session still serves after a reported panic"
+            );
+            drop(client);
+            shutdown.cancel();
+            timeout(Duration::from_secs(6), task)
+                .await
+                .expect("serve returns after shutdown")
+                .expect("serve task finished")
+                .expect("serve succeeded");
+        }
     }
 }
