@@ -146,6 +146,7 @@ fn sp_who_executes_with_the_nine_learn_columns() {
     let mut session = session(SPID_A);
     let sink = run_batch(&mut session, "EXEC sp_who;");
     assert!(sink.errors.is_empty(), "{:?}", sink.errors);
+    assert!(!sink.columns.is_empty(), "expected a result set");
     assert_eq!(sink.columns.len(), 9);
     let names: Vec<_> = sink.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(

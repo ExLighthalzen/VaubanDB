@@ -21,10 +21,7 @@ BEGIN
         s.login_name AS loginame,
         s.host_name AS hostname,
         CONVERT(char(5), ISNULL(r.blocking_session_id, 0)) AS blk,
-        CASE
-            WHEN s.database_id IS NULL OR s.database_id = 0 THEN NULL
-            ELSE DB_NAME(s.database_id)
-        END AS dbname,
+        DB_NAME(CAST(s.database_id AS int)) AS dbname,
         CAST(LEFT(
             CASE WHEN r.session_id IS NULL THEN N'AWAITING COMMAND' ELSE r.command END
             + REPLICATE(N' ', 30), 30) AS varchar(30)) AS cmd,
@@ -50,10 +47,7 @@ BEGIN
         s.login_name AS loginame,
         s.host_name AS hostname,
         CONVERT(char(5), ISNULL(r.blocking_session_id, 0)) AS blk,
-        CASE
-            WHEN s.database_id IS NULL OR s.database_id = 0 THEN NULL
-            ELSE DB_NAME(s.database_id)
-        END AS dbname,
+        DB_NAME(CAST(s.database_id AS int)) AS dbname,
         CAST(LEFT(
             CASE WHEN r.session_id IS NULL THEN N'AWAITING COMMAND' ELSE r.command END
             + REPLICATE(N' ', 30), 30) AS varchar(30)) AS cmd,
@@ -75,10 +69,7 @@ BEGIN
         s.login_name AS loginame,
         s.host_name AS hostname,
         CONVERT(char(5), ISNULL(r.blocking_session_id, 0)) AS blk,
-        CASE
-            WHEN s.database_id IS NULL OR s.database_id = 0 THEN NULL
-            ELSE DB_NAME(s.database_id)
-        END AS dbname,
+        DB_NAME(CAST(s.database_id AS int)) AS dbname,
         CAST(LEFT(
             CASE WHEN r.session_id IS NULL THEN N'AWAITING COMMAND' ELSE r.command END
             + REPLICATE(N' ', 30), 30) AS varchar(30)) AS cmd,
@@ -98,10 +89,7 @@ SELECT
     s.login_name AS loginame,
     s.host_name AS hostname,
     CONVERT(char(5), ISNULL(r.blocking_session_id, 0)) AS blk,
-    CASE
-        WHEN s.database_id IS NULL OR s.database_id = 0 THEN NULL
-        ELSE DB_NAME(s.database_id)
-    END AS dbname,
+    DB_NAME(CAST(s.database_id AS int)) AS dbname,
     CAST(LEFT(
         CASE WHEN r.session_id IS NULL THEN N'AWAITING COMMAND' ELSE r.command END
         + REPLICATE(N' ', 30), 30) AS varchar(30)) AS cmd,
@@ -131,10 +119,7 @@ BEGIN
             WHEN ISNULL(r.blocking_session_id, 0) = 0 THEN N'  .'
             ELSE LEFT(CAST(r.blocking_session_id AS varchar(11)) + REPLICATE(N' ', 5), 5)
         END AS BlkBy,
-        CASE
-            WHEN s.database_id IS NULL OR s.database_id = 0 THEN NULL
-            ELSE DB_NAME(s.database_id)
-        END AS DBName,
+        DB_NAME(CAST(s.database_id AS int)) AS DBName,
         CAST(LEFT(
             CASE WHEN r.session_id IS NULL THEN N'AWAITING COMMAND' ELSE r.command END
             + REPLICATE(N' ', 16), 16) AS nvarchar(16)) AS Command,
@@ -174,10 +159,7 @@ BEGIN
             WHEN ISNULL(r.blocking_session_id, 0) = 0 THEN N'  .'
             ELSE LEFT(CAST(r.blocking_session_id AS varchar(11)) + REPLICATE(N' ', 5), 5)
         END AS BlkBy,
-        CASE
-            WHEN s.database_id IS NULL OR s.database_id = 0 THEN NULL
-            ELSE DB_NAME(s.database_id)
-        END AS DBName,
+        DB_NAME(CAST(s.database_id AS int)) AS DBName,
         CAST(LEFT(
             CASE WHEN r.session_id IS NULL THEN N'AWAITING COMMAND' ELSE r.command END
             + REPLICATE(N' ', 16), 16) AS nvarchar(16)) AS Command,
@@ -213,10 +195,7 @@ BEGIN
             WHEN ISNULL(r.blocking_session_id, 0) = 0 THEN N'  .'
             ELSE LEFT(CAST(r.blocking_session_id AS varchar(11)) + REPLICATE(N' ', 5), 5)
         END AS BlkBy,
-        CASE
-            WHEN s.database_id IS NULL OR s.database_id = 0 THEN NULL
-            ELSE DB_NAME(s.database_id)
-        END AS DBName,
+        DB_NAME(CAST(s.database_id AS int)) AS DBName,
         CAST(LEFT(
             CASE WHEN r.session_id IS NULL THEN N'AWAITING COMMAND' ELSE r.command END
             + REPLICATE(N' ', 16), 16) AS nvarchar(16)) AS Command,
@@ -250,10 +229,7 @@ SELECT
         WHEN ISNULL(r.blocking_session_id, 0) = 0 THEN N'  .'
         ELSE LEFT(CAST(r.blocking_session_id AS varchar(11)) + REPLICATE(N' ', 5), 5)
     END AS BlkBy,
-    CASE
-        WHEN s.database_id IS NULL OR s.database_id = 0 THEN NULL
-        ELSE DB_NAME(s.database_id)
-    END AS DBName,
+    DB_NAME(CAST(s.database_id AS int)) AS DBName,
     CAST(LEFT(
         CASE WHEN r.session_id IS NULL THEN N'AWAITING COMMAND' ELSE r.command END
         + REPLICATE(N' ', 16), 16) AS nvarchar(16)) AS Command,
