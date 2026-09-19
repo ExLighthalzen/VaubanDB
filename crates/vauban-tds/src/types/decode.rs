@@ -174,7 +174,7 @@ pub(crate) fn decode_type_info(input: &mut &[u8]) -> Result<TypeInfo, TdsError> 
             let len = read_u8(input, "TYPE_INFO decimal length")?;
             let precision = read_u8(input, "TYPE_INFO decimal precision")?;
             let scale = read_u8(input, "TYPE_INFO decimal scale")?;
-            if len != decimal_len(precision)? {
+            if !accept_decimal_wire_len(len, precision)? {
                 return Err(TdsError::Malformed(
                     "TYPE_INFO decimal length does not match its precision",
                 ));
@@ -324,12 +324,13 @@ pub(crate) fn decode_value(ti: &TypeInfo, input: &mut &[u8]) -> Result<Value, Td
             if actual == 0 {
                 return Ok(Value::Null);
             }
-            if actual != len {
+            let payload_len = decimal_value_len(ti.ty, len, actual)?;
+            if payload_len != actual {
                 return Err(TdsError::Malformed(
                     "BYTELEN value length does not match the TYPE_INFO",
                 ));
             }
-            let bytes = take(input, actual, "BYTELEN value data")?;
+            let bytes = take(input, payload_len, "BYTELEN value data")?;
             decode_scalar(ti.ty, bytes)
         }
         Layout::UShortLen {
@@ -593,6 +594,43 @@ fn decimal_len(precision: u8) -> Result<u8, TdsError> {
         _ => Err(TdsError::Malformed(
             "TYPE_INFO decimal precision out of range 1..=38",
         )),
+    }
+}
+
+/// The four legal DECIMALNTYPE wire lengths ([MS-TDS] 2.2.5.5.1).
+fn is_legal_decimal_wire_len(len: u8) -> bool {
+    matches!(len, 5 | 9 | 13 | 17)
+}
+
+/// A TYPE_INFO decimal length is legal when it is one of the four wire sizes and covers
+/// the precision announced alongside it.
+fn accept_decimal_wire_len(len: u8, precision: u8) -> Result<bool, TdsError> {
+    Ok(is_legal_decimal_wire_len(len) && len >= decimal_len(precision)?)
+}
+
+/// BYTELEN payload length for a decimal value: exact match for the encoder layout, or one
+/// of the four legal wire sizes when a client padded the magnitude.
+fn decimal_value_len(ty: SqlType, layout_len: usize, actual: usize) -> Result<usize, TdsError> {
+    let (SqlType::Decimal { precision, .. } | SqlType::Numeric { precision, .. }) = ty else {
+        return if actual == layout_len {
+            Ok(actual)
+        } else {
+            Err(TdsError::Malformed(
+                "BYTELEN value length does not match the TYPE_INFO",
+            ))
+        };
+    };
+    if actual == layout_len {
+        return Ok(actual);
+    }
+    let actual = u8::try_from(actual)
+        .map_err(|_| TdsError::Malformed("BYTELEN value length does not match the TYPE_INFO"))?;
+    if accept_decimal_wire_len(actual, precision)? {
+        Ok(usize::from(actual))
+    } else {
+        Err(TdsError::Malformed(
+            "BYTELEN value length does not match the TYPE_INFO",
+        ))
     }
 }
 
@@ -1439,6 +1477,45 @@ mod tests {
     }
 
     #[test]
+    fn sqlclient_numeric_rpc_announces_len_17_for_precision_4() {
+        let t = type_info(&hex("6C 11 04 02"));
+        assert_eq!(
+            t.ty,
+            SqlType::Numeric {
+                precision: 4,
+                scale: 2
+            }
+        );
+        assert!(t.nullable);
+    }
+
+    #[test]
+    fn decimal_len_below_the_precision_floor_is_malformed() {
+        for bytes in ["6A 05 14 02", "6C 05 14 02", "6A 03 04 02", "6C 03 04 02"] {
+            assert!(
+                matches!(type_info_err(&hex(bytes)), TdsError::Malformed(_)),
+                "{bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_decimal_value_padded_to_legal_wire_len() {
+        let t = type_info(&hex("6C 11 04 02"));
+        assert_eq!(
+            value(
+                &t,
+                &hex("11 01 39 30 00 00 00 00 00 00 00 00 00 00 00 00 00 00")
+            ),
+            Value::Decimal(Decimal {
+                mantissa: 12345,
+                precision: 4,
+                scale: 2
+            })
+        );
+    }
+
+    #[test]
     fn decode_inconsistent_lengths() {
         // INTNTYPE of maximum length 4 with a value of length 3.
         let t = type_info(&hex("26 04"));
@@ -1456,10 +1533,17 @@ mod tests {
             type_info_err(&hex("6A 11 28 00")),
             TdsError::Malformed(_)
         ));
-        assert!(matches!(
-            type_info_err(&hex("6A 09 05 02")),
-            TdsError::Malformed(_)
-        ));
+        // A legal wire length above the precision floor is accepted.
+        assert_eq!(
+            type_info(&hex("6A 09 05 02")),
+            TypeInfo::new(
+                SqlType::Decimal {
+                    precision: 5,
+                    scale: 2
+                },
+                true
+            )
+        );
         assert!(matches!(
             type_info_err(&hex("6A 05 05 06")),
             TdsError::Malformed(_)
@@ -1469,10 +1553,16 @@ mod tests {
             type_info_err(&hex("6C 11 28 00")),
             TdsError::Malformed(_)
         ));
-        assert!(matches!(
-            type_info_err(&hex("6C 09 05 02")),
-            TdsError::Malformed(_)
-        ));
+        assert_eq!(
+            type_info(&hex("6C 09 05 02")),
+            TypeInfo::new(
+                SqlType::Numeric {
+                    precision: 5,
+                    scale: 2
+                },
+                true
+            )
+        );
         assert!(matches!(
             type_info_err(&hex("6C 05 05 06")),
             TdsError::Malformed(_)
