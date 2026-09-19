@@ -1062,15 +1062,120 @@ fn resolve_login_database(engine: &Engine, requested: &str) -> Option<String> {
     found
 }
 
+/// Placeholder written instead of a password literal in journal text.
+const LOGGED_SECRET_REDACTED: &str = "<redacted>";
+
+/// Replaces `PASSWORD = '…'` literals before SQL text is written to the journal.
+fn mask_logged_sql_text(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(keyword_end) = password_keyword_end(bytes, i) {
+            let mut j = keyword_end;
+            if skip_ascii_whitespace(bytes, &mut j) && j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                if skip_ascii_whitespace(bytes, &mut j) {
+                    if matches!(bytes.get(j), Some(b'N' | b'n')) && bytes.get(j + 1) == Some(&b'\'')
+                    {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'\'') {
+                        out.push_str(&text[i..=j]);
+                        let literal_end =
+                            find_sql_string_literal_end(bytes, j).unwrap_or(bytes.len());
+                        out.push_str(LOGGED_SECRET_REDACTED);
+                        i = literal_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = text[i..]
+            .chars()
+            .next()
+            .expect("byte index on a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Whether `bytes[start..]` begins with `password` as its own keyword.
+fn password_keyword_end(bytes: &[u8], start: usize) -> Option<usize> {
+    const KEYWORD: &[u8] = b"password";
+    if start + KEYWORD.len() > bytes.len() || !is_password_keyword_boundary_before(bytes, start) {
+        return None;
+    }
+    for (offset, &expected) in KEYWORD.iter().enumerate() {
+        if bytes[start + offset].to_ascii_lowercase() != expected {
+            return None;
+        }
+    }
+    let end = start + KEYWORD.len();
+    if is_password_keyword_boundary_after(bytes, end) {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+fn is_password_keyword_boundary_before(bytes: &[u8], start: usize) -> bool {
+    start == 0 || (!bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_')
+}
+
+fn is_password_keyword_boundary_after(bytes: &[u8], end: usize) -> bool {
+    match bytes.get(end) {
+        None => true,
+        Some(byte) => byte.is_ascii_whitespace() || *byte == b'=',
+    }
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], index: &mut usize) -> bool {
+    while *index < bytes.len() && bytes[*index].is_ascii_whitespace() {
+        *index += 1;
+    }
+    true
+}
+
+/// Index after the closing quote of a single-quoted literal that starts at `quote_start`.
+fn find_sql_string_literal_end(bytes: &[u8], quote_start: usize) -> Option<usize> {
+    debug_assert_eq!(bytes.get(quote_start), Some(&b'\''));
+    let mut index = quote_start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' => {
+                if bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                } else {
+                    return Some(index + 1);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 /// Writes the text of a SQL batch at `debug`, with the connection SPID and the request
 /// sequence number of this connection.
 fn log_received_sql_batch(spid: i16, seq: u64, text: &str) {
-    debug!(spid, seq, text, "SQL batch received");
+    debug!(
+        spid,
+        seq,
+        text = mask_logged_sql_text(text),
+        "SQL batch received"
+    );
 }
 
 /// Writes an RPC at `debug`, with enough detail to replay it as a T-SQL `EXEC`.
 fn log_received_rpc(spid: i16, seq: u64, rpc: &Rpc) {
-    debug!(spid, seq, text = format_received_rpc(rpc), "RPC received");
+    debug!(
+        spid,
+        seq,
+        text = mask_logged_sql_text(&format_received_rpc(rpc)),
+        "RPC received"
+    );
 }
 
 /// Writes a client-visible error at `debug`, tied to the request that raised it.
@@ -1129,7 +1234,7 @@ fn format_rpc_param_value(ty: &TypeInfo, value: &Value) -> String {
         return "NULL".to_owned();
     }
     if let Value::String(s) = value {
-        let escaped = s.text.replace('\'', "''");
+        let escaped = mask_logged_sql_text(&s.text).replace('\'', "''");
         return if matches!(ty.ty, SqlType::NVarChar(_) | SqlType::NChar(_)) {
             format!("N'{escaped}'")
         } else {
@@ -1644,6 +1749,139 @@ mod tests {
         assert!(lines[0].contains("seq=1"));
         assert!(lines[0].contains("EXEC sp_executesql"));
         assert!(lines[0].contains("SELECT 1"));
+    }
+
+    #[test]
+    fn debug_logs_password_literals_redacted_in_sql_batches() {
+        for batch in [
+            "CREATE LOGIN u WITH PASSWORD = 'Secret1!'",
+            "create login u with password='Secret1!'",
+            "ALTER LOGIN u WITH PASSWORD  =  N'Secret1!'",
+            "CREATE USER u WITH PASSWORD = 'Secret1!'",
+        ] {
+            let lines = collect_logs("debug", || log_received_sql_batch(55, 1, batch));
+            assert!(
+                lines[0].to_ascii_lowercase().contains("password"),
+                "{batch}: {lines:?}"
+            );
+            assert!(
+                lines[0].contains(LOGGED_SECRET_REDACTED),
+                "{batch}: {lines:?}"
+            );
+            assert!(!lines[0].contains("Secret1!"), "{batch}: {lines:?}");
+        }
+    }
+
+    #[test]
+    fn debug_logs_password_literals_redacted_in_rpc_replay() {
+        use vauban_tds::{ResetConnection, Rpc, RpcParam, RpcProc};
+        use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+
+        let nvarchar = |text: &str| Value::String(SqlString { text: text.into() });
+        let stmt = "CREATE LOGIN u WITH PASSWORD = 'RpcSecret'";
+        let rpc = Rpc {
+            proc: RpcProc::SP_EXECUTESQL,
+            options: 0,
+            transaction_descriptor: 0,
+            reset: ResetConnection::None,
+            params: vec![RpcParam {
+                name: "stmt".into(),
+                output: false,
+                default: false,
+                ty: TypeInfo::new(SqlType::NVarChar(Len::Max), false),
+                value: nvarchar(stmt),
+            }],
+        };
+        let lines = collect_logs("debug", || log_received_rpc(56, 1, &rpc));
+        assert!(lines[0].contains(LOGGED_SECRET_REDACTED), "{lines:?}");
+        assert!(!lines[0].contains("RpcSecret"), "{lines:?}");
+        assert_eq!(
+            match &rpc.params[0].value {
+                Value::String(s) => s.text.as_str(),
+                _ => panic!("expected a string parameter"),
+            },
+            stmt
+        );
+    }
+
+    #[test]
+    fn logging_a_password_batch_leaves_the_source_text_unchanged() {
+        let batch = "CREATE LOGIN u WITH PASSWORD = 'ExecSecret'";
+        let mut source = batch.to_owned();
+        let lines = collect_logs("debug", || log_received_sql_batch(57, 1, &source));
+        assert!(lines[0].contains(LOGGED_SECRET_REDACTED));
+        assert_eq!(source, batch);
+        source.push(';');
+        assert_ne!(source, batch);
+    }
+
+    #[test]
+    fn batch_with_a_password_literal_still_executes_the_original_text() {
+        use vauban_storage::MemoryStorage;
+        use vauban_tds::ColumnMeta;
+
+        let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+        let mut session = Session::new(engine, SessionState::new(58));
+        let batch = "SELECT 'ExecSecret' AS pwd; /* note PASSWORD = 'Hidden' */";
+        struct RowSink {
+            rows: Vec<Value>,
+            errors: Vec<SqlError>,
+        }
+        impl ResultSink for RowSink {
+            fn columns(&mut self, _cols: &[ColumnMeta]) -> SqlResult<()> {
+                Ok(())
+            }
+            fn row(&mut self, row: &[Value]) -> SqlResult<()> {
+                self.rows.push(row[0].clone());
+                Ok(())
+            }
+            fn done(&mut self, _rowcount: Option<u64>, _more: bool) -> SqlResult<()> {
+                Ok(())
+            }
+            fn info(&mut self, _msg: &vauban_errors::InfoMessage) -> SqlResult<()> {
+                Ok(())
+            }
+            fn error(&mut self, err: &SqlError) -> SqlResult<()> {
+                self.errors.push(err.clone());
+                Ok(())
+            }
+            fn env_change(&mut self, _change: &vauban_tds::EnvChange) -> SqlResult<()> {
+                Ok(())
+            }
+            fn return_value(
+                &mut self,
+                _name: &str,
+                _ty: &TypeInfo,
+                _value: &Value,
+            ) -> SqlResult<()> {
+                Ok(())
+            }
+            fn return_status(&mut self, _status: i32) -> SqlResult<()> {
+                Ok(())
+            }
+        }
+        let mut sink = RowSink {
+            rows: Vec::new(),
+            errors: Vec::new(),
+        };
+        session.run_batch(batch, &mut sink).expect("batch runs");
+        assert!(sink.errors.is_empty(), "{:?}", sink.errors);
+        assert_eq!(
+            sink.rows,
+            vec![Value::String(vauban_types::SqlString {
+                text: "ExecSecret".into()
+            })]
+        );
+        let lines = collect_logs("debug", || log_received_sql_batch(58, 1, batch));
+        assert!(lines[0].contains(LOGGED_SECRET_REDACTED));
+        assert!(!lines[0].contains("Hidden"));
+    }
+
+    #[test]
+    fn batches_without_secrets_are_logged_unchanged() {
+        let batch = "SELECT 1; INSERT INTO t VALUES ('public')";
+        let lines = collect_logs("debug", || log_received_sql_batch(59, 1, batch));
+        assert!(lines[0].contains("text=\"SELECT 1; INSERT INTO t VALUES ('public')\""));
     }
 
     #[test]
