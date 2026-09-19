@@ -1,7 +1,7 @@
 //! Integration tests of `Session::run_nested`: parameter scope, procedure-style DONE
 //! tokens, and output parameters.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
@@ -10,8 +10,10 @@ use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use vauban_errors::{InfoMessage, SqlError, SqlResult};
+use vauban_parser::{ParseOptions, parse_parameter_declarations};
 use vauban_session::{
-    Engine, NestedOutcome, NestedParam, ResultSink, Session, SessionState, TdsSink,
+    Engine, NestedOutcome, NestedParam, ProcAction, ProcArg, ProcParam, ResultSink, Session,
+    SessionState, TdsSink, register_system_procedure_resolver,
 };
 use vauban_storage::MemoryStorage;
 use vauban_tds::{
@@ -142,8 +144,86 @@ impl ResultSink for CountingSink {
     }
 }
 
+fn register_test_resolver() {
+    static REGISTERED: Once = Once::new();
+    REGISTERED.call_once(|| {
+        register_system_procedure_resolver(|name, args| {
+            let base = name.rsplit('.').next().unwrap_or(name);
+            if base.eq_ignore_ascii_case("sp_executesql") {
+                Some(resolve_executesql(args))
+            } else {
+                None
+            }
+        });
+    });
+}
+
+fn resolve_executesql(args: &[ProcArg<'_>]) -> Result<ProcAction, SqlError> {
+    let statement = args
+        .iter()
+        .find_map(|arg| {
+            let named = matches!(
+                arg.name,
+                None | Some("@statement") | Some("@stmt") | Some("stmt")
+            );
+            if !named {
+                return None;
+            }
+            match arg.value {
+                Value::String(text) => Some(text.text.clone()),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| SqlError::procedure_expects_parameter("sp_executesql", "@statement"))?;
+    let params_text = args
+        .iter()
+        .find_map(|arg| match (arg.name, arg.value) {
+            (Some("@params") | Some("params"), Value::String(text)) => Some(text.text.clone()),
+            (None, Value::String(text)) if text.text != statement => Some(text.text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let declarations =
+        parse_parameter_declarations(&params_text, &ParseOptions::default()).unwrap_or_default();
+    let mut bound = vec![None; declarations.len()];
+    let mut positional = 0usize;
+    for arg in args {
+        if let Some(name) = arg.name {
+            if name == "@statement" || name == "@stmt" || name == "@params" || name == "params" {
+                continue;
+            }
+            if let Some(index) = declarations
+                .iter()
+                .position(|decl| decl.name.eq_ignore_ascii_case(name))
+            {
+                bound[index] = Some(ProcParam {
+                    name: declarations[index].name.clone(),
+                    ty: arg.ty.clone(),
+                    value: arg.value.clone(),
+                    output: arg.output,
+                });
+            }
+        } else if matches!(arg.value, Value::String(_)) {
+            continue;
+        } else if positional < declarations.len() {
+            bound[positional] = Some(ProcParam {
+                name: declarations[positional].name.clone(),
+                ty: arg.ty.clone(),
+                value: arg.value.clone(),
+                output: arg.output,
+            });
+            positional += 1;
+        }
+    }
+    Ok(ProcAction::ExecuteSql {
+        statement,
+        params: bound.into_iter().flatten().collect(),
+    })
+}
+
 fn session() -> Session {
     vauban_sysfn::register_builtins();
+    register_test_resolver();
     Session::new(
         Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
         SessionState::new(SPID),
@@ -214,6 +294,32 @@ fn caller_variables_are_out_of_scope() {
     assert!(outcome.failed);
     let err = only_error(&sink.0);
     assert_eq!(err.number, 137);
+}
+
+#[test]
+fn nested_exec_sp_executesql_writes_output() {
+    let (outcome, events) = run_nested(
+        &mut session(),
+        "EXEC sp_executesql N'SET @o = 7', N'@o int OUTPUT', @o = @v OUTPUT; SELECT @v",
+        &[NestedParam {
+            name: "@v".into(),
+            ty: TypeInfo::new(SqlType::Int, true),
+            value: Value::Null,
+            output: true,
+        }],
+    );
+    assert!(!outcome.failed, "{:?}", events.0);
+    assert_eq!(outcome.outputs, vec![("@v".to_owned(), Value::I32(7))]);
+    assert_eq!(only_row(&events.0), 7);
+    assert!(
+        !events.0.iter().any(|event| matches!(
+            event,
+            Event::Error(err) if err.number == 50000
+                && err.message.contains("does not handle")
+        )),
+        "counter-proof: no internal does-not-handle error, got {:?}",
+        events.0
+    );
 }
 
 #[test]

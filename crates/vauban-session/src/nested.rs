@@ -6,17 +6,18 @@ use std::sync::Arc;
 use vauban_binder::{BatchVariables, BindContext, BoundStatement, DdlStatement};
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
-use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSink};
+use vauban_executor::{EvaluatedExecArg, ExecContext, ExecOutcome, ExecSession, RowSink};
 use vauban_parser::{Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
-use vauban_tds::EnvChange;
+use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
 use vauban_txn::IsolationLevel;
-use vauban_types::{TypeInfo, Value};
+use vauban_types::{Len, SqlType, TypeInfo, Value};
 
 use crate::batch::Session;
 use crate::eval_context::{SessionEvalContext, apply_exec_session};
 use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
+use crate::rpc::{ProcAction, ProcArg, ProcParam, StaticResultColumn};
 use crate::set_options::{SetOutcome, apply_set_statement, sync_exec_session};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
@@ -452,12 +453,26 @@ impl Session {
             Ok(ExecOutcome::Cancelled) => Err(SqlError::from(InternalError::Bug(
                 crate::cancel::CANCELLED.to_owned(),
             ))),
-            Ok(
-                flow @ (ExecOutcome::Break
-                | ExecOutcome::Continue
-                | ExecOutcome::CallProcedure { .. }
-                | ExecOutcome::RunDynamic { .. }),
-            ) => {
+            Ok(ExecOutcome::CallProcedure {
+                name,
+                args,
+                return_into,
+                line: exec_line,
+            }) => self.run_nested_procedure(
+                &name,
+                &args,
+                return_into.as_deref(),
+                exec_line,
+                more,
+                nested_state,
+                sink,
+                outcome,
+            ),
+            Ok(ExecOutcome::RunDynamic {
+                text,
+                line: exec_line,
+            }) => self.run_nested_dynamic(&text, exec_line, more, nested_state, sink, outcome),
+            Ok(flow @ (ExecOutcome::Break | ExecOutcome::Continue)) => {
                 let err = SqlError::from(InternalError::Bug(format!(
                     "run_nested_prepared: the executor answered {flow:?}, which this layer does \
                      not handle"
@@ -557,6 +572,405 @@ impl Session {
                 .fail_nested_statement(err, sink, outcome)
                 .map(|()| Flow::Stop),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_nested_procedure(
+        &mut self,
+        name: &str,
+        exec_args: &[EvaluatedExecArg],
+        return_into: Option<&str>,
+        line: u32,
+        more: bool,
+        nested_state: &mut SessionState,
+        sink: &mut dyn ResultSink,
+        outcome: &mut NestedOutcome,
+    ) -> SqlResult<Flow> {
+        let proc_args = exec_args_to_proc_args(exec_args);
+        let resolver_args: Vec<ProcArg<'_>> = proc_args
+            .iter()
+            .map(|arg| ProcArg {
+                name: arg.name.as_deref(),
+                ty: &arg.ty,
+                value: &arg.value,
+                output: arg.output,
+                default: arg.default,
+            })
+            .collect();
+        let Some(resolver) = crate::rpc::system_procedure_resolver() else {
+            let err = SqlError::procedure_not_found(name).with_line(line);
+            return self.finish_nested_procedure_error(err, more, nested_state, sink, outcome);
+        };
+        match resolver(name, &resolver_args) {
+            None => {
+                let err = SqlError::procedure_not_found(name).with_line(line);
+                self.finish_nested_procedure_error(err, more, nested_state, sink, outcome)
+            }
+            Some(Err(err)) => self.finish_nested_procedure_error(
+                at_procedure_line(err, line),
+                more,
+                nested_state,
+                sink,
+                outcome,
+            ),
+            Some(Ok(action)) => self.execute_nested_proc_action(
+                action,
+                exec_args,
+                return_into,
+                more,
+                nested_state,
+                sink,
+                outcome,
+            ),
+        }
+    }
+
+    fn run_nested_dynamic(
+        &mut self,
+        text: &str,
+        line: u32,
+        more: bool,
+        nested_state: &mut SessionState,
+        sink: &mut dyn ResultSink,
+        outcome: &mut NestedOutcome,
+    ) -> SqlResult<Flow> {
+        let _ = line;
+        let mut wrapper = NestedProcedureSink::new(sink, more, nested_state.options.xact_abort);
+        let inner = self.run_nested(text, &[], &mut wrapper)?;
+        self.finish_nested_procedure_flow(inner, &wrapper, more, nested_state, outcome, &[], None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_nested_proc_action(
+        &mut self,
+        action: ProcAction,
+        exec_args: &[EvaluatedExecArg],
+        return_into: Option<&str>,
+        more: bool,
+        nested_state: &mut SessionState,
+        sink: &mut dyn ResultSink,
+        outcome: &mut NestedOutcome,
+    ) -> SqlResult<Flow> {
+        match action {
+            ProcAction::ExecuteSql { statement, params } => {
+                let nested_params = proc_params_to_nested(&params);
+                let mut wrapper =
+                    NestedProcedureSink::new(sink, more, nested_state.options.xact_abort);
+                let inner = self.run_nested(&statement, &nested_params, &mut wrapper)?;
+                self.finish_nested_procedure_flow(
+                    inner,
+                    &wrapper,
+                    more,
+                    nested_state,
+                    outcome,
+                    exec_args,
+                    return_into,
+                )
+            }
+            ProcAction::Template { sql, params } => {
+                let nested_params = proc_params_to_nested(&params);
+                let mut wrapper =
+                    NestedProcedureSink::new(sink, more, nested_state.options.xact_abort);
+                let inner = self.run_nested(&sql, &nested_params, &mut wrapper)?;
+                self.finish_nested_procedure_flow(
+                    inner,
+                    &wrapper,
+                    more,
+                    nested_state,
+                    outcome,
+                    exec_args,
+                    return_into,
+                )
+            }
+            ProcAction::Static { columns, rows } => {
+                self.run_nested_static(&columns, &rows, more, nested_state, sink, outcome)
+            }
+            ProcAction::Refuse(err) => {
+                self.finish_nested_procedure_error(err, more, nested_state, sink, outcome)
+            }
+            ProcAction::Prepare { .. } => self.finish_nested_procedure_error(
+                SqlError::procedure_not_found("sp_prepare"),
+                more,
+                nested_state,
+                sink,
+                outcome,
+            ),
+            ProcAction::Execute { .. } => self.finish_nested_procedure_error(
+                SqlError::procedure_not_found("sp_execute"),
+                more,
+                nested_state,
+                sink,
+                outcome,
+            ),
+            ProcAction::Unprepare { .. } => self.finish_nested_procedure_error(
+                SqlError::procedure_not_found("sp_unprepare"),
+                more,
+                nested_state,
+                sink,
+                outcome,
+            ),
+        }
+    }
+
+    fn run_nested_static(
+        &mut self,
+        columns: &[StaticResultColumn],
+        rows: &[Vec<Value>],
+        more: bool,
+        nested_state: &mut SessionState,
+        sink: &mut dyn ResultSink,
+        outcome: &mut NestedOutcome,
+    ) -> SqlResult<Flow> {
+        let meta: Vec<ColumnMeta> = columns
+            .iter()
+            .map(|column| ColumnMeta {
+                flags: ColumnFlags {
+                    nullable: column.ty.nullable,
+                    ..ColumnFlags::default()
+                },
+                name: column.name.clone(),
+                ty: column.ty.clone(),
+            })
+            .collect();
+        sink.columns(&meta)?;
+        for row in rows {
+            sink.row(row)?;
+        }
+        let rowcount = rows.len() as u64;
+        outcome.had_result_set = true;
+        let reported = if nested_state.options.nocount {
+            None
+        } else {
+            Some(rowcount)
+        };
+        sink.done_in_proc(reported, more)?;
+        nested_state.rowcount = rowcount as i64;
+        apply_exec_session(nested_state, self.exec(), true, true);
+        self.exec_mut().identity_updated = false;
+        Ok(Flow::Continue)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_nested_procedure_flow(
+        &mut self,
+        inner: NestedOutcome,
+        wrapper: &NestedProcedureSink<'_>,
+        more: bool,
+        nested_state: &mut SessionState,
+        outcome: &mut NestedOutcome,
+        exec_args: &[EvaluatedExecArg],
+        return_into: Option<&str>,
+    ) -> SqlResult<Flow> {
+        apply_nested_procedure_outputs(self, exec_args, return_into, &inner);
+        if inner.failed {
+            outcome.failed = true;
+            nested_state.last_error = wrapper.last_error();
+        } else {
+            nested_state.last_error = 0;
+        }
+        if inner.had_result_set {
+            outcome.had_result_set = true;
+        }
+        nested_state.rowcount = inner.rowcount;
+        let exec = self.exec().clone();
+        apply_exec_session(nested_state, &exec, true, !inner.failed);
+        self.exec_mut().identity_updated = false;
+        let continues =
+            nested_procedure_continues(nested_state, more, inner.failed, wrapper.last_error());
+        Ok(if continues {
+            Flow::Continue
+        } else {
+            Flow::Stop
+        })
+    }
+
+    fn finish_nested_procedure_error(
+        &mut self,
+        err: SqlError,
+        more: bool,
+        nested_state: &mut SessionState,
+        sink: &mut dyn ResultSink,
+        outcome: &mut NestedOutcome,
+    ) -> SqlResult<Flow> {
+        nested_state.last_error = err.number;
+        outcome.failed = true;
+        sink.error(&err)?;
+        let continues = nested_procedure_continues(nested_state, more, true, err.number);
+        sink.done_in_proc(None, continues)?;
+        Ok(if continues {
+            Flow::Continue
+        } else {
+            Flow::Stop
+        })
+    }
+}
+
+struct StoredProcArg {
+    name: Option<String>,
+    ty: TypeInfo,
+    value: Value,
+    output: bool,
+    default: bool,
+}
+
+fn exec_args_to_proc_args(args: &[EvaluatedExecArg]) -> Vec<StoredProcArg> {
+    args.iter()
+        .map(|arg| {
+            let (ty, value, default) = match &arg.value {
+                None => (TypeInfo::new(SqlType::Int, true), Value::Null, true),
+                Some((value, ty)) => (coerce_unicode_literal_ty(ty, value), value.clone(), false),
+            };
+            StoredProcArg {
+                name: arg.name.clone(),
+                ty,
+                value,
+                output: arg.output,
+                default,
+            }
+        })
+        .collect()
+}
+
+fn coerce_unicode_literal_ty(ty: &TypeInfo, value: &Value) -> TypeInfo {
+    if matches!(value, Value::String(_)) && matches!(ty.ty, SqlType::VarChar(_)) {
+        TypeInfo::new(SqlType::NVarChar(Len::Max), ty.nullable)
+    } else {
+        ty.clone()
+    }
+}
+
+fn proc_params_to_nested(params: &[ProcParam]) -> Vec<NestedParam> {
+    params
+        .iter()
+        .map(|param| NestedParam {
+            name: param.name.clone(),
+            ty: param.ty.clone(),
+            value: param.value.clone(),
+            output: param.output,
+        })
+        .collect()
+}
+
+fn apply_nested_procedure_outputs(
+    session: &mut Session,
+    exec_args: &[EvaluatedExecArg],
+    return_into: Option<&str>,
+    nested: &NestedOutcome,
+) {
+    if let Some(var) = return_into {
+        session
+            .exec_mut()
+            .variables
+            .insert(var.to_owned(), Value::I32(nested.return_status));
+    }
+    for arg in exec_args {
+        if !arg.output {
+            continue;
+        }
+        let Some(var) = arg.output_variable.as_ref() else {
+            continue;
+        };
+        let key = arg.name.as_deref().unwrap_or(var);
+        let value = nested
+            .outputs
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.clone())
+            .or_else(|| session.exec().variables.get(key).cloned());
+        if let Some(value) = value {
+            session.exec_mut().variables.insert(var.clone(), value);
+        }
+    }
+}
+
+fn nested_procedure_continues(
+    nested_state: &SessionState,
+    more: bool,
+    failed: bool,
+    error_number: u32,
+) -> bool {
+    if !failed {
+        return more;
+    }
+    more && !nested_state.options.xact_abort
+        && error_number != 0
+        && SqlError::new(error_number, 16, 1, "x").batch_scope() == BatchErrorScope::Statement
+}
+
+fn at_procedure_line(err: SqlError, line: u32) -> SqlError {
+    if line == 0 { err } else { err.with_line(line) }
+}
+
+struct NestedProcedureSink<'a> {
+    inner: &'a mut dyn ResultSink,
+    more: bool,
+    xact_abort: bool,
+    last_error: u32,
+}
+
+impl<'a> NestedProcedureSink<'a> {
+    fn new(inner: &'a mut dyn ResultSink, more: bool, xact_abort: bool) -> Self {
+        Self {
+            inner,
+            more,
+            xact_abort,
+            last_error: 0,
+        }
+    }
+
+    fn last_error(&self) -> u32 {
+        self.last_error
+    }
+}
+
+impl ResultSink for NestedProcedureSink<'_> {
+    fn columns(&mut self, cols: &[ColumnMeta]) -> SqlResult<()> {
+        self.inner.columns(cols)
+    }
+
+    fn row(&mut self, row: &[Value]) -> SqlResult<()> {
+        self.inner.row(row)
+    }
+
+    fn done(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
+        self.inner.done(rowcount, more)
+    }
+
+    fn done_in_proc(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
+        self.inner.done_in_proc(rowcount, more)
+    }
+
+    fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
+        let continues = if self.last_error != 0 {
+            self.more
+                && !self.xact_abort
+                && SqlError::new(self.last_error, 16, 1, "x").batch_scope()
+                    == BatchErrorScope::Statement
+        } else {
+            self.more
+        };
+        self.inner.done_in_proc(rowcount, continues)
+    }
+
+    fn info(&mut self, msg: &vauban_errors::InfoMessage) -> SqlResult<()> {
+        self.inner.info(msg)
+    }
+
+    fn error(&mut self, err: &SqlError) -> SqlResult<()> {
+        self.last_error = err.number;
+        self.inner.error(err)
+    }
+
+    fn env_change(&mut self, change: &EnvChange) -> SqlResult<()> {
+        self.inner.env_change(change)
+    }
+
+    fn return_value(&mut self, name: &str, ty: &TypeInfo, value: &Value) -> SqlResult<()> {
+        self.inner.return_value(name, ty, value)
+    }
+
+    fn return_status(&mut self, _status: i32) -> SqlResult<()> {
+        Ok(())
     }
 }
 
