@@ -403,6 +403,7 @@ async fn run_connection(
     // The session lives here and is moved onto the blocking pool for each request, then
     // taken back: no mutex on the path of a request.
     let transaction_engine = Arc::clone(&engine);
+    let login_database = state.database.clone();
     let mut session = Session::new(engine, state);
     loop {
         // `None`: the reader task is gone, which only happens once its message reached us.
@@ -414,6 +415,9 @@ async fn run_connection(
             ClientMessage::SqlBatch(batch) => {
                 let descriptor = batch.transaction_descriptor;
                 let text = batch.text;
+                let reset = batch.reset;
+                let login_db = login_database.clone();
+                let engine_for_reset = Arc::clone(&transaction_engine);
                 let outcome = run_request(
                     &mut writer,
                     &mut client_rx,
@@ -421,6 +425,13 @@ async fn run_connection(
                     false,
                     None,
                     move |session, sink| {
+                        crate::reset::apply_reset(
+                            session,
+                            &engine_for_reset,
+                            &login_db,
+                            reset,
+                            sink,
+                        )?;
                         let mut state = session.state().clone();
                         if !txn_request::reject_mismatched_descriptor(descriptor, &mut state, sink)?
                         {
@@ -438,6 +449,9 @@ async fn run_connection(
             }
             ClientMessage::Rpc(rpc) => {
                 let descriptor = rpc.transaction_descriptor;
+                let reset = rpc.reset;
+                let login_db = login_database.clone();
+                let engine_for_reset = Arc::clone(&transaction_engine);
                 let outcome = run_request(
                     &mut writer,
                     &mut client_rx,
@@ -445,6 +459,13 @@ async fn run_connection(
                     true,
                     None,
                     move |session, sink| {
+                        crate::reset::apply_reset(
+                            session,
+                            &engine_for_reset,
+                            &login_db,
+                            reset,
+                            sink,
+                        )?;
                         let mut state = session.state().clone();
                         if !txn_request::reject_mismatched_descriptor(descriptor, &mut state, sink)?
                         {

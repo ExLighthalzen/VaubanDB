@@ -29,6 +29,7 @@ mod login;
 mod nested;
 mod prepared;
 mod procedures;
+mod reset;
 mod rpc;
 mod server;
 mod set_options;
@@ -63,3 +64,6 @@ pub use state::*;
 
 // Re-export: `cli` configures the encryption policy without depending on `tds` directly.
 pub use vauban_tds::EncryptPolicy;
+
+#[doc(hidden)]
+pub use reset::apply_reset;
