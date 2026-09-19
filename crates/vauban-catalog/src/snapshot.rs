@@ -1056,7 +1056,7 @@ mod tests {
             Some(["sys.databases".to_owned(), "sys.schemas".to_owned()].as_slice()),
             "-16 and -17, as the rows of `vauban_sys_all_objects` number them"
         );
-        let trailing: Vec<&String> = names.iter().rev().take(7).collect();
+        let trailing: Vec<&String> = names.iter().rev().take(8).collect();
         assert_eq!(
             trailing,
             vec![
@@ -1065,16 +1065,17 @@ mod tests {
                 "sys.dm_exec_connections",
                 "sys.dm_exec_sessions",
                 "sys.configurations",
+                "sys.extended_properties",
                 "sys.master_files",
                 "sys.database_files",
             ]
         );
-        // The seven files of `views/` are filled, for 29 distinct names, each described once per
-        // system database, which is what the `views_of` of those files does: 116 descriptions.
+        // The seven files of `views/` are filled, for 30 distinct names, each described once per
+        // system database, which is what the `views_of` of those files does: 120 descriptions.
         assert_eq!(described.len(), names.len() * SYSTEM_DATABASES.len());
         assert_eq!(named_once(&names), names, "a name is described twice");
-        assert_eq!(names.len(), 29);
-        assert_eq!(described.len(), 116);
+        assert_eq!(names.len(), 30);
+        assert_eq!(described.len(), 120);
         // The identifiers are negative and run from -1 without a hole, so two views of the
         // 29 do not share one: the rank rule numbers the distinct names (module
         // documentation, section "The identifiers of the system views are the rows of
@@ -1112,7 +1113,7 @@ mod tests {
             .collect();
         let of_the_rows = described_system_view_rows();
         assert_eq!(of_the_snapshot, of_the_rows);
-        assert_eq!(of_the_snapshot.len(), 29, "{of_the_snapshot:?}");
+        assert_eq!(of_the_snapshot.len(), 30, "{of_the_snapshot:?}");
         // Counter-proof that the comparison reads something: the rows are there, negative,
         // and the first of them is the one of `sys.objects`.
         assert_eq!(
@@ -1122,7 +1123,7 @@ mod tests {
         );
         assert_eq!(
             of_the_rows.last().map(|&(id, _, _)| id),
-            Some(-29),
+            Some(-30),
             "{of_the_rows:?}"
         );
     }

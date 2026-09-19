@@ -68,7 +68,7 @@ fn text(value: &str) -> Value {
 /// `the_internal_tables_are_numbered_from_their_position` of `src/snapshot.rs`, which is where
 /// `bootstrap::internal_table_defs` is reachable; here it is written out, so that a table
 /// added to `views/` is added to this list too.
-const INTERNAL_TABLES: [&str; 22] = [
+const INTERNAL_TABLES: [&str; 23] = [
     "vauban_sys_objects",
     "vauban_sys_columns",
     "vauban_sys_types",
@@ -87,6 +87,7 @@ const INTERNAL_TABLES: [&str; 22] = [
     "vauban_sys_partitions",
     "vauban_sys_allocation_units",
     "vauban_sys_files",
+    "vauban_sys_extended_properties",
     "vauban_sys_configurations",
     "vauban_sys_os_info",
     "vauban_sys_databases",
@@ -1224,7 +1225,7 @@ fn every_described_internal_table_resolves() {
     let mut once = ids.clone();
     once.sort_unstable();
     once.dedup();
-    assert_eq!(once.len(), 24, "{ids:?}");
+    assert_eq!(once.len(), 25, "{ids:?}");
     assert!(
         ids.iter().take(22).all(|&id| id < user_in_master.id.0),
         "{ids:?}"

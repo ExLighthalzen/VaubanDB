@@ -1,15 +1,17 @@
 //! `sys.all_objects`, `sys.all_columns`, `sys.views`, `sys.partitions`,
-//! `sys.allocation_units`, `sys.database_files` and `sys.master_files`.
+//! `sys.allocation_units`, `sys.database_files`, `sys.master_files` and
+//! `sys.extended_properties`.
 //!
 //! # The shape of the views
 //!
-//! The column list of each of the seven views — names, order, types — is the one SQL Server
+//! The column list of each of the eight views — names, order, types — is the one SQL Server
 //! 2022 publishes: `sys.all_objects` 12 columns, `sys.all_columns` 40, `sys.views` 23,
-//! `sys.partitions` 11, `sys.allocation_units` 8, `sys.database_files` 30 and
-//! `sys.master_files` 32. The unit test `the_columns_of_the_seven_views_are_the_published_ones`
-//! freezes the seven vectors of names and compares them with the text this file builds.
+//! `sys.partitions` 11, `sys.allocation_units` 8, `sys.database_files` 30,
+//! `sys.master_files` 32 and `sys.extended_properties` 6. The unit test
+//! `the_columns_of_the_eight_views_are_the_published_ones` freezes the eight vectors of
+//! names and compares them with the text this file builds.
 //!
-//! # Five internal tables for seven views
+//! # Six internal tables for eight views
 //!
 //! A view is a `SELECT` over one denormalised internal table, without a join (unit test
 //! `no_definition_holds_a_join`).
@@ -21,6 +23,7 @@
 //! | [`PARTITIONS_TABLE`] | `sys.partitions` |
 //! | [`ALLOCATION_UNITS_TABLE`] | `sys.allocation_units` |
 //! | [`FILES_TABLE`] | `sys.database_files`, `sys.master_files` |
+//! | [`EXTENDED_PROPERTIES_TABLE`] | `sys.extended_properties` |
 //!
 //! [`ALL_OBJECTS_TABLE`] and [`ALL_COLUMNS_TABLE`] are the two tables of `views/sys_tables.rs`
 //! again, column for column, with one change: their `database_id` is nullable, a `NULL`
@@ -121,13 +124,16 @@ pub(crate) const ALLOCATION_UNITS_TABLE: &str = "vauban_sys_allocation_units";
 /// Internal table of the logical files, read by `sys.database_files` and `sys.master_files`.
 pub(crate) const FILES_TABLE: &str = "vauban_sys_files";
 
-/// The schema the seven views of this file live in.
+/// Internal table of the extended properties, read by `sys.extended_properties`.
+pub(crate) const EXTENDED_PROPERTIES_TABLE: &str = "vauban_sys_extended_properties";
+
+/// The schema the eight views of this file live in.
 const VIEW_SCHEMA: &str = "sys";
 
 /// The type of a `sysname` column, `nvarchar(128)`.
 const SYSNAME: SqlType = SqlType::NVarChar(Len::Fixed(128));
 
-/// The column names of the seven views that are T-SQL reserved words and are therefore
+/// The column names of the eight views that are T-SQL reserved words and are therefore
 /// written as delimited identifiers in the text of a view: `rows`, a column of
 /// `sys.partitions`, and `precision`, a column of `sys.all_columns` (unit test
 /// `a_reserved_column_name_is_delimited`).
@@ -265,6 +271,27 @@ pub(crate) mod allocation_units_columns {
     pub(crate) const CONTAINER_ID: usize = 2;
     /// Width of a row of the table.
     pub(crate) const WIDTH: usize = 3;
+}
+
+/// Where each column of [`EXTENDED_PROPERTIES_TABLE`] sits in a [`Row`]. Same rule as
+/// [`objects_columns`].
+pub(crate) mod extended_properties_columns {
+    /// `database_id int`: the database the property belongs to, the filter of the view.
+    pub(crate) const DATABASE_ID: usize = 0;
+    /// `class tinyint`.
+    pub(crate) const CLASS: usize = 1;
+    /// `class_desc nvarchar(60)`.
+    pub(crate) const CLASS_DESC: usize = 2;
+    /// `major_id int`.
+    pub(crate) const MAJOR_ID: usize = 3;
+    /// `minor_id int`.
+    pub(crate) const MINOR_ID: usize = 4;
+    /// `name sysname`.
+    pub(crate) const NAME: usize = 5;
+    /// `value sql_variant` on SQL Server; see the module documentation.
+    pub(crate) const VALUE: usize = 6;
+    /// Width of a row of the table.
+    pub(crate) const WIDTH: usize = 7;
 }
 
 /// Where each column of [`FILES_TABLE`] sits in a [`Row`]. Same rule as [`objects_columns`].
@@ -512,6 +539,21 @@ const MASTER_FILES_VIEW: [(&str, &str); 32] = [
     ("credential_id", "CAST(NULL AS int)"),
 ];
 
+/// The select list of `sys.extended_properties`: six items, each reading
+/// [`EXTENDED_PROPERTIES_TABLE`].
+///
+/// VaubanDB stores no extended property: the table stays empty. The `value` column is
+/// `nvarchar(max)` nullable here, where SQL Server publishes `sql_variant` (module
+/// documentation).
+const EXTENDED_PROPERTIES_VIEW: [(&str, &str); 6] = [
+    ("class", "class"),
+    ("class_desc", "class_desc"),
+    ("major_id", "major_id"),
+    ("minor_id", "minor_id"),
+    ("name", "name"),
+    ("value", "value"),
+];
+
 /// The filter of a view read over [`ALL_OBJECTS_TABLE`] or [`ALL_COLUMNS_TABLE`]: the objects
 /// of the current database, and those whose `database_id` is `NULL`.
 const ANY_DATABASE_FILTER: &str = "database_id = DB_ID()\n    OR database_id IS NULL";
@@ -568,11 +610,18 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
             ]
             .concat(),
         },
+        InternalTableDef {
+            name: EXTENDED_PROPERTIES_TABLE.to_owned(),
+            columns: extended_properties_table_columns(),
+            clustered_key: None,
+            rows: Vec::new(),
+            views: views_of("extended_properties", &extended_properties_definition()),
+        },
     ]
 }
 
 /// The views this file installs, which [`installed_system_views`] needs before
-/// [`internal_tables`] can build its rows: the seven of the table of the module documentation.
+/// [`internal_tables`] can build its rows: the eight of the table of the module documentation.
 ///
 /// Written apart from [`internal_tables`] so that the rows of [`ALL_OBJECTS_TABLE`] can name
 /// the views of this file without that function calling itself.
@@ -585,6 +634,7 @@ fn own_views() -> Vec<SystemViewDef> {
         views_of("allocation_units", &allocation_units_definition()),
         views_of("database_files", &database_files_definition()),
         views_of("master_files", &master_files_definition()),
+        views_of("extended_properties", &extended_properties_definition()),
     ]
     .concat()
 }
@@ -984,9 +1034,31 @@ fn master_files_definition() -> String {
     definition(&MASTER_FILES_VIEW, FILES_TABLE, None)
 }
 
+/// The text of `sys.extended_properties`: the properties of the current database.
+fn extended_properties_definition() -> String {
+    definition(
+        &EXTENDED_PROPERTIES_VIEW,
+        EXTENDED_PROPERTIES_TABLE,
+        Some("database_id = DB_ID()"),
+    )
+}
+
+/// The columns of [`EXTENDED_PROPERTIES_TABLE`], in the order of [`extended_properties_columns`].
+fn extended_properties_table_columns() -> Vec<InternalColumnDef> {
+    vec![
+        column("database_id", SqlType::Int, false),
+        column("class", SqlType::TinyInt, false),
+        column("class_desc", SqlType::NVarChar(Len::Fixed(60)), false),
+        column("major_id", SqlType::Int, false),
+        column("minor_id", SqlType::Int, false),
+        column("name", SYSNAME, false),
+        column("value", SqlType::NVarChar(Len::Max), true),
+    ]
+}
+
 /// The same view installed in the four system databases, `sys.<name>` in each of them.
 ///
-/// The seven views filter on the current database or on nothing, so the four definitions share
+/// The eight views filter on the current database or on nothing, so the four definitions share
 /// their text (unit test `the_views_are_installed_in_the_four_system_databases`). A database
 /// created by `CREATE DATABASE` receives no copies yet, as for the other files of `views/`.
 fn views_of(name: &str, definition: &str) -> Vec<SystemViewDef> {
@@ -1216,6 +1288,15 @@ mod tests {
         "redo_target_fork_guid",
         "backup_lsn",
     ];
+    /// The ordered column names of `sys.extended_properties`.
+    const PUBLISHED_EXTENDED_PROPERTIES_COLUMNS: [&str; 6] = [
+        "class",
+        "class_desc",
+        "major_id",
+        "minor_id",
+        "name",
+        "value",
+    ];
     /// The ordered column names of `sys.master_files`.
     const PUBLISHED_MASTER_FILES_COLUMNS: [&str; 32] = [
         "database_id",
@@ -1280,7 +1361,7 @@ mod tests {
         ("is_dropped_ledger_view", Some("0")),
     ];
 
-    /// The seven views of this file, as `(name, definition, published column names)`.
+    /// The eight views of this file, as `(name, definition, published column names)`.
     fn views_and_published_columns() -> Vec<(&'static str, String, Vec<&'static str>)> {
         vec![
             (
@@ -1317,6 +1398,11 @@ mod tests {
                 "master_files",
                 master_files_definition(),
                 PUBLISHED_MASTER_FILES_COLUMNS.to_vec(),
+            ),
+            (
+                "extended_properties",
+                extended_properties_definition(),
+                PUBLISHED_EXTENDED_PROPERTIES_COLUMNS.to_vec(),
             ),
         ]
     }
@@ -1413,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn the_columns_of_the_seven_views_are_the_published_ones() {
+    fn the_columns_of_the_eight_views_are_the_published_ones() {
         for (name, definition, published) in views_and_published_columns() {
             assert_eq!(
                 published_columns(&definition),
@@ -1463,12 +1549,12 @@ mod tests {
                 }
             }
         }
-        // The seven views of the file, four copies each.
+        // The eight views of the file, four copies each.
         let installed: usize = internal_tables()
             .iter()
             .map(|table| table.views.len())
             .sum();
-        assert_eq!(installed, 7 * SYSTEM_DATABASES.len());
+        assert_eq!(installed, 8 * SYSTEM_DATABASES.len());
     }
 
     #[test]
@@ -1563,6 +1649,7 @@ mod tests {
             "allocation_units",
             "database_files",
             "master_files",
+            "extended_properties",
             "dm_exec_sessions",
             "dm_exec_connections",
             "dm_exec_requests",
@@ -1807,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn the_described_tables_are_five_and_named_apart() {
+    fn the_described_tables_are_six_and_named_apart() {
         let names: Vec<String> = internal_tables()
             .into_iter()
             .map(|table| table.name)
@@ -1819,7 +1906,8 @@ mod tests {
                 ALL_COLUMNS_TABLE,
                 PARTITIONS_TABLE,
                 ALLOCATION_UNITS_TABLE,
-                FILES_TABLE
+                FILES_TABLE,
+                EXTENDED_PROPERTIES_TABLE,
             ]
         );
         // A name another file of `views/` describes is not in this list.
@@ -1841,8 +1929,8 @@ mod tests {
 
     #[test]
     fn the_objects_and_the_files_tables_are_the_two_the_bootstrap_fills() {
-        // The three others hold the rows of a user object, written into `storage` at each
-        // DDL (module documentation).
+        // The four others hold the rows of a user object, written into `storage` at each
+        // DDL (module documentation), or stay empty (`EXTENDED_PROPERTIES_TABLE`).
         for table in internal_tables() {
             let filled = table.name == ALL_OBJECTS_TABLE || table.name == FILES_TABLE;
             assert_eq!(!table.rows.is_empty(), filled, "{}", table.name);

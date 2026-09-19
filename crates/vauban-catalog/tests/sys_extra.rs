@@ -254,6 +254,7 @@ fn the_objects_copy_carries_the_system_views_of_the_catalogue() {
         "allocation_units",
         "database_files",
         "master_files",
+        "extended_properties",
     ] {
         assert!(names.contains(&view.to_owned()), "{names:?}");
     }

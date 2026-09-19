@@ -14,7 +14,7 @@
 //! | `sys_indexes.rs` | `sys.indexes`, `sys.index_columns`, `sys.key_constraints`, `sys.identity_columns` |
 //! | `info_schema.rs` | `INFORMATION_SCHEMA.TABLES`, `COLUMNS`, `SCHEMATA` |
 //! | `sys_constraints.rs` | `sys.foreign_keys`, `sys.foreign_key_columns`, `sys.check_constraints`, `sys.default_constraints` |
-//! | `sys_extra.rs` | `sys.all_objects`, `sys.views`, `sys.partitions`, `sys.allocation_units`, the file views |
+//! | `sys_extra.rs` | `sys.all_objects`, `sys.views`, `sys.partitions`, `sys.allocation_units`, the file views, `sys.extended_properties` |
 //! | `dm_exec.rs` | `sys.dm_exec_sessions`, `sys.dm_exec_connections`, `sys.dm_exec_requests`, `sys.configurations`, `sys.dm_os_sys_info` |
 
 use crate::def::InternalTableDef;
