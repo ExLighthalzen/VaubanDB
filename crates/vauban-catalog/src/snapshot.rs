@@ -218,8 +218,8 @@ use vauban_txn::TxnHandle;
 use vauban_types::{Collation, Value};
 
 use crate::bootstrap::{
-    DATABASES_TABLE, SCHEMAS_TABLE, SYSTEM_DATABASES, databases_columns, internal_table_defs,
-    internal_table_id,
+    DATABASES_TABLE, SCHEMAS_TABLE, SYSTEM_DATABASES, SYSTEM_SCHEMAS, databases_columns,
+    internal_table_defs, internal_table_id,
 };
 use crate::catalog::Catalog;
 use crate::def::{InternalTableDef, SystemViewDef};
@@ -292,6 +292,19 @@ impl CatalogSnapshot {
     /// The database of identifier `id`, `None` when this snapshot holds no such database.
     pub fn database_by_id(&self, id: vauban_storage::DbId) -> Option<&DatabaseMeta> {
         self.databases.iter().find(|database| database.id == id)
+    }
+
+    /// The name of the schema of identifier `schema_id`, `None` when no schema carries that
+    /// identifier.
+    ///
+    /// The three schemas the bootstrap writes in each database — `dbo` 1, `INFORMATION_SCHEMA`
+    /// 3, `sys` 4 — are the ones answered ([`SYSTEM_SCHEMAS`]; unit test
+    /// `schema_name_from_identifier`).
+    pub fn schema_name(&self, schema_id: i32) -> Option<String> {
+        SYSTEM_SCHEMAS
+            .iter()
+            .find(|(_, id, _)| *id == schema_id)
+            .map(|(name, _, _)| (*name).to_owned())
     }
 
     /// The object named by one to three parts, `None` when the name resolves to nothing.
@@ -860,6 +873,23 @@ mod tests {
         assert!(snapshot.view_definition(ObjectId(1)).is_none());
         assert!(snapshot.indexes_of(ObjectId(1)).is_empty());
         assert!(snapshot.object_name(ObjectId(1)).is_none());
+    }
+
+    /// The three bootstrap schemas and an unknown identifier (`schema_name_from_identifier`).
+    #[test]
+    fn schema_name_from_identifier() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let manager = Arc::new(TransactionManager::new(Arc::clone(&storage)));
+        let catalog = Catalog::bootstrap(storage, Arc::clone(&manager)).expect("bootstrap");
+        let handle = manager.begin(IsolationLevel::ReadCommitted);
+        let snapshot = build(&catalog, &handle);
+        assert_eq!(snapshot.schema_name(1), Some("dbo".to_owned()));
+        assert_eq!(
+            snapshot.schema_name(3),
+            Some("INFORMATION_SCHEMA".to_owned())
+        );
+        assert_eq!(snapshot.schema_name(4), Some("sys".to_owned()));
+        assert_eq!(snapshot.schema_name(99), None);
     }
 
     #[test]

@@ -60,26 +60,21 @@
 //!
 //! ## Two answers this file leaves to a later reader API of the catalogue
 //!
-//! `SCHEMA_NAME(id)` and `DB_NAME(id)` need a lookup by identifier that
-//! [`CatalogSnapshot`] does not publish: it answers a database by **name**
-//! ([`CatalogSnapshot::database`]) and carries no schema entry (an `ObjectMeta` holds a
-//! schema *name*, no `schema_id`; `schema_name_is_not_resolved_yet`). So:
+//! `DB_NAME(id)` needs a lookup by identifier that [`CatalogSnapshot`] does not publish for
+//! a database other than the current one: it answers a database by **name**
+//! ([`CatalogSnapshot::database`]) and
+//! `database_name` answers the **current** one and `None` for another identifier, where SQL
+//! Server answers `tempdb` for 2 (`database_name_answers_the_current_database_only`).
 //!
-//! - [`EvalContext::schema_name`] is left on its trait default, `None`, where SQL Server
-//!   answers `dbo`, `guest`, `INFORMATION_SCHEMA` and `sys` for 1, 2, 3 and 4
-//!   (`schema_name_is_not_resolved_yet`). `SCHEMA_NAME()` without an argument is `dbo`
-//!   inside `sysfn` and does not come through this file;
-//! - [`EvalContext::schema_id`] answers the default schema, `dbo` = 1, and `None`
-//!   for another name, where SQL Server answers 2, 3 and 4 for `guest`,
-//!   `INFORMATION_SCHEMA` and `sys` (`schema_id_of_another_schema_is_not_resolved_yet`).
-//!   Reading those three needs the same lookup: `CatalogSnapshot` carries no schema entry
-//!   and the numbers the bootstrap writes in `sys.schemas` are `pub(crate)` to
-//!   `vauban_catalog`;
-//! - `database_name` answers the **current** database and `None` for another identifier,
-//!   where SQL Server answers `tempdb` for 2
-//!   (`database_name_answers_the_current_database_only`).
+//! [`EvalContext::schema_name`] reads [`CatalogSnapshot::schema_name`]: the three schemas
+//! the bootstrap writes (`dbo` 1, `INFORMATION_SCHEMA` 3, `sys` 4; unit test
+//! `schema_name_from_identifier`). `SCHEMA_NAME()` without an argument is `dbo` inside
+//! `sysfn` and does not come through this file.
 //!
-//! Both widen when `catalog` publishes those lookups.
+//! [`EvalContext::schema_id`] answers the default schema, `dbo` = 1, and `None` for another
+//! name, where SQL Server answers 2, 3 and 4 for `guest`, `INFORMATION_SCHEMA` and `sys`
+//! (`schema_id_of_another_schema_is_not_resolved_yet`). Reading those three by name needs the
+//! same lookup [`CatalogSnapshot::schema_name`] already provides in the other direction.
 
 use std::cell::OnceCell;
 use std::cmp::Ordering;
@@ -609,6 +604,16 @@ impl EvalContext for SessionEvalContext<'_> {
         (i32::try_from(current.id.0) == Ok(id)).then(|| current.name.clone())
     }
 
+    /// The name of the schema of identifier `id` (`SCHEMA_NAME(id)`), read from the
+    /// snapshot of the current database, `None` without a catalogue, when the session's
+    /// database is not in the snapshot, or when the identifier matches no schema the
+    /// catalogue holds (`schema_name_from_identifier`).
+    fn schema_name(&self, id: i32) -> Option<String> {
+        let catalog = self.catalog()?;
+        catalog.database(&self.state.database)?;
+        catalog.schema_name(id)
+    }
+
     /// The identifier of the schema `name`, or of the session's default schema when `name`
     /// is `None` (`SCHEMA_ID`): [`DEFAULT_SCHEMA_ID`] for [`DEFAULT_SCHEMA`], `None` for a
     /// name that is not it, the bound of the module documentation, section "Two answers
@@ -976,19 +981,18 @@ mod tests {
         assert_eq!(ctx.database_name(tempdb), None);
     }
 
+    /// `SCHEMA_NAME(1)`, `(3)`, `(4)` and `(99)` answer `dbo`, `INFORMATION_SCHEMA`, `sys`
+    /// and `NULL` (`schema_name_from_identifier`).
     #[test]
-    fn schema_name_is_not_resolved_yet() {
-        // SQL Server answers `dbo`, `INFORMATION_SCHEMA` and `sys` for 1, 3 and 4;
-        // `CatalogSnapshot` publishes no schema identifier, so this context answers NULL.
-        // A reader API of `catalog` lifts it; `SCHEMA_ID` was added without one, so the
-        // name of an identifier is still unresolved here.
+    fn schema_name_from_identifier() {
         let (snapshot, _) = catalogue_with_a_table();
         let state = state();
         let ctx = SessionEvalContext::new(&state, Some(&snapshot));
         let ctx: &dyn EvalContext = &ctx;
-        for id in [1, 3, 4, 99] {
-            assert_eq!(ctx.schema_name(id), None, "{id}");
-        }
+        assert_eq!(ctx.schema_name(1), Some("dbo".to_owned()));
+        assert_eq!(ctx.schema_name(3), Some("INFORMATION_SCHEMA".to_owned()));
+        assert_eq!(ctx.schema_name(4), Some("sys".to_owned()));
+        assert_eq!(ctx.schema_name(99), None);
     }
 
     /// `SCHEMA_ID()` and `SCHEMA_ID('dbo')` answer 1, the number of the default schema, with
