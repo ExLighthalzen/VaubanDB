@@ -132,9 +132,12 @@ pub(crate) fn bind_select_with_parent(
             "bind_select: FOR XML and FOR JSON are not implemented yet",
         ));
     }
-    let plan = match &stmt.body {
-        QueryBody::Select(spec) => bind_query_spec(spec, stmt, ctx, parent)?,
-        QueryBody::SetOp { .. } => setop::bind_set_op(&stmt.body, stmt, ctx)?,
+    let (plan, from_scope) = match &stmt.body {
+        QueryBody::Select(spec) => {
+            let (plan, scope) = bind_query_spec(spec, stmt, ctx, parent)?;
+            (plan, Some(scope))
+        }
+        QueryBody::SetOp { .. } => (setop::bind_set_op(&stmt.body, stmt, ctx)?, None),
         QueryBody::Nested(..) => {
             return Err(not_yet(
                 "bind_select: a parenthesised query body is not implemented yet",
@@ -144,7 +147,7 @@ pub(crate) fn bind_select_with_parent(
     if stmt.order_by.is_empty() {
         return Ok(plan);
     }
-    sort::bind_order_by(stmt, plan, ctx)
+    sort::bind_order_by(stmt, plan, ctx, from_scope)
 }
 
 /// Binds one `SELECT … WHERE …` specification, the body of [`bind_select`].
@@ -157,7 +160,7 @@ fn bind_query_spec(
     stmt: &SelectStatement,
     ctx: &BindContext<'_>,
     parent: &Scope,
-) -> SqlResult<LogicalPlan> {
+) -> SqlResult<(LogicalPlan, Scope)> {
     for table_ref in &spec.from {
         check_table_arguments(table_ref, line_of(&stmt.span), ctx)?;
     }
@@ -257,7 +260,7 @@ fn bind_query_spec(
         // ([`aggregated_select_list`]): the group is then the whole input, and the
         // `group_by` of the variant is empty.
         let grouped = aggregate::bind_aggregate(spec, plan, &scope, ctx)?;
-        return finish(grouped, spec, stmt, ctx);
+        return Ok((finish(grouped, spec, stmt, ctx)?, scope));
     }
 
     let mut projections = Vec::with_capacity(spec.items.len());
@@ -279,7 +282,7 @@ fn bind_query_spec(
         schema,
     };
 
-    finish(plan, spec, stmt, ctx)
+    Ok((finish(plan, spec, stmt, ctx)?, scope))
 }
 
 /// Puts the operators that sit **above** the projection on a projected plan: `DISTINCT`,

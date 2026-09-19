@@ -13,7 +13,7 @@ use vauban_binder::{
 };
 use vauban_catalog::{ColumnId, ObjectId, TableId};
 use vauban_errors::SqlError;
-use vauban_parser::{ObjectName, ParseOptions, parse_batch};
+use vauban_parser::{Ident, ObjectName, ParseOptions, parse_batch};
 use vauban_sysfn::register_builtins;
 use vauban_types::{Len, SqlType, TypeInfo};
 
@@ -752,5 +752,301 @@ fn a_key_written_as_an_alias_is_bound_a_second_time() {
         matches!(keys[0].expr.kind, BoundExprKind::Convert { .. }),
         "the key converts another, got {:?}",
         keys[0].expr.kind
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// `ORDER BY` over a join or a derived table
+// ---------------------------------------------------------------------------------------
+
+/// Three tables in `master.dbo`: `a (k, c)`, `b (k, c)` and `d (k, e)`.
+struct ThreeTables;
+
+impl CatalogView for ThreeTables {
+    fn resolve_table(
+        &self,
+        name: &ObjectName,
+        database: &str,
+        default_schema: &str,
+    ) -> Option<ResolvedTable> {
+        if name.server.is_some() {
+            return None;
+        }
+        let part = |ident: Option<&Ident>, default: &str| {
+            ident.map_or_else(|| default.to_owned(), |ident| ident.value.clone())
+        };
+        if !part(name.database.as_ref(), database).eq_ignore_ascii_case("master")
+            || !part(name.schema.as_ref(), default_schema).eq_ignore_ascii_case("dbo")
+        {
+            return None;
+        }
+        let (object, second) = match name.name.value.to_ascii_lowercase().as_str() {
+            "a" => (1, "c"),
+            "b" => (2, "c"),
+            "d" => (3, "e"),
+            _ => return None,
+        };
+        Some(ResolvedTable {
+            object: ObjectId(object),
+            table: Some(TableId(u32::try_from(object).expect("a small identifier"))),
+            columns: vec![
+                column(object * 10 + 1, 0, "k", TypeInfo::new(SqlType::Int, false)),
+                column(
+                    object * 10 + 2,
+                    1,
+                    second,
+                    TypeInfo::new(SqlType::Int, true),
+                ),
+            ],
+            kind: ResolvedTableKind::Table,
+        })
+    }
+}
+
+/// Two tables: `a (k, c)` and `b (k, c)`.
+struct TwoTables;
+
+impl CatalogView for TwoTables {
+    fn resolve_table(
+        &self,
+        name: &ObjectName,
+        _database: &str,
+        _default_schema: &str,
+    ) -> Option<ResolvedTable> {
+        let object = match name.name.value.as_str() {
+            "a" | "A" => 1,
+            "b" | "B" => 2,
+            _ => return None,
+        };
+        Some(ResolvedTable {
+            object: ObjectId(object),
+            table: Some(TableId(u32::try_from(object).expect("a small identifier"))),
+            columns: vec![
+                column(1, 0, "k", TypeInfo::new(SqlType::Int, false)),
+                column(2, 1, "c", TypeInfo::new(SqlType::Int, true)),
+            ],
+            kind: ResolvedTableKind::Table,
+        })
+    }
+}
+
+/// Binds against `ThreeTables`.
+fn bound_join(text: &str) -> Result<BoundStatement, SqlError> {
+    register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+    let catalog = ThreeTables;
+    let ctx = BindContext {
+        text,
+        catalog: Some(&catalog),
+        database: "master",
+        default_schema: "dbo",
+        variables: &NoVariables,
+        options: SessionOptions::default(),
+    };
+    bind(batch.statements.first().expect("one statement"), &ctx)
+}
+
+fn plan_join(text: &str) -> LogicalPlan {
+    match bound_join(text)
+        .unwrap_or_else(|e| panic!("{text} binds, got {} {}", e.number, e.message))
+    {
+        BoundStatement::Query(plan) => *plan,
+        other => panic!("{text} is a query, got {other:?}"),
+    }
+}
+
+fn err_join(text: &str) -> SqlError {
+    bound_join(text).expect_err(text)
+}
+
+/// Binds against `TwoTables`.
+fn bound_derived(text: &str) -> Result<BoundStatement, SqlError> {
+    register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+    let catalog = TwoTables;
+    let ctx = BindContext {
+        text,
+        catalog: Some(&catalog),
+        database: "master",
+        default_schema: "dbo",
+        variables: &NoVariables,
+        options: SessionOptions::default(),
+    };
+    bind(batch.statements.first().expect("one statement"), &ctx)
+}
+
+fn plan_derived(text: &str) -> LogicalPlan {
+    match bound_derived(text)
+        .unwrap_or_else(|e| panic!("{text} binds, got {} {}", e.number, e.message))
+    {
+        BoundStatement::Query(plan) => *plan,
+        other => panic!("{text} is a query, got {other:?}"),
+    }
+}
+
+fn err_derived(text: &str) -> SqlError {
+    bound_derived(text).expect_err(text)
+}
+
+/// The `(name, index)` of the one key of a join plan.
+fn join_key(text: &str) -> (String, usize) {
+    let plan = plan_join(text);
+    let [key] = keys(&plan) else {
+        panic!("{text}: one key")
+    };
+    match &key.expr.kind {
+        BoundExprKind::ColumnRef(binding) => (binding.name.clone(), binding.index),
+        other => panic!("{text}: the key is a column, got {other:?}"),
+    }
+}
+
+/// The `(name, index)` of the one key of a derived-table plan.
+fn derived_key(text: &str) -> (String, usize) {
+    let plan = plan_derived(text);
+    let [key] = keys(&plan) else {
+        panic!("{text}: one key")
+    };
+    match &key.expr.kind {
+        BoundExprKind::ColumnRef(binding) => (binding.name.clone(), binding.index),
+        other => panic!("{text}: the key is a column, got {other:?}"),
+    }
+}
+
+/// The operator stack through a `Join` or `Subquery` leaf.
+fn stack_relational(plan: &LogicalPlan) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    let mut node = plan;
+    loop {
+        let (name, next) = match node {
+            LogicalPlan::Limit { input, .. } => ("Limit", Some(input.as_ref())),
+            LogicalPlan::Sort { input, .. } => ("Sort", Some(input.as_ref())),
+            LogicalPlan::Distinct(input) => ("Distinct", Some(input.as_ref())),
+            LogicalPlan::Project { input, .. } => ("Project", Some(input.as_ref())),
+            LogicalPlan::Filter { input, .. } => ("Filter", Some(input.as_ref())),
+            LogicalPlan::Join { .. } => ("Join", None),
+            LogicalPlan::Subquery { .. } => ("Subquery", None),
+            LogicalPlan::Scan { .. } => ("Scan", None),
+            LogicalPlan::OneRow => ("OneRow", None),
+            other => panic!("unexpected node {other:?}"),
+        };
+        names.push(name);
+        match next {
+            Some(input) => node = input,
+            None => return names,
+        }
+    }
+}
+
+/// A join `ORDER BY` keeps the documented stack: `Sort` under the `Project`, over the `Join`.
+#[test]
+fn order_by_over_a_join_keeps_the_documented_stack() {
+    assert_eq!(
+        stack_relational(&plan_join(
+            "SELECT a.k, b.c FROM dbo.a JOIN dbo.b ON a.k = b.k ORDER BY b.c"
+        )),
+        ["Project", "Sort", "Join"]
+    );
+    assert_eq!(
+        stack_relational(&plan_derived(
+            "SELECT d.c FROM (SELECT c FROM a) AS d ORDER BY d.c"
+        )),
+        ["Project", "Sort", "Subquery"]
+    );
+}
+
+/// Each side of a join may supply a sort key.
+#[test]
+fn order_by_either_side_of_a_join() {
+    assert_eq!(
+        join_key("SELECT a.k, b.c FROM dbo.a JOIN dbo.b ON a.k = b.k ORDER BY b.c"),
+        ("c".to_owned(), 3)
+    );
+    assert_eq!(
+        join_key("SELECT a.k, b.c FROM dbo.a JOIN dbo.b ON a.k = b.k ORDER BY a.k"),
+        ("k".to_owned(), 0)
+    );
+}
+
+/// A bare name two joined tables carry is 209 in the sort list.
+#[test]
+fn an_ambiguous_join_column_in_order_by_is_209() {
+    let error = err_join("SELECT a.k FROM dbo.a JOIN dbo.b ON a.k = b.k ORDER BY c");
+    assert_eq!(error.number, 209, "{}", error.message);
+    assert_eq!(error.message, "Column name 'c' is ambiguous.");
+}
+
+/// A table alias qualifies a sort key on a join.
+#[test]
+fn order_by_a_qualified_table_alias_on_a_join() {
+    assert_eq!(
+        join_key("SELECT a.k FROM dbo.a JOIN dbo.b ON a.k = b.k ORDER BY b.k"),
+        ("k".to_owned(), 2)
+    );
+}
+
+/// Under a `LEFT JOIN`, the right side is nullable and its columns sort from that side.
+#[test]
+fn order_by_the_right_side_of_a_left_join() {
+    assert_eq!(
+        join_key("SELECT a.k FROM dbo.a LEFT JOIN dbo.b ON a.k = b.k ORDER BY b.c"),
+        ("c".to_owned(), 3)
+    );
+    let plan = plan_join("SELECT b.c FROM dbo.a LEFT JOIN dbo.b ON a.k = b.k ORDER BY b.c");
+    let [key] = keys(&plan) else {
+        panic!("one key")
+    };
+    assert!(key.expr.ty.nullable, "b.c is nullable under a LEFT JOIN");
+}
+
+/// Three joined tables publish six columns; a sort key may name one of them.
+#[test]
+fn order_by_over_three_tables() {
+    assert_eq!(
+        join_key(
+            "SELECT 1 FROM dbo.a JOIN dbo.b ON a.k = b.k JOIN dbo.d ON a.k = d.k ORDER BY d.e"
+        ),
+        ("e".to_owned(), 5)
+    );
+}
+
+/// A derived table alias qualifies its published columns in the sort list.
+#[test]
+fn order_by_over_a_derived_table() {
+    assert_eq!(
+        derived_key("SELECT d.c FROM (SELECT c FROM a) AS d ORDER BY d.c"),
+        ("c".to_owned(), 0)
+    );
+}
+
+/// A column the derived table does not publish is 207 in the sort list.
+#[test]
+fn order_by_a_column_the_derived_table_does_not_publish_is_207() {
+    let error = err_derived("SELECT d.c FROM (SELECT c FROM a) AS d ORDER BY d.k");
+    assert_eq!(error.number, 207, "{}", error.message);
+    assert_eq!(error.message, "Unknown column name 'k'.");
+}
+
+/// `ORDER BY 2` over a join reads the second item of the select list.
+#[test]
+fn order_by_an_ordinal_over_a_join() {
+    assert_eq!(
+        join_key("SELECT a.k, b.c FROM dbo.a JOIN dbo.b ON a.k = b.k ORDER BY 2"),
+        ("c".to_owned(), 3)
+    );
+    assert_eq!(
+        err_join("SELECT a.k FROM dbo.a JOIN dbo.b ON a.k = b.k ORDER BY 99").number,
+        108
+    );
+}
+
+/// A grouped query still answers the internal refusal for its `ORDER BY`.
+#[test]
+fn order_by_over_a_grouped_query_is_still_refused() {
+    let error = err_join("SELECT a.k FROM dbo.a GROUP BY a.k ORDER BY a.c");
+    assert_eq!(error.number, 50000, "{}", error.message);
+    assert!(
+        error.message.contains("the ORDER BY of a grouped query"),
+        "{}",
+        error.message
     );
 }

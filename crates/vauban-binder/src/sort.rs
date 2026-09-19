@@ -125,9 +125,10 @@ pub(crate) fn bind_order_by(
     stmt: &SelectStatement,
     input: LogicalPlan,
     ctx: &BindContext<'_>,
+    from_scope: Option<Scope>,
 ) -> SqlResult<LogicalPlan> {
     match &stmt.body {
-        QueryBody::Select(spec) => bind_order_by_select(stmt, input, ctx, spec),
+        QueryBody::Select(spec) => bind_order_by_select(stmt, input, ctx, spec, from_scope),
         QueryBody::SetOp { .. } | QueryBody::Nested(..) => bind_order_by_set_op(stmt, input, ctx),
     }
 }
@@ -138,6 +139,7 @@ fn bind_order_by_select(
     input: LogicalPlan,
     ctx: &BindContext<'_>,
     spec: &QuerySpec,
+    from_scope: Option<Scope>,
 ) -> SqlResult<LogicalPlan> {
     let (body, top) = strip_limit(input);
     let (deduplicated, projected) = match body {
@@ -155,7 +157,13 @@ fn bind_order_by_select(
         )));
     };
 
-    let scope = scope_of(&source, spec, ctx)?;
+    let scope = match from_scope {
+        Some(scope) => scope,
+        None => scope_of(&source, spec, ctx)?,
+    };
+    if grouped_source(&source) {
+        return Err(not_implemented("the ORDER BY of a grouped query"));
+    }
     let mut keys = Vec::with_capacity(stmt.order_by.len());
     for (position, item) in stmt.order_by.iter().enumerate() {
         keys.push(resolve_key(item, position, &exprs, &schema, &scope, ctx)?);
@@ -701,22 +709,20 @@ fn is_constant(written: &Expr) -> bool {
     true
 }
 
-/// The scope the keys of an `ORDER BY` bind in: the source of the `FROM`, read off the plan
-/// the select list was projected from.
+/// Whether the plan under a `Project` is a grouped query.
+fn grouped_source(source: &LogicalPlan) -> bool {
+    let mut node = source;
+    while let LogicalPlan::Filter { input, .. } = node {
+        node = input;
+    }
+    matches!(node, LogicalPlan::Aggregate { .. })
+}
+
+/// The scope the keys of an `ORDER BY` bind in when none was handed over from
+/// `query.rs::bind_query_spec`.
 ///
-/// `query.rs::bind_query_spec` builds the same scope for the select list and does not hand
-/// it over — this file rebuilds it from the node under the `Project`, by the rules of that
-/// function: a `Scan` publishes its columns under its own `alias`, and an expanded view
-/// publishes the columns of its output under the alias read off the reference
-/// (`view::source_columns`).
-///
-/// # Errors
-///
-/// An internal error 50000 naming a source this file does not read: a join, a grouped
-/// query (where `ORDER BY b` over `GROUP BY a` answers 8127 on SQL Server) or a derived
-/// table. The three of them answer their own internal error while binding the `FROM`,
-/// before an `ORDER BY` is looked at (`tests/bound_shape_relational.rs`,
-/// `an_unimplemented_form_names_itself`).
+/// A `Scan` publishes its columns under its own `alias`, and an expanded view publishes
+/// the columns of its output under the alias read off the reference (`view::source_columns`).
 fn scope_of(source: &LogicalPlan, spec: &QuerySpec, ctx: &BindContext<'_>) -> SqlResult<Scope> {
     let mut node = source;
     while let LogicalPlan::Filter { input, .. } = node {
@@ -737,10 +743,6 @@ fn scope_of(source: &LogicalPlan, spec: &QuerySpec, ctx: &BindContext<'_>) -> Sq
         (LogicalPlan::Aggregate { .. }, _) => {
             Err(not_implemented("the ORDER BY of a grouped query"))
         }
-        (LogicalPlan::Join { .. }, _) => Err(not_implemented("the ORDER BY of a join")),
-        (LogicalPlan::Subquery { .. }, _) => Err(not_implemented(
-            "the ORDER BY of a query over a derived table",
-        )),
         (expanded, Some(reference)) => match reference_alias(reference) {
             Some(alias) => Ok(Scope::over(Source::new(
                 &alias,
