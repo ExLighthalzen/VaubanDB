@@ -8,6 +8,7 @@ use vauban_tds::{Rpc, RpcProc};
 use vauban_types::{Len, SqlType, TypeInfo, Value};
 
 use crate::batch::Session;
+use crate::prepared::execute_prepared_action;
 use crate::procedures::{ProcFinish, execute_proc_action};
 use crate::sink::ResultSink;
 
@@ -141,14 +142,17 @@ impl Session {
             None => fail_rpc(&name, sink),
             Some(Err(err)) => fail_rpc_error(self, &err, sink),
             Some(Ok(action)) => {
-                let outcome = execute_proc_action(
-                    self,
-                    action,
-                    ProcFinish::Rpc {
-                        rpc_params: &rpc.params,
-                    },
-                    sink,
-                )?;
+                let finish = ProcFinish::Rpc {
+                    rpc_params: &rpc.params,
+                };
+                let outcome = match &action {
+                    ProcAction::Prepare { .. }
+                    | ProcAction::Execute { .. }
+                    | ProcAction::Unprepare { .. } => {
+                        execute_prepared_action(self, action, finish, &rpc.params, sink)?
+                    }
+                    _ => execute_proc_action(self, action, finish, sink)?,
+                };
                 if outcome.failed {
                     self.state_mut().last_error = outcome.error_number;
                 } else {

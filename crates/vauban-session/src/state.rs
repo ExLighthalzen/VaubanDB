@@ -4,6 +4,7 @@
 use crate::login::{EDITION, VERSION_BANNER};
 use vauban_txn::IsolationLevel;
 
+use crate::prepared::PreparedStatements;
 use crate::set_options::{SetOptions, default_isolation};
 use crate::txn_session::SessionTxn;
 
@@ -72,6 +73,8 @@ pub struct SessionState {
     /// One table at a time: a second `SET IDENTITY_INSERT … ON` answers 8107 and leaves
     /// this field as it was (`tests/set_options_effects.rs`).
     pub identity_insert: Option<IdentityInsertTable>,
+    /// Handles allocated by `sp_prepare` / `sp_prepexec` on this connection.
+    pub prepared: PreparedStatements,
 }
 
 /// The table `SET IDENTITY_INSERT` opened on this session, in three parts stripped of the
@@ -133,6 +136,7 @@ impl SessionState {
             server_name: Self::DEFAULT_SERVER_NAME.into(),
             next_transaction_descriptor: 1,
             identity_insert: None,
+            prepared: PreparedStatements::new(),
         }
     }
 
@@ -172,6 +176,7 @@ mod tests {
         assert_eq!(state.edition, EDITION);
         assert_eq!(state.server_name, "vauban");
         assert_eq!(state.identity_insert, None);
+        assert_eq!(state.prepared, PreparedStatements::new());
     }
 
     #[test]

@@ -27,6 +27,7 @@ mod eval_context;
 mod fake_engine;
 mod login;
 mod nested;
+mod prepared;
 mod procedures;
 mod rpc;
 mod server;
