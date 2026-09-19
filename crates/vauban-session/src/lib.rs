@@ -27,6 +27,8 @@ mod eval_context;
 mod fake_engine;
 mod login;
 mod nested;
+mod procedures;
+mod rpc;
 mod server;
 mod set_options;
 mod sink;
@@ -49,6 +51,8 @@ pub use fake_engine::*;
 pub use login::*;
 #[allow(unused_imports)]
 pub use nested::*;
+#[allow(unused_imports)]
+pub use rpc::*;
 #[allow(unused_imports)]
 pub use set_options::*;
 #[allow(unused_imports)]

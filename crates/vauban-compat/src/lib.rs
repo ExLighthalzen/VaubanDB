@@ -69,23 +69,73 @@ pub fn call_system_procedure(
     })
 }
 
-fn dispatch_system_procedure(
+fn resolve_for_session(
     name: &str,
-    params: &[(Option<&str>, &Value)],
-) -> Option<vauban_session::SystemProcedureResult> {
-    call_system_procedure(name, params).map(|result| vauban_session::SystemProcedureResult {
-        columns: result
-            .result_set
-            .columns
-            .into_iter()
-            .map(|column| vauban_session::SystemProcedureColumn {
-                name: column.name,
-                ty: column.ty,
-            })
-            .collect(),
-        rows: result.result_set.rows,
-        return_status: result.return_status,
-    })
+    params: &[vauban_session::ProcArg<'_>],
+) -> Option<SqlResult<vauban_session::ProcAction>> {
+    let compat_args: Vec<special_procs::ProcArg<'_>> = params
+        .iter()
+        .map(|arg| special_procs::ProcArg {
+            name: arg.name,
+            ty: arg.ty,
+            value: arg.value,
+            output: arg.output,
+            default: arg.default,
+        })
+        .collect();
+    resolve_system_procedure(name, &compat_args).map(|result| result.map(convert_proc_action))
+}
+
+fn convert_proc_action(action: ProcAction) -> vauban_session::ProcAction {
+    match action {
+        ProcAction::ExecuteSql { statement, params } => vauban_session::ProcAction::ExecuteSql {
+            statement,
+            params: convert_proc_params(params),
+        },
+        ProcAction::Prepare {
+            statement,
+            params,
+            handle_arg,
+            execute_with,
+        } => vauban_session::ProcAction::Prepare {
+            statement,
+            params,
+            handle_arg,
+            execute_with: execute_with.map(convert_proc_params),
+        },
+        ProcAction::Execute { handle, params } => vauban_session::ProcAction::Execute {
+            handle,
+            params: convert_proc_params(params),
+        },
+        ProcAction::Unprepare { handle } => vauban_session::ProcAction::Unprepare { handle },
+        ProcAction::Template { sql, params } => vauban_session::ProcAction::Template {
+            sql,
+            params: convert_proc_params(params),
+        },
+        ProcAction::Static { columns, rows } => vauban_session::ProcAction::Static {
+            columns: columns
+                .into_iter()
+                .map(|column| vauban_session::StaticResultColumn {
+                    name: column.name,
+                    ty: column.ty,
+                })
+                .collect(),
+            rows,
+        },
+        ProcAction::Refuse(err) => vauban_session::ProcAction::Refuse(err),
+    }
+}
+
+fn convert_proc_params(params: Vec<ProcParam>) -> Vec<vauban_session::ProcParam> {
+    params
+        .into_iter()
+        .map(|param| vauban_session::ProcParam {
+            name: param.name,
+            ty: param.ty,
+            value: param.value,
+            output: param.output,
+        })
+        .collect()
 }
 
 /// Result type of `SELECT @@VERSION`.
@@ -229,7 +279,7 @@ pub fn register_functions() {
         vauban_sysfn::register(SERVER_PROPERTY_DEF);
         vauban_sysfn::register(DATABASE_PROPERTY_DEF);
         server_functions::register_server_functions();
-        vauban_session::register_system_procedure_dispatcher(dispatch_system_procedure);
+        vauban_session::register_system_procedure_resolver(resolve_for_session);
     });
 }
 

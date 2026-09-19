@@ -121,17 +121,7 @@
 //! in this engine rather than a place in the client's query, so it carries no line at all
 //! (`executor`, `errors.rs`; `an_internal_error_raised_at_run_time_still_carries_no_line`).
 
-use std::sync::{Arc, OnceLock};
-
-use vauban_binder::{BatchVariables, BindContext, BoundStatement, DdlStatement, OutputSchema};
-use vauban_catalog::CatalogSnapshot;
-use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
-use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSink};
-use vauban_parser::{Statement, parse_batch};
-use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
-use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange, Rpc, RpcProc};
-use vauban_txn::IsolationLevel;
-use vauban_types::{TypeInfo, Value};
+use std::sync::Arc;
 
 use crate::cancel::CancelHandle;
 use crate::eval_context::{SessionEvalContext, apply_exec_session};
@@ -142,6 +132,16 @@ use crate::set_options::{SetOutcome, apply_set_statement};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
 use crate::txn_session::{self, StatementTxn};
+use vauban_binder::{
+    BatchVariables, BindContext, BoundExecute, BoundStatement, DdlStatement, OutputSchema,
+};
+use vauban_catalog::CatalogSnapshot;
+use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
+use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSink};
+use vauban_parser::{Statement, parse_batch};
+use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
+use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
+use vauban_txn::IsolationLevel;
 
 /// Number of the generic internal error (`errors`, `InternalError` → `SqlError`): the
 /// binder answers it for each statement that is not implemented yet.
@@ -149,38 +149,6 @@ const INTERNAL_ERROR: u32 = 50000;
 
 /// Default schema of a login, `dbo` until `catalog` knows better.
 const DEFAULT_SCHEMA: &str = "dbo";
-
-/// One column returned by a registered system procedure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SystemProcedureColumn {
-    /// Column name sent in COLMETADATA.
-    pub name: String,
-    /// SQL type, nullability and collation sent in COLMETADATA.
-    pub ty: TypeInfo,
-}
-
-/// Result of a system procedure, independent of TDS and [`ResultSink`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct SystemProcedureResult {
-    /// Metadata of the procedure's single result set.
-    pub columns: Vec<SystemProcedureColumn>,
-    /// Rows of that result set.
-    pub rows: Vec<Vec<Value>>,
-    /// RETURNSTATUS value emitted after the rows.
-    pub return_status: i32,
-}
-
-/// Function registered by `vauban-compat` at process start-up.
-pub type SystemProcedureDispatcher =
-    fn(&str, &[(Option<&str>, &Value)]) -> Option<SystemProcedureResult>;
-
-static SYSTEM_PROCEDURE_DISPATCHER: OnceLock<SystemProcedureDispatcher> = OnceLock::new();
-
-/// Registers the compatibility-layer dispatcher without introducing a `session → compat`
-/// dependency cycle. Repeated registration is harmless, like the function registry.
-pub fn register_system_procedure_dispatcher(dispatcher: SystemProcedureDispatcher) {
-    let _ = SYSTEM_PROCEDURE_DISPATCHER.set(dispatcher);
-}
 
 /// The numbers that come out of `executor::execute` with a line of their own to keep.
 ///
@@ -240,7 +208,7 @@ impl Session {
 }
 
 /// What one statement of a batch decided about the rest of it.
-enum Flow {
+pub(crate) enum Flow {
     /// Go on with the next statement.
     Continue,
     /// Stop the batch here; the DONE has been sent.
@@ -275,6 +243,8 @@ enum PreparedStatement {
         database: String,
         line: u32,
     },
+    /// A bound `EXECUTE`, evaluated at run time without going through the planner.
+    Execute { stmt: BoundExecute, line: u32 },
 }
 
 impl Session {
@@ -459,6 +429,13 @@ impl Session {
                     batch_variables.declare(&declaration.name, declaration.ty.clone())?;
                 }
             }
+            if let BoundStatement::Execute(execute) = bound {
+                prepared.push(PreparedStatement::Execute {
+                    stmt: execute,
+                    line: statement_line(statement),
+                });
+                continue;
+            }
 
             let indexes = StorageIndexes(self.engine.storage.as_ref());
             let physical = vauban_planner::plan(bound, &PlanContext { catalog: &indexes })
@@ -539,6 +516,81 @@ impl Session {
             return self.fall_back(text, error, more, sink);
         }
 
+        if let PreparedStatement::Execute { stmt, line } = prepared {
+            self.exec.identity_updated = false;
+            self.exec.rowcount = 0;
+            let mut adapter = RowSinkAdapter::new(sink);
+            let (result, txn) = self.execute_bound_in_a_transaction(stmt, &mut adapter);
+            let succeeded = result.is_ok();
+            txn_session::finish_statement(
+                &mut self.state,
+                &self.engine,
+                &mut self.exec,
+                txn,
+                txn_session::TxnKind::Other,
+                succeeded,
+                sink,
+            )?;
+            return match result {
+                Ok(ExecOutcome::CallProcedure {
+                    name,
+                    args,
+                    return_into,
+                    line: exec_line,
+                }) => {
+                    let (flow, outcome) = crate::procedures::run_batch_procedure(
+                        self,
+                        &name,
+                        &args,
+                        return_into.as_deref(),
+                        exec_line,
+                        more,
+                        sink,
+                    )?;
+                    if !outcome.failed {
+                        self.state.rowcount = outcome.rowcount;
+                    }
+                    Ok(flow)
+                }
+                Ok(ExecOutcome::RunDynamic {
+                    text,
+                    line: exec_line,
+                }) => {
+                    let (flow, outcome) =
+                        crate::procedures::run_batch_dynamic(self, &text, exec_line, more, sink)?;
+                    if !outcome.failed {
+                        self.state.rowcount = outcome.rowcount;
+                    }
+                    Ok(flow)
+                }
+                Err(err) => {
+                    let err = at_statement(err, *line);
+                    self.state.last_error = err.number;
+                    sink.error(&err)?;
+                    let continues = more
+                        && !self.state.options.xact_abort
+                        && err.number != 0
+                        && err.batch_scope() == BatchErrorScope::Statement;
+                    sink.done(None, continues)?;
+                    self.state.rowcount = self.exec.rowcount;
+                    apply_exec_session(&mut self.state, &self.exec, true, false);
+                    self.exec.identity_updated = false;
+                    Ok(if continues {
+                        Flow::Continue
+                    } else {
+                        Flow::Stop
+                    })
+                }
+                Ok(outcome) => {
+                    let err = SqlError::from(InternalError::Bug(format!(
+                        "run_prepared: execute_bound answered {outcome:?}, which this layer does \
+                         not handle"
+                    )));
+                    self.fail(&err, sink).map(|()| Flow::Stop)
+                }
+            };
+        }
+
         // A `USE` is a `Bound` statement with one thing more: the name its ENVCHANGE and its
         // INFO 5701 carry, resolved against the catalogue while the batch was bound.
         let (bound, line, target) = match prepared {
@@ -548,8 +600,10 @@ impl Session {
                 database,
                 line,
             } => (statement, *line, Some(database.as_str())),
-            PreparedStatement::Set { .. } | PreparedStatement::Fallback { .. } => {
-                unreachable!("SET and fallback were handled above")
+            PreparedStatement::Set { .. }
+            | PreparedStatement::Fallback { .. }
+            | PreparedStatement::Execute { .. } => {
+                unreachable!("SET, fallback and EXECUTE were handled above")
             }
         };
 
@@ -633,12 +687,35 @@ impl Session {
             Ok(ExecOutcome::Cancelled) => Err(SqlError::from(InternalError::Bug(
                 crate::cancel::CANCELLED.to_owned(),
             ))),
-            Ok(
-                outcome @ (ExecOutcome::Break
-                | ExecOutcome::Continue
-                | ExecOutcome::CallProcedure { .. }
-                | ExecOutcome::RunDynamic { .. }),
-            ) => {
+            Ok(ExecOutcome::CallProcedure {
+                name,
+                args,
+                return_into,
+                line,
+            }) => {
+                let (flow, outcome) = crate::procedures::run_batch_procedure(
+                    self,
+                    &name,
+                    &args,
+                    return_into.as_deref(),
+                    line,
+                    more,
+                    sink,
+                )?;
+                if !outcome.failed {
+                    self.state.rowcount = outcome.rowcount;
+                }
+                Ok(flow)
+            }
+            Ok(ExecOutcome::RunDynamic { text, line }) => {
+                let (flow, outcome) =
+                    crate::procedures::run_batch_dynamic(self, &text, line, more, sink)?;
+                if !outcome.failed {
+                    self.state.rowcount = outcome.rowcount;
+                }
+                Ok(flow)
+            }
+            Ok(outcome @ (ExecOutcome::Break | ExecOutcome::Continue)) => {
                 let err = SqlError::from(InternalError::Bug(format!(
                     "run_prepared: the executor answered {outcome:?}, which this layer does \
                      not handle"
@@ -753,6 +830,50 @@ impl Session {
         )
     }
 
+    /// Runs one bound `EXECUTE` in a transaction, like [`execute_in_a_transaction`] but
+    /// without going through the planner.
+    fn execute_bound_in_a_transaction(
+        &mut self,
+        stmt: &BoundExecute,
+        sink: &mut dyn RowSink,
+    ) -> (SqlResult<ExecOutcome>, StatementTxn) {
+        let txn = match txn_session::statement_txn(&self.state, &self.engine, &mut self.exec) {
+            Ok(txn) => txn,
+            Err(err) => return (Err(err), StatementTxn::Skipped),
+        };
+        let handle = match &txn {
+            StatementTxn::Explicit => self
+                .state
+                .txn
+                .as_ref()
+                .map(|session_txn| session_txn.handle.clone()),
+            StatementTxn::Autocommit(handle) => Some(handle.clone()),
+            StatementTxn::Skipped => None,
+        };
+        let Some(handle) = handle else {
+            return (
+                Err(SqlError::from(InternalError::Bug(
+                    "execute_bound_in_a_transaction: the session transaction has no handle"
+                        .to_owned(),
+                ))),
+                txn,
+            );
+        };
+        let snap = self.engine.txn.statement_snapshot(&handle);
+        let eval = SessionEvalContext::deferred(&self.state, &self.engine.catalog, &handle);
+        let token = self.cancel.token();
+        let mut exec_ctx = ExecContext::scalar(&eval, self.state.options.to_binder())
+            .with_engine(self.engine.storage.as_ref(), &self.engine.txn, &snap)
+            .with_catalog(&self.engine.catalog)
+            .with_handle(&handle)
+            .with_cancel(&token)
+            .with_session(&mut self.exec);
+        (
+            vauban_executor::execute_bound(stmt, &mut exec_ctx, sink),
+            txn,
+        )
+    }
+
     /// Sends `err` and the DONE that closes the batch, and records `@@ERROR`.
     ///
     /// The DONE carries no row count and no `MORE`. Run-time execution errors take the
@@ -777,57 +898,6 @@ impl Session {
             Some(false) => Ok(Flow::Stop),
             None => self.fail(err, sink).map(|()| Flow::Stop),
         }
-    }
-
-    /// Runs an RPC ([MS-TDS] 2.2.6.6). Same contract as [`run_batch`](Self::run_batch).
-    ///
-    /// The compatibility dispatcher serves known system procedures. Every other RPC is
-    /// answered with error 2812 then a DONEPROC carrying `DoneStatus::ERROR`. A `ProcID`
-    /// is named after the special procedure it stands for ([MS-TDS] 2.2.6.6, e.g. 10 →
-    /// `sp_executesql`).
-    pub fn run_rpc(&mut self, rpc: &Rpc, sink: &mut dyn ResultSink) -> SqlResult<()> {
-        let name = match &rpc.proc {
-            RpcProc::Name(name) => name.clone(),
-            RpcProc::Id(id) => rpc
-                .proc
-                .well_known_name()
-                .map_or_else(|| id.to_string(), str::to_owned),
-        };
-
-        let params: Vec<_> = rpc
-            .params
-            .iter()
-            .map(|param| {
-                let name = (!param.name.is_empty()).then_some(param.name.as_str());
-                (name, &param.value)
-            })
-            .collect();
-        if let Some(result) = SYSTEM_PROCEDURE_DISPATCHER
-            .get()
-            .and_then(|dispatcher| dispatcher(&name, &params))
-        {
-            let columns: Vec<_> = result
-                .columns
-                .into_iter()
-                .map(|column| ColumnMeta {
-                    flags: ColumnFlags {
-                        nullable: column.ty.nullable,
-                        ..ColumnFlags::default()
-                    },
-                    name: column.name,
-                    ty: column.ty,
-                })
-                .collect();
-            sink.columns(&columns)?;
-            let rowcount = result.rows.len() as u64;
-            for row in &result.rows {
-                sink.row(row)?;
-            }
-            sink.return_status(result.return_status)?;
-            return sink.done(Some(rowcount), false);
-        }
-
-        self.fail(&SqlError::procedure_not_found(&name), sink)
     }
 }
 
@@ -1150,7 +1220,7 @@ mod tests {
     use vauban_parser::ParseOptions;
     use vauban_storage::MemoryStorage;
     use vauban_tds::EnvChange;
-    use vauban_types::{SqlType, TypeInfo};
+    use vauban_types::{SqlType, TypeInfo, Value};
 
     fn parse(text: &str) -> Vec<Statement> {
         parse_batch(text, &ParseOptions::default())
