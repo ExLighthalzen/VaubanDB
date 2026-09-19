@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use vauban_binder::{BoundExpr, BoundExprKind, OutputSchema};
+use vauban_binder::{BoundExpr, BoundExprKind, CompareOp, LogicalOp, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{PhysicalJoinKind, PhysicalPlan};
 use vauban_types::Value;
@@ -227,34 +227,192 @@ impl<'a> Operator<'a> for HashJoin<'a> {
     }
 }
 
-/// Pairs each equality as `(build-side, probe-side)` with indices relative to that row.
-///
-/// The planner keeps the `ON` order `(left, right)` in join coordinates; the build input
-/// is the right operand and the probe input is the left one.
-fn orient_hash_keys(
-    left: &BoundExpr,
-    right: &BoundExpr,
-    left_width: usize,
-) -> (BoundExpr, BoundExpr) {
-    if references_probe_side(left, left_width) && references_build_side(right, left_width) {
-        (remap_for_build_side(right, left_width), left.clone())
-    } else {
-        (remap_for_build_side(left, left_width), right.clone())
+/// Which join inputs a hash-key expression touches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KeySideRefs {
+    probe: bool,
+    build: bool,
+}
+
+impl KeySideRefs {
+    fn probe_only(self) -> bool {
+        self.probe && !self.build
+    }
+
+    fn build_only(self) -> bool {
+        self.build && !self.probe
+    }
+
+    fn neither(self) -> bool {
+        !self.probe && !self.build
+    }
+
+    fn both(self) -> bool {
+        self.probe && self.build
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            probe: self.probe || other.probe,
+            build: self.build || other.build,
+        }
     }
 }
 
-fn references_probe_side(expr: &BoundExpr, left_width: usize) -> bool {
-    matches!(
-        &expr.kind,
-        BoundExprKind::ColumnRef(binding) if binding.index < left_width
-    )
+/// Walks `expr` and records whether it reads probe columns, build columns, or neither.
+fn key_side_refs(expr: &BoundExpr, probe_width: usize) -> KeySideRefs {
+    match &expr.kind {
+        BoundExprKind::ColumnRef(binding) => {
+            if binding.index < probe_width {
+                KeySideRefs {
+                    probe: true,
+                    build: false,
+                }
+            } else {
+                KeySideRefs {
+                    probe: false,
+                    build: true,
+                }
+            }
+        }
+        BoundExprKind::Literal(_) | BoundExprKind::Variable { .. } => KeySideRefs {
+            probe: false,
+            build: false,
+        },
+        BoundExprKind::Negate(inner) | BoundExprKind::BitNot(inner) | BoundExprKind::Not(inner) => {
+            key_side_refs(inner, probe_width)
+        }
+        BoundExprKind::IsNull { expr, .. } => key_side_refs(expr, probe_width),
+        BoundExprKind::Convert { expr, .. } => key_side_refs(expr, probe_width),
+        BoundExprKind::Collate { expr } => key_side_refs(expr, probe_width),
+        BoundExprKind::Arith { left, right, .. } => {
+            key_side_refs(left, probe_width).union(key_side_refs(right, probe_width))
+        }
+        BoundExprKind::Compare { left, right, .. } => {
+            key_side_refs(left, probe_width).union(key_side_refs(right, probe_width))
+        }
+        BoundExprKind::Logical { left, right, .. } => {
+            key_side_refs(left, probe_width).union(key_side_refs(right, probe_width))
+        }
+        BoundExprKind::In { expr, list, .. } => list
+            .iter()
+            .fold(key_side_refs(expr, probe_width), |acc, item| {
+                acc.union(key_side_refs(item, probe_width))
+            }),
+        BoundExprKind::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            let mut refs =
+                key_side_refs(expr, probe_width).union(key_side_refs(pattern, probe_width));
+            if let Some(escape) = escape {
+                refs = refs.union(key_side_refs(escape, probe_width));
+            }
+            refs
+        }
+        BoundExprKind::Case {
+            operand,
+            arms,
+            else_,
+        } => {
+            let mut refs = operand.as_ref().map_or(
+                KeySideRefs {
+                    probe: false,
+                    build: false,
+                },
+                |expr| key_side_refs(expr, probe_width),
+            );
+            for arm in arms {
+                refs = refs
+                    .union(key_side_refs(&arm.when, probe_width))
+                    .union(key_side_refs(&arm.then, probe_width));
+            }
+            if let Some(else_) = else_ {
+                refs = refs.union(key_side_refs(else_, probe_width));
+            }
+            refs
+        }
+        BoundExprKind::Function { args, .. } => args.iter().fold(
+            KeySideRefs {
+                probe: false,
+                build: false,
+            },
+            |acc, arg| acc.union(key_side_refs(arg, probe_width)),
+        ),
+        BoundExprKind::Exists(_) | BoundExprKind::ScalarSubquery(_) => KeySideRefs {
+            probe: false,
+            build: false,
+        },
+        BoundExprKind::InSubquery { expr, .. } => key_side_refs(expr, probe_width),
+    }
 }
 
-fn references_build_side(expr: &BoundExpr, left_width: usize) -> bool {
-    matches!(
-        &expr.kind,
-        BoundExprKind::ColumnRef(binding) if binding.index >= left_width
-    )
+/// Pairs each equality as `(build-side, probe-side)` with indices relative to that row.
+///
+/// The planner keeps the `ON` order `(left, right)` in join coordinates; the build input
+/// is the right operand and the probe input is the left one. A side that references both
+/// inputs, or neither, is not a hash key and stays in the residual predicate.
+fn orient_hash_keys(
+    left: &BoundExpr,
+    right: &BoundExpr,
+    probe_width: usize,
+) -> Option<(BoundExpr, BoundExpr)> {
+    let left_refs = key_side_refs(left, probe_width);
+    let right_refs = key_side_refs(right, probe_width);
+
+    if left_refs.both() || right_refs.both() || left_refs.neither() || right_refs.neither() {
+        return None;
+    }
+
+    if left_refs.probe_only() && right_refs.build_only() {
+        Some((remap_for_build_side(right, probe_width), left.clone()))
+    } else if left_refs.build_only() && right_refs.probe_only() {
+        Some((remap_for_build_side(left, probe_width), right.clone()))
+    } else if left_refs.probe_only() && right_refs.probe_only() {
+        // Unit plans may already carry build-local indices on the left operand.
+        Some((remap_for_build_side(left, probe_width), right.clone()))
+    } else {
+        None
+    }
+}
+
+fn eq_expr(left: BoundExpr, right: BoundExpr, template: &BoundExpr) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+        ty: template.ty.clone(),
+        line: template.line,
+    }
+}
+
+fn and_exprs(left: BoundExpr, right: BoundExpr, template: &BoundExpr) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Logical {
+            op: LogicalOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+        ty: template.ty.clone(),
+        line: template.line,
+    }
+}
+
+fn merge_residual(
+    residual: Option<BoundExpr>,
+    extra: impl IntoIterator<Item = BoundExpr>,
+    template: &BoundExpr,
+) -> Option<BoundExpr> {
+    extra.into_iter().fold(residual, |acc, expr| {
+        Some(match acc {
+            None => expr,
+            Some(existing) => and_exprs(existing, expr, template),
+        })
+    })
 }
 
 fn remap_for_build_side(expr: &BoundExpr, left_width: usize) -> BoundExpr {
@@ -383,18 +541,32 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
     }
 
     let right_width = build.schema().columns.len();
-    let left_width = schema.columns.len() - right_width;
-    let keys = keys
-        .iter()
-        .map(|(left, right)| orient_hash_keys(left, right, left_width))
-        .collect();
+    let probe_width = probe.schema().columns.len();
+    let left_width = probe_width;
+
+    let template = keys
+        .first()
+        .map(|(left, _)| left)
+        .or(residual.as_ref())
+        .expect("HashJoin carries at least one ON conjunct");
+
+    let mut hash_keys = Vec::with_capacity(keys.len());
+    let mut extra_residual = Vec::new();
+    for (left, right) in keys {
+        if let Some(pair) = orient_hash_keys(left, right, probe_width) {
+            hash_keys.push(pair);
+        } else {
+            extra_residual.push(eq_expr(left.clone(), right.clone(), template));
+        }
+    }
+    let residual = merge_residual(residual.clone(), extra_residual, template);
 
     Ok(Box::new(HashJoin {
         build: build_operator(build)?,
         probe: build_operator(probe)?,
         kind: *kind,
-        keys,
-        residual: residual.clone(),
+        keys: hash_keys,
+        residual,
         schema: schema.clone(),
         left_width,
         right_width,

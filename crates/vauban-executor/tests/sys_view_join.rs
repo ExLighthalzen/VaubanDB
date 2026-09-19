@@ -174,3 +174,45 @@ fn join_predicate_reads_session_id_from_each_side() {
         .run(sql)
         .expect("ON predicate should not raise 50000");
 }
+
+#[test]
+fn three_sys_views_join_without_an_index_error() {
+    let sql = "SELECT s.session_id, r.command, c.net_transport \
+               FROM sys.dm_exec_sessions s \
+               LEFT JOIN sys.dm_exec_requests r ON s.session_id = r.session_id \
+               LEFT JOIN sys.dm_exec_connections c ON s.session_id = c.session_id";
+    let count = Fixture::new()
+        .run(sql)
+        .expect("three-way join should succeed");
+    assert!(count >= 1, "expected at least one row, got {count}");
+}
+
+#[test]
+fn join_key_with_an_expression_on_one_side() {
+    let sql = "SELECT s.session_id, r.command FROM sys.dm_exec_sessions s \
+               LEFT JOIN sys.dm_exec_requests r ON s.session_id + 0 = r.session_id";
+    let count = Fixture::new()
+        .run(sql)
+        .expect("expression key should not raise 50000");
+    assert!(count >= 1, "expected at least one row, got {count}");
+}
+
+#[test]
+fn join_key_with_a_constant_on_one_side() {
+    let sql = "SELECT s.session_id, r.command FROM sys.dm_exec_sessions s \
+               LEFT JOIN sys.dm_exec_requests r ON 51 = r.session_id";
+    let count = Fixture::new()
+        .run(sql)
+        .expect("constant key should not raise 50000");
+    assert!(count >= 1, "LEFT JOIN keeps the session row, got {count}");
+}
+
+#[test]
+fn join_key_written_right_to_left() {
+    let sql = "SELECT s.session_id, r.command FROM sys.dm_exec_sessions s \
+               LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id";
+    let count = Fixture::new()
+        .run(sql)
+        .expect("reversed ON should not raise 50000");
+    assert!(count >= 1, "expected at least one row, got {count}");
+}
