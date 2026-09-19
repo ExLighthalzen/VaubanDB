@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use vauban_binder::{BoundExpr, OutputSchema};
+use vauban_binder::{BoundExpr, BoundExprKind, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{PhysicalJoinKind, PhysicalPlan};
 use vauban_types::Value;
@@ -227,6 +227,137 @@ impl<'a> Operator<'a> for HashJoin<'a> {
     }
 }
 
+/// Pairs each equality as `(build-side, probe-side)` with indices relative to that row.
+///
+/// The planner keeps the `ON` order `(left, right)` in join coordinates; the build input
+/// is the right operand and the probe input is the left one.
+fn orient_hash_keys(
+    left: &BoundExpr,
+    right: &BoundExpr,
+    left_width: usize,
+) -> (BoundExpr, BoundExpr) {
+    if references_probe_side(left, left_width) && references_build_side(right, left_width) {
+        (remap_for_build_side(right, left_width), left.clone())
+    } else {
+        (remap_for_build_side(left, left_width), right.clone())
+    }
+}
+
+fn references_probe_side(expr: &BoundExpr, left_width: usize) -> bool {
+    matches!(
+        &expr.kind,
+        BoundExprKind::ColumnRef(binding) if binding.index < left_width
+    )
+}
+
+fn references_build_side(expr: &BoundExpr, left_width: usize) -> bool {
+    matches!(
+        &expr.kind,
+        BoundExprKind::ColumnRef(binding) if binding.index >= left_width
+    )
+}
+
+fn remap_for_build_side(expr: &BoundExpr, left_width: usize) -> BoundExpr {
+    BoundExpr {
+        kind: remap_for_build_side_kind(expr.kind.clone(), left_width),
+        ty: expr.ty.clone(),
+        line: expr.line,
+    }
+}
+
+fn remap_for_build_side_kind(kind: BoundExprKind, left_width: usize) -> BoundExprKind {
+    match kind {
+        BoundExprKind::ColumnRef(mut binding) => {
+            if binding.index >= left_width {
+                binding.index -= left_width;
+            }
+            BoundExprKind::ColumnRef(binding)
+        }
+        BoundExprKind::Negate(inner) => {
+            BoundExprKind::Negate(Box::new(remap_for_build_side(&inner, left_width)))
+        }
+        BoundExprKind::BitNot(inner) => {
+            BoundExprKind::BitNot(Box::new(remap_for_build_side(&inner, left_width)))
+        }
+        BoundExprKind::Not(inner) => {
+            BoundExprKind::Not(Box::new(remap_for_build_side(&inner, left_width)))
+        }
+        BoundExprKind::IsNull { expr, negated } => BoundExprKind::IsNull {
+            expr: Box::new(remap_for_build_side(&expr, left_width)),
+            negated,
+        },
+        BoundExprKind::Convert { expr, style, try_ } => BoundExprKind::Convert {
+            expr: Box::new(remap_for_build_side(&expr, left_width)),
+            style,
+            try_,
+        },
+        BoundExprKind::Collate { expr } => BoundExprKind::Collate {
+            expr: Box::new(remap_for_build_side(&expr, left_width)),
+        },
+        BoundExprKind::Arith { op, left, right } => BoundExprKind::Arith {
+            op,
+            left: Box::new(remap_for_build_side(&left, left_width)),
+            right: Box::new(remap_for_build_side(&right, left_width)),
+        },
+        BoundExprKind::Compare { op, left, right } => BoundExprKind::Compare {
+            op,
+            left: Box::new(remap_for_build_side(&left, left_width)),
+            right: Box::new(remap_for_build_side(&right, left_width)),
+        },
+        BoundExprKind::Logical { op, left, right } => BoundExprKind::Logical {
+            op,
+            left: Box::new(remap_for_build_side(&left, left_width)),
+            right: Box::new(remap_for_build_side(&right, left_width)),
+        },
+        BoundExprKind::In {
+            expr,
+            list,
+            negated,
+        } => BoundExprKind::In {
+            expr: Box::new(remap_for_build_side(&expr, left_width)),
+            list: list
+                .into_iter()
+                .map(|item| remap_for_build_side(&item, left_width))
+                .collect(),
+            negated,
+        },
+        BoundExprKind::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => BoundExprKind::Like {
+            expr: Box::new(remap_for_build_side(&expr, left_width)),
+            pattern: Box::new(remap_for_build_side(&pattern, left_width)),
+            escape: escape.map(|item| Box::new(remap_for_build_side(&item, left_width))),
+            negated,
+        },
+        BoundExprKind::Case {
+            operand,
+            arms,
+            else_,
+        } => BoundExprKind::Case {
+            operand: operand.map(|item| Box::new(remap_for_build_side(&item, left_width))),
+            arms: arms
+                .into_iter()
+                .map(|arm| vauban_binder::BoundCaseArm {
+                    when: remap_for_build_side(&arm.when, left_width),
+                    then: remap_for_build_side(&arm.then, left_width),
+                })
+                .collect(),
+            else_: else_.map(|item| Box::new(remap_for_build_side(&item, left_width))),
+        },
+        BoundExprKind::Function { def, args } => BoundExprKind::Function {
+            def,
+            args: args
+                .into_iter()
+                .map(|arg| remap_for_build_side(&arg, left_width))
+                .collect(),
+        },
+        other => other,
+    }
+}
+
 /// Builds the operator of a [`PhysicalPlan::HashJoin`].
 ///
 /// # Errors
@@ -253,12 +384,16 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
 
     let right_width = build.schema().columns.len();
     let left_width = schema.columns.len() - right_width;
+    let keys = keys
+        .iter()
+        .map(|(left, right)| orient_hash_keys(left, right, left_width))
+        .collect();
 
     Ok(Box::new(HashJoin {
         build: build_operator(build)?,
         probe: build_operator(probe)?,
         kind: *kind,
-        keys: keys.clone(),
+        keys,
         residual: residual.clone(),
         schema: schema.clone(),
         left_width,
