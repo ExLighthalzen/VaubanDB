@@ -70,15 +70,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 use vauban_catalog::Catalog;
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::Storage;
 use vauban_tds::{
-    ClientMessage, DoneStatus, EncryptPolicy, Login7, TdsError, TdsReader, TdsStream, TdsWriter,
-    Token,
+    ClientMessage, DoneStatus, EncryptPolicy, Login7, Rpc, RpcParam, RpcProc, TdsError, TdsReader,
+    TdsStream, TdsWriter, Token,
 };
 use vauban_txn::TransactionManager;
+use vauban_types::{SqlType, TypeInfo, Value, default_display};
 
 use crate::auth::Authenticator;
 use crate::batch::Session;
@@ -420,6 +421,7 @@ async fn run_connection(
     let transaction_engine = Arc::clone(&engine);
     let login_database = state.database.clone();
     let mut session = Session::new(engine, state);
+    let mut request_seq = 0u64;
     loop {
         // `None`: the reader task is gone, which only happens once its message reached us.
         let Some(message) = client_rx.recv().await else {
@@ -431,6 +433,9 @@ async fn run_connection(
                 let descriptor = batch.transaction_descriptor;
                 let text = batch.text;
                 let reset = batch.reset;
+                request_seq += 1;
+                let seq = request_seq;
+                log_received_sql_batch(spid, seq, &text);
                 let login_db = login_database.clone();
                 let engine_for_reset = Arc::clone(&transaction_engine);
                 let text_len = i32::try_from(text.len()).unwrap_or(i32::MAX);
@@ -441,6 +446,8 @@ async fn run_connection(
                     false,
                     None,
                     text_len,
+                    spid,
+                    seq,
                     move |session, sink| {
                         crate::reset::apply_reset(
                             session,
@@ -467,6 +474,9 @@ async fn run_connection(
             ClientMessage::Rpc(rpc) => {
                 let descriptor = rpc.transaction_descriptor;
                 let reset = rpc.reset;
+                request_seq += 1;
+                let seq = request_seq;
+                log_received_rpc(spid, seq, &rpc);
                 let login_db = login_database.clone();
                 let engine_for_reset = Arc::clone(&transaction_engine);
                 let outcome = run_request(
@@ -476,6 +486,8 @@ async fn run_connection(
                     true,
                     None,
                     0,
+                    spid,
+                    seq,
                     move |session, sink| {
                         crate::reset::apply_reset(
                             session,
@@ -508,6 +520,8 @@ async fn run_connection(
             }
             ClientMessage::TransactionManager(request) => {
                 let engine = Arc::clone(&transaction_engine);
+                request_seq += 1;
+                let seq = request_seq;
                 let outcome = run_request(
                     &mut writer,
                     &mut client_rx,
@@ -515,6 +529,8 @@ async fn run_connection(
                     false,
                     Some(CUR_CMD_TRANSACTION_MANAGER),
                     0,
+                    spid,
+                    seq,
                     move |session, sink| {
                         let mut state = session.state().clone();
                         let result = txn_request::handle(&request, &engine, &mut state, sink);
@@ -607,6 +623,7 @@ enum Relayed {
 /// session back — a pool thread cannot be killed, it is asked to stop and awaited. A token
 /// the codec refused ends the response the same way as an internal error, by
 /// [`report_unencodable`], and the connection is kept.
+#[allow(clippy::too_many_arguments)] // relay needs SPID and seq alongside the existing request parameters.
 async fn run_request<F>(
     writer: &mut TdsWriter,
     client_rx: &mut mpsc::Receiver<Result<ClientMessage, TdsError>>,
@@ -614,6 +631,8 @@ async fn run_request<F>(
     rpc: bool,
     done_cur_cmd: Option<u16>,
     sql_text_len: i32,
+    spid: i16,
+    seq: u64,
     run: F,
 ) -> Result<RequestOutcome, TdsError>
 where
@@ -624,7 +643,6 @@ where
     let cancel = session.cancel_handle();
     cancel.reset();
     let engine = Arc::clone(session.engine());
-    let spid = session.state().spid;
     let database = session.state().database.clone();
     let handle = spawn_blocking(move || {
         let mut sink = if rpc {
@@ -649,7 +667,7 @@ where
         (session, result)
     });
 
-    let relayed = relay(writer, &mut rx, client_rx, &cancel, done_cur_cmd).await;
+    let relayed = relay(writer, &mut rx, client_rx, &cancel, done_cur_cmd, spid, seq).await;
     // The relay left the channel empty and closed: whatever happens next, no `blocking_send`
     // is holding a pool thread and the request task is on its way out.
     drop(rx);
@@ -718,11 +736,16 @@ async fn relay(
     client_rx: &mut mpsc::Receiver<Result<ClientMessage, TdsError>>,
     cancel: &CancelHandle,
     done_cur_cmd: Option<u16>,
+    spid: i16,
+    seq: u64,
 ) -> Relayed {
     loop {
         tokio::select! {
             token = rx.recv() => match token {
                 Some(mut token) => {
+                    if let Token::Error(ref err) = token {
+                        log_rendered_client_error(spid, seq, err);
+                    }
                     if let (
                         Some(cur_cmd_override),
                         Token::Done {
@@ -958,6 +981,83 @@ fn resolve_login_database(engine: &Engine, requested: &str) -> Option<String> {
         warn!(error = %err, "the transaction that read the catalogue at login did not commit");
     }
     found
+}
+
+/// Writes the text of a SQL batch at `debug`, with the connection SPID and the request
+/// sequence number of this connection.
+fn log_received_sql_batch(spid: i16, seq: u64, text: &str) {
+    debug!(spid, seq, text, "SQL batch received");
+}
+
+/// Writes an RPC at `debug`, with enough detail to replay it as a T-SQL `EXEC`.
+fn log_received_rpc(spid: i16, seq: u64, rpc: &Rpc) {
+    debug!(spid, seq, text = format_received_rpc(rpc), "RPC received");
+}
+
+/// Writes a client-visible error at `debug`, tied to the request that raised it.
+fn log_rendered_client_error(spid: i16, seq: u64, err: &SqlError) {
+    debug!(
+        spid,
+        seq,
+        error = err.number,
+        severity = err.severity,
+        state = err.state,
+        line = err.line,
+        procedure = err.procedure.as_deref().unwrap_or(""),
+        message = %err.message,
+        "client error rendered"
+    );
+}
+
+/// Rebuilds an RPC as a T-SQL `EXEC` line, for replay in a script.
+fn format_received_rpc(rpc: &Rpc) -> String {
+    let proc_name = match &rpc.proc {
+        RpcProc::Name(name) => name.clone(),
+        RpcProc::Id(id) => rpc
+            .proc
+            .well_known_name()
+            .map_or_else(|| id.to_string(), str::to_owned),
+    };
+    let args: Vec<String> = rpc.params.iter().map(format_rpc_argument).collect();
+    if args.is_empty() {
+        format!("EXEC {proc_name}")
+    } else {
+        format!("EXEC {proc_name} {}", args.join(", "))
+    }
+}
+
+/// One argument of an RPC in replay form.
+fn format_rpc_argument(param: &RpcParam) -> String {
+    let value = format_rpc_param_value(&param.ty, &param.value);
+    if param.name.is_empty() || param.name == "stmt" || param.name == "params" {
+        return value;
+    }
+    let name = if param.name.starts_with('@') {
+        param.name.clone()
+    } else {
+        format!("@{}", param.name)
+    };
+    if param.output {
+        format!("{name} = {value} OUTPUT")
+    } else {
+        format!("{name} = {value}")
+    }
+}
+
+/// Literal form of one RPC parameter value.
+fn format_rpc_param_value(ty: &TypeInfo, value: &Value) -> String {
+    if matches!(value, Value::Null) {
+        return "NULL".to_owned();
+    }
+    if let Value::String(s) = value {
+        let escaped = s.text.replace('\'', "''");
+        return if matches!(ty.ty, SqlType::NVarChar(_) | SqlType::NChar(_)) {
+            format!("N'{escaped}'")
+        } else {
+            format!("'{escaped}'")
+        };
+    }
+    default_display(value, ty)
 }
 
 /// Name of a client message for the log ([MS-TDS] 2.2.3.1.1 packet types).
@@ -1396,5 +1496,187 @@ mod tests {
         assert_eq!(server.next_spid(), 32766);
         assert_eq!(server.next_spid(), 32767);
         assert_eq!(server.next_spid(), 51);
+    }
+
+    #[test]
+    fn debug_logs_sql_batch_text_with_spid_and_sequence() {
+        let lines = collect_logs("debug", || {
+            log_received_sql_batch(51, 1, "SELECT 1");
+            log_received_sql_batch(51, 2, "SELECT 2");
+        });
+        assert!(lines[0].contains("text=\"SELECT 1\""));
+        assert!(lines[0].contains("spid=51"));
+        assert!(lines[0].contains("seq=1"));
+        assert!(lines[1].contains("text=\"SELECT 2\""));
+        assert!(lines[1].contains("seq=2"));
+    }
+
+    #[test]
+    fn debug_logs_batch_text_and_client_error_on_the_same_request() {
+        let err = SqlError::incorrect_syntax_near("SELEC", 1);
+        let lines = collect_logs("debug", || {
+            log_received_sql_batch(52, 3, "SELECT 1; SELEC 1");
+            log_rendered_client_error(52, 3, &err);
+        });
+        assert!(lines[0].contains("text=\"SELECT 1; SELEC 1\""));
+        assert!(lines[1].contains("error=102"));
+        assert!(lines[0].contains("spid=52"));
+        assert!(lines[1].contains("spid=52"));
+        assert!(lines[0].contains("seq=3"));
+        assert!(lines[1].contains("seq=3"));
+    }
+
+    #[test]
+    fn debug_logs_rpc_text_for_replay() {
+        use vauban_tds::{ResetConnection, Rpc, RpcParam, RpcProc};
+        use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+
+        let nvarchar = |text: &str| Value::String(SqlString { text: text.into() });
+        let rpc = Rpc {
+            proc: RpcProc::SP_EXECUTESQL,
+            options: 0,
+            transaction_descriptor: 0,
+            reset: ResetConnection::None,
+            params: vec![RpcParam {
+                name: String::new(),
+                output: false,
+                default: false,
+                ty: TypeInfo::new(SqlType::NVarChar(Len::Max), false),
+                value: nvarchar("SELECT 1"),
+            }],
+        };
+        let lines = collect_logs("debug", || log_received_rpc(53, 1, &rpc));
+        assert!(lines[0].contains("spid=53"));
+        assert!(lines[0].contains("seq=1"));
+        assert!(lines[0].contains("EXEC sp_executesql"));
+        assert!(lines[0].contains("SELECT 1"));
+    }
+
+    #[test]
+    fn info_level_leaves_request_logs_silent() {
+        use vauban_tds::{ResetConnection, Rpc, RpcProc};
+
+        let lines = collect_logs("info", || {
+            log_received_sql_batch(54, 1, "SELECT 1");
+            log_received_rpc(
+                54,
+                1,
+                &Rpc {
+                    proc: RpcProc::Name("sp_help".into()),
+                    options: 0,
+                    transaction_descriptor: 0,
+                    reset: ResetConnection::None,
+                    params: Vec::new(),
+                },
+            );
+            log_rendered_client_error(54, 1, &SqlError::incorrect_syntax_near("x", 1));
+        });
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    fn collect_logs(level: &str, emit: impl FnOnce()) -> Vec<String> {
+        use std::fmt::Write as _;
+        use std::sync::{Arc, Mutex};
+
+        use tracing::Subscriber;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Default)]
+        struct Fields {
+            text: String,
+        }
+
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if !self.text.is_empty() {
+                    self.text.push(' ');
+                }
+                let _ = write!(self.text, "{}={value:?}", field.name());
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if !self.text.is_empty() {
+                    self.text.push(' ');
+                }
+                let _ = write!(self.text, "{}={value:?}", field.name());
+            }
+        }
+
+        struct LogCollector {
+            lines: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl<S> Layer<S> for LogCollector
+        where
+            S: Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.lines.lock().unwrap().push(format!(
+                    "{} {}",
+                    event.metadata().name(),
+                    fields.text
+                ));
+            }
+        }
+
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(format!("vauban_session={level}")))
+            .with(LogCollector {
+                lines: Arc::clone(&lines),
+            });
+        tracing::subscriber::with_default(subscriber, emit);
+        Arc::try_unwrap(lines)
+            .expect("no stray collector handles")
+            .into_inner()
+            .unwrap()
+    }
+
+    #[test]
+    fn format_received_rpc_replays_sp_executesql() {
+        use vauban_tds::{ResetConnection, Rpc, RpcParam, RpcProc};
+        use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+
+        let nvarchar = |text: &str| Value::String(SqlString { text: text.into() });
+        let rpc = Rpc {
+            proc: RpcProc::SP_EXECUTESQL,
+            options: 0,
+            transaction_descriptor: 0,
+            reset: ResetConnection::None,
+            params: vec![
+                RpcParam {
+                    name: "stmt".into(),
+                    output: false,
+                    default: false,
+                    ty: TypeInfo::new(SqlType::NVarChar(Len::Max), false),
+                    value: nvarchar("SELECT @p"),
+                },
+                RpcParam {
+                    name: "params".into(),
+                    output: false,
+                    default: false,
+                    ty: TypeInfo::new(SqlType::NVarChar(Len::Max), false),
+                    value: nvarchar("@p int"),
+                },
+                RpcParam {
+                    name: "@p".into(),
+                    output: false,
+                    default: false,
+                    ty: TypeInfo::new(SqlType::Int, false),
+                    value: Value::I32(1),
+                },
+            ],
+        };
+        assert_eq!(
+            format_received_rpc(&rpc),
+            "EXEC sp_executesql N'SELECT @p', N'@p int', @p = 1"
+        );
     }
 }
