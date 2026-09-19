@@ -195,17 +195,21 @@ impl Session {
             {
                 break;
             }
-            if catalog_changed(current, &batch.statements[index + 1..])
-                && index + 1 < batch.statements.len()
-            {
+            let tail_start = index + 1;
+            if crate::batch::should_reprepare_tail(
+                tail_start,
+                prepared.len(),
+                batch.statements.len(),
+                catalog_changed(current, &batch.statements[tail_start..]),
+            ) {
                 let tail = self.reprepare_nested_tail(
                     text,
-                    &batch.statements[index + 1..],
+                    &batch.statements[tail_start..],
                     params,
                     &mut bind_state,
                     &mut batch_variables,
                 )?;
-                prepared.truncate(index + 1);
+                prepared.truncate(tail_start);
                 prepared.extend(tail);
             }
             index += 1;
@@ -1201,5 +1205,105 @@ fn statement_span(stmt: &Statement) -> vauban_parser::Span {
         | Statement::Throw { span, .. }
         | Statement::Goto { span, .. }
         | Statement::Label { span, .. } => *span,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vauban_errors::{InfoMessage, SqlError, SqlResult};
+    use vauban_storage::MemoryStorage;
+    use vauban_tds::{ColumnMeta, EnvChange};
+    use vauban_txn::IsolationLevel;
+    use vauban_types::{TypeInfo, Value};
+
+    use crate::state::SessionState;
+    use crate::{Engine, ResultSink, Session};
+
+    const SPID: i16 = 84;
+
+    #[derive(Default)]
+    struct Recording {
+        rows: Vec<Vec<Value>>,
+        errors: Vec<SqlError>,
+    }
+
+    impl ResultSink for Recording {
+        fn columns(&mut self, _cols: &[ColumnMeta]) -> SqlResult<()> {
+            Ok(())
+        }
+        fn row(&mut self, row: &[Value]) -> SqlResult<()> {
+            self.rows.push(row.to_vec());
+            Ok(())
+        }
+        fn done(&mut self, _rowcount: Option<u64>, _more: bool) -> SqlResult<()> {
+            Ok(())
+        }
+        fn done_in_proc(&mut self, _rowcount: Option<u64>, _more: bool) -> SqlResult<()> {
+            Ok(())
+        }
+        fn done_proc(&mut self, _rowcount: Option<u64>) -> SqlResult<()> {
+            Ok(())
+        }
+        fn info(&mut self, _msg: &InfoMessage) -> SqlResult<()> {
+            Ok(())
+        }
+        fn error(&mut self, err: &SqlError) -> SqlResult<()> {
+            self.errors.push(err.clone());
+            Ok(())
+        }
+        fn env_change(&mut self, _change: &EnvChange) -> SqlResult<()> {
+            Ok(())
+        }
+        fn return_value(&mut self, _name: &str, _ty: &TypeInfo, _value: &Value) -> SqlResult<()> {
+            Ok(())
+        }
+        fn return_status(&mut self, _status: i32) -> SqlResult<()> {
+            Ok(())
+        }
+    }
+
+    fn engine() -> Arc<Engine> {
+        Arc::new(Engine::new(Arc::new(MemoryStorage::new())))
+    }
+
+    fn session(engine: &Arc<Engine>) -> Session {
+        vauban_sysfn::register_builtins();
+        Session::new(Arc::clone(engine), SessionState::new(SPID))
+    }
+
+    /// The body of `EXEC sp_executesql N'SELECT 1; CREATE TABLE t …; ALTER TABLE t ADD c int;'`
+    /// creates the table and adds the column (`nested_select_create_alter_runs_all_statements`).
+    #[test]
+    fn nested_select_create_alter_runs_all_statements() {
+        let engine = engine();
+        let mut session = session(&engine);
+        let mut sink = Recording::default();
+        let outcome = session
+            .run_nested(
+                "SELECT 1; CREATE TABLE t (id int); ALTER TABLE t ADD c int;",
+                &[],
+                &mut sink,
+            )
+            .expect("nested completes");
+        assert!(!outcome.failed, "{:?}", sink.errors);
+        assert_eq!(
+            sink.rows.first().and_then(|row| match row.first() {
+                Some(Value::I32(n)) => Some(*n),
+                _ => None,
+            }),
+            Some(1)
+        );
+        let handle = engine.txn.begin(IsolationLevel::ReadCommitted);
+        let snapshot = engine.catalog.snapshot(&handle);
+        let object = snapshot
+            .resolve_object("master", Some("dbo"), "t", "dbo")
+            .expect("the table was created");
+        assert_eq!(
+            snapshot.table(object.id).expect("table meta").columns.len(),
+            2
+        );
+        engine.txn.commit(handle).expect("commit");
     }
 }

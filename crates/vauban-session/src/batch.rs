@@ -315,10 +315,12 @@ impl Session {
                 break;
             }
             let tail_start = index + 1;
-            if tail_start < batch.statements.len()
-                && (catalog_changed(current, &batch.statements[tail_start..])
-                    || tail_start >= prepared.len())
-            {
+            if should_reprepare_tail(
+                tail_start,
+                prepared.len(),
+                batch.statements.len(),
+                catalog_changed(current, &batch.statements[tail_start..]),
+            ) {
                 let tail = self.reprepare_tail(
                     text,
                     &batch.statements[tail_start..],
@@ -962,6 +964,19 @@ pub(crate) fn batch_has_alter_table(statements: &[Statement]) -> bool {
 /// the tail is prepared one statement at a time when the batch holds an `ALTER TABLE`.
 pub(crate) fn bind_limit_for(statements: &[Statement]) -> Option<usize> {
     batch_has_alter_table(statements).then_some(1)
+}
+
+/// Whether binding should resume on the statements after index `tail_start`.
+///
+/// The bind limit says how many statements to bind at once; it does not decide whether
+/// binding continues when fewer were prepared than remain in the text.
+pub(crate) fn should_reprepare_tail(
+    tail_start: usize,
+    prepared_len: usize,
+    statements_len: usize,
+    catalog_changed: bool,
+) -> bool {
+    tail_start < statements_len && (catalog_changed || tail_start >= prepared_len)
 }
 
 /// Whether the batch tail must be rebound after this statement ran.
