@@ -5,8 +5,7 @@
 //! The copy includes rows visible to the current transaction; uncommitted writes from
 //! other sessions fall outside that snapshot until a schema lock serializes readers.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeSet;
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{BinaryOp, Expr, InList, Literal};
@@ -21,44 +20,23 @@ use crate::index;
 use crate::meta::{ColumnMeta, ConstraintMeta, QualifiedName, TableMeta};
 use crate::table::{self, TableStore};
 
-/// Key for [`column_id_watermarks`]: one catalogue instance and one table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct WatermarkKey {
-    catalogue: usize,
-    table: ObjectId,
-}
-
-/// Highest `column_id` handed out per table, including ids of columns since dropped
-/// (`tests/alter.rs`, `drop_last_column_then_add_uses_high_water`).
-fn column_id_watermarks() -> &'static Mutex<BTreeMap<WatermarkKey, i32>> {
-    static WATERMARKS: Mutex<BTreeMap<WatermarkKey, i32>> = Mutex::new(BTreeMap::new());
-    &WATERMARKS
-}
-
-fn watermark_key(catalog: &Catalog, table: ObjectId) -> WatermarkKey {
-    WatermarkKey {
-        catalogue: Arc::as_ptr(&catalog.storage) as *const () as usize,
-        table,
-    }
-}
-
-/// The highest `column_id` already used on `table`, live or dropped.
-fn max_column_id_used(catalog: &Catalog, table: ObjectId, columns: &[ColumnMeta]) -> i32 {
-    let live_max = columns.iter().map(|column| column.id.0).max().unwrap_or(0);
-    column_id_watermarks()
-        .lock()
-        .expect("column_id watermarks mutex")
-        .get(&watermark_key(catalog, table))
-        .copied()
-        .unwrap_or(0)
+/// The highest `column_id` already used on the table, live or dropped.
+///
+/// The watermark of the entry outlives the columns it counted, so an `ADD COLUMN` after a
+/// `DROP COLUMN` does not hand the freed id out again (`tests/alter.rs`,
+/// `drop_last_column_then_add_uses_high_water`).
+fn max_column_id_used(store: &TableStore, table: &TableMeta) -> i32 {
+    let live_max = table
+        .columns
+        .iter()
+        .map(|column| column.id.0)
+        .max()
+        .unwrap_or(0);
+    store
+        .entries
+        .get(&table.id)
+        .map_or(0, |entry| entry.column_id_watermark)
         .max(live_max)
-}
-
-fn set_max_column_id_used(catalog: &Catalog, table: ObjectId, value: i32) {
-    column_id_watermarks()
-        .lock()
-        .expect("column_id watermarks mutex")
-        .insert(watermark_key(catalog, table), value);
 }
 
 /// What one `ALTER TABLE` builds before the copy.
@@ -68,6 +46,8 @@ struct AlterPlan {
     preserved: Vec<ConstraintMeta>,
     add: Vec<ConstraintDef>,
     statement_indexes: Vec<IndexDef>,
+    /// Watermark the entry carries once the change is applied, see [`max_column_id_used`].
+    column_id_watermark: i32,
 }
 
 /// Applies `change` to `table`. See [`Catalog::alter_table`].
@@ -121,6 +101,7 @@ pub(crate) fn alter_table(
             entry.previous_meta = Some(old.clone());
             entry.meta = meta.clone();
             entry.dropped_by = None;
+            entry.column_id_watermark = plan.column_id_watermark;
         }
         prune_constraint_objects(&mut store, &meta);
     }
@@ -264,6 +245,7 @@ fn plan_change(
     let (mut keys, preserved) = split_constraints(store, old)?;
     let statement_indexes = statement_index_defs(store, old);
     let add = Vec::new();
+    let mut column_id_watermark = max_column_id_used(store, old);
     let columns = match change {
         AlterTable::AddColumn { column } => {
             refuse_duplicate_column(old, &column.name)?;
@@ -285,8 +267,8 @@ fn plan_change(
                     old.name
                 ))
             })?;
-            let next = max_column_id_used(catalog, old.id, &old.columns) + 1;
-            set_max_column_id_used(catalog, old.id, next);
+            let next = column_id_watermark + 1;
+            column_id_watermark = next;
             columns.push(ColumnMeta {
                 id: ColumnId(next),
                 name: column.name.clone(),
@@ -307,11 +289,7 @@ fn plan_change(
                 return Err(SqlError::column_does_not_exist_in_target(name));
             };
             refuse_drop_column_used(store, old, target)?;
-            set_max_column_id_used(
-                catalog,
-                old.id,
-                max_column_id_used(catalog, old.id, &old.columns).max(target.id.0),
-            );
+            column_id_watermark = column_id_watermark.max(target.id.0);
             let mut columns = Vec::new();
             for (position, column) in old
                 .columns
@@ -341,6 +319,7 @@ fn plan_change(
                 preserved,
                 add,
                 statement_indexes,
+                column_id_watermark,
             });
         }
         AlterTable::AddConstraint { constraint } => {
@@ -369,6 +348,7 @@ fn plan_change(
                     preserved,
                     add,
                     statement_indexes,
+                    column_id_watermark,
                 });
             }
             let Some(object) = store.constraints.entries.values().find(|object| {
@@ -405,6 +385,7 @@ fn plan_change(
                 preserved,
                 add,
                 statement_indexes,
+                column_id_watermark,
             });
         }
     };
@@ -414,6 +395,7 @@ fn plan_change(
         preserved,
         add,
         statement_indexes,
+        column_id_watermark,
     })
 }
 

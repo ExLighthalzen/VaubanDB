@@ -416,6 +416,73 @@ fn drop_last_of_three_then_add_uses_high_water() {
     txn.commit(handle).expect("commit");
 }
 
+/// The high water mark belongs to the table of one catalogue: a later catalogue numbers the
+/// columns of its own table from its own history, whatever the first one dropped.
+#[test]
+fn the_high_water_of_a_closed_catalogue_does_not_number_the_next_one() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(
+            &handle,
+            &table(
+                "t",
+                vec![
+                    column("a", SqlType::Int, false),
+                    column("b", SqlType::Int, false),
+                    column("c", SqlType::Int, false),
+                ],
+            ),
+        )
+        .expect("create_table");
+    let without_c = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::DropColumn {
+                name: "c".to_owned(),
+            },
+        )
+        .expect("drop c");
+    catalog
+        .alter_table(
+            &handle,
+            without_c.id,
+            &AlterTable::AddColumn {
+                column: Box::new(column("d", SqlType::Int, true)),
+            },
+        )
+        .expect("add d");
+    txn.commit(handle).expect("commit");
+    drop((catalog, _storage, txn));
+
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &two_int_columns("t"))
+        .expect("create_table");
+    let without_b = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::DropColumn {
+                name: "b".to_owned(),
+            },
+        )
+        .expect("drop b");
+    let with_d = catalog
+        .alter_table(
+            &handle,
+            without_b.id,
+            &AlterTable::AddColumn {
+                column: Box::new(column("d", SqlType::Int, true)),
+            },
+        )
+        .expect("add d");
+    assert_eq!(with_d.columns[1].id.0, 3);
+    txn.commit(handle).expect("commit");
+}
+
 #[test]
 fn add_after_drop_does_not_reuse_freed_column_id() {
     let (catalog, _storage, txn) = instance();

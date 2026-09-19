@@ -206,6 +206,11 @@ pub(crate) struct TableEntry {
     /// closed without the drop taking effect, which is what a rolled-back `DROP TABLE` looks
     /// like from here (`tests/table.rs`, `a_rolled_back_drop_leaves_the_table_droppable`).
     pub(crate) dropped_by: Option<TxnId>,
+    /// Highest `column_id` handed out on the table, including the ids of columns since
+    /// dropped: an `ADD COLUMN` takes the next one rather than a freed one (`alter.rs`,
+    /// `tests/alter.rs`, `drop_last_column_then_add_uses_high_water`). `alter.rs` owns the
+    /// accesses to it; it sits here so that it dies with the table it counts for.
+    pub(crate) column_id_watermark: i32,
 }
 
 /// Creates a table. See [`Catalog::create_table`].
@@ -332,6 +337,12 @@ pub(crate) fn create_table(
     store.entries.insert(
         id,
         TableEntry {
+            column_id_watermark: meta
+                .columns
+                .iter()
+                .map(|column| column.id.0)
+                .max()
+                .unwrap_or(0),
             meta: meta.clone(),
             previous_meta: None,
             dropped_by: None,

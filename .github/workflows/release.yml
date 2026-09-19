@@ -29,7 +29,7 @@ jobs:
       publish: ${{ steps.meta.outputs.publish }}
       image: ${{ steps.meta.outputs.image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Resolve version, tag and destination
         id: meta
         run: |
@@ -96,7 +96,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -198,7 +198,7 @@ jobs:
       # image does not ship. The crate carries prebuilt objects for x86_64.
       AWS_LC_SYS_PREBUILT_NASM: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -230,7 +230,7 @@ jobs:
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Archives only: the *.dockerbuild artifacts of build-push-action made the download
       # fail "after 5 attempts" in the v0.0.2 run.
       - uses: actions/download-artifact@v4

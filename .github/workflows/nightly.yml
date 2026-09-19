@@ -44,7 +44,7 @@ jobs:
       image: ${{ steps.meta.outputs.image }}
       previous: ${{ steps.meta.outputs.previous }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
       - name: Compare main with the last nightly
@@ -89,7 +89,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
       - uses: dtolnay/rust-toolchain@stable
@@ -191,7 +191,7 @@ jobs:
       # image does not ship. The crate carries prebuilt objects for x86_64.
       AWS_LC_SYS_PREBUILT_NASM: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
       - uses: dtolnay/rust-toolchain@stable
@@ -225,7 +225,7 @@ jobs:
     needs: [prepare, build, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
           fetch-depth: 0
