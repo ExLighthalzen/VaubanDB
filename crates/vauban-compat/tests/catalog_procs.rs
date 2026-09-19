@@ -139,6 +139,30 @@ impl ResultSink for Recording {
 }
 
 #[test]
+fn batch_exec_sp_columns_returns_rows() {
+    vauban_sysfn::register_builtins();
+    register_functions();
+    let mut session = Session::new(
+        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        SessionState::new(91),
+    );
+    let mut sink = Recording::default();
+    session
+        .run_batch(
+            "CREATE TABLE dbo.t (id int NOT NULL); EXEC sys.sp_columns @table_name = 't';",
+            &mut sink,
+        )
+        .expect("batch completes");
+    assert!(
+        sink.errors.is_empty(),
+        "errors: {:?}",
+        sink.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    assert_eq!(sink.columns, 1);
+    assert_eq!(sink.rows, 1);
+}
+
+#[test]
 fn batch_exec_sp_server_info_returns_rows() {
     vauban_sysfn::register_builtins();
     register_functions();
