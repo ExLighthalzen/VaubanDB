@@ -18,6 +18,7 @@
 //! | `dm_exec.rs` | `sys.dm_exec_sessions`, `sys.dm_exec_connections`, `sys.dm_exec_requests`, `sys.configurations`, `sys.dm_os_sys_info` |
 //! | `sys_routines.rs` | `sys.procedures`, `sql_modules`, `sys.parameters` |
 //! | `sys_object_kinds.rs` | `sys.triggers`, `sys.synonyms`, `sys.sequences`, `sys.table_types` |
+//! | `info_schema_constraints.rs` | `INFORMATION_SCHEMA.TABLE_CONSTRAINTS`, `KEY_COLUMN_USAGE`, `REFERENTIAL_CONSTRAINTS`, `VIEWS` |
 
 use crate::def::InternalTableDef;
 
@@ -27,6 +28,7 @@ use crate::def::InternalTableDef;
 pub(crate) mod dm_exec;
 #[allow(dead_code)]
 pub(crate) mod info_schema;
+pub(crate) mod info_schema_constraints;
 #[allow(dead_code)]
 pub(crate) mod sys_constraints;
 pub(crate) mod sys_core;
@@ -62,6 +64,7 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
         dm_exec::internal_tables(),
         sys_routines::internal_tables(),
         sys_object_kinds::internal_tables(),
+        info_schema_constraints::internal_tables(),
     ]
     .into_iter()
     .flatten()

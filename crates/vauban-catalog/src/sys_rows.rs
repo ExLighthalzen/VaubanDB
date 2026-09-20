@@ -52,7 +52,9 @@ use crate::catalog::Catalog;
 use crate::ids::ObjectId;
 use crate::index::IndexStore;
 use crate::meta::{ObjectMeta, TableMeta};
-use crate::views::{info_schema, sys_constraints, sys_extra, sys_indexes, sys_tables};
+use crate::views::{
+    info_schema, info_schema_constraints, sys_constraints, sys_extra, sys_indexes, sys_tables,
+};
 
 /// How a row of an internal table names the table it describes, which is what tells the rows
 /// to delete from the rows of the other tables of the instance.
@@ -157,7 +159,7 @@ fn constraint_names_for(
 ///
 /// The list is the one both [`write`] and [`remove`] walk: a table added here is written at
 /// `CREATE` and removed at `DROP` by that single edit (unit test
-/// `every_internal_table_of_the_list_is_one_the_bootstrap_created` checks the twelve names
+/// `every_internal_table_of_the_list_is_one_the_bootstrap_created` checks the seventeen names
 /// against `bootstrap::internal_table_defs`).
 ///
 /// # Errors
@@ -291,6 +293,40 @@ fn rows_of(
                 sys_constraints::foreign_key_columns_columns::PARENT_OBJECT_ID,
             ),
             rows: sys_constraints::foreign_key_column_rows(one)?,
+        },
+        Rows {
+            name: info_schema_constraints::TABLE_CONSTRAINTS_TABLE,
+            owner: Owner::Named(
+                info_schema_constraints::table_constraints_columns::DATABASE_ID,
+                info_schema_constraints::table_constraints_columns::TABLE_SCHEMA,
+                info_schema_constraints::table_constraints_columns::TABLE_NAME,
+            ),
+            rows: info_schema_constraints::table_constraint_rows(one, indexes, constraint_names)?,
+        },
+        Rows {
+            name: info_schema_constraints::KEY_COLUMN_USAGE_TABLE,
+            owner: Owner::Named(
+                info_schema_constraints::key_column_usage_columns::DATABASE_ID,
+                info_schema_constraints::key_column_usage_columns::TABLE_SCHEMA,
+                info_schema_constraints::key_column_usage_columns::TABLE_NAME,
+            ),
+            rows: info_schema_constraints::key_column_usage_rows(one, indexes, constraint_names)?,
+        },
+        Rows {
+            name: info_schema_constraints::REFERENTIAL_CONSTRAINTS_TABLE,
+            // The view names no `table_schema` / `table_name` column (module documentation of
+            // `views/info_schema_constraints.rs`), so the two positions here are the hidden
+            // columns that file carries for this alone.
+            owner: Owner::Named(
+                info_schema_constraints::referential_constraints_columns::DATABASE_ID,
+                info_schema_constraints::referential_constraints_columns::TABLE_SCHEMA,
+                info_schema_constraints::referential_constraints_columns::TABLE_NAME,
+            ),
+            rows: info_schema_constraints::referential_constraint_rows(
+                one,
+                indexes,
+                constraint_names,
+            )?,
         },
     ])
 }
@@ -434,7 +470,7 @@ fn object_create_date(
 }
 
 /// Internal tables that carry a `database_id` column and the position of that column.
-const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 16] = [
+const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 19] = [
     (DATABASES_TABLE, databases_columns::DATABASE_ID),
     (SCHEMAS_TABLE, schemas_columns::DATABASE_ID),
     (
@@ -492,6 +528,18 @@ const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 16] = [
     (
         sys_constraints::FOREIGN_KEY_COLUMNS_TABLE,
         sys_constraints::foreign_key_columns_columns::DATABASE_ID,
+    ),
+    (
+        info_schema_constraints::TABLE_CONSTRAINTS_TABLE,
+        info_schema_constraints::table_constraints_columns::DATABASE_ID,
+    ),
+    (
+        info_schema_constraints::KEY_COLUMN_USAGE_TABLE,
+        info_schema_constraints::key_column_usage_columns::DATABASE_ID,
+    ),
+    (
+        info_schema_constraints::REFERENTIAL_CONSTRAINTS_TABLE,
+        info_schema_constraints::referential_constraints_columns::DATABASE_ID,
     ),
 ];
 
@@ -664,8 +712,11 @@ mod tests {
             sys_extra::ALLOCATION_UNITS_TABLE,
             sys_constraints::FOREIGN_KEYS_TABLE,
             sys_constraints::FOREIGN_KEY_COLUMNS_TABLE,
+            info_schema_constraints::TABLE_CONSTRAINTS_TABLE,
+            info_schema_constraints::KEY_COLUMN_USAGE_TABLE,
+            info_schema_constraints::REFERENTIAL_CONSTRAINTS_TABLE,
         ];
-        assert_eq!(listed.len(), 14, "the fourteen tables of the module list");
+        assert_eq!(listed.len(), 17, "the seventeen tables of the module list");
         for name in listed {
             assert!(
                 described.contains(&name.to_owned()),

@@ -569,10 +569,10 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
 /// `sys_extra.rs`, in the order `views::internal_tables()` lists them, then the two views of
 /// the tables of the bootstrap (`views::sys_core::bootstrap_views`, which `bootstrap.rs` reads
 /// too), then the eight of `sys_extra.rs`, then the five of `dm_exec.rs`, then the four of
-/// `sys_object_kinds.rs`. A file that describes no view adds nothing here, so
-/// the vector grows with the files of `views/` — and so do the identifiers of the views that
-/// follow the new ones (module documentation, section "The identifiers of the system views
-/// are the rows of `sys.all_objects`").
+/// `sys_object_kinds.rs`, then the four of `info_schema_constraints.rs`. A file that describes
+/// no view adds nothing here, so the vector grows with the files of `views/` — and so do the
+/// identifiers of the views that follow the new ones (module documentation, section "The
+/// identifiers of the system views are the rows of `sys.all_objects`").
 fn described_views() -> Vec<SystemViewDef> {
     let of_the_six_files = [
         views::sys_tables::internal_tables(),
@@ -601,6 +601,11 @@ fn described_views() -> Vec<SystemViewDef> {
     );
     described.extend(
         views::sys_object_kinds::internal_tables()
+            .into_iter()
+            .flat_map(|table| table.views),
+    );
+    described.extend(
+        views::info_schema_constraints::internal_tables()
             .into_iter()
             .flat_map(|table| table.views),
     );
@@ -1086,14 +1091,14 @@ mod tests {
         assert_eq!(
             trailing,
             vec![
+                "INFORMATION_SCHEMA.VIEWS",
+                "INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS",
+                "INFORMATION_SCHEMA.KEY_COLUMN_USAGE",
+                "INFORMATION_SCHEMA.TABLE_CONSTRAINTS",
                 "sys.table_types",
                 "sys.sequences",
                 "sys.synonyms",
                 "sys.triggers",
-                "sys.dm_os_sys_info",
-                "sys.dm_exec_requests",
-                "sys.dm_exec_connections",
-                "sys.dm_exec_sessions",
             ]
         );
         // The files of `views/` are filled, each name described once per system database,

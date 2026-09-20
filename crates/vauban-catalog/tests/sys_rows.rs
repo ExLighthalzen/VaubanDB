@@ -13,6 +13,7 @@ use vauban_catalog::{
     Catalog, ColumnDef, ConstraintDef, IndexDef, ObjectId, QualifiedName, SortedColumn, TableDef,
     TableMeta,
 };
+use vauban_parser::RefAction;
 use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager};
 use vauban_types::{Len, SqlType, TypeInfo, Value};
@@ -296,6 +297,48 @@ fn allocation_units_shape() -> Vec<TypeInfo> {
     vec![ty(SqlType::Int), ty(SqlType::BigInt), ty(SqlType::BigInt)]
 }
 
+/// The shape of the internal table `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` reads: 6 columns
+/// (`tests/info_schema_constraints.rs`).
+fn is_table_constraints_shape() -> Vec<TypeInfo> {
+    vec![
+        ty(SqlType::Int),
+        sysname(true),
+        sysname(false),
+        sysname(true),
+        sysname(true),
+        TypeInfo::new(SqlType::VarChar(Len::Fixed(11)), true),
+    ]
+}
+
+/// The shape of the internal table `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` reads: 7 columns.
+fn is_key_column_usage_shape() -> Vec<TypeInfo> {
+    vec![
+        ty(SqlType::Int),
+        sysname(true),
+        sysname(false),
+        sysname(true),
+        sysname(false),
+        sysname(true),
+        ty(SqlType::Int),
+    ]
+}
+
+/// The shape of the internal table `INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS` reads: 9
+/// columns, the first two of which (`table_schema`, `table_name`) the view does not read.
+fn is_referential_constraints_shape() -> Vec<TypeInfo> {
+    vec![
+        ty(SqlType::Int),
+        sysname(false),
+        sysname(false),
+        sysname(true),
+        sysname(false),
+        sysname(true),
+        sysname(true),
+        TypeInfo::new(SqlType::VarChar(Len::Fixed(11)), true),
+        TypeInfo::new(SqlType::VarChar(Len::Fixed(11)), true),
+    ]
+}
+
 /// Position of `database_id` in every internal table of this file: the first column
 /// (`src/views/*.rs`, the `*_columns` modules).
 const DATABASE_ID: usize = 0;
@@ -411,6 +454,113 @@ fn drop_table_removes_every_row_of_the_table() {
     let handle = txn.begin(IsolationLevel::ReadCommitted);
     catalog.drop_table(&handle, meta.id).expect("drop_table");
     txn.commit(handle).expect("commit of the drop");
+
+    let after: Vec<usize> = watched
+        .iter()
+        .map(|&table| rows(&storage, &txn, table).len())
+        .collect();
+    assert_eq!(after, before, "the drop left the tables as it found them");
+}
+
+#[test]
+fn drop_table_removes_every_row_of_the_information_schema_constraint_tables() {
+    // On the model of `drop_table_removes_every_row_of_the_table`, for the three tables
+    // `views/info_schema_constraints.rs` describes. A parent with a `PRIMARY KEY` and a
+    // `UNIQUE` and a child with a `PRIMARY KEY` and a named `FOREIGN KEY` exercise all three:
+    // `TABLE_CONSTRAINTS` and `KEY_COLUMN_USAGE` from either table, `REFERENTIAL_CONSTRAINTS`
+    // from the child alone.
+    let (catalog, storage, txn) = instance();
+    let watched = [
+        table_shaped(&storage, &is_table_constraints_shape()),
+        table_shaped(&storage, &is_key_column_usage_shape()),
+        table_shaped(&storage, &is_referential_constraints_shape()),
+    ];
+    let before: Vec<usize> = watched
+        .iter()
+        .map(|&table| rows(&storage, &txn, table).len())
+        .collect();
+
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let parent = catalog
+        .create_table(
+            &handle,
+            &TableDef {
+                name: QualifiedName {
+                    database: "master".to_owned(),
+                    schema: "dbo".to_owned(),
+                    name: "isc_parent".to_owned(),
+                },
+                columns: vec![
+                    column("a", SqlType::Int, false),
+                    column("u", SqlType::Int, false),
+                ],
+                constraints: vec![
+                    primary_key("isc_parent"),
+                    ConstraintDef::Unique {
+                        name: Some("uq_isc_parent".to_owned()),
+                        columns: vec![SortedColumn {
+                            column: "u".to_owned(),
+                            descending: false,
+                        }],
+                        clustered: false,
+                    },
+                ],
+            },
+        )
+        .expect("create_table parent");
+    let child = catalog
+        .create_table(
+            &handle,
+            &TableDef {
+                name: QualifiedName {
+                    database: "master".to_owned(),
+                    schema: "dbo".to_owned(),
+                    name: "isc_child".to_owned(),
+                },
+                columns: vec![
+                    column("a", SqlType::Int, false),
+                    column("fa", SqlType::Int, false),
+                ],
+                constraints: vec![
+                    primary_key("isc_child"),
+                    ConstraintDef::ForeignKey {
+                        name: Some("fk_isc_child".to_owned()),
+                        columns: vec!["fa".to_owned()],
+                        referenced: QualifiedName {
+                            database: "master".to_owned(),
+                            schema: "dbo".to_owned(),
+                            name: "isc_parent".to_owned(),
+                        },
+                        referenced_columns: vec!["a".to_owned()],
+                        on_delete: RefAction::NoAction,
+                        on_update: RefAction::NoAction,
+                    },
+                ],
+            },
+        )
+        .expect("create_table child");
+    txn.commit(handle).expect("commit");
+
+    let written: Vec<usize> = watched
+        .iter()
+        .zip(&before)
+        .map(|(&table, count)| rows(&storage, &txn, table).len() - count)
+        .collect();
+    // `TABLE_CONSTRAINTS`: parent PK, parent UNIQUE, child PK, child FOREIGN KEY.
+    // `KEY_COLUMN_USAGE`: one column per one of those four keys.
+    // `REFERENTIAL_CONSTRAINTS`: the one FOREIGN KEY.
+    assert_eq!(written, vec![4, 4, 1], "{written:?}");
+
+    let drop_child = txn.begin(IsolationLevel::ReadCommitted);
+    catalog
+        .drop_table(&drop_child, child.id)
+        .expect("drop_table child");
+    txn.commit(drop_child).expect("commit of the child drop");
+    let drop_parent = txn.begin(IsolationLevel::ReadCommitted);
+    catalog
+        .drop_table(&drop_parent, parent.id)
+        .expect("drop_table parent");
+    txn.commit(drop_parent).expect("commit of the parent drop");
 
     let after: Vec<usize> = watched
         .iter()
