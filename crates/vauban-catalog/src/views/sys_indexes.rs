@@ -1468,12 +1468,21 @@ mod tests {
         identity: Vec<Row>,
     }
 
-    /// What `catalog` publishes now, the stores having been refreshed as `index.rs` asks.
+    /// What `catalog` publishes now, the stores having been refreshed as `index.rs` asks, and
+    /// the five tables of `bootstrap::MASTER_DBO_SHIPPED_TABLES` left out: the bootstrap seeds
+    /// them into the same store, each a heap with no index, and every caller of `created` means
+    /// only the tables it asked for.
     fn published(catalog: &Catalog) -> Published {
         let mut store = table::store(catalog);
         table::refresh(catalog, &mut store).expect("refresh of the tables");
         index::refresh(catalog, &mut store).expect("refresh of the indexes");
-        let tables: Vec<TableMeta> = store.live().cloned().collect();
+        let tables: Vec<TableMeta> = store
+            .live()
+            .filter(|meta| {
+                !crate::bootstrap::MASTER_DBO_SHIPPED_TABLES.contains(&meta.name.as_str())
+            })
+            .cloned()
+            .collect();
         Published {
             indexes: index_rows(&tables, &store.indexes).expect("index rows"),
             index_columns: index_column_rows(&tables, &store.indexes).expect("index column rows"),

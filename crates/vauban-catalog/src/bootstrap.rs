@@ -14,7 +14,11 @@
 //!    when a file of `views/` already describes a table of that name;
 //! 3. the rows each description carries: one per database in [`DATABASES_TABLE`], one per
 //!    (database, schema) pair in [`SCHEMAS_TABLE`], which is 4 and 12 rows on a fresh
-//!    `MemoryStorage` (unit test `a_fresh_bootstrap_writes_four_and_twelve_rows`).
+//!    `MemoryStorage` (unit test `a_fresh_bootstrap_writes_four_and_twelve_rows`);
+//! 4. the five tables of [`MASTER_DBO_SHIPPED_TABLES`], ordinary tables of `master.dbo`
+//!    created through [`Catalog::create_table`] once the internal tables above exist, so that
+//!    `sys.objects`, `sys.columns` and the other views carry them like any other table of the
+//!    instance (`master_dbo_shipped_tables`).
 //!
 //! The table a view reads arrives with that view (`views/mod.rs`). The two tables above sit
 //! here rather than in `views/sys_core.rs` because their rows are not constants — they carry
@@ -57,8 +61,8 @@ use vauban_types::{
 };
 
 use crate::catalog::Catalog;
-use crate::def::{InternalColumnDef, InternalTableDef};
-use crate::meta::SnapshotIsolationState;
+use crate::def::{ColumnDef, InternalColumnDef, InternalTableDef, TableDef};
+use crate::meta::{QualifiedName, SnapshotIsolationState};
 use crate::views;
 
 /// The system databases, in the order the bootstrap creates them.
@@ -116,6 +120,20 @@ pub(crate) const DATABASES_TABLE: &str = "vauban_sys_databases";
 /// One row per (database, schema) pair: `sys.schemas` is a per-database view while the
 /// internal tables live in `master`, so the database a schema belongs to is a column here.
 pub(crate) const SCHEMAS_TABLE: &str = "vauban_sys_schemas";
+
+/// The names of the tables [`install`] creates in `master.dbo`, in creation order.
+///
+/// mssql-jdbc and pyodbc read them through `sp_tables` and `sp_columns_100` rather than
+/// through a table a client owns: `views/sys_tables.rs` reads this list to publish
+/// `is_ms_shipped` 1 for a table of `dbo` whose name is one of these five, which is what marks
+/// them apart from a table a client creates under the same name in another database.
+pub(crate) const MASTER_DBO_SHIPPED_TABLES: [&str; 5] = [
+    "spt_fallback_db",
+    "spt_fallback_dev",
+    "spt_fallback_usg",
+    "spt_monitor",
+    "MSreplication_options",
+];
 
 /// Internal table of the live sessions, read by the `sys.dm_exec_*` views of `catalog`.
 pub(crate) const SESSIONS_TABLE: &str = "vauban_sys_sessions";
@@ -298,7 +316,115 @@ fn install(catalog: &Catalog, txn: &TxnHandle) -> Result<(), InternalError> {
     }
     views::sys_tables::write_internal_object_rows(catalog, txn, master, instant)
         .map_err(internal)?;
+    for def in master_dbo_shipped_tables() {
+        catalog.create_table(txn, &def).map_err(internal)?;
+    }
     Ok(())
+}
+
+/// The definitions of [`MASTER_DBO_SHIPPED_TABLES`], in the same order: heaps, no constraint,
+/// created through the ordinary [`Catalog::create_table`] path so that `sys.objects`,
+/// `sys.columns`, `sys.all_objects`, `sys.all_columns` and `INFORMATION_SCHEMA` carry them at
+/// once (`sys_rows.rs`, `write`), the way any other table of the instance is published.
+///
+/// `spt_fallback_db` carries the eight columns clients read through it; the other four carry
+/// what `sp_columns_100` answers about them on SQL Server 2022.
+fn master_dbo_shipped_tables() -> Vec<TableDef> {
+    fn name(table: &str) -> QualifiedName {
+        QualifiedName {
+            database: "master".to_owned(),
+            schema: "dbo".to_owned(),
+            name: table.to_owned(),
+        }
+    }
+    fn col(name: &str, ty: SqlType, nullable: bool) -> ColumnDef {
+        ColumnDef {
+            name: name.to_owned(),
+            ty: TypeInfo::new(ty, nullable),
+            default: None,
+            identity: None,
+            computed: None,
+        }
+    }
+    fn varchar(len: u16) -> SqlType {
+        SqlType::VarChar(Len::Fixed(len))
+    }
+    vec![
+        TableDef {
+            name: name(MASTER_DBO_SHIPPED_TABLES[0]),
+            columns: vec![
+                col("xserver_name", varchar(30), false),
+                col("xdttm_ins", SqlType::DateTime, false),
+                col("xdttm_last_ins_upd", SqlType::DateTime, false),
+                col("xfallback_dbid", SqlType::SmallInt, true),
+                col("name", varchar(30), false),
+                col("dbid", SqlType::SmallInt, false),
+                col("status", SqlType::SmallInt, false),
+                col("version", SqlType::SmallInt, false),
+            ],
+            constraints: Vec::new(),
+        },
+        TableDef {
+            name: name(MASTER_DBO_SHIPPED_TABLES[1]),
+            columns: vec![
+                col("xserver_name", varchar(30), false),
+                col("xdttm_ins", SqlType::DateTime, false),
+                col("xdttm_last_ins_upd", SqlType::DateTime, false),
+                col("xfallback_low", SqlType::Int, true),
+                col("xfallback_drive", SqlType::Char(Len::Fixed(2)), true),
+                col("low", SqlType::Int, false),
+                col("high", SqlType::Int, false),
+                col("status", SqlType::SmallInt, false),
+                col("name", varchar(30), false),
+                col("phyname", varchar(127), false),
+            ],
+            constraints: Vec::new(),
+        },
+        TableDef {
+            name: name(MASTER_DBO_SHIPPED_TABLES[2]),
+            columns: vec![
+                col("xserver_name", varchar(30), false),
+                col("xdttm_ins", SqlType::DateTime, false),
+                col("xdttm_last_ins_upd", SqlType::DateTime, false),
+                col("xfallback_vstart", SqlType::Int, true),
+                col("dbid", SqlType::SmallInt, false),
+                col("segmap", SqlType::Int, false),
+                col("lstart", SqlType::Int, false),
+                col("sizepg", SqlType::Int, false),
+                col("vstart", SqlType::Int, false),
+            ],
+            constraints: Vec::new(),
+        },
+        TableDef {
+            name: name(MASTER_DBO_SHIPPED_TABLES[3]),
+            columns: vec![
+                col("lastrun", SqlType::DateTime, false),
+                col("cpu_busy", SqlType::Int, false),
+                col("io_busy", SqlType::Int, false),
+                col("idle", SqlType::Int, false),
+                col("pack_received", SqlType::Int, false),
+                col("pack_sent", SqlType::Int, false),
+                col("connections", SqlType::Int, false),
+                col("pack_errors", SqlType::Int, false),
+                col("total_read", SqlType::Int, false),
+                col("total_write", SqlType::Int, false),
+                col("total_errors", SqlType::Int, false),
+            ],
+            constraints: Vec::new(),
+        },
+        TableDef {
+            name: name(MASTER_DBO_SHIPPED_TABLES[4]),
+            columns: vec![
+                col("optname", SYSNAME, false),
+                col("value", SqlType::Bit, false),
+                col("major_version", SqlType::Int, false),
+                col("minor_version", SqlType::Int, false),
+                col("revision", SqlType::Int, false),
+                col("install_failures", SqlType::Int, false),
+            ],
+            constraints: Vec::new(),
+        },
+    ]
 }
 
 /// Inserts the rows of a description into the table `storage` has just created for it.
@@ -945,13 +1071,14 @@ mod tests {
             .collect();
         // One table created per description, in the order of the list, so the position of a
         // name in the list is the position of its `TableId`; the positions are read from the
-        // list rather than written down, a file of `views/` adding its tables in front.
+        // list rather than written down, a file of `views/` adding its tables in front. The
+        // five tables of `MASTER_DBO_SHIPPED_TABLES` follow them, outside this list.
         let names: Vec<String> = internal_table_defs()
             .unwrap()
             .into_iter()
             .map(|def| def.name)
             .collect();
-        assert_eq!(created.len(), names.len());
+        assert_eq!(created.len(), names.len() + MASTER_DBO_SHIPPED_TABLES.len());
         let position = |name: &str| {
             names
                 .iter()
@@ -1058,5 +1185,42 @@ mod tests {
             Value::I32(database_id(existing).unwrap())
         );
         assert!(database_row(&catalog, "MASTER").is_none());
+    }
+
+    #[test]
+    fn the_five_shipped_tables_are_defined_in_dbo_of_master() {
+        let defs = master_dbo_shipped_tables();
+        assert_eq!(defs.len(), MASTER_DBO_SHIPPED_TABLES.len());
+        for (def, name) in defs.iter().zip(MASTER_DBO_SHIPPED_TABLES) {
+            assert_eq!(def.name.database, "master");
+            assert_eq!(def.name.schema, "dbo");
+            assert_eq!(def.name.name, name);
+            assert!(def.constraints.is_empty(), "{name} is a heap");
+            assert!(!def.columns.is_empty(), "{name} has columns");
+        }
+        // The column counts `sp_columns_100` answers for each of the five tables.
+        let widths: Vec<usize> = defs.iter().map(|def| def.columns.len()).collect();
+        assert_eq!(widths, vec![8, 10, 9, 11, 6]);
+    }
+
+    #[test]
+    fn the_five_shipped_tables_exist_in_master_after_a_bootstrap() {
+        let catalog = bootstrapped();
+        let master = find_database(&catalog, "master").unwrap().unwrap();
+        let handle = catalog.txn.begin(IsolationLevel::ReadCommitted);
+        for name in MASTER_DBO_SHIPPED_TABLES {
+            let found = catalog
+                .snapshot(&handle)
+                .resolve_object("master", Some("dbo"), name, "dbo")
+                .is_some();
+            assert!(found, "{name} is resolved in the catalogue");
+        }
+        catalog.txn.commit(handle).unwrap();
+        // The names are ordinary tables of `master`, on top of the internal ones.
+        let tables = catalog.storage.tables(master).unwrap();
+        assert_eq!(
+            tables.len(),
+            internal_table_defs().unwrap().len() + MASTER_DBO_SHIPPED_TABLES.len()
+        );
     }
 }

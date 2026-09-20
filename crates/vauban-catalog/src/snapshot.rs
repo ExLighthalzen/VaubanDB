@@ -1178,9 +1178,15 @@ mod tests {
                 )
             })
             .collect();
+        // `master.dbo` also carries the five tables of `bootstrap::MASTER_DBO_SHIPPED_TABLES`,
+        // created as ordinary tables (`FIRST_USER_OBJECT_ID` and up): left out of this
+        // comparison, which is about the internal tables described in `bootstrap.rs`.
         let held: Vec<(ObjectId, String)> = snapshot
             .tables
             .values()
+            .filter(|meta| {
+                !crate::bootstrap::MASTER_DBO_SHIPPED_TABLES.contains(&meta.name.as_str())
+            })
             .map(|meta| (meta.id, meta.name.clone()))
             .collect();
         assert_eq!(held, expected);
@@ -1208,6 +1214,9 @@ mod tests {
         let again: Vec<(ObjectId, String)> = other
             .tables
             .values()
+            .filter(|meta| {
+                !crate::bootstrap::MASTER_DBO_SHIPPED_TABLES.contains(&meta.name.as_str())
+            })
             .map(|meta| (meta.id, meta.name.clone()))
             .collect();
         assert_eq!(again, expected);

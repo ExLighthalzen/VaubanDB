@@ -41,16 +41,19 @@ fn rows(
     rows
 }
 
-/// The rows of the table of `master` that holds a row carrying the text `text`.
+/// The rows of the table of `master` that holds a row carrying the text `text`, each row
+/// `width` values wide.
 ///
 /// How these tests reach an internal table without knowing its name, the names being
-/// `pub(crate)`: the types table holds the row of `int`, the table of the databases the row
-/// of `msdb`, the table of the schemas the row of `dbo`. The assertion below fails if a
-/// second table of `master` ever carries the same text, rather than reading the wrong one.
+/// `pub(crate)`: the types table holds the row of `int` (15 wide), the table of the databases
+/// the row of `msdb` (7 wide). `width` tells a table apart from another of the same text and a
+/// different shape. The schemas table needs [`schemas_table`] instead: `dbo`, at 4 wide, no
+/// longer singles it out.
 fn table_holding(
     storage: &Arc<dyn Storage>,
     txn: &Arc<TransactionManager>,
     text: &str,
+    width: usize,
 ) -> Vec<Vec<Value>> {
     let master = storage.databases().expect("databases()")[0].0;
     let mut found = Vec::new();
@@ -58,7 +61,7 @@ fn table_holding(
         let content = rows(storage, txn, table);
         if content
             .iter()
-            .any(|row| row.iter().any(|value| is_text(value, text)))
+            .any(|row| row.len() == width && row.iter().any(|value| is_text(value, text)))
         {
             found.push(content);
         }
@@ -66,7 +69,7 @@ fn table_holding(
     assert_eq!(
         found.len(),
         1,
-        "one table of master carries the text `{text}`"
+        "one table of master, {width} values wide, carries the text `{text}`"
     );
     found.pop().unwrap_or_default()
 }
@@ -75,6 +78,37 @@ fn table_holding(
 /// `SQL_Latin1_General_CP1_CI_AS` compares a `sysname`.
 fn is_text(value: &Value, text: &str) -> bool {
     matches!(value, Value::String(stored) if stored.text.eq_ignore_ascii_case(text))
+}
+
+/// The three schemas [`table_holding`] cannot tell `dbo` apart by: the internal table behind
+/// `INFORMATION_SCHEMA.TABLES` is 4 values wide too, and now carries a `dbo` row of its own for
+/// each of the five tables the bootstrap seeds `master.dbo` with (`MASTER_DBO_SHIPPED_TABLES`
+/// of `tests/bootstrap.rs`). A table's own schema name is never `sys` or `INFORMATION_SCHEMA`,
+/// so the table of master, 4 values wide, that carries a row for each of the three is the
+/// schemas table and no other.
+const SYSTEM_SCHEMAS: [&str; 3] = ["dbo", "sys", "INFORMATION_SCHEMA"];
+
+/// The rows of the table of `master` that carries a row for each of [`SYSTEM_SCHEMAS`], 4
+/// values wide.
+fn schemas_table(storage: &Arc<dyn Storage>, txn: &Arc<TransactionManager>) -> Vec<Vec<Value>> {
+    let master = storage.databases().expect("databases()")[0].0;
+    let mut found = Vec::new();
+    for (table, _) in storage.tables(master).expect("tables(master)") {
+        let content = rows(storage, txn, table);
+        if SYSTEM_SCHEMAS.iter().all(|schema| {
+            content
+                .iter()
+                .any(|row| row.len() == 4 && row.iter().any(|value| is_text(value, schema)))
+        }) {
+            found.push(content);
+        }
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "one table of master, 4 values wide, carries a row for each of dbo, sys and INFORMATION_SCHEMA"
+    );
+    found.pop().unwrap_or_default()
 }
 
 /// The row of the types table whose `name` column is `name`.
@@ -88,7 +122,7 @@ fn type_row(rows: &[Vec<Value>], name: &str) -> Vec<Value> {
 #[test]
 fn bootstrap_writes_the_system_types_in_master() {
     let (storage, txn) = instance();
-    let types = table_holding(&storage, &txn, "int");
+    let types = table_holding(&storage, &txn, "int", 15);
     // The 34 system types, each row as wide as the 15 columns of `sys.types`.
     assert_eq!(types.len(), 34);
     for row in &types {
@@ -99,7 +133,7 @@ fn bootstrap_writes_the_system_types_in_master() {
 #[test]
 fn sys_types_contains_int_and_nvarchar() {
     let (storage, txn) = instance();
-    let types = table_holding(&storage, &txn, "int");
+    let types = table_holding(&storage, &txn, "int", 15);
     // `name` is matched without regard to case; `system_type_id` and `user_type_id` are the
     // ones of `sys.types`.
     let int = type_row(&types, "INT");
@@ -116,7 +150,7 @@ fn sys_types_contains_int_and_nvarchar() {
 #[test]
 fn the_rows_sys_databases_reads_name_the_four_system_databases() {
     let (storage, txn) = instance();
-    let databases = table_holding(&storage, &txn, "msdb");
+    let databases = table_holding(&storage, &txn, "msdb", 7);
     let names: BTreeSet<String> = databases
         .iter()
         .filter_map(|row| match &row[1] {
@@ -134,7 +168,7 @@ fn the_rows_sys_databases_reads_name_the_four_system_databases() {
 #[test]
 fn the_rows_sys_schemas_reads_carry_the_three_schemas_of_each_database() {
     let (storage, txn) = instance();
-    let schemas = table_holding(&storage, &txn, "dbo");
+    let schemas = schemas_table(&storage, &txn);
     // Three schemas in each of the four system databases: the view filters this table on
     // `database_id = DB_ID()`.
     assert_eq!(schemas.len(), 12);

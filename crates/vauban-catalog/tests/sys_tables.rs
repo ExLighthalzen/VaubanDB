@@ -129,8 +129,10 @@ fn the_bootstrap_creates_the_two_internal_tables_of_this_file() {
     let (_catalog, storage, txn) = instance();
     let objects = table_shaped(&storage, &objects_shape());
     assert!(row_count(&storage, &txn, objects) > 0);
+    // `master.dbo` carries five tables of its own at a fresh bootstrap, so this table is not
+    // empty either.
     let columns = table_shaped(&storage, &columns_shape());
-    assert_eq!(row_count(&storage, &txn, columns), 0);
+    assert!(row_count(&storage, &txn, columns) > 0);
 }
 
 #[test]
@@ -141,6 +143,7 @@ fn a_created_table_writes_its_object_row_and_its_two_column_rows() {
     let columns = table_shaped(&storage, &columns_shape());
 
     let before_objects = row_count(&storage, &txn, objects);
+    let before_columns = row_count(&storage, &txn, columns);
     let handle = txn.begin(IsolationLevel::ReadCommitted);
     let meta = catalog
         .create_table(
@@ -163,7 +166,7 @@ fn a_created_table_writes_its_object_row_and_its_two_column_rows() {
 
     assert_eq!(meta.columns.len(), 2);
     assert_eq!(row_count(&storage, &txn, objects), before_objects + 1);
-    assert_eq!(row_count(&storage, &txn, columns), 2);
+    assert_eq!(row_count(&storage, &txn, columns), before_columns + 2);
 }
 
 #[test]
@@ -197,4 +200,54 @@ fn schema_id_is_the_resolved_schema() {
         })
         .expect("the object row");
     assert_eq!(row[3], Value::I32(4));
+}
+
+#[test]
+fn is_ms_shipped_is_scoped_to_master() {
+    // A table named and schema-scoped like one of the five master.dbo tables `sp_tables`
+    // and `sp_columns_100` read, created in `dbo` of a database that is not `master`, does
+    // not inherit `is_ms_shipped`; the row the bootstrap itself wrote for `spt_monitor` in
+    // `master.dbo` keeps it.
+    let (catalog, storage, txn) = instance();
+    let objects = table_shaped(&storage, &objects_shape());
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    catalog
+        .create_database(&handle, "sys_tables_other", None)
+        .expect("create_database");
+    catalog
+        .create_table(
+            &handle,
+            &TableDef {
+                name: QualifiedName {
+                    database: "sys_tables_other".to_owned(),
+                    schema: "dbo".to_owned(),
+                    name: "spt_monitor".to_owned(),
+                },
+                columns: vec![column("a", SqlType::Int, false)],
+                constraints: Vec::new(),
+            },
+        )
+        .expect("create_table");
+    txn.commit(handle).expect("commit");
+
+    let read = rows(&storage, &txn, objects);
+    let named_spt_monitor: Vec<Vec<Value>> = read
+        .into_iter()
+        .filter(|row| matches!(row.get(2), Some(Value::String(text)) if text.text == "spt_monitor"))
+        .collect();
+    assert_eq!(
+        named_spt_monitor.len(),
+        2,
+        "master's own row and the one just created"
+    );
+    let master_row = named_spt_monitor
+        .iter()
+        .find(|row| row[0] == Value::I32(1))
+        .expect("the row of master.dbo.spt_monitor");
+    assert_eq!(master_row[7], Value::Bit(true));
+    let other_row = named_spt_monitor
+        .iter()
+        .find(|row| row[0] != Value::I32(1))
+        .expect("the row of sys_tables_other.dbo.spt_monitor");
+    assert_eq!(other_row[7], Value::Bit(false));
 }

@@ -16,6 +16,17 @@ use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager};
 use vauban_types::{Len, SqlType, TypeInfo};
 
+/// The names of the tables `Catalog::bootstrap` seeds `master.dbo` with, mirrored from
+/// `tests/bootstrap.rs`: integration test files do not share state. Each is a heap, so its
+/// only row here is in the internal table of `sys.indexes`.
+const MASTER_DBO_SHIPPED_TABLES: [&str; 5] = [
+    "spt_fallback_db",
+    "spt_fallback_dev",
+    "spt_fallback_usg",
+    "spt_monitor",
+    "MSreplication_options",
+];
+
 /// A bootstrapped catalogue over a fresh `MemoryStorage`, with its storage and its manager.
 fn instance() -> (Catalog, Arc<dyn Storage>, Arc<TransactionManager>) {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
@@ -153,12 +164,15 @@ fn shapes() -> Vec<Vec<TypeInfo>> {
 #[test]
 fn the_bootstrap_creates_the_four_internal_tables_of_this_file() {
     let (_catalog, storage, txn) = instance();
-    for shape in shapes() {
+    // Otherwise no row at bootstrap: the rows of the four tables are those of the objects a
+    // client creates, and a fresh instance holds none of its own (unit test
+    // `the_internal_tables_of_the_catalogue_have_no_row_in_these_views`). The bootstrap also
+    // seeds `master.dbo` with the five tables of `MASTER_DBO_SHIPPED_TABLES`, each a heap: one
+    // row per table in the internal table of `sys.indexes`, none in the other three.
+    let expected = [MASTER_DBO_SHIPPED_TABLES.len(), 0, 0, 0];
+    for (shape, expected) in shapes().into_iter().zip(expected) {
         let table = table_shaped(&storage, &shape);
-        // No row at bootstrap: the rows of the four tables are those of the objects a client
-        // creates, and a fresh instance holds none (unit test
-        // `the_internal_tables_of_the_catalogue_have_no_row_in_these_views`).
-        assert_eq!(row_count(&storage, &txn, table), 0);
+        assert_eq!(row_count(&storage, &txn, table), expected);
     }
 }
 
@@ -237,5 +251,7 @@ fn a_created_table_with_a_key_and_an_identity_writes_two_two_one_and_one_rows() 
         .into_iter()
         .map(|table| row_count(&storage, &txn, table))
         .collect();
-    assert_eq!(counts, vec![2, 2, 1, 1]);
+    // The internal table of `sys.indexes` also carries one heap row per table of
+    // `MASTER_DBO_SHIPPED_TABLES`, which the bootstrap seeds `master.dbo` with.
+    assert_eq!(counts, vec![2 + MASTER_DBO_SHIPPED_TABLES.len(), 2, 1, 1]);
 }

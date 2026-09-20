@@ -14,6 +14,34 @@ use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager};
 use vauban_types::{Len, SqlType, TypeInfo, Value};
 
+/// The names of the tables `Catalog::bootstrap` seeds `master.dbo` with, mirrored from
+/// `tests/bootstrap.rs`: integration test files do not share state.
+const MASTER_DBO_SHIPPED_TABLES: [&str; 5] = [
+    "spt_fallback_db",
+    "spt_fallback_dev",
+    "spt_fallback_usg",
+    "spt_monitor",
+    "MSreplication_options",
+];
+
+/// The `object_id` of each table of [`MASTER_DBO_SHIPPED_TABLES`], read through the public API.
+fn shipped_object_ids(catalog: &Catalog, txn: &Arc<TransactionManager>) -> Vec<i32> {
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = catalog.snapshot(&handle);
+    let ids = MASTER_DBO_SHIPPED_TABLES
+        .iter()
+        .map(|name| {
+            snapshot
+                .resolve_object("master", Some("dbo"), name, "dbo")
+                .unwrap_or_else(|| panic!("{name} resolves"))
+                .id
+                .0
+        })
+        .collect();
+    txn.commit(handle).expect("commit of the reading txn");
+    ids
+}
+
 /// A bootstrapped catalogue over a fresh `MemoryStorage`, with its storage and its manager.
 fn instance() -> (Catalog, Arc<dyn Storage>, Arc<TransactionManager>) {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
@@ -164,25 +192,37 @@ fn texts(row: &[Value]) -> Vec<String> {
 
 #[test]
 fn the_bootstrap_creates_the_five_internal_tables_of_this_file() {
-    let (_catalog, storage, txn) = instance();
+    let (catalog, storage, txn) = instance();
     // The copy of the objects table carries the system views and the table of the files the two
     // files of each of the four system databases; the three others hold the rows of a user
     // object, written at each DDL (unit test
-    // `the_objects_and_the_files_tables_are_the_two_the_bootstrap_fills`).
+    // `the_objects_and_the_files_tables_are_the_two_the_bootstrap_fills`). The bootstrap also
+    // seeds `master.dbo` with the five tables of `MASTER_DBO_SHIPPED_TABLES`, whose rows enter
+    // `all_columns` and `partitions` through `create_table` like any other table's: filtered out
+    // below by their `object_id`. `allocation_units` carries no `object_id` of its own (it is
+    // keyed on a derived `allocation_unit_id` instead), so its five rows — one heap per shipped
+    // table — are counted rather than filtered.
+    let shipped = shipped_object_ids(&catalog, &txn);
     let objects = rows(&storage, &txn, table_shaped(&storage, &all_objects_shape()));
     assert!(!objects.is_empty());
     assert_eq!(
         rows(&storage, &txn, table_shaped(&storage, &files_shape())).len(),
         8
     );
-    for shape in [
-        all_columns_shape(),
-        partitions_shape(),
-        allocation_units_shape(),
-    ] {
+    for shape in [all_columns_shape(), partitions_shape()] {
         let table = table_shaped(&storage, &shape);
-        assert_eq!(rows(&storage, &txn, table).len(), 0);
+        let unrelated = rows(&storage, &txn, table)
+            .into_iter()
+            .filter(|row| !matches!(&row[1], Value::I32(id) if shipped.contains(id)))
+            .count();
+        assert_eq!(unrelated, 0);
     }
+    let allocation_units = rows(
+        &storage,
+        &txn,
+        table_shaped(&storage, &allocation_units_shape()),
+    );
+    assert_eq!(allocation_units.len(), MASTER_DBO_SHIPPED_TABLES.len());
 }
 
 #[test]
@@ -238,12 +278,15 @@ fn the_file_rows_name_the_databases_of_the_databases_table() {
 
 #[test]
 fn the_objects_copy_carries_the_system_views_of_the_catalogue() {
-    let (_catalog, storage, txn) = instance();
+    let (catalog, storage, txn) = instance();
+    let shipped = shipped_object_ids(&catalog, &txn);
     let objects = rows(&storage, &txn, table_shaped(&storage, &all_objects_shape()));
     let names: Vec<String> = objects.iter().flat_map(|row| texts(row)).collect();
     // `sys.tables` of `views/sys_tables.rs`, `sys.databases` of `views/sys_core.rs` and the
-    // seven views of `views/sys_extra.rs`; each row is a view, so `sys.views` shows these and
-    // no user object.
+    // seven views of `views/sys_extra.rs`; each such row is a view, so `sys.views` shows these
+    // and no user object. The bootstrap also seeds `master.dbo` with the five tables of
+    // `MASTER_DBO_SHIPPED_TABLES`, rows of this same table with `type` `U `: left out of the
+    // check below by their `object_id`, `sys.views` filtering `type = 'V '` in their place.
     for view in [
         "tables",
         "databases",
@@ -258,7 +301,10 @@ fn the_objects_copy_carries_the_system_views_of_the_catalogue() {
     ] {
         assert!(names.contains(&view.to_owned()), "{names:?}");
     }
-    for row in &objects {
+    for row in objects
+        .iter()
+        .filter(|row| !matches!(&row[1], Value::I32(id) if shipped.contains(id)))
+    {
         assert!(texts(row).contains(&"VIEW".to_owned()), "{row:?}");
     }
 }

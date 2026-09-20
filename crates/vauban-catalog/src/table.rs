@@ -732,16 +732,30 @@ mod tests {
 
     #[test]
     fn the_store_lists_the_tables_that_no_drop_has_claimed() {
+        // Bootstrap also seeds `master.dbo` with the five tables of
+        // `bootstrap::MASTER_DBO_SHIPPED_TABLES`, live in the same store as `t`: left out of
+        // this count, which is about the table `catalogue_with_one_table` creates.
         let (catalog, meta) = catalogue_with_one_table();
         {
             let store = store(&catalog);
-            let listed: Vec<&TableMeta> = store.live().collect();
+            let listed: Vec<&TableMeta> = store
+                .live()
+                .filter(|entry| {
+                    !crate::bootstrap::MASTER_DBO_SHIPPED_TABLES.contains(&entry.name.as_str())
+                })
+                .collect();
             assert_eq!(listed, vec![&meta]);
         }
         let handle = catalog.txn.begin(IsolationLevel::ReadCommitted);
         drop_table(&catalog, &handle, meta.id).expect("drop_table");
         let store = store(&catalog);
-        assert_eq!(store.live().count(), 0, "the drop is registered");
+        let remaining = store
+            .live()
+            .filter(|entry| {
+                !crate::bootstrap::MASTER_DBO_SHIPPED_TABLES.contains(&entry.name.as_str())
+            })
+            .count();
+        assert_eq!(remaining, 0, "the drop is registered");
         assert!(store.get(meta.id).is_some(), "the metadata is still read");
     }
 }

@@ -1796,7 +1796,10 @@ mod tests {
         }
     }
 
-    /// The tables `catalog` holds once `master.dbo.<name>` has been created and committed.
+    /// The tables `catalog` holds once `master.dbo.<name>` has been created and committed,
+    /// the five tables of `bootstrap::MASTER_DBO_SHIPPED_TABLES` left out: the bootstrap seeds
+    /// them into the same store, and the callers below mean the one table each asked for
+    /// (`information_schema_tables_lists_user_table`, which checks `rows.len()`).
     fn created(catalog: &Catalog, name: &str, columns: Vec<ColumnDef>) -> Vec<TableMeta> {
         let def = TableDef {
             name: QualifiedName {
@@ -1811,7 +1814,13 @@ mod tests {
         catalog.create_table(&handle, &def).expect("create_table");
         catalog.txn.commit(handle).expect("commit");
         let store = table::store(catalog);
-        store.live().cloned().collect()
+        store
+            .live()
+            .filter(|meta| {
+                !crate::bootstrap::MASTER_DBO_SHIPPED_TABLES.contains(&meta.name.as_str())
+            })
+            .cloned()
+            .collect()
     }
 
     /// The text of a value, `None` for `NULL`.
@@ -2546,12 +2555,19 @@ mod tests {
     fn the_internal_tables_are_not_published_as_user_tables() {
         // The two `vauban_is_*` tables and the `vauban_sys_*` ones are out of
         // `INFORMATION_SCHEMA.TABLES`: its rows are those of the tables the store of `table.rs`
-        // holds, which a bootstrap leaves empty.
+        // holds, which a bootstrap leaves with the five tables of
+        // `bootstrap::MASTER_DBO_SHIPPED_TABLES`, filtered out below before the assertion.
         let catalog = bootstrapped();
         let store = table::store(&catalog);
-        let tables: Vec<TableMeta> = store.live().cloned().collect();
+        let tables: Vec<TableMeta> = store
+            .live()
+            .filter(|meta| {
+                !crate::bootstrap::MASTER_DBO_SHIPPED_TABLES.contains(&meta.name.as_str())
+            })
+            .cloned()
+            .collect();
         drop(store);
-        assert!(tables.is_empty());
+        assert!(tables.is_empty(), "{tables:?}");
         assert!(table_rows(&tables).expect("table_rows").is_empty());
         assert!(column_rows(&tables).expect("column_rows").is_empty());
     }

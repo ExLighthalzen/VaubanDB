@@ -406,11 +406,31 @@ fn object_row(table: &TableMeta, create_date: &Value, modify_date: &Value) -> Sq
         Value::I32(NO_PARENT),
         text(USER_TABLE_TYPE),
         text(USER_TABLE_TYPE_DESC),
-        Value::Bit(false),
+        Value::Bit(is_shipped_table(table)),
         create_date.clone(),
         modify_date.clone(),
         Value::I32(max_column_id_used),
     ]))
+}
+
+/// The [`DbId`] `master` holds: the first of the four system databases `bootstrap.rs`
+/// creates (`SYSTEM_DATABASES`, "That order is the one of `sys.databases.database_id`:
+/// `master` 1"). A restart hands the same identifiers back on `MemoryStorage` (integration
+/// tests `bootstrap_is_idempotent` and `restart_finds_master`, `tests/bootstrap.rs`).
+const MASTER_DATABASE_ID: DbId = DbId(1);
+
+/// Whether `table` is one of [`bootstrap::MASTER_DBO_SHIPPED_TABLES`] **of `master`**: the
+/// database, the schema and the name a driver reads through `sp_tables` / `sp_columns_100`
+/// rather than through a table a client owns. A table under the same schema and name in
+/// another database is an ordinary table of that database, not one of the five (unit test
+/// `is_ms_shipped_is_set_for_the_shipped_tables_of_master_dbo`). [`object_row`] publishes
+/// `is_ms_shipped` 1 for it, as SQL Server does.
+fn is_shipped_table(table: &TableMeta) -> bool {
+    table.database == MASTER_DATABASE_ID
+        && table.schema.eq_ignore_ascii_case("dbo")
+        && bootstrap::MASTER_DBO_SHIPPED_TABLES
+            .iter()
+            .any(|name| table.name.eq_ignore_ascii_case(name))
 }
 
 /// The rows of [`OBJECTS_TABLE`] for the internal tables of `master`, one per description.
@@ -798,13 +818,14 @@ fn text(value: &str) -> Value {
 mod tests {
     use std::sync::Arc;
 
-    use vauban_storage::{MemoryStorage, Storage};
+    use vauban_storage::{MemoryStorage, Storage, TableId};
     use vauban_txn::{IsolationLevel, TransactionManager};
 
     use super::*;
     use crate::bootstrap;
     use crate::catalog::Catalog;
     use crate::def::{ColumnDef, TableDef};
+    use crate::ids::ObjectId;
     use crate::meta::IdentitySpec;
     use crate::table;
 
@@ -1733,7 +1754,9 @@ mod tests {
     #[test]
     fn user_table_has_object_and_column_rows() {
         let catalog = bootstrapped();
-        let tables = created(
+        // `created` returns the tables the store holds, the five shipped ones of
+        // `master.dbo` among them: filtered down to the one this test just created.
+        let tables: Vec<TableMeta> = created(
             &catalog,
             &table_def(
                 "t",
@@ -1742,7 +1765,10 @@ mod tests {
                     column_def("b", SqlType::NVarChar(Len::Fixed(20)), true, false),
                 ],
             ),
-        );
+        )
+        .into_iter()
+        .filter(|table| table.name == "t")
+        .collect();
         assert_eq!(tables.len(), 1);
         let object_id = tables[0].id.0;
 
@@ -1820,10 +1846,56 @@ mod tests {
     }
 
     #[test]
+    fn is_ms_shipped_is_set_for_the_shipped_tables_of_master_dbo() {
+        let base = TableMeta {
+            id: ObjectId(1_000_000),
+            storage_id: TableId(1),
+            database: DbId(1),
+            schema: "dbo".to_owned(),
+            name: bootstrap::MASTER_DBO_SHIPPED_TABLES[3].to_owned(),
+            columns: Vec::new(),
+            clustered: None,
+            constraints: Vec::new(),
+        };
+        assert!(is_shipped_table(&base), "the name and the schema match");
+        // Identifiers compare without regard to case.
+        let upper = TableMeta {
+            name: base.name.to_uppercase(),
+            ..base.clone()
+        };
+        assert!(is_shipped_table(&upper));
+        // A table under the same name in another schema is not one of the five.
+        let other_schema = TableMeta {
+            schema: "app".to_owned(),
+            ..base.clone()
+        };
+        assert!(!is_shipped_table(&other_schema));
+        // The same name and schema, in a database that is not `master`, is an ordinary
+        // table of that database, not one of the five.
+        let other_database = TableMeta {
+            database: DbId(2),
+            ..base.clone()
+        };
+        assert!(
+            !is_shipped_table(&other_database),
+            "a table named and schema-scoped like a shipped one, outside master, does not \
+             inherit is_ms_shipped"
+        );
+        // An ordinary table of `dbo` is not one of the five.
+        let ordinary = TableMeta {
+            name: "t".to_owned(),
+            ..base
+        };
+        assert!(!is_shipped_table(&ordinary));
+    }
+
+    #[test]
     fn the_column_rows_of_a_five_column_table_carry_its_values() {
         // The five columns of `dbo.columns_target`, in declaration order.
         let catalog = bootstrapped();
-        let tables = created(
+        // `created` returns the tables the store holds, the five shipped ones of
+        // `master.dbo` among them: filtered down to the one this test just created.
+        let tables: Vec<TableMeta> = created(
             &catalog,
             &table_def(
                 "columns_target",
@@ -1843,7 +1915,10 @@ mod tests {
                     column_def("made_on", SqlType::DateTime2(3), true, false),
                 ],
             ),
-        );
+        )
+        .into_iter()
+        .filter(|table| table.name == "columns_target")
+        .collect();
         let rows = column_rows(&tables).expect("the rows of the columns table");
         assert_eq!(rows.len(), EXPECTED_COLUMN_ROWS.len());
         for (row, expected) in rows.iter().zip(EXPECTED_COLUMN_ROWS) {
@@ -1856,7 +1931,19 @@ mod tests {
     #[test]
     fn internal_tables_are_system_tables_in_sys_objects() {
         let catalog = bootstrapped();
-        let objects = rows_of(&catalog, OBJECTS_TABLE);
+        // The five tables of `MASTER_DBO_SHIPPED_TABLES` are rows of this same table, of
+        // type `U `: excluded here so this loop checks the internal tables alone.
+        let objects: Vec<Row> = rows_of(&catalog, OBJECTS_TABLE)
+            .into_iter()
+            .filter(|row| {
+                !matches!(
+                    rendered(&row.0[objects_columns::NAME]),
+                    Some(name) if bootstrap::MASTER_DBO_SHIPPED_TABLES
+                        .iter()
+                        .any(|shipped| shipped.eq_ignore_ascii_case(&name))
+                )
+            })
+            .collect();
         assert!(!objects.is_empty());
         for row in &objects {
             assert_eq!(
@@ -1873,12 +1960,15 @@ mod tests {
             &catalog,
             &table_def("t", vec![column_def("a", SqlType::Int, false, false)]),
         );
+        // `tables` returns the tables the store holds, the five shipped ones included:
+        // filtered down to the one just created.
         let user = object_rows(&tables)
             .expect("the rows of the objects table")
             .into_iter()
-            .map(|row| rendered(&row.0[objects_columns::NAME]))
+            .filter_map(|row| rendered(&row.0[objects_columns::NAME]))
+            .filter(|name| name == "t")
             .collect::<Vec<_>>();
-        assert_eq!(user, vec![Some("t".to_owned())]);
+        assert_eq!(user, vec!["t".to_owned()]);
     }
 
     #[test]

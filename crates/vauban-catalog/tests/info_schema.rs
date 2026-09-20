@@ -14,7 +14,19 @@ use std::sync::Arc;
 use vauban_catalog::{Catalog, ColumnDef, QualifiedName, TableDef};
 use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager};
-use vauban_types::{Len, SqlType, TypeInfo};
+use vauban_types::{Len, SqlType, TypeInfo, Value};
+
+/// The names of the tables `Catalog::bootstrap` seeds `master.dbo` with, for the drivers that
+/// read them through `sp_tables` / `sp_columns_100` rather than through a table a client owns.
+/// `tests/bootstrap.rs` names the same five as a local constant of its own: integration test
+/// files do not share state.
+const MASTER_DBO_SHIPPED_TABLES: [&str; 5] = [
+    "spt_fallback_db",
+    "spt_fallback_dev",
+    "spt_fallback_usg",
+    "spt_monitor",
+    "MSreplication_options",
+];
 
 /// The column names a `SELECT` text of `views/` publishes, in order: the last identifier of
 /// each comma-separated item.
@@ -158,13 +170,36 @@ fn table_shaped(storage: &Arc<dyn Storage>, columns: &[TypeInfo]) -> TableId {
     found.pop().expect("the shape was found")
 }
 
-/// The number of rows of `table`, read through a transaction of its own.
-fn row_count(storage: &Arc<dyn Storage>, txn: &Arc<TransactionManager>, table: TableId) -> usize {
+/// The rows of `table`, read through a transaction of its own. `TABLE_NAME` is column 2 of
+/// both [`tables_shape`] and [`columns_shape`] (`views/info_schema.rs`, `tables_table_columns`,
+/// `columns_table_columns`).
+fn rows(
+    storage: &Arc<dyn Storage>,
+    txn: &Arc<TransactionManager>,
+    table: TableId,
+) -> Vec<Vec<Value>> {
     let handle = txn.begin(IsolationLevel::ReadCommitted);
     let snapshot = txn.statement_snapshot(&handle);
-    let rows = storage.scan(&snapshot, table).expect("scan").count();
+    let rows: Vec<Vec<Value>> = storage
+        .scan(&snapshot, table)
+        .expect("scan")
+        .map(|row| row.expect("row").1.0)
+        .collect();
     txn.commit(handle).expect("commit of the reading txn");
     rows
+}
+
+/// The rows of `table` whose `TABLE_NAME` is `name`.
+fn rows_named(
+    storage: &Arc<dyn Storage>,
+    txn: &Arc<TransactionManager>,
+    table: TableId,
+    name: &str,
+) -> Vec<Vec<Value>> {
+    rows(storage, txn, table)
+        .into_iter()
+        .filter(|row| matches!(&row[2], Value::String(s) if s.text == name))
+        .collect()
 }
 
 /// A column of a definition, with its type and nothing else on it.
@@ -220,11 +255,19 @@ fn the_bootstrap_creates_the_two_internal_tables_of_this_file() {
     let (_catalog, storage, txn) = instance();
     for shape in [tables_shape(), columns_shape()] {
         let table = table_shaped(&storage, &shape);
-        // No row at bootstrap: the rows of the two tables are those of the tables a client
-        // creates, and a fresh instance holds none (unit test
-        // `the_two_internal_tables_hold_no_row_at_bootstrap`). SQL Server answers 0 to
-        // `SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES` on a fresh database as well.
-        assert_eq!(row_count(&storage, &txn, table), 0);
+        // The bootstrap also seeds `master.dbo` with the five tables of
+        // `MASTER_DBO_SHIPPED_TABLES`: their rows enter these two internal tables through
+        // `create_table`, like any other table's. Filtered out below, the rows of the two
+        // tables are those of the tables a client creates, and a fresh instance holds none
+        // (unit test `the_two_internal_tables_hold_no_row_at_bootstrap`).
+        let unrelated = rows(&storage, &txn, table)
+            .into_iter()
+            .filter(|row| match &row[2] {
+                Value::String(name) => !MASTER_DBO_SHIPPED_TABLES.contains(&name.text.as_str()),
+                other => panic!("TABLE_NAME carries {other:?}"),
+            })
+            .count();
+        assert_eq!(unrelated, 0);
     }
 }
 
@@ -283,6 +326,9 @@ fn a_created_table_writes_its_table_row_and_its_two_column_rows() {
     txn.commit(handle).expect("commit");
 
     assert_eq!(meta.columns.len(), 2);
-    assert_eq!(row_count(&storage, &txn, tables), 1);
-    assert_eq!(row_count(&storage, &txn, columns), 2);
+    // Bootstrap also seeds `master.dbo` with five tables of its own
+    // (`MASTER_DBO_SHIPPED_TABLES`), whose rows enter the same two internal tables: filtered
+    // here to the rows `t`'s own `TABLE_NAME` names.
+    assert_eq!(rows_named(&storage, &txn, tables, "t").len(), 1);
+    assert_eq!(rows_named(&storage, &txn, columns, "t").len(), 2);
 }

@@ -53,11 +53,13 @@ fn rows(
     rows
 }
 
-/// The internal table of the schemas: the table of `master` that holds a row with the text
-/// `dbo`.
+/// The internal table of the schemas: the table of `master` that holds a row for each of
+/// `dbo`, `sys` and `INFORMATION_SCHEMA`.
 ///
 /// Read through `Storage::scan` rather than through a `CatalogSnapshot`, so that the test
-/// depends on the storage alone.
+/// depends on the storage alone. A row with the text `dbo` alone is not enough to single out
+/// this table: `master.dbo` carries tables of its own, published under that same schema name
+/// wherever a table lists the schema it belongs to.
 fn schemas_table(
     storage: &Arc<dyn Storage>,
     txn: &Arc<TransactionManager>,
@@ -66,17 +68,25 @@ fn schemas_table(
     let mut found = Vec::new();
     for (table, _) in storage.tables(master).expect("tables(master)") {
         let content = rows(storage, txn, table);
-        if content.iter().any(|row| row.iter().any(is_dbo)) {
+        if SYSTEM_SCHEMAS.iter().all(|schema| {
+            content
+                .iter()
+                .any(|row| row.iter().any(|v| is_text(v, schema)))
+        }) {
             found.push(content);
         }
     }
-    assert_eq!(found.len(), 1, "one table of master holds the text `dbo`");
+    assert_eq!(
+        found.len(),
+        1,
+        "one table of master holds a row for each of dbo, sys and INFORMATION_SCHEMA"
+    );
     found.pop().unwrap_or_default()
 }
 
-/// Whether a value is the text `dbo`.
-fn is_dbo(value: &Value) -> bool {
-    matches!(value, Value::String(s) if s.text == "dbo")
+/// Whether a value is the text `expected`.
+fn is_text(value: &Value, expected: &str) -> bool {
+    matches!(value, Value::String(s) if s.text == expected)
 }
 
 /// The texts a row carries.
@@ -210,4 +220,49 @@ fn the_internal_tables_hold_a_row_per_database() {
         "the row of msdb carries its collation name: {:?}",
         named[0]
     );
+}
+
+/// The names of the tables a fresh instance carries in `master.dbo` for the drivers that read
+/// them through `sp_tables` / `sp_columns_100` rather than through a table a client owns.
+const MASTER_DBO_SHIPPED_TABLES: [&str; 5] = [
+    "spt_fallback_db",
+    "spt_fallback_dev",
+    "spt_fallback_usg",
+    "spt_monitor",
+    "MSreplication_options",
+];
+
+#[test]
+fn master_dbo_carries_the_shipped_tables() {
+    let (storage, txn) = instance();
+    Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn)).expect("bootstrap");
+    let master = databases(&storage)[0].0;
+    for name in MASTER_DBO_SHIPPED_TABLES {
+        let mut found: Vec<Vec<Value>> = Vec::new();
+        for (table, _) in storage.tables(master).expect("tables(master)") {
+            for row in rows(&storage, &txn, table) {
+                let t = texts(&row);
+                // The row of the table of objects carrying this name and the type of a user
+                // table: eleven fields, `name` and `U ` among its texts.
+                if row.len() == 11
+                    && t.iter().any(|text| text == name)
+                    && t.iter().any(|text| text == "U ")
+                {
+                    found.push(row);
+                }
+            }
+        }
+        // `sys.objects` and `sys.all_objects` each carry a row of this shape for the table:
+        // both publish it `is_ms_shipped`.
+        assert!(
+            !found.is_empty(),
+            "a row of master names {name} with type U"
+        );
+        for row in &found {
+            assert!(
+                row.contains(&Value::Bit(true)),
+                "{name} is published is_ms_shipped: {row:?}"
+            );
+        }
+    }
 }
