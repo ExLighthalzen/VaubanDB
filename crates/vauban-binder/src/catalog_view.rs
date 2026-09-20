@@ -93,6 +93,13 @@ impl CatalogView for CatalogSnapshot {
 
     /// Names of the constraints on `table`: index-backed `PRIMARY KEY` and `UNIQUE`, then
     /// `FOREIGN KEY`, `CHECK` and `DEFAULT` objects.
+    ///
+    /// The three non-key kinds are named through [`CatalogSnapshot::constraint_name`] and not
+    /// [`CatalogSnapshot::object_name`]: a constraint is not an entry of `objects`
+    /// ([`CatalogSnapshot`] module documentation), whether it was declared in the
+    /// `CREATE TABLE` or added by a later `ALTER TABLE … ADD` (`bind_alter_table.rs`,
+    /// `drop_constraint_binds_a_create_table_foreign_key`,
+    /// `drop_constraint_binds_an_added_check`).
     fn constraint_names_on_table(&self, table: ObjectId) -> Vec<String> {
         let Some(meta) = self.table(table) else {
             return Vec::new();
@@ -115,7 +122,7 @@ impl CatalogView for CatalogSnapshot {
                 | ConstraintMeta::Default { constraint, .. } => *constraint,
                 _ => continue,
             };
-            if let Some(qualified) = self.object_name(object) {
+            if let Some(qualified) = self.constraint_name(object) {
                 names.push(qualified.name);
             }
         }

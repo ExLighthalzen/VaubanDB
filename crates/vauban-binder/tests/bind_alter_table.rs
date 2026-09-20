@@ -325,3 +325,154 @@ fn duplicate_constraint_name_is_2714() {
     );
     assert_eq!((error.number, error.severity, error.state), (2714, 16, 5));
 }
+
+/// The two tests below bind against a [`vauban_catalog::CatalogSnapshot`] built from a real
+/// [`vauban_catalog::Catalog`]: `Tables` answers `constraint_names_on_table` from a list
+/// handed to it, so it cannot exercise the lookup a real snapshot makes.
+fn real_column(name: &str, ty: SqlType, nullable: bool) -> vauban_catalog::ColumnDef {
+    vauban_catalog::ColumnDef {
+        name: name.to_owned(),
+        ty: TypeInfo::new(ty, nullable),
+        default: None,
+        identity: None,
+        computed: None,
+    }
+}
+
+fn real_ctx<'a>(text: &'a str, snapshot: &'a vauban_catalog::CatalogSnapshot) -> BindContext<'a> {
+    BindContext {
+        text,
+        catalog: Some(snapshot),
+        database: "master",
+        default_schema: "dbo",
+        variables: &NoVariables,
+        options: SessionOptions::default(),
+    }
+}
+
+fn real_alter(text: &str, snapshot: &vauban_catalog::CatalogSnapshot) -> AlterTable {
+    register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default()).expect("parse");
+    match bind(&batch.statements[0], &real_ctx(text, snapshot)).expect("bind") {
+        BoundStatement::Ddl(DdlStatement::AlterTable { action, .. }) => action,
+        other => panic!("expected AlterTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn drop_constraint_binds_a_create_table_foreign_key() {
+    use std::sync::Arc;
+    use vauban_catalog::{Catalog, QualifiedName, SortedColumn, TableDef};
+    use vauban_storage::{MemoryStorage, Storage};
+    use vauban_txn::{IsolationLevel, TransactionManager};
+
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let txn = Arc::new(TransactionManager::new(Arc::clone(&storage)));
+    let catalog = Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn)).expect("bootstrap");
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+
+    let mut t1 = TableDef {
+        name: QualifiedName {
+            database: "master".to_owned(),
+            schema: "dbo".to_owned(),
+            name: "t1".to_owned(),
+        },
+        columns: vec![real_column("id", SqlType::Int, false)],
+        constraints: Vec::new(),
+    };
+    t1.constraints.push(ConstraintDef::PrimaryKey {
+        name: Some("pk_t1".to_owned()),
+        columns: vec![SortedColumn {
+            column: "id".to_owned(),
+            descending: false,
+        }],
+        clustered: true,
+    });
+    catalog.create_table(&handle, &t1).expect("create t1");
+
+    let mut t2 = TableDef {
+        name: QualifiedName {
+            database: "master".to_owned(),
+            schema: "dbo".to_owned(),
+            name: "t2".to_owned(),
+        },
+        columns: vec![real_column("b", SqlType::Int, false)],
+        constraints: Vec::new(),
+    };
+    t2.constraints.push(ConstraintDef::ForeignKey {
+        name: Some("fk_t2".to_owned()),
+        columns: vec!["b".to_owned()],
+        referenced: QualifiedName {
+            database: "master".to_owned(),
+            schema: "dbo".to_owned(),
+            name: "t1".to_owned(),
+        },
+        referenced_columns: vec!["id".to_owned()],
+        on_delete: vauban_parser::RefAction::NoAction,
+        on_update: vauban_parser::RefAction::NoAction,
+    });
+    catalog.create_table(&handle, &t2).expect("create t2");
+    txn.commit(handle).expect("commit create");
+
+    let read = txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = catalog.snapshot(&read);
+    let action = real_alter("ALTER TABLE dbo.t2 DROP CONSTRAINT fk_t2;", &snapshot);
+    assert_eq!(
+        action,
+        AlterTable::DropConstraint {
+            name: "fk_t2".to_owned()
+        }
+    );
+    txn.commit(read).expect("commit read");
+}
+
+#[test]
+fn drop_constraint_binds_an_added_check() {
+    use std::sync::Arc;
+    use vauban_catalog::{Catalog, QualifiedName, TableDef};
+    use vauban_storage::{MemoryStorage, Storage};
+    use vauban_txn::{IsolationLevel, TransactionManager};
+
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let txn = Arc::new(TransactionManager::new(Arc::clone(&storage)));
+    let catalog = Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn)).expect("bootstrap");
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+
+    let t3 = TableDef {
+        name: QualifiedName {
+            database: "master".to_owned(),
+            schema: "dbo".to_owned(),
+            name: "t3".to_owned(),
+        },
+        columns: vec![real_column("a", SqlType::Int, false)],
+        constraints: Vec::new(),
+    };
+    let meta = catalog.create_table(&handle, &t3).expect("create t3");
+    catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &vauban_catalog::AlterTable::AddConstraint {
+                constraint: Box::new(ConstraintDef::Check {
+                    name: Some("ck_t3".to_owned()),
+                    expr: vauban_parser::Expr::Literal(
+                        vauban_parser::Literal::Integer("1".to_owned()),
+                        vauban_parser::Span::EMPTY,
+                    ),
+                }),
+            },
+        )
+        .expect("add check");
+    txn.commit(handle).expect("commit create");
+
+    let read = txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = catalog.snapshot(&read);
+    let action = real_alter("ALTER TABLE dbo.t3 DROP CONSTRAINT ck_t3;", &snapshot);
+    assert_eq!(
+        action,
+        AlterTable::DropConstraint {
+            name: "ck_t3".to_owned()
+        }
+    );
+    txn.commit(read).expect("commit read");
+}

@@ -14,5 +14,9 @@ vauban-parser.workspace = true
 vauban-sysfn.workspace = true
 vauban-types.workspace = true
 
+[dev-dependencies]
+vauban-storage.workspace = true
+vauban-txn.workspace = true
+
 [lints]
 workspace = true

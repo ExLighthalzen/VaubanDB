@@ -989,3 +989,188 @@ fn identity_counter_survives_the_copy() {
     );
     txn.commit(handle).expect("commit");
 }
+
+#[test]
+fn drop_constraint_declared_in_create_table_removes_it() {
+    use vauban_catalog::SortedColumn;
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let mut t1 = table(
+        "t1",
+        vec![
+            column("a", SqlType::Int, false),
+            column("b", SqlType::Int, false),
+        ],
+    );
+    t1.constraints.push(ConstraintDef::PrimaryKey {
+        name: Some("pk_t1".to_owned()),
+        columns: vec![SortedColumn {
+            column: "a".to_owned(),
+            descending: false,
+        }],
+        clustered: true,
+    });
+    t1.constraints.push(ConstraintDef::Unique {
+        name: Some("uq_t1".to_owned()),
+        columns: vec![SortedColumn {
+            column: "b".to_owned(),
+            descending: false,
+        }],
+        clustered: false,
+    });
+    let t1_meta = catalog.create_table(&handle, &t1).expect("create t1");
+
+    let mut t2 = table(
+        "t2",
+        vec![
+            column("a", SqlType::Int, false),
+            column("b", SqlType::Int, false),
+        ],
+    );
+    t2.constraints.push(ConstraintDef::ForeignKey {
+        name: Some("fk_t2".to_owned()),
+        columns: vec!["b".to_owned()],
+        referenced: QualifiedName {
+            database: "master".to_owned(),
+            schema: "dbo".to_owned(),
+            name: "t1".to_owned(),
+        },
+        referenced_columns: vec!["a".to_owned()],
+        on_delete: vauban_parser::RefAction::NoAction,
+        on_update: vauban_parser::RefAction::NoAction,
+    });
+    t2.constraints.push(ConstraintDef::Check {
+        name: Some("ck_t2".to_owned()),
+        expr: Expr::Binary {
+            op: vauban_parser::BinaryOp::Gt,
+            op_span: Span::EMPTY,
+            left: Box::new(Expr::Column(vauban_parser::ColumnRef {
+                qualifier: None,
+                name: vauban_parser::Ident {
+                    value: "b".to_owned(),
+                    quoted: false,
+                },
+                span: Span::EMPTY,
+            })),
+            right: Box::new(Expr::Literal(Literal::Integer("0".to_owned()), Span::EMPTY)),
+            span: Span::EMPTY,
+        },
+    });
+    let t2_meta = catalog.create_table(&handle, &t2).expect("create t2");
+    txn.commit(handle).expect("commit create");
+    let handle = begin(&txn);
+    assert_eq!(catalog.constraints_of(t2_meta.id).expect("before").len(), 2);
+
+    let after_ck = catalog
+        .alter_table(
+            &handle,
+            t2_meta.id,
+            &AlterTable::DropConstraint {
+                name: "ck_t2".to_owned(),
+            },
+        )
+        .expect("ALTER TABLE t2 DROP CONSTRAINT ck_t2;");
+    assert_eq!(after_ck.constraints.len(), 1);
+
+    let after_fk = catalog
+        .alter_table(
+            &handle,
+            t2_meta.id,
+            &AlterTable::DropConstraint {
+                name: "fk_t2".to_owned(),
+            },
+        )
+        .expect("ALTER TABLE t2 DROP CONSTRAINT fk_t2;");
+    assert!(after_fk.constraints.is_empty());
+    assert!(
+        catalog
+            .referencing_foreign_keys(t1_meta.id)
+            .expect("referencing_foreign_keys")
+            .is_empty()
+    );
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
+fn drop_constraint_rollback_restores_a_create_table_foreign_key() {
+    use vauban_catalog::SortedColumn;
+    let (catalog, _storage, txn) = instance();
+    let setup = begin(&txn);
+    let mut t1 = table("t1", vec![column("a", SqlType::Int, false)]);
+    t1.constraints.push(ConstraintDef::PrimaryKey {
+        name: Some("pk_t1".to_owned()),
+        columns: vec![SortedColumn {
+            column: "a".to_owned(),
+            descending: false,
+        }],
+        clustered: true,
+    });
+    let t1_meta = catalog.create_table(&setup, &t1).expect("create t1");
+
+    let mut t2 = table("t2", vec![column("b", SqlType::Int, false)]);
+    t2.constraints.push(ConstraintDef::ForeignKey {
+        name: Some("fk_t2".to_owned()),
+        columns: vec!["b".to_owned()],
+        referenced: QualifiedName {
+            database: "master".to_owned(),
+            schema: "dbo".to_owned(),
+            name: "t1".to_owned(),
+        },
+        referenced_columns: vec!["a".to_owned()],
+        on_delete: vauban_parser::RefAction::NoAction,
+        on_update: vauban_parser::RefAction::NoAction,
+    });
+    let t2_meta = catalog.create_table(&setup, &t2).expect("create t2");
+    txn.commit(setup).expect("commit create");
+
+    // BEGIN TRAN; ALTER TABLE t2 DROP CONSTRAINT fk_t2; -- the foreign key leaves the table
+    // this transaction sees.
+    let handle = begin(&txn);
+    assert_eq!(
+        catalog
+            .referencing_foreign_keys(t1_meta.id)
+            .expect("referencing_foreign_keys before the drop")
+            .len(),
+        1
+    );
+    let dropped = catalog
+        .alter_table(
+            &handle,
+            t2_meta.id,
+            &AlterTable::DropConstraint {
+                name: "fk_t2".to_owned(),
+            },
+        )
+        .expect("ALTER TABLE t2 DROP CONSTRAINT fk_t2;");
+    assert!(dropped.constraints.is_empty());
+    assert!(
+        catalog
+            .referencing_foreign_keys(t1_meta.id)
+            .expect("referencing_foreign_keys mid-transaction")
+            .is_empty(),
+        "the drop is visible to its own transaction before it commits"
+    );
+
+    // ROLLBACK; -- the foreign key is back, as SQL Server leaves it.
+    txn.rollback(handle).expect("rollback");
+    let reader = begin(&txn);
+    let snapshot = catalog.snapshot(&reader);
+    let after_rollback = snapshot.table(t2_meta.id).expect("t2 after rollback");
+    assert_eq!(after_rollback.constraints.len(), 1);
+    assert_eq!(
+        catalog
+            .referencing_foreign_keys(t1_meta.id)
+            .expect("referencing_foreign_keys after rollback")
+            .len(),
+        1,
+        "a rolled back DROP CONSTRAINT leaves the foreign key on the child table"
+    );
+    assert_eq!(
+        catalog
+            .constraints_of(t2_meta.id)
+            .expect("constraints_of after rollback")
+            .len(),
+        1
+    );
+    txn.commit(reader).expect("commit reader");
+}

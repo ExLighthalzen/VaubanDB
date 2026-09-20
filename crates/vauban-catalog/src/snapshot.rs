@@ -3,7 +3,7 @@
 //!
 //! # Where the halves of a snapshot come from
 //!
-//! The catalogue keeps its metadata in four places, so a snapshot reads four sources:
+//! The catalogue keeps its metadata in five places, so a snapshot reads five sources:
 //!
 //! - the **databases** are the rows of `vauban_sys_databases`, read with
 //!   [`Storage::scan`](vauban_storage::Storage::scan) under the snapshot of the transaction
@@ -26,7 +26,11 @@
 //!   below; `tests/snapshot.rs`, `vauban_sys_databases_resolves_to_a_table_with_its_columns`);
 //! - the **system views** are the `SystemViewDef` the files of `views/` describe, read from
 //!   code and not from `storage` ([`described_views`]): a [`Catalog`] built from this binary
-//!   describes the same ones, so there is no row to scan for them (section below).
+//!   describes the same ones, so there is no row to scan for them (section below);
+//! - the **constraint names** are the `FOREIGN KEY`, `CHECK` and `DEFAULT` entries of
+//!   `constraints.rs`'s `ConstraintStore`, read from the same store as the tables and the
+//!   indexes, under the same lock and after the same refresh
+//!   ([`CatalogSnapshot::constraint_name`]).
 //!
 //! # The system views of `views/`
 //!
@@ -228,7 +232,7 @@ use crate::meta::{
     ColumnMeta, DatabaseMeta, IndexMeta, ObjectKind, ObjectMeta, QualifiedName,
     SnapshotIsolationState, TableMeta,
 };
-use crate::{index, table, views};
+use crate::{constraints, index, table, views};
 
 /// The [`ObjectId`] of the internal table whose description comes first in
 /// `bootstrap::internal_table_defs`; the following ones count up from it.
@@ -276,6 +280,19 @@ pub struct CatalogSnapshot {
     /// entry here, and [`CatalogSnapshot::indexes_of`] answers an empty slice for it
     /// (`tests/snapshot.rs`, `indexes_of_an_unknown_table_is_empty`).
     indexes: BTreeMap<ObjectId, Vec<IndexMeta>>,
+    /// The three-part name of each `FOREIGN KEY`, `CHECK` and `DEFAULT` constraint the
+    /// transaction sees, by the [`ObjectId`] of [`ConstraintMeta`](crate::meta::ConstraintMeta)
+    /// ([`crate::constraints::ConstraintStore`]).
+    ///
+    /// Kept apart from `objects`, which never carries a constraint (module documentation,
+    /// section "Where the halves of a snapshot come from"): a `PRIMARY KEY` and a `UNIQUE`
+    /// are named through their index ([`CatalogSnapshot::indexes_of`]), and merging the other
+    /// three kinds into `objects` would also make [`CatalogSnapshot::resolve_object`] and the
+    /// `OBJECT_NAME`/`OBJECT_ID` builtins answer for them, which is outside what this map is
+    /// for. [`CatalogSnapshot::constraint_name`] is the one reader
+    /// (`crates/vauban-binder/tests/bind_alter_table.rs`,
+    /// `drop_constraint_binds_a_create_table_foreign_key`).
+    constraint_names: BTreeMap<ObjectId, QualifiedName>,
 }
 
 impl CatalogSnapshot {
@@ -454,6 +471,21 @@ impl CatalogSnapshot {
     pub fn object_name(&self, id: ObjectId) -> Option<QualifiedName> {
         self.objects.get(&id).map(|object| object.name.clone())
     }
+
+    /// The three-part name of the `FOREIGN KEY`, `CHECK` or `DEFAULT` constraint of
+    /// identifier `id`, `None` for a `PRIMARY KEY`, a `UNIQUE`, an identifier this snapshot
+    /// does not hold, or an identifier that names something else entirely.
+    ///
+    /// A `PRIMARY KEY` and a `UNIQUE` are named through their index instead
+    /// ([`CatalogSnapshot::indexes_of`]); `binder`'s `constraint_names_on_table` reads this
+    /// for the other three kinds, whether the `CREATE TABLE` declared them or an
+    /// `ALTER TABLE … ADD` did (struct documentation;
+    /// `crates/vauban-binder/tests/bind_alter_table.rs`,
+    /// `drop_constraint_binds_a_create_table_foreign_key`,
+    /// `drop_constraint_binds_an_added_check`).
+    pub fn constraint_name(&self, id: ObjectId) -> Option<QualifiedName> {
+        self.constraint_names.get(&id).cloned()
+    }
 }
 
 /// Builds the snapshot [`Catalog::snapshot`] returns.
@@ -492,10 +524,15 @@ pub(crate) fn build(catalog: &Catalog, txn: &TxnHandle) -> CatalogSnapshot {
 /// of the table store and of the index store.
 fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
     let databases = databases_of(catalog, txn)?;
-    let (live, mut indexes) = {
+    let (live, mut indexes, constraint_names) = {
         let mut store = table::store(catalog);
         table::refresh(catalog, &mut store)?;
         index::refresh(catalog, &mut store)?;
+        // Same refresh `Catalog::constraints_of` runs before reading `store.constraints`
+        // (`constraints.rs`), under the same lock as the tables and the indexes above: a
+        // `FOREIGN KEY` or a `CHECK` this snapshot names comes from one state of the store.
+        constraints::refresh_sessions(catalog, &mut store)?;
+        constraints::forget_dropped(&mut store);
         let live: Vec<TableMeta> = store.live().cloned().collect();
         let indexes: BTreeMap<ObjectId, Vec<IndexMeta>> = live
             .iter()
@@ -509,7 +546,16 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
                 (!metas.is_empty()).then_some((meta.id, metas))
             })
             .collect();
-        (live, indexes)
+        // An object whose database is not among the ones read is left out, as for a table
+        // (module documentation).
+        let constraint_names: BTreeMap<ObjectId, QualifiedName> = store
+            .constraints
+            .entries
+            .values()
+            .filter(|object| databases.iter().any(|db| db.id == object.database))
+            .map(|object| (object.id, object.name.clone()))
+            .collect();
+        (live, indexes, constraint_names)
     };
     let mut objects = BTreeMap::new();
     let mut system_views = Vec::new();
@@ -557,6 +603,7 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
         system_views,
         tables,
         indexes,
+        constraint_names,
     })
 }
 
@@ -1444,6 +1491,7 @@ mod tests {
             system_views,
             tables: BTreeMap::new(),
             indexes: BTreeMap::new(),
+            constraint_names: BTreeMap::new(),
         }
     }
 

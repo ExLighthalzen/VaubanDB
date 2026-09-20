@@ -1485,7 +1485,9 @@ dependencies = [
  "vauban-catalog",
  "vauban-errors",
  "vauban-parser",
+ "vauban-storage",
  "vauban-sysfn",
+ "vauban-txn",
  "vauban-types",
 ]
 
