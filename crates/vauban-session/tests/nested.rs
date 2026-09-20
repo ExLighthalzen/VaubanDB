@@ -274,6 +274,44 @@ fn only_error(events: &[Event]) -> SqlError {
         .expect("one error")
 }
 
+/// Every error number the events carry, in order.
+fn error_numbers(events: &[Event]) -> Vec<u32> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Error(err) => Some(err.number),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `true` once a row whose first column is the int `n` appears.
+fn has_int_row(events: &[Event], n: i32) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, Event::Row(row) if row.first() == Some(&Value::I32(n))))
+}
+
+/// The last row of the events, as plain values.
+fn last_row(events: &[Event]) -> &[Value] {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Row(row) => Some(row.as_slice()),
+            _ => None,
+        })
+        .expect("at least one row")
+}
+
+fn run_batch(session: &mut Session, text: &str) -> Recording {
+    let mut sink = Recording::default();
+    session
+        .run_batch(text, &mut sink)
+        .expect("run_batch reports client errors through the sink");
+    sink
+}
+
 #[test]
 fn parameter_is_visible_in_the_text() {
     let (outcome, events) = run_nested(&mut session(), "SELECT @a + 1", &[int_param("@a", 41)]);
@@ -535,6 +573,230 @@ fn a_table_created_by_sp_executesql_is_read_by_the_calling_batch() {
     assert_eq!(only_row(&sink.0), 4);
 }
 
+/// The batch that issued `EXEC('…')` goes on past a `208` its nested text raised: only the
+/// nested text stops at the missing name, not the batch that called it.
+#[test]
+fn a_208_in_an_exec_lets_the_caller_continue() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('SELECT 1; SELECT * FROM dbo.nested_missing; SELECT 2;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![208]);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// An unknown column of a table that already exists is a compile error for the whole
+/// nested text (its `SELECT 1` never runs), and the caller still goes on afterward.
+#[test]
+fn a_207_compile_error_in_an_exec_lets_the_caller_continue() {
+    let mut session = session();
+    run_batch(&mut session, "CREATE TABLE dbo.nested_pre (a int);");
+    let events = run_batch(
+        &mut session,
+        "EXEC('SELECT 1; SELECT nosuch FROM dbo.nested_pre; SELECT 2;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![207]);
+    assert!(!has_int_row(&events.0, 1), "{:?}", events.0);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// A missing procedure called from inside an `EXEC('…')` also lets the caller continue.
+#[test]
+fn a_2812_in_an_exec_lets_the_caller_continue() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('EXEC dbo.nested_no_such_proc;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2812]);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// `8134` only stops the statement that raised it: the nested text goes on to its own next
+/// statement, which succeeds, so the caller sees the call as a whole succeed, and `@@ERROR`
+/// right after the call is `0`, not the division by zero in the middle of the text.
+#[test]
+fn an_8134_in_an_exec_lets_the_caller_continue_and_error_is_cleared_after() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('SELECT 1; SELECT 1/0; SELECT 2;'); SELECT @@ERROR;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![8134]);
+    assert_eq!(last_row(&events.0), &[Value::I32(0)]);
+}
+
+/// A `NOT NULL` violation inside an `EXEC('…')` lets the caller continue.
+#[test]
+fn a_515_in_an_exec_lets_the_caller_continue() {
+    let mut session = session();
+    run_batch(
+        &mut session,
+        "CREATE TABLE dbo.nested_notnull (a int NOT NULL);",
+    );
+    let events = run_batch(
+        &mut session,
+        "EXEC('INSERT dbo.nested_notnull (a) VALUES (NULL);'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![515]);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// A foreign-key violation inside an `EXEC('…')` lets the caller continue.
+#[test]
+fn a_547_in_an_exec_lets_the_caller_continue() {
+    let mut session = session();
+    run_batch(
+        &mut session,
+        "CREATE TABLE dbo.nested_parent (a int PRIMARY KEY); \
+         CREATE TABLE dbo.nested_child (a int REFERENCES dbo.nested_parent(a));",
+    );
+    let events = run_batch(
+        &mut session,
+        "EXEC('INSERT dbo.nested_child (a) VALUES (9);'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![547]);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// A unique-key violation inside an `EXEC('…')` lets the caller continue.
+#[test]
+fn a_2627_in_an_exec_lets_the_caller_continue() {
+    let mut session = session();
+    run_batch(
+        &mut session,
+        "CREATE TABLE dbo.nested_uniq (a int UNIQUE); INSERT dbo.nested_uniq (a) VALUES (1);",
+    );
+    let events = run_batch(
+        &mut session,
+        "EXEC('INSERT dbo.nested_uniq (a) VALUES (1);'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2627]);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// One of a family of checked exceptions: a conversion error raised while a nested statement
+/// runs ends the caller's batch too, unlike the numbers checked above, even without
+/// `XACT_ABORT`.
+#[test]
+fn a_245_in_an_exec_also_ends_the_caller_batch() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('SELECT 1; SELECT CAST(''abc'' AS int); SELECT 2;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![245]);
+    assert!(!has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// Same family as `245`: a date conversion that fails while a nested statement runs.
+#[test]
+fn a_241_in_an_exec_also_ends_the_caller_batch() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('SELECT 1; SELECT CAST(''zz'' AS datetime); SELECT 2;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![241]);
+    assert!(!has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// Same family as `245`: a numeric conversion that fails while a nested statement runs.
+#[test]
+fn an_8114_in_an_exec_also_ends_the_caller_batch() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('SELECT 1; SELECT CAST(''abc'' AS decimal(5,2)); SELECT 2;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![8114]);
+    assert!(!has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// Counter-proof: an operand type clash does not join the family above on every shape.
+/// `NEWID() + 1` fails to compile the whole nested text (no row from its own `SELECT 1`),
+/// like `207`, and the caller still continues on this one.
+#[test]
+fn a_206_operand_type_clash_lets_the_caller_continue_on_this_shape() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('SELECT 1; SELECT NEWID() + 1; SELECT 2;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![206]);
+    assert!(!has_int_row(&events.0, 1), "{:?}", events.0);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// Same family as `245`: an object that already exists, found while a nested statement of
+/// `EXEC('…')` runs.
+#[test]
+fn a_2714_in_an_exec_also_ends_the_caller_batch() {
+    let mut session = session();
+    run_batch(&mut session, "CREATE TABLE dbo.nested_dup (x int);");
+    let events = run_batch(
+        &mut session,
+        "EXEC('CREATE TABLE dbo.nested_dup (x int);'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2714]);
+    assert!(!has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// `XACT_ABORT ON` overrides the default: the caller stops after the `EXEC('…')` fails, even
+/// on a number (`208`) that lets it continue when `XACT_ABORT` is `OFF`.
+#[test]
+fn xact_abort_on_ends_the_caller_batch_even_after_a_208() {
+    let events = run_batch(
+        &mut session(),
+        "SET XACT_ABORT ON; EXEC('SELECT 1; SELECT * FROM dbo.nested_xact; SELECT 2;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![208]);
+    assert!(!has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// The same rule one level deeper: a `sp_executesql` called from inside a nested text lets
+/// that nested text continue to its own next statement after a `208`.
+#[test]
+fn a_208_from_sp_executesql_inside_a_nested_text_lets_it_continue() {
+    let (outcome, events) = run_nested(
+        &mut session(),
+        "EXEC sp_executesql N'SELECT 1; SELECT * FROM dbo.nested_deep; SELECT 2;'; SELECT 30;",
+        &[],
+    );
+    assert!(outcome.failed);
+    assert_eq!(error_numbers(&events.0), vec![208]);
+    assert!(has_int_row(&events.0, 30), "{:?}", events.0);
+}
+
+/// A missing procedure found by an `sp_executesql` called from inside an `EXEC('…')` lets
+/// both the nested text (its own `SELECT 22`) and the caller continue: no `DONEINPROC`
+/// carrying `more = false` goes out for the failing `EXEC dbo.nope;`, which a client can
+/// read as the end of the whole response and stop there, short of the caller's own rows.
+#[test]
+fn a_2812_from_sp_executesql_inside_an_exec_lets_both_levels_continue() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('EXEC sp_executesql N''EXEC dbo.nope;''; SELECT 22;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2812]);
+    assert!(has_int_row(&events.0, 22), "{:?}", events.0);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+    assert!(
+        !events
+            .0
+            .iter()
+            .any(|event| matches!(event, Event::DoneInProc(_, false))),
+        "{:?}",
+        events.0
+    );
+}
+
+/// An open transaction around the `EXEC('…')` does not change the rule: the caller still
+/// continues past the nested `208`, and the transaction commits.
+#[test]
+fn a_208_in_an_exec_inside_an_open_transaction_lets_the_caller_continue() {
+    let events = run_batch(
+        &mut session(),
+        "BEGIN TRAN; EXEC('SELECT * FROM dbo.nested_tx;'); SELECT 3; COMMIT;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![208]);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
 fn minimal_login_tokens() -> Vec<Token> {
     vec![
         Token::EnvChange(EnvChange::Database {
@@ -644,4 +906,100 @@ async fn tiberius_reads_run_nested_doneinproc_and_doneproc() {
         .expect("row read")
         .expect("one row returned");
     assert_eq!(row.get::<i32, _>(0), Some(42));
+}
+
+/// The rule this project applies to decide whether the caller of an `EXEC('…')` goes on: an
+/// error raised while a statement of the nested text *runs* stops the caller exactly when
+/// its catalogued scope (`vauban_errors::SqlError::batch_scope`) already stops the batch
+/// that raised it. Parameterized over the numbers this project checks that scope on.
+#[test]
+fn nested_batch_scope_family_decides_caller_continuation() {
+    let stops: &[(&str, u32)] = &[
+        ("SELECT CAST(''abc'' AS uniqueidentifier)", 8169),
+        ("SELECT DATEFROMPARTS(2020, 13, 1)", 289),
+        ("SELECT CAST(''zz'' AS smalldatetime)", 295),
+        ("SELECT CAST(''abc'' AS money)", 235),
+        ("SELECT CAST(NEWID() AS char(3))", 8170),
+        ("SELECT CONVERT(varchar(30), GETDATE(), 999)", 281),
+        ("SELECT CAST($12345678 AS varchar(3))", 234),
+    ];
+    for (stmt, number) in stops {
+        let text = format!("EXEC('SELECT 1; {stmt}; SELECT 2;'); SELECT 3;");
+        let events = run_batch(&mut session(), &text);
+        assert_eq!(
+            error_numbers(&events.0),
+            vec![*number],
+            "{stmt}: {:?}",
+            events.0
+        );
+        assert!(
+            !has_int_row(&events.0, 3),
+            "{stmt} is batch-scoped, should stop the caller: {:?}",
+            events.0
+        );
+    }
+
+    let continues: &[String] = &[
+        "EXEC('SELECT 1; SELECT 1/0; SELECT 2;'); SELECT 3;".to_owned(),
+        "EXEC('SELECT 1; SELECT CAST(100000 AS smallint); SELECT 2;'); SELECT 3;".to_owned(),
+    ];
+    for text in continues {
+        let events = run_batch(&mut session(), text);
+        assert!(
+            has_int_row(&events.0, 3),
+            "statement-scoped, should let the caller continue: {:?}",
+            events.0
+        );
+    }
+
+    {
+        let mut nn_session = session();
+        run_batch(
+            &mut nn_session,
+            "CREATE TABLE dbo.nested_scope_nn (a int NOT NULL);",
+        );
+        let events = run_batch(
+            &mut nn_session,
+            "EXEC('INSERT dbo.nested_scope_nn (a) VALUES (NULL);'); SELECT 3;",
+        );
+        assert_eq!(error_numbers(&events.0), vec![515]);
+        assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+    }
+
+    {
+        let mut fk_session = session();
+        run_batch(
+            &mut fk_session,
+            "CREATE TABLE dbo.nested_scope_parent (a int PRIMARY KEY); \
+             CREATE TABLE dbo.nested_scope_child (a int REFERENCES dbo.nested_scope_parent(a));",
+        );
+        let events = run_batch(
+            &mut fk_session,
+            "EXEC('INSERT dbo.nested_scope_child (a) VALUES (9);'); SELECT 3;",
+        );
+        assert_eq!(error_numbers(&events.0), vec![547]);
+        assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+    }
+
+    {
+        let mut uniq_session = session();
+        run_batch(
+            &mut uniq_session,
+            "CREATE TABLE dbo.nested_scope_uniq (a int UNIQUE); \
+             INSERT dbo.nested_scope_uniq (a) VALUES (1);",
+        );
+        let events = run_batch(
+            &mut uniq_session,
+            "EXEC('INSERT dbo.nested_scope_uniq (a) VALUES (1);'); SELECT 3;",
+        );
+        assert_eq!(error_numbers(&events.0), vec![2627]);
+        assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+    }
+
+    let events = run_batch(
+        &mut session(),
+        "EXEC('DROP TABLE dbo.nested_scope_no_such_table;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![3701]);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
 }

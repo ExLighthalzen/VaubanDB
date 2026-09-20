@@ -134,7 +134,11 @@ pub(crate) fn run_batch_dynamic(
         return_status: nested.return_status,
         failed: nested.failed,
         error_number: wrapper.last_error(),
-        continues: batch_continues(session, more, nested.failed, wrapper.last_error()),
+        continues: continues_after_nested(
+            more,
+            session.state().options.xact_abort,
+            wrapper.last_error(),
+        ),
     };
     if outcome.failed {
         session.state_mut().last_error = outcome.error_number;
@@ -177,7 +181,9 @@ fn execute_nested_sql(
         ))?;
     }
     let continues = match finish {
-        ProcFinish::Batch { more } => batch_continues(session, more, nested.failed, last_error),
+        ProcFinish::Batch { more } => {
+            continues_after_nested(more, session.state().options.xact_abort, last_error)
+        }
         ProcFinish::Rpc { .. } => false,
     };
     if nested.failed {
@@ -298,6 +304,46 @@ fn batch_continues(session: &Session, more: bool, failed: bool, error_number: u3
     more && !session.state().options.xact_abort
         && error_number != 0
         && SqlError::new(error_number, 16, 1, "x").batch_scope() == BatchErrorScope::Statement
+}
+
+/// A statement of a nested text that fails to compile stops the whole text before any of it
+/// runs: on the shapes checked, none of these numbers stops the caller
+/// (`tests/nested.rs`, `a_208_in_an_exec_lets_the_caller_continue` and its siblings for the
+/// other numbers of this list).
+const NESTED_TEXT_COMPILATION_ERRORS: [u32; 7] = [102, 137, 206, 207, 208, 2812, 4104];
+
+/// A `NOT NULL`, a `FOREIGN KEY`, a `UNIQUE` violation and a `DROP` of a name that does not
+/// exist let the caller continue on the shapes checked
+/// (`tests/nested.rs`, `nested_batch_scope_family_decides_caller_continuation`), matching the
+/// scope every other number here reads from `vauban_errors::SqlError::batch_scope`, which
+/// still answers `Batch` for these four: an open gap of that catalogue, not closed here.
+const NESTED_STATEMENT_ERRORS_LEFT_OUT_OF_THE_CATALOGUE: [u32; 4] = [515, 547, 2627, 3701];
+
+/// Whether the batch that issued `EXEC('…')` or `sp_executesql` runs its next statement once
+/// the nested text this call ran is done.
+///
+/// `XACT_ABORT ON` on the caller stops it after any failure. Otherwise, an error the nested
+/// text fails to *compile* on (`NESTED_TEXT_COMPILATION_ERRORS`) does not stop the caller: no
+/// statement of the text ran, so nothing there needed the caller to stop either. An error
+/// raised while a statement of the nested text *runs* stops the caller exactly when its
+/// catalogued scope (`vauban_errors::SqlError::batch_scope`) already stops the batch that
+/// raised it — `BatchErrorScope::Batch` — and lets the caller go on when it is
+/// `BatchErrorScope::Statement`, with the same answer restated for
+/// `NESTED_STATEMENT_ERRORS_LEFT_OUT_OF_THE_CATALOGUE` (`tests/nested.rs`,
+/// `nested_batch_scope_family_decides_caller_continuation`).
+pub(crate) fn continues_after_nested(more: bool, xact_abort: bool, error_number: u32) -> bool {
+    if error_number == 0 {
+        return more;
+    }
+    if xact_abort {
+        return false;
+    }
+    if NESTED_TEXT_COMPILATION_ERRORS.contains(&error_number)
+        || NESTED_STATEMENT_ERRORS_LEFT_OUT_OF_THE_CATALOGUE.contains(&error_number)
+    {
+        return more;
+    }
+    more && SqlError::new(error_number, 16, 1, "x").batch_scope() == BatchErrorScope::Statement
 }
 
 fn apply_batch_outputs(
@@ -497,10 +543,17 @@ impl ResultSink for BodySink<'_> {
     }
 }
 
-/// Forwards nested tokens and records the last client error number.
+/// Forwards nested tokens and records the error number of the nested statement most
+/// recently closed, `0` once one finishes without one: the same rule `@@ERROR` follows
+/// between two statements of a batch (`eval_context.rs`, `apply_exec_session`), carried
+/// here for the statement the caller sees once the whole call returns.
 struct TrackedSink<'a> {
     inner: &'a mut dyn ResultSink,
     last_error: u32,
+    /// `true` from an `error()` call until the `done_in_proc`/`done_proc` that closes the
+    /// statement it belongs to; tells that closing call whether to keep `last_error` or
+    /// zero it.
+    pending_error: bool,
 }
 
 impl<'a> TrackedSink<'a> {
@@ -508,7 +561,20 @@ impl<'a> TrackedSink<'a> {
         Self {
             inner,
             last_error: 0,
+            pending_error: false,
         }
+    }
+
+    /// Closes the statement `error()` last opened: keeps `last_error` when it just failed,
+    /// zeroes it when it ran to completion instead (`tests/nested.rs`,
+    /// `an_8134_in_an_exec_lets_the_caller_continue_and_error_is_cleared_after` for the
+    /// success case, `a_2812_in_an_exec_lets_the_caller_continue` for a failure that still
+    /// closes a statement this way).
+    fn close_statement(&mut self) {
+        if !self.pending_error {
+            self.last_error = 0;
+        }
+        self.pending_error = false;
     }
 }
 
@@ -526,6 +592,7 @@ impl ResultSink for TrackedSink<'_> {
     }
 
     fn done_in_proc(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
+        self.close_statement();
         self.inner.done_in_proc(rowcount, more)
     }
 
@@ -539,6 +606,7 @@ impl ResultSink for TrackedSink<'_> {
 
     fn error(&mut self, err: &SqlError) -> SqlResult<()> {
         self.last_error = err.number;
+        self.pending_error = true;
         self.inner.error(err)
     }
 
@@ -651,14 +719,7 @@ impl ResultSink for BatchExecSink<'_> {
     }
 
     fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
-        let more = if self.tracked.last_error != 0 {
-            self.more
-                && !self.xact_abort
-                && SqlError::new(self.tracked.last_error, 16, 1, "x").batch_scope()
-                    == BatchErrorScope::Statement
-        } else {
-            self.more
-        };
+        let more = continues_after_nested(self.more, self.xact_abort, self.tracked.last_error);
         self.tracked.done(rowcount, more)
     }
 

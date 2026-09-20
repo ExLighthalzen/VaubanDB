@@ -899,8 +899,11 @@ impl Session {
         let exec = self.exec().clone();
         apply_exec_session(nested_state, &exec, true, !inner.failed);
         self.exec_mut().identity_updated = false;
-        let continues =
-            nested_procedure_continues(nested_state, more, inner.failed, wrapper.last_error());
+        let continues = crate::procedures::continues_after_nested(
+            more,
+            nested_state.options.xact_abort,
+            wrapper.last_error(),
+        );
         Ok(if continues {
             Flow::Continue
         } else {
@@ -920,12 +923,12 @@ impl Session {
         outcome.failed = true;
         sink.error(&err)?;
         let continues = nested_procedure_continues(nested_state, more, true, err.number);
-        sink.done_in_proc(None, continues)?;
-        Ok(if continues {
-            Flow::Continue
+        if continues {
+            sink.done_in_proc(None, true)?;
+            Ok(Flow::Continue)
         } else {
-            Flow::Stop
-        })
+            Ok(Flow::Stop)
+        }
     }
 }
 
@@ -1030,6 +1033,8 @@ struct NestedProcedureSink<'a> {
     more: bool,
     xact_abort: bool,
     last_error: u32,
+    /// See `procedures.rs`, `TrackedSink::pending_error`.
+    pending_error: bool,
 }
 
 impl<'a> NestedProcedureSink<'a> {
@@ -1039,11 +1044,20 @@ impl<'a> NestedProcedureSink<'a> {
             more,
             xact_abort,
             last_error: 0,
+            pending_error: false,
         }
     }
 
     fn last_error(&self) -> u32 {
         self.last_error
+    }
+
+    /// See `procedures.rs`, `TrackedSink::close_statement`.
+    fn close_statement(&mut self) {
+        if !self.pending_error {
+            self.last_error = 0;
+        }
+        self.pending_error = false;
     }
 }
 
@@ -1061,18 +1075,13 @@ impl ResultSink for NestedProcedureSink<'_> {
     }
 
     fn done_in_proc(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
+        self.close_statement();
         self.inner.done_in_proc(rowcount, more)
     }
 
     fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
-        let continues = if self.last_error != 0 {
-            self.more
-                && !self.xact_abort
-                && SqlError::new(self.last_error, 16, 1, "x").batch_scope()
-                    == BatchErrorScope::Statement
-        } else {
-            self.more
-        };
+        let continues =
+            crate::procedures::continues_after_nested(self.more, self.xact_abort, self.last_error);
         self.inner.done_in_proc(rowcount, continues)
     }
 
@@ -1082,6 +1091,7 @@ impl ResultSink for NestedProcedureSink<'_> {
 
     fn error(&mut self, err: &SqlError) -> SqlResult<()> {
         self.last_error = err.number;
+        self.pending_error = true;
         self.inner.error(err)
     }
 
