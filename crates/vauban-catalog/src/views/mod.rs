@@ -19,6 +19,7 @@
 //! | `sys_routines.rs` | `sys.procedures`, `sql_modules`, `sys.parameters` |
 //! | `sys_object_kinds.rs` | `sys.triggers`, `sys.synonyms`, `sys.sequences`, `sys.table_types` |
 //! | `info_schema_constraints.rs` | `INFORMATION_SCHEMA.TABLE_CONSTRAINTS`, `KEY_COLUMN_USAGE`, `REFERENTIAL_CONSTRAINTS`, `VIEWS` |
+//! | `sys_principals.rs` | `sys.database_principals`, `sys.server_principals`, `sys.database_role_members`, `sys.server_role_members` |
 
 use crate::def::InternalTableDef;
 
@@ -38,6 +39,8 @@ pub(crate) mod sys_extra;
 pub(crate) mod sys_indexes;
 #[allow(dead_code)]
 pub(crate) mod sys_object_kinds;
+#[allow(dead_code)]
+pub(crate) mod sys_principals;
 #[allow(dead_code)]
 pub(crate) mod sys_routines;
 #[allow(dead_code)]
@@ -65,6 +68,7 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
         sys_routines::internal_tables(),
         sys_object_kinds::internal_tables(),
         info_schema_constraints::internal_tables(),
+        sys_principals::internal_tables(),
     ]
     .into_iter()
     .flatten()

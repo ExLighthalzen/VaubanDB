@@ -102,10 +102,11 @@ pub(crate) const DEFAULT_COLLATION_NAME: &str = "SQL_Latin1_General_CP1_CI_AS";
 ///
 /// The numbers are those `master.sys.schemas` publishes: `dbo` 1/1, `INFORMATION_SCHEMA`
 /// 3/3, `sys` 4/4. The other rows of that view — `guest` (2) and the `db_*` database roles
-/// from 16384 up — describe database principals VaubanDB does not serve, so their numbers
-/// are left unused rather than reassigned. Being constants rather than a counter, these identifiers do not
-/// depend on the order the rows were written in, so a restart publishes them unchanged
-/// (integration test `bootstrap_creates_three_schemas_in_master`).
+/// from 16384 up — are principals `views/sys_principals.rs` serves without a schema of their
+/// own, so their numbers stay unused here rather than reassigned. Being constants rather than
+/// a counter, these identifiers do not depend on the order the rows were written in, so a
+/// restart publishes them unchanged (integration test
+/// `bootstrap_creates_three_schemas_in_master`).
 pub(crate) const SYSTEM_SCHEMAS: [(&str, i32, i32); 3] =
     [("dbo", 1, 1), ("INFORMATION_SCHEMA", 3, 3), ("sys", 4, 4)];
 

@@ -106,7 +106,7 @@ use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
 use crate::meta::{QualifiedName, TableMeta};
 use crate::views::{
     dm_exec, info_schema, info_schema_constraints, sys_constraints, sys_core, sys_indexes,
-    sys_object_kinds, sys_routines, sys_tables,
+    sys_object_kinds, sys_principals, sys_routines, sys_tables,
 };
 
 /// Internal table of the objects of a database, system views included, read by
@@ -653,9 +653,9 @@ fn own_views() -> Vec<SystemViewDef> {
 /// [`crate::views::sys_core::bootstrap_views`], those two views being carried by the tables
 /// `bootstrap.rs` owns rather than by a table of a file of `views/` (integration test
 /// `the_objects_copy_carries_the_system_views_of_the_catalogue`, which reads `databases`).
-/// `dm_exec.rs`, `sys_object_kinds.rs` and `info_schema_constraints.rs` are chained last, after
-/// `own`, in that order, so a view already numbered keeps its identifier when a file that adds
-/// views is chained at the end.
+/// `dm_exec.rs`, `sys_object_kinds.rs`, `info_schema_constraints.rs` and `sys_principals.rs`
+/// are chained last, after `own`, in that order, so a view already numbered keeps its
+/// identifier when a file that adds views is chained at the end.
 fn installed_system_views(own: &[SystemViewDef]) -> Vec<QualifiedName> {
     let described = [
         sys_tables::internal_tables(),
@@ -672,6 +672,7 @@ fn installed_system_views(own: &[SystemViewDef]) -> Vec<QualifiedName> {
     let dm_exec = dm_exec::internal_tables();
     let sys_object_kinds = sys_object_kinds::internal_tables();
     let info_schema_constraints = info_schema_constraints::internal_tables();
+    let sys_principals = sys_principals::internal_tables();
     let installed = described
         .iter()
         .flatten()
@@ -684,7 +685,8 @@ fn installed_system_views(own: &[SystemViewDef]) -> Vec<QualifiedName> {
             info_schema_constraints
                 .iter()
                 .flat_map(|table| table.views.iter()),
-        );
+        )
+        .chain(sys_principals.iter().flat_map(|table| table.views.iter()));
     let mut names: Vec<QualifiedName> = Vec::new();
     for view in installed {
         if !names.iter().any(|kept| {
