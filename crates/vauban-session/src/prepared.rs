@@ -30,6 +30,9 @@ pub struct Prepared {
     pub text: String,
     /// Declarations from the `@params` argument.
     pub params: Vec<ParameterDeclaration>,
+    /// Type of each entry of `params`, resolved once when the handle is prepared: `execute`
+    /// and `sp_execute` reuse it instead of resolving the declaration again.
+    pub param_types: Vec<TypeInfo>,
 }
 
 /// Per-session table of prepared handles. Handles start at 1 and are not reused.
@@ -112,17 +115,29 @@ fn execute_prepare(
     sink: &mut dyn ResultSink,
 ) -> SqlResult<BatchProcOutcome> {
     let nested_state = session.state().clone();
-    if let Err(err) = validate_prepared_text(session, statement, declarations, &nested_state) {
-        sink.error(&err)?;
-        sink.error(&SqlError::statement_could_not_be_prepared())?;
-        session.state_mut().last_error = err.number;
-        sink.done_proc(None)?;
-        return Ok(failed_outcome(err.number));
+
+    // The `@params` declarations resolve before the text is even parsed, but an unknown type
+    // there still carries the same `statement_could_not_be_prepared` (8180) as a real compile
+    // error of the text (`unknown_param_type_is_2715_followed_by_8180` on that shape).
+    let param_types = match resolve_declaration_types(declarations) {
+        Ok(types) => types,
+        Err(err) => return prepare_failed(session, sink, err),
+    };
+
+    if let Err(err) = validate_prepared_text(
+        session,
+        statement,
+        &param_types,
+        declarations,
+        &nested_state,
+    ) {
+        return prepare_failed(session, sink, err);
     }
 
     let prepared = Prepared {
         text: statement.to_owned(),
         params: declarations.to_vec(),
+        param_types,
     };
     let handle = session.state_mut().prepared.allocate(prepared.clone());
     let handle_ty = rpc_params
@@ -244,6 +259,21 @@ fn failed_outcome(error_number: u32) -> BatchProcOutcome {
     }
 }
 
+/// Sends `err`, then the `statement_could_not_be_prepared` (8180) that follows it whether the
+/// cause is an unknown `@params` type or a compile error of the text
+/// (`unknown_param_type_is_2715_followed_by_8180`, `invalid_prepare_text_emits_8180`).
+fn prepare_failed(
+    session: &mut Session,
+    sink: &mut dyn ResultSink,
+    err: SqlError,
+) -> SqlResult<BatchProcOutcome> {
+    sink.error(&err)?;
+    sink.error(&SqlError::statement_could_not_be_prepared())?;
+    session.state_mut().last_error = err.number;
+    sink.done_proc(None)?;
+    Ok(failed_outcome(err.number))
+}
+
 fn emit_handle_return_value(
     sink: &mut dyn ResultSink,
     rpc_params: &[RpcParam],
@@ -277,11 +307,12 @@ fn proc_params_to_nested(prepared: &Prepared, params: &[ProcParam]) -> SqlResult
     prepared
         .params
         .iter()
+        .zip(prepared.param_types.iter())
         .zip(params.iter())
-        .map(|(decl, arg)| {
+        .map(|((decl, ty), arg)| {
             Ok(NestedParam {
                 name: decl.name.clone(),
-                ty: declaration_type(&decl.ty),
+                ty: ty.clone(),
                 value: arg.value.clone(),
                 output: decl.output || arg.output,
             })
@@ -305,6 +336,7 @@ fn parameterized_query(declarations: &[ParameterDeclaration], statement: &str) -
 fn validate_prepared_text(
     session: &Session,
     text: &str,
+    param_types: &[TypeInfo],
     declarations: &[ParameterDeclaration],
     state: &SessionState,
 ) -> SqlResult<()> {
@@ -313,8 +345,8 @@ fn validate_prepared_text(
         return Ok(());
     }
     let mut batch_variables = BatchVariables::new();
-    for decl in declarations {
-        batch_variables.declare(&decl.name, declaration_type(&decl.ty))?;
+    for (decl, ty) in declarations.iter().zip(param_types.iter()) {
+        batch_variables.declare(&decl.name, ty.clone())?;
     }
     let binding = session.engine().txn.begin(IsolationLevel::ReadCommitted);
     let snapshot = session.engine().catalog.snapshot(&binding);
@@ -376,11 +408,22 @@ fn bind_prepared_statements(
     Ok(())
 }
 
-fn declaration_type(decl: &DataType) -> TypeInfo {
-    resolve_decl_type(decl).unwrap_or_else(|_| TypeInfo::new(SqlType::Int, true))
+/// Resolves each declaration of `@params`, in order, or refuses the first one it cannot name
+/// instead of falling back to a silent `int` (message 2715, naming the type; see
+/// `unknown_param_type_is_2715_followed_by_8180`).
+fn resolve_declaration_types(declarations: &[ParameterDeclaration]) -> SqlResult<Vec<TypeInfo>> {
+    declarations
+        .iter()
+        .enumerate()
+        .map(|(index, decl)| declaration_type(&decl.ty, index as u32 + 1))
+        .collect()
 }
 
-fn resolve_decl_type(decl: &DataType) -> SqlResult<TypeInfo> {
+fn declaration_type(decl: &DataType, position: u32) -> SqlResult<TypeInfo> {
+    resolve_decl_type(decl, position)
+}
+
+fn resolve_decl_type(decl: &DataType, position: u32) -> SqlResult<TypeInfo> {
     let name = decl.name.to_ascii_lowercase();
     let sql_type = match name.as_str() {
         "int" | "integer" => SqlType::Int,
@@ -389,18 +432,20 @@ fn resolve_decl_type(decl: &DataType) -> SqlResult<TypeInfo> {
         "tinyint" => SqlType::TinyInt,
         "bit" => SqlType::Bit,
         "nvarchar" | "national char varying" | "national character varying" => {
-            sized_sql_type(decl, SqlType::NVarChar, 4_000, true)?
+            sized_sql_type(decl, SqlType::NVarChar, 4_000, true, position)?
         }
         "varchar" | "char varying" | "character varying" => {
-            sized_sql_type(decl, SqlType::VarChar, 8_000, true)?
+            sized_sql_type(decl, SqlType::VarChar, 8_000, true, position)?
         }
         "nchar" | "national char" | "national character" => {
-            sized_sql_type(decl, SqlType::NChar, 4_000, false)?
+            sized_sql_type(decl, SqlType::NChar, 4_000, false, position)?
         }
-        "char" | "character" => sized_sql_type(decl, SqlType::Char, 8_000, false)?,
-        "varbinary" | "binary varying" => sized_sql_type(decl, SqlType::VarBinary, 8_000, true)?,
-        "binary" => sized_sql_type(decl, SqlType::Binary, 8_000, false)?,
-        "decimal" | "dec" | "numeric" => exact_numeric(decl)?,
+        "char" | "character" => sized_sql_type(decl, SqlType::Char, 8_000, false, position)?,
+        "varbinary" | "binary varying" => {
+            sized_sql_type(decl, SqlType::VarBinary, 8_000, true, position)?
+        }
+        "binary" => sized_sql_type(decl, SqlType::Binary, 8_000, false, position)?,
+        "decimal" | "dec" | "numeric" => exact_numeric(decl, position)?,
         "float" | "double precision" => SqlType::Float,
         "real" => SqlType::Real,
         "money" => SqlType::Money,
@@ -409,9 +454,17 @@ fn resolve_decl_type(decl: &DataType) -> SqlResult<TypeInfo> {
         "datetime" => SqlType::DateTime,
         "smalldatetime" => SqlType::SmallDateTime,
         "datetime2" => SqlType::DateTime2(7),
+        "datetimeoffset" => SqlType::DateTimeOffset(7),
         "time" => SqlType::Time(7),
         "uniqueidentifier" => SqlType::UniqueIdentifier,
-        _ => return Err(SqlError::cannot_find_data_type(1, &decl.name)),
+        // Plain `sysname` is `nvarchar(128)`; a length is refused in a declaration.
+        "sysname" => {
+            if !decl.args.is_empty() {
+                return Err(SqlError::cannot_find_data_type(position, &decl.name));
+            }
+            SqlType::NVarChar(Len::Fixed(128))
+        }
+        _ => return Err(SqlError::cannot_find_data_type(position, &decl.name)),
     };
     Ok(TypeInfo::new(sql_type, true))
 }
@@ -421,32 +474,34 @@ fn sized_sql_type(
     make: fn(Len) -> SqlType,
     max: i64,
     allow_max: bool,
+    position: u32,
 ) -> SqlResult<SqlType> {
     let len = match decl.args.as_slice() {
         [] => Len::Fixed(1),
         [TypeArg::Number(n)] if (1..=max).contains(n) => Len::Fixed(
-            u16::try_from(*n).map_err(|_| SqlError::cannot_find_data_type(1, &decl.name))?,
+            u16::try_from(*n).map_err(|_| SqlError::cannot_find_data_type(position, &decl.name))?,
         ),
         [TypeArg::Max] if allow_max => Len::Max,
-        _ => return Err(SqlError::cannot_find_data_type(1, &decl.name)),
+        _ => return Err(SqlError::cannot_find_data_type(position, &decl.name)),
     };
     Ok(make(len))
 }
 
-fn exact_numeric(decl: &DataType) -> SqlResult<SqlType> {
+fn exact_numeric(decl: &DataType, position: u32) -> SqlResult<SqlType> {
     let (precision, scale) = match decl.args.as_slice() {
         [] => (18, 0),
         [TypeArg::Number(p)] => (*p, 0),
         [TypeArg::Number(p), TypeArg::Number(s)] => (*p, *s),
-        _ => return Err(SqlError::cannot_find_data_type(1, &decl.name)),
+        _ => return Err(SqlError::cannot_find_data_type(position, &decl.name)),
     };
     if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
-        return Err(SqlError::cannot_find_data_type(1, &decl.name));
+        return Err(SqlError::cannot_find_data_type(position, &decl.name));
     }
     Ok(SqlType::Decimal {
         precision: u8::try_from(precision)
-            .map_err(|_| SqlError::cannot_find_data_type(1, &decl.name))?,
-        scale: u8::try_from(scale).map_err(|_| SqlError::cannot_find_data_type(1, &decl.name))?,
+            .map_err(|_| SqlError::cannot_find_data_type(position, &decl.name))?,
+        scale: u8::try_from(scale)
+            .map_err(|_| SqlError::cannot_find_data_type(position, &decl.name))?,
     })
 }
 
@@ -534,10 +589,12 @@ mod tests {
         let first = table.allocate(Prepared {
             text: "SELECT 1".into(),
             params: Vec::new(),
+            param_types: Vec::new(),
         });
         let second = table.allocate(Prepared {
             text: "SELECT 2".into(),
             params: Vec::new(),
+            param_types: Vec::new(),
         });
         assert_eq!(first, 1);
         assert_eq!(second, 2);
@@ -545,6 +602,7 @@ mod tests {
         let third = table.allocate(Prepared {
             text: "SELECT 3".into(),
             params: Vec::new(),
+            param_types: Vec::new(),
         });
         assert_eq!(third, 3);
     }

@@ -427,6 +427,101 @@ fn prepexec_rpc_of(text: &str) -> Rpc {
     rpc
 }
 
+/// `sp_prepare` with `params_text` as its `@params` argument, on a statement free to ignore
+/// what it declares.
+fn prepare_rpc_of(params_text: &str) -> Rpc {
+    Rpc {
+        reset: ResetConnection::None,
+        proc: RpcProc::Name("sp_prepare".into()),
+        options: 0,
+        params: vec![
+            RpcParam {
+                name: String::new(),
+                output: true,
+                default: false,
+                ty: int_ty(),
+                value: int(0),
+            },
+            RpcParam {
+                name: "params".into(),
+                output: false,
+                default: false,
+                ty: nvarchar_ty(),
+                value: nvarchar(params_text),
+            },
+            RpcParam {
+                name: "stmt".into(),
+                output: false,
+                default: false,
+                ty: nvarchar_ty(),
+                value: nvarchar("SELECT 1 AS n"),
+            },
+        ],
+        transaction_descriptor: 0,
+    }
+}
+
+/// A type `resolve_data_type` does not name is refused (2715, naming the type) instead of
+/// silently becoming an `int`, and the refusal carries the same `statement_could_not_be_prepared`
+/// (8180) that follows a real compile error of the text: `@a notarealtype` on `sp_prepare`
+/// answers 2715 then 8180, same order and same pair as `invalid_prepare_text_emits_8180`.
+#[test]
+fn unknown_param_type_is_2715_followed_by_8180() {
+    let mut sink = ErrorLines::default();
+    session()
+        .run_rpc(&prepare_rpc_of("@a notarealtype"), &mut sink)
+        .expect("the prepare answers");
+    assert_eq!(sink.0.len(), 2);
+    assert_eq!(sink.0[0].number, 2715);
+    assert!(sink.0[0].message.contains("notarealtype"));
+    assert_eq!(sink.0[1].number, 8180);
+}
+
+/// `sp_prepexec` carries the same pair as `sp_prepare` on the same shape.
+#[test]
+fn unknown_param_type_is_2715_followed_by_8180_on_prepexec() {
+    let mut rpc = prepexec_rpc(1);
+    rpc.params[1].value = nvarchar("@a notarealtype");
+    let mut sink = ErrorLines::default();
+    session()
+        .run_rpc(&rpc, &mut sink)
+        .expect("the prepare answers");
+    assert_eq!(sink.0.len(), 2);
+    assert_eq!(sink.0[0].number, 2715);
+    assert_eq!(sink.0[1].number, 8180);
+}
+
+/// The rank named in the refusal is the 1-based position of the declaration in `@params`, not
+/// always `1`.
+#[test]
+fn unknown_param_type_names_its_rank_among_declarations() {
+    let mut sink = ErrorLines::default();
+    session()
+        .run_rpc(&prepare_rpc_of("@a int, @b notarealtype"), &mut sink)
+        .expect("the prepare answers");
+    assert_eq!(
+        sink.0[0].message,
+        "Column, parameter or variable #2: unknown data type notarealtype."
+    );
+}
+
+/// `sysname` and `datetimeoffset` are already served elsewhere in the engine: `sp_prepare`
+/// recognizes both instead of refusing them.
+#[test]
+fn sysname_and_datetimeoffset_params_are_recognized() {
+    for params_text in ["@p sysname", "@p datetimeoffset"] {
+        let mut sink = Recording::default();
+        session()
+            .run_rpc(&prepare_rpc_of(params_text), &mut sink)
+            .expect("the prepare answers");
+        assert!(
+            !sink.0.iter().any(|event| matches!(event, Event::Error(_))),
+            "{params_text} was refused: {:?}",
+            sink.0
+        );
+    }
+}
+
 /// A `DECLARE` of a type the binder does not know fails while the prepared text is bound,
 /// and the number leaves on the line the `DECLARE` was written on, not on the first line
 /// of that text.
