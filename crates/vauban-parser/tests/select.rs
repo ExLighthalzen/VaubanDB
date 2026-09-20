@@ -635,6 +635,124 @@ fn from_joins_are_left_associative() {
     );
 }
 
+/// A parenthesised join tree associates its content before the join that wraps it,
+/// against the default left association of [`from_joins_are_left_associative`].
+#[test]
+fn from_join_tree_in_parentheses() {
+    let text = "SELECT * FROM a LEFT JOIN (b INNER JOIN c ON b.k = c.k) ON a.j = b.j";
+    match &one_table_ref(text) {
+        TableRef::Join {
+            left,
+            right,
+            kind,
+            on,
+            ..
+        } => {
+            assert_eq!(table_parts(left).0, "a");
+            assert_eq!(*kind, JoinKind::Left);
+            assert!(on.is_some());
+            match right.as_ref() {
+                TableRef::Join {
+                    left: inner_left,
+                    right: inner_right,
+                    kind: inner_kind,
+                    on: inner_on,
+                    ..
+                } => {
+                    assert_eq!(table_parts(inner_left).0, "b");
+                    assert_eq!(table_parts(inner_right).0, "c");
+                    assert_eq!(*inner_kind, JoinKind::Inner);
+                    assert!(inner_on.is_some());
+                }
+                other => unreachable!("the parenthesised operand, got {other:?}"),
+            }
+        }
+        other => unreachable!("{text} is a join, got {other:?}"),
+    }
+
+    // Nested twice, three sources associating left-to-right inside the parentheses this
+    // time: `(a JOIN b) JOIN c`, the same tree `a JOIN b JOIN c` already builds without
+    // them, so the redundant parentheses leave the AST unchanged.
+    assert_eq!(
+        p("SELECT * FROM ((a JOIN b ON 1 = 1) JOIN c ON 2 = 2)"),
+        p("SELECT * FROM a JOIN b ON 1 = 1 JOIN c ON 2 = 2")
+    );
+    // Redundant parentheses print away where they change nothing.
+    assert_eq!(
+        rt("SELECT * FROM ((a JOIN b ON 1 = 1) JOIN c ON 2 = 2)"),
+        "SELECT * FROM a INNER JOIN b ON 1 = 1 INNER JOIN c ON 2 = 2"
+    );
+
+    // A derived table can stand as the first source a parenthesised join tree opens on.
+    match &one_table_ref("SELECT * FROM ((SELECT 1 AS n) AS x JOIN t ON x.n = t.n)") {
+        TableRef::Join { left, .. } => {
+            assert!(matches!(**left, TableRef::Derived { .. }));
+        }
+        other => unreachable!("a join, got {other:?}"),
+    }
+
+    // A pair of parentheses that hold no join at all is not the redundant grouping an
+    // expression would allow: SQL Server refuses a single reference or a comma list
+    // wrapped for no reason, on the token where a join operator was expected.
+    assert_eq!(p_err("SELECT * FROM (a)").number, 102);
+    assert_eq!(p_err("SELECT * FROM (a, b)").number, 102);
+    assert_eq!(p_err("SELECT * FROM ()").number, 102);
+    // A missing closing parenthesis is the syntax error of whatever follows.
+    assert_eq!(p_err("SELECT * FROM (a JOIN b ON a.id = b.id").number, 102);
+    // No alias follows a parenthesised join tree: `AS` is reserved, so the token left
+    // unconsumed is reported as a reserved keyword out of place, not a missing one.
+    assert_eq!(
+        p_err("SELECT * FROM (a JOIN b ON a.id = b.id) AS z").number,
+        156
+    );
+
+    // The one truly ambiguous shape, two parentheses in a row: a derived table wrapped an
+    // extra time for a set operator is still read as one, the join tree it might also
+    // have opened failing to find any join inside.
+    assert_eq!(
+        rt("SELECT * FROM ((SELECT 1 AS n) UNION (SELECT 2 AS n)) AS d"),
+        "SELECT * FROM ((SELECT 1 AS n) UNION (SELECT 2 AS n)) AS d"
+    );
+}
+
+/// A `right` side that is itself a [`TableRef::Join`] or [`TableRef::Apply`] needs its
+/// parentheses back for `Display` to hand a batch that reparses to the same tree: `left op
+/// right` alone would read back left-associative, changing the association the source
+/// picked with its own parentheses.
+#[test]
+fn from_join_right_is_reparenthesised() {
+    // The right side of the outer join is a plain two-source join tree.
+    assert_eq!(
+        rt("SELECT * FROM a LEFT JOIN (b INNER JOIN c ON b.k = c.k) ON a.j = b.j"),
+        "SELECT * FROM a LEFT JOIN (b INNER JOIN c ON b.k = c.k) ON a.j = b.j"
+    );
+
+    // The right side is a parenthesised, left-nested three-source join tree: the source's
+    // own redundant parentheses print away (`from_join_tree_in_parentheses`), the ones the
+    // outer join needs are added back around what is left.
+    assert_eq!(
+        rt(
+            "SELECT * FROM x LEFT JOIN ((a JOIN b ON a.id = b.id) JOIN c ON b.id = c.id) \
+             ON x.id = a.id"
+        ),
+        "SELECT * FROM x LEFT JOIN (a INNER JOIN b ON a.id = b.id INNER JOIN c ON b.id = c.id) \
+         ON x.id = a.id"
+    );
+
+    // `CROSS APPLY`/`OUTER APPLY` (V2) associate the same way and need the same guard.
+    assert_eq!(
+        rt("SELECT * FROM a CROSS APPLY (f(a.id) AS x CROSS APPLY g(x.n) AS y)"),
+        "SELECT * FROM a CROSS APPLY (f(a.id) AS x CROSS APPLY g(x.n) AS y)"
+    );
+
+    // The left side of a plain, unparenthesised chain of joins needs nothing: left
+    // association is already what `Display` produces by default.
+    assert_eq!(
+        rt("SELECT * FROM a JOIN b ON 1 = 1 JOIN c ON 2 = 2"),
+        "SELECT * FROM a INNER JOIN b ON 1 = 1 INNER JOIN c ON 2 = 2"
+    );
+}
+
 #[test]
 fn from_derived_table() {
     match &one_table_ref("SELECT * FROM (SELECT 1 AS n) AS d") {

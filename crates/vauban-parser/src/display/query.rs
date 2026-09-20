@@ -205,6 +205,21 @@ impl fmt::Display for TableHint {
     }
 }
 
+/// Writes the right operand of a [`TableRef::Join`] or [`TableRef::Apply`], parenthesised
+/// when it is itself one of those two: `left op right` would otherwise read back
+/// left-associative, `a LEFT JOIN b INNER JOIN c` building `(a LEFT JOIN b) INNER JOIN c`
+/// rather than the `a LEFT JOIN (b INNER JOIN c)` the tree holds. The parser builds this
+/// shape from a parenthesised join tree written on the right (see the module header of
+/// `parser::from`), so the parentheses added here mirror the ones read there;
+/// `tests/select.rs` carries the loop on that shape.
+fn write_join_operand(f: &mut fmt::Formatter<'_>, operand: &TableRef) -> fmt::Result {
+    if matches!(operand, TableRef::Join { .. } | TableRef::Apply { .. }) {
+        write!(f, "({operand})")
+    } else {
+        write!(f, "{operand}")
+    }
+}
+
 /// Writes a table reference. An alias is always introduced by `AS`: unlike a select item,
 /// a table reference does not record whether the user wrote the keyword.
 ///
@@ -251,7 +266,8 @@ impl fmt::Display for TableRef {
                 on,
                 ..
             } => {
-                write!(f, "{left} {kind} {right}")?;
+                write!(f, "{left} {kind} ")?;
+                write_join_operand(f, right)?;
                 if let Some(on) = on {
                     write!(f, " ON {on}")?;
                 }
@@ -266,7 +282,10 @@ impl fmt::Display for TableRef {
             }
             Self::Apply {
                 left, right, kind, ..
-            } => write!(f, "{left} {kind} {right}"),
+            } => {
+                write!(f, "{left} {kind} ")?;
+                write_join_operand(f, right)
+            }
             Self::Function {
                 name, args, alias, ..
             } => {

@@ -21,6 +21,34 @@
 //! `Display` always writes `LEFT JOIN`. The AST of both spellings is the same one, which
 //! is what the `parse` -> `Display` -> `parse` loop needs; the deviation is deliberate.
 //!
+//! A [`TableRef::Join`] whose `right` side is itself a [`TableRef::Join`] or
+//! [`TableRef::Apply`] -- the shape a grouped join tree builds, see below -- needs the
+//! parentheses back for the loop to hold, `Display` writing `a LEFT JOIN b INNER JOIN c`
+//! left-associative otherwise, `(a LEFT JOIN b) INNER JOIN c` rather than the tree it
+//! came from. `Display` adds them around that one shape; `tests/select.rs` carries the
+//! loop on it.
+//!
+//! # The meanings of a `(` in the source position of the `FROM`
+//!
+//! A `(` that opens a table reference -- not glued to a name, where the arguments of a
+//! function or a hint list read differently, see below -- is either the start of a
+//! **derived table** or a **grouped join tree**, told apart by the token right after it:
+//! `SELECT` or `WITH` opens a query, anything else -- a name, `@variable`, another `(` --
+//! opens a join tree. A join tree in parentheses must actually **join** something: SQL
+//! Server refuses a lone table or derived table wrapped for no reason, `FROM (dbo.t)`
+//! answering "Syntax error near ')'" exactly like `FROM (dbo.t, dbo.u)` answers one near
+//! ','. Once accepted, the parentheses are not kept in the tree: the shape of what they
+//! held -- a [`TableRef::Join`] or [`TableRef::Apply`] -- already says how it associates,
+//! `a LEFT JOIN (b INNER JOIN c ON …) ON …` handing back a [`TableRef::Join`] whose right
+//! side is itself one (see the `Display` parentheses this needs, above).
+//!
+//! A `(` immediately followed by another `(` is genuinely ambiguous -- `((SELECT 1) UNION
+//! (SELECT 2)) AS d` and `((SELECT 1) AS x JOIN t ON …)` share the same two opening
+//! tokens -- and the grammar cannot be told apart without reading past the first closing
+//! one. [`parse_table_primary`] tries the join tree first in that one case and falls back
+//! to the derived table when it fails; the rest of the grammar reads in one pass, without
+//! resetting the cursor. `tests/select.rs` covers both branches of that fallback.
+//!
 //! # The meanings of a `(` after a table reference
 //!
 //! The rule depends only on **where** the parenthesis stands, never on what it holds:
@@ -222,7 +250,7 @@ fn parse_table_primary(p: &mut Parser) -> SqlResult<TableRef> {
         });
     }
     if p.at_punct(Punct::LeftParen) {
-        return parse_derived_table(p);
+        return parse_parenthesised_source(p);
     }
     let name = p.parse_object_name()?;
     if p.at_punct(Punct::LeftParen) {
@@ -244,6 +272,65 @@ fn parse_table_primary(p: &mut Parser) -> SqlResult<TableRef> {
         alias,
         hints,
         span: p.span_from(start),
+    })
+}
+
+/// Reads a table reference that opens with `(`, the cursor on it: a derived table or a
+/// grouped join tree, see the module header.
+///
+/// The two are told apart by the token right after the `(`: `SELECT` or `WITH` opens a
+/// query, so anything else sends the parse to [`parse_parenthesised_join_tree`]. Another
+/// `(` right there is the one shape that reads either way -- `((SELECT 1) UNION
+/// (SELECT 2)) AS d` and `((SELECT 1) AS x JOIN t ON …)` open alike -- so the join tree is
+/// tried first and the derived table picked up on its failure. `tests/select.rs` covers
+/// both.
+///
+/// # Errors
+///
+/// The syntax error that stopped the parse, of either shape.
+fn parse_parenthesised_source(p: &mut Parser) -> SqlResult<TableRef> {
+    if matches!(
+        p.peek_at(1).kind,
+        TokenKind::Keyword(Keyword::Select) | TokenKind::Keyword(Keyword::With)
+    ) {
+        return parse_derived_table(p);
+    }
+    if !matches!(p.peek_at(1).kind, TokenKind::Punct(Punct::LeftParen)) {
+        return parse_parenthesised_join_tree(p);
+    }
+    let start = p.mark();
+    match parse_parenthesised_join_tree(p) {
+        Ok(table_ref) => Ok(table_ref),
+        Err(_) => {
+            p.reset(start);
+            parse_derived_table(p)
+        }
+    }
+}
+
+/// Reads a join tree grouped in parentheses, the cursor on the `(`: `(a JOIN b ON …)`,
+/// nested arbitrarily deep.
+///
+/// The parentheses are not kept: the shape of what comes back, a [`TableRef::Join`] or
+/// [`TableRef::Apply`], already carries the association they forced. A single reference
+/// with no join is not accepted here, SQL Server refusing the parentheses instead
+/// of treating them as redundant -- `FROM (dbo.t)` and `FROM (dbo.t, dbo.u)` are both
+/// syntax errors, on `)` and `,` respectively, the token where a join operator was
+/// expected and was not found.
+///
+/// # Errors
+///
+/// The syntax error that stopped the parse of the join tree, one reporting a lone
+/// reference where a join was expected, or a missing `)`.
+fn parse_parenthesised_join_tree(p: &mut Parser) -> SqlResult<TableRef> {
+    p.nested(|p| {
+        p.expect_punct(Punct::LeftParen)?;
+        let inner = parse_join_tree(p)?;
+        if !matches!(inner, TableRef::Join { .. } | TableRef::Apply { .. }) {
+            return Err(p.error_here());
+        }
+        p.expect_punct(Punct::RightParen)?;
+        Ok(inner)
     })
 }
 
