@@ -1293,7 +1293,7 @@ const ALWAYS_NULLABLE: [&str; 65] = [
 ];
 
 /// The functions that are never nullable ([`with_inferred_nullability`]).
-const NEVER_NULLABLE: [&str; 12] = [
+const NEVER_NULLABLE: [&str; 13] = [
     "CONCAT",
     "PI",
     "GETDATE",
@@ -1306,6 +1306,7 @@ const NEVER_NULLABLE: [&str; 12] = [
     "@@ERROR",
     "@@TRANCOUNT",
     "@@LOCK_TIMEOUT",
+    "@@MICROSOFTVERSION",
 ];
 
 /// The functions whose result follows their arguments ([`with_inferred_nullability`]);
@@ -2456,6 +2457,7 @@ pub(crate) mod tests {
 
     #[test]
     fn global_variables() {
+        registry();
         assert_eq!(
             bind_variable_function("@@ROWCOUNT", &span(1))
                 .expect("@@ROWCOUNT binds")
@@ -2469,6 +2471,19 @@ pub(crate) mod tests {
                 .ty
                 .ty,
             SqlType::SmallInt
+        );
+        assert_eq!(
+            bind_variable_function("@@MICROSOFTVERSION", &span(1))
+                .expect("@@MICROSOFTVERSION binds")
+                .ty
+                .ty,
+            SqlType::Int
+        );
+        assert!(
+            !bind_variable_function("@@MICROSOFTVERSION", &span(1))
+                .expect("@@MICROSOFTVERSION binds")
+                .ty
+                .nullable
         );
         // Case-insensitive, and bound as a call with no argument.
         let bound = bind_variable_function("@@spid", &span(1)).expect("@@spid binds");

@@ -1,4 +1,5 @@
-//! Session variables (`@@SPID`, `@@ROWCOUNT`, `@@ERROR`, `@@TRANCOUNT`, `@@SERVERNAME`),
+//! Session variables (`@@SPID`, `@@ROWCOUNT`, `@@ERROR`, `@@TRANCOUNT`, `@@SERVERNAME`,
+//! `@@MICROSOFTVERSION`),
 //! `DB_NAME()` and `NEWID()`: the built-ins whose answer comes from the session rather
 //! than from their arguments.
 //!
@@ -118,6 +119,32 @@ fn string(text: &str) -> Value {
 /// Evaluates `@@SERVERNAME`: the name of the server instance.
 fn server_name_eval(_args: &EvalArgs<'_>, ctx: &dyn EvalContext) -> SqlResult<Value> {
     Ok(string(ctx.server_name()))
+}
+
+/// Major, minor and build of the product version the server announces in LOGINACK.
+const MICROSOFT_VERSION_MAJOR: u8 = 16;
+const MICROSOFT_VERSION_MINOR: u8 = 0;
+const MICROSOFT_VERSION_BUILD: u16 = 4275;
+
+/// Integer returned by `SELECT @@MICROSOFTVERSION` for the announced build.
+const ANNOUNCED_MICROSOFT_VERSION: i32 = microsoft_version_from_build(
+    MICROSOFT_VERSION_MAJOR,
+    MICROSOFT_VERSION_MINOR,
+    MICROSOFT_VERSION_BUILD,
+);
+
+/// Encodes `major`, `minor` and `build` into the integer `@@MICROSOFTVERSION` returns.
+///
+/// The build is split into two bytes, most significant first — the layout of the four
+/// LOGINACK version bytes in `session`.
+const fn microsoft_version_from_build(major: u8, minor: u8, build: u16) -> i32 {
+    let [build_hi, build_lo] = build.to_be_bytes();
+    i32::from_be_bytes([major, minor, build_hi, build_lo])
+}
+
+/// Evaluates `@@MICROSOFTVERSION`: the product version as a single integer.
+fn microsoft_version_eval(_args: &EvalArgs<'_>, _ctx: &dyn EvalContext) -> SqlResult<Value> {
+    Ok(Value::I32(ANNOUNCED_MICROSOFT_VERSION))
 }
 
 /// Evaluates `DB_NAME()` and `DB_NAME(id)`.
@@ -274,6 +301,17 @@ const SERVER_NAME_DEF: FunctionDef = FunctionDef {
     arity: Arity::Exact(0),
     return_type: name_type,
     eval: server_name_eval,
+    aggregate: None,
+};
+
+/// `@@MICROSOFTVERSION`: Microsoft Learn, "@@MICROSOFTVERSION (Transact-SQL)".
+const MICROSOFT_VERSION_DEF: FunctionDef = FunctionDef {
+    name: "@@MICROSOFTVERSION",
+    kind: FunctionKind::Scalar,
+    deterministic: false,
+    arity: Arity::Exact(0),
+    return_type: int_type,
+    eval: microsoft_version_eval,
     aggregate: None,
 };
 
@@ -948,6 +986,7 @@ pub(crate) fn register_all() {
     register(ERROR_DEF);
     register(TRANCOUNT_DEF);
     register(SERVER_NAME_DEF);
+    register(MICROSOFT_VERSION_DEF);
     register(DB_NAME_DEF);
     register(NEWID_DEF);
     register(SQL_VARIANT_PROPERTY_DEF);
@@ -1059,6 +1098,37 @@ mod tests {
             Value::String(s) => &s.text,
             other => panic!("expected a string, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn microsoft_version_follows_announced_build() {
+        assert_eq!(
+            call("@@MICROSOFTVERSION", &[], &StaticContext::default()),
+            Value::I32(ANNOUNCED_MICROSOFT_VERSION)
+        );
+        assert_eq!(
+            microsoft_version_from_build(
+                MICROSOFT_VERSION_MAJOR,
+                MICROSOFT_VERSION_MINOR,
+                MICROSOFT_VERSION_BUILD
+            ),
+            ANNOUNCED_MICROSOFT_VERSION
+        );
+        assert_eq!(
+            microsoft_version_from_build(15, 0, 2000),
+            i32::from_be_bytes([15, 0, 0x07, 0xD0])
+        );
+    }
+
+    #[test]
+    fn microsoft_version_is_int_and_registered() {
+        register_builtins();
+        let def = lookup("@@microsoftversion").expect("@@MICROSOFTVERSION must be registered");
+        assert_eq!(def.name, "@@MICROSOFTVERSION");
+        assert_eq!(
+            check_call(def, &[]).expect("@@MICROSOFTVERSION accepts no argument"),
+            TypeInfo::new(SqlType::Int, false)
+        );
     }
 
     #[test]
