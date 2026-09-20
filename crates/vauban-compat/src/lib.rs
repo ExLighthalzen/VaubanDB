@@ -15,6 +15,7 @@ mod server_functions;
 mod server_properties;
 mod sp_datatype_info;
 mod special_procs;
+mod stored_procedures;
 mod version;
 mod who_procs;
 

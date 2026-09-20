@@ -147,6 +147,9 @@ fn resolve_catalog_procedure(name: &str, args: &[ProcArg<'_>]) -> Option<SqlResu
     if let Some(result) = crate::catalog_keys::resolve(name, args) {
         return Some(result);
     }
+    if let Some(result) = crate::stored_procedures::resolve(name, args) {
+        return Some(result);
+    }
     if let Some(result) = crate::who_procs::resolve(name, args) {
         return Some(result);
     }
