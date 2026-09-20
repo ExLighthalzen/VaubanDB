@@ -17,6 +17,7 @@
 //! | `sys_extra.rs` | `sys.all_objects`, `sys.views`, `sys.partitions`, `sys.allocation_units`, the file views, `sys.extended_properties` |
 //! | `dm_exec.rs` | `sys.dm_exec_sessions`, `sys.dm_exec_connections`, `sys.dm_exec_requests`, `sys.configurations`, `sys.dm_os_sys_info` |
 //! | `sys_routines.rs` | `sys.procedures`, `sql_modules`, `sys.parameters` |
+//! | `sys_object_kinds.rs` | `sys.triggers`, `sys.synonyms`, `sys.sequences`, `sys.table_types` |
 
 use crate::def::InternalTableDef;
 
@@ -33,6 +34,8 @@ pub(crate) mod sys_core;
 pub(crate) mod sys_extra;
 #[allow(dead_code)]
 pub(crate) mod sys_indexes;
+#[allow(dead_code)]
+pub(crate) mod sys_object_kinds;
 #[allow(dead_code)]
 pub(crate) mod sys_routines;
 #[allow(dead_code)]
@@ -58,6 +61,7 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
         sys_extra::internal_tables(),
         dm_exec::internal_tables(),
         sys_routines::internal_tables(),
+        sys_object_kinds::internal_tables(),
     ]
     .into_iter()
     .flatten()

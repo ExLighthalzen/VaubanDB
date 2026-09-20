@@ -568,7 +568,8 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
 /// other than
 /// `sys_extra.rs`, in the order `views::internal_tables()` lists them, then the two views of
 /// the tables of the bootstrap (`views::sys_core::bootstrap_views`, which `bootstrap.rs` reads
-/// too), then the seven of `sys_extra.rs`. A file that describes no view adds nothing here, so
+/// too), then the eight of `sys_extra.rs`, then the five of `dm_exec.rs`, then the four of
+/// `sys_object_kinds.rs`. A file that describes no view adds nothing here, so
 /// the vector grows with the files of `views/` — and so do the identifiers of the views that
 /// follow the new ones (module documentation, section "The identifiers of the system views
 /// are the rows of `sys.all_objects`").
@@ -595,6 +596,11 @@ fn described_views() -> Vec<SystemViewDef> {
     );
     described.extend(
         views::dm_exec::internal_tables()
+            .into_iter()
+            .flat_map(|table| table.views),
+    );
+    described.extend(
+        views::sys_object_kinds::internal_tables()
             .into_iter()
             .flat_map(|table| table.views),
     );
@@ -1080,14 +1086,14 @@ mod tests {
         assert_eq!(
             trailing,
             vec![
+                "sys.table_types",
+                "sys.sequences",
+                "sys.synonyms",
+                "sys.triggers",
                 "sys.dm_os_sys_info",
                 "sys.dm_exec_requests",
                 "sys.dm_exec_connections",
                 "sys.dm_exec_sessions",
-                "sys.configurations",
-                "sys.extended_properties",
-                "sys.master_files",
-                "sys.database_files",
             ]
         );
         // The files of `views/` are filled, each name described once per system database,
