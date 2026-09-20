@@ -311,13 +311,18 @@ fn bind_catalog_params(
 }
 
 fn bind_one(spec: ParamSpec, arg: &ProcArg<'_>) -> SqlResult<ProcParam> {
-    if spec.unicode && !is_unicode_text(arg.ty) {
+    // A literal `NULL` carries no type of its own; the checks below skip `arg.ty` for a
+    // `NULL` value, so it binds to a `unicode`, `int_param` or `bit_param` slot without a
+    // type error (`bind_one_accepts_null` below).
+    let is_null = matches!(arg.value, Value::Null);
+    if spec.unicode && !is_null && !is_unicode_text(arg.ty) {
         return Err(SqlError::procedure_expects_type(
             spec.canonical,
             "ntext/nchar/nvarchar",
         ));
     }
     if spec.int_param
+        && !is_null
         && !matches!(
             arg.ty.ty,
             SqlType::Int | SqlType::SmallInt | SqlType::TinyInt
@@ -325,7 +330,10 @@ fn bind_one(spec: ParamSpec, arg: &ProcArg<'_>) -> SqlResult<ProcParam> {
     {
         return Err(SqlError::procedure_expects_type(spec.canonical, "int"));
     }
-    if spec.bit_param && !matches!(arg.ty.ty, SqlType::Bit | SqlType::Int | SqlType::TinyInt) {
+    if spec.bit_param
+        && !is_null
+        && !matches!(arg.ty.ty, SqlType::Bit | SqlType::Int | SqlType::TinyInt)
+    {
         return Err(SqlError::procedure_expects_type(spec.canonical, "bit"));
     }
     Ok(ProcParam {
@@ -1147,7 +1155,7 @@ SELECT
     CAST(OBJECT_NAME(c.object_id) AS nvarchar(128)) AS TABLE_NAME,
     CAST(c.name AS nvarchar(128)) AS COLUMN_NAME,
     CAST(CASE WHEN @ODBCVer = 3 THEN
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
@@ -1159,10 +1167,28 @@ SELECT
             WHEN N'datetime2' THEN CAST(93 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(93 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(93 AS smallint)
+            WHEN N'date' THEN CAST(91 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     ELSE
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
@@ -1174,106 +1200,222 @@ SELECT
             WHEN N'datetime2' THEN CAST(11 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(11 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(11 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     END AS smallint) AS DATA_TYPE,
     CAST(CASE WHEN @ODBCVer = 3 THEN
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
             WHEN N'numeric' THEN CAST(2 AS smallint)
             WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-            WHEN N'varchar' THEN CAST(CASE WHEN c.max_length = -1 THEN CAST(12 AS smallint) ELSE CAST(-1 AS smallint) END AS smallint)
+            WHEN N'varchar' THEN CAST(12 AS smallint)
             WHEN N'text' THEN CAST(-1 AS smallint)
             WHEN N'varbinary' THEN CAST(-3 AS smallint)
             WHEN N'datetime2' THEN CAST(93 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(93 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(93 AS smallint)
+            WHEN N'date' THEN CAST(91 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     ELSE
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
             WHEN N'numeric' THEN CAST(2 AS smallint)
             WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-            WHEN N'varchar' THEN CAST(CASE WHEN c.max_length = -1 THEN CAST(12 AS smallint) ELSE CAST(-1 AS smallint) END AS smallint)
+            WHEN N'varchar' THEN CAST(12 AS smallint)
             WHEN N'text' THEN CAST(-1 AS smallint)
             WHEN N'varbinary' THEN CAST(-3 AS smallint)
             WHEN N'datetime2' THEN CAST(11 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(11 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(11 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     END AS smallint) AS odbc_data_type,
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar') AND c.max_length = -1 THEN N'varchar'
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'numeric' THEN N'numeric'
-        ELSE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        WHEN t.name IN (N'varchar') AND c.max_length = -1 THEN N'varchar'
+        WHEN t.name = N'numeric' THEN N'numeric'
+        ELSE t.name
     END AS nvarchar(128)) AS TYPE_NAME,
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar') AND c.max_length = -1 THEN N'varchar'
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'numeric' THEN N'numeric'
-        ELSE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        WHEN t.name IN (N'varchar') AND c.max_length = -1 THEN N'varchar'
+        WHEN t.name = N'numeric' THEN N'numeric'
+        ELSE t.name
     END AS nvarchar(128)) AS odbc_type_name,
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(c.[precision] AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length / 2 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(23 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bit' THEN CAST(1 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'uniqueidentifier' THEN CAST(36 AS int)
+        WHEN t.name IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'nvarchar' THEN CAST(c.max_length / 2 AS int)
+        WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
+        WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name = N'datetime2' THEN CAST(23 AS int)
+        WHEN t.name = N'bit' THEN CAST(1 AS int)
+        WHEN t.name = N'uniqueidentifier' THEN CAST(36 AS int)
+        WHEN t.name IN (N'smallint', N'tinyint', N'money', N'smallmoney') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'char' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'nchar' THEN CAST(c.max_length / 2 AS int)
+        WHEN t.name IN (N'datetime', N'smalldatetime', N'date', N'time', N'datetimeoffset') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'float' THEN CAST(CASE WHEN @ODBCVer = 3 THEN 53 ELSE 15 END AS int)
+        WHEN t.name = N'real' THEN CAST(CASE WHEN @ODBCVer = 3 THEN 24 ELSE 7 END AS int)
+        WHEN t.name = N'binary' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(1073741823 AS int)
+        WHEN t.name IN (N'xml', N'sql_variant') THEN CAST(0 AS int)
         ELSE CAST(0 AS int)
     END AS int) AS [PRECISION],
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(c.[precision] AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length / 2 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(23 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bit' THEN CAST(1 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'uniqueidentifier' THEN CAST(36 AS int)
+        WHEN t.name IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'nvarchar' THEN CAST(c.max_length / 2 AS int)
+        WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
+        WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name = N'datetime2' THEN CAST(23 AS int)
+        WHEN t.name = N'bit' THEN CAST(1 AS int)
+        WHEN t.name = N'uniqueidentifier' THEN CAST(36 AS int)
+        WHEN t.name IN (N'smallint', N'tinyint', N'money', N'smallmoney') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'char' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'nchar' THEN CAST(c.max_length / 2 AS int)
+        WHEN t.name IN (N'datetime', N'smalldatetime', N'date', N'time', N'datetimeoffset') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'float' THEN CAST(CASE WHEN @ODBCVer = 3 THEN 53 ELSE 15 END AS int)
+        WHEN t.name = N'real' THEN CAST(CASE WHEN @ODBCVer = 3 THEN 24 ELSE 7 END AS int)
+        WHEN t.name = N'binary' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(1073741823 AS int)
+        WHEN t.name IN (N'xml', N'sql_variant') THEN CAST(0 AS int)
         ELSE CAST(0 AS int)
     END AS int) AS odbc_precision,
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'int' THEN CAST(4 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bigint' THEN CAST(8 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'decimal', N'numeric') THEN CAST(5 + (c.[precision] + 3) / 2 + (c.[precision] + 9) / 10 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(16 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bit' THEN CAST(1 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'uniqueidentifier' THEN CAST(16 AS int)
+        WHEN t.name = N'int' THEN CAST(4 AS int)
+        WHEN t.name = N'bigint' THEN CAST(8 AS int)
+        WHEN t.name IN (N'decimal', N'numeric') THEN CAST(5 + (c.[precision] + 3) / 2 + (c.[precision] + 9) / 10 AS int)
+        WHEN t.name = N'nvarchar' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
+        WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name = N'datetime2' THEN CAST(16 AS int)
+        WHEN t.name = N'bit' THEN CAST(1 AS int)
+        WHEN t.name = N'uniqueidentifier' THEN CAST(16 AS int)
+        WHEN t.name = N'smallint' THEN CAST(2 AS int)
+        WHEN t.name = N'tinyint' THEN CAST(1 AS int)
+        WHEN t.name = N'char' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'nchar' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'datetime', N'smalldatetime') THEN CAST(16 AS int)
+        WHEN t.name = N'date' THEN CAST(6 AS int)
+        WHEN t.name = N'time' THEN CAST(12 AS int)
+        WHEN t.name = N'float' THEN CAST(8 AS int)
+        WHEN t.name = N'real' THEN CAST(4 AS int)
+        WHEN t.name = N'money' THEN CAST(21 AS int)
+        WHEN t.name = N'smallmoney' THEN CAST(12 AS int)
+        WHEN t.name = N'binary' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(2147483646 AS int)
+        WHEN t.name = N'datetimeoffset' THEN CAST(20 AS int)
+        WHEN t.name = N'xml' THEN CAST(0 AS int)
+        WHEN t.name = N'sql_variant' THEN CAST(8000 AS int)
         ELSE CAST(0 AS int)
     END AS int) AS [LENGTH],
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'int' THEN CAST(4 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bigint' THEN CAST(8 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'decimal', N'numeric') THEN CAST(5 + (c.[precision] + 3) / 2 + (c.[precision] + 9) / 10 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(16 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bit' THEN CAST(1 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'uniqueidentifier' THEN CAST(16 AS int)
+        WHEN t.name = N'int' THEN CAST(4 AS int)
+        WHEN t.name = N'bigint' THEN CAST(8 AS int)
+        WHEN t.name IN (N'decimal', N'numeric') THEN CAST(5 + (c.[precision] + 3) / 2 + (c.[precision] + 9) / 10 AS int)
+        WHEN t.name = N'nvarchar' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
+        WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name = N'datetime2' THEN CAST(16 AS int)
+        WHEN t.name = N'bit' THEN CAST(1 AS int)
+        WHEN t.name = N'uniqueidentifier' THEN CAST(16 AS int)
+        WHEN t.name = N'smallint' THEN CAST(2 AS int)
+        WHEN t.name = N'tinyint' THEN CAST(1 AS int)
+        WHEN t.name = N'char' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'nchar' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'datetime', N'smalldatetime') THEN CAST(16 AS int)
+        WHEN t.name = N'date' THEN CAST(6 AS int)
+        WHEN t.name = N'time' THEN CAST(12 AS int)
+        WHEN t.name = N'float' THEN CAST(8 AS int)
+        WHEN t.name = N'real' THEN CAST(4 AS int)
+        WHEN t.name = N'money' THEN CAST(21 AS int)
+        WHEN t.name = N'smallmoney' THEN CAST(12 AS int)
+        WHEN t.name = N'binary' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(2147483646 AS int)
+        WHEN t.name = N'datetimeoffset' THEN CAST(20 AS int)
+        WHEN t.name = N'xml' THEN CAST(0 AS int)
+        WHEN t.name = N'sql_variant' THEN CAST(8000 AS int)
         ELSE CAST(0 AS int)
     END AS int) AS odbc_length,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'int', N'bigint') THEN CAST(0 AS smallint) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'decimal', N'numeric') THEN CAST(c.scale AS smallint) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(c.scale AS smallint) ELSE CAST(NULL AS smallint) END AS smallint) AS SCALE,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(10 AS smallint) ELSE CAST(NULL AS smallint) END AS smallint) AS odbc_scale,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(10 AS smallint) ELSE CAST(NULL AS smallint) END AS smallint) AS RADIX,
+    CAST(CASE WHEN t.name IN (N'int', N'bigint') THEN CAST(0 AS smallint) WHEN t.name IN (N'decimal', N'numeric') THEN CAST(c.scale AS smallint) WHEN t.name = N'datetime2' THEN CAST(c.scale AS smallint)
+        WHEN t.name IN (N'smallint', N'tinyint') THEN CAST(0 AS smallint)
+        WHEN t.name IN (N'money', N'smallmoney') THEN CAST(c.scale AS smallint)
+        WHEN t.name IN (N'datetime', N'smalldatetime', N'date', N'time', N'datetimeoffset') THEN CAST(c.scale AS smallint)
+        ELSE CAST(NULL AS smallint) END AS smallint) AS SCALE,
+    CAST(CASE WHEN t.name IN (N'int', N'bigint', N'decimal', N'numeric', N'smallint', N'tinyint', N'money', N'smallmoney', N'sql_variant') THEN CAST(10 AS smallint)
+        WHEN t.name IN (N'float', N'real') THEN CAST(CASE WHEN @ODBCVer = 3 THEN 2 ELSE 10 END AS smallint)
+        ELSE CAST(NULL AS smallint) END AS smallint) AS odbc_scale,
+    CAST(CASE WHEN t.name IN (N'int', N'bigint', N'decimal', N'numeric', N'smallint', N'tinyint', N'money', N'smallmoney', N'sql_variant') THEN CAST(10 AS smallint)
+        WHEN t.name IN (N'float', N'real') THEN CAST(CASE WHEN @ODBCVer = 3 THEN 2 ELSE 10 END AS smallint)
+        ELSE CAST(NULL AS smallint) END AS smallint) AS RADIX,
     CAST(CASE WHEN c.is_nullable = 1 THEN CAST(1 AS smallint) ELSE CAST(0 AS smallint) END AS smallint) AS NULLABLE,
     CAST(NULL AS varchar(254)) AS REMARKS,
     CAST(NULL AS nvarchar(4000)) AS COLUMN_DEF,
     CAST(CASE WHEN @ODBCVer = 3 THEN
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
@@ -1285,10 +1427,28 @@ SELECT
             WHEN N'datetime2' THEN CAST(9 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(9 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(9 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     ELSE
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
@@ -1300,58 +1460,152 @@ SELECT
             WHEN N'datetime2' THEN CAST(9 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(9 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(9 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     END AS smallint) AS SQL_DATA_TYPE,
     CAST(CASE WHEN @ODBCVer = 3 THEN
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
             WHEN N'numeric' THEN CAST(2 AS smallint)
             WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-            WHEN N'varchar' THEN CAST(CASE WHEN c.max_length = -1 THEN CAST(12 AS smallint) ELSE CAST(-1 AS smallint) END AS smallint)
+            WHEN N'varchar' THEN CAST(12 AS smallint)
             WHEN N'text' THEN CAST(-1 AS smallint)
             WHEN N'varbinary' THEN CAST(-3 AS smallint)
             WHEN N'datetime2' THEN CAST(9 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(9 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(9 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     ELSE
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
             WHEN N'numeric' THEN CAST(2 AS smallint)
             WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-            WHEN N'varchar' THEN CAST(CASE WHEN c.max_length = -1 THEN CAST(12 AS smallint) ELSE CAST(-1 AS smallint) END AS smallint)
+            WHEN N'varchar' THEN CAST(12 AS smallint)
             WHEN N'text' THEN CAST(-1 AS smallint)
             WHEN N'varbinary' THEN CAST(-3 AS smallint)
             WHEN N'datetime2' THEN CAST(9 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(9 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(9 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     END AS smallint) AS odbc_sql_data_type,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(3 AS smallint) ELSE CAST(NULL AS smallint) END AS smallint) AS odbc_sql_datetime_sub,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length AS int) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int) ELSE CAST(NULL AS int) END AS int) AS CHAR_OCTET_LENGTH,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length AS int) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int) ELSE CAST(NULL AS int) END AS int) AS odbc_char_octet_length,
+    CAST(CASE WHEN t.name = N'datetime2' THEN CAST(3 AS smallint)
+        WHEN t.name IN (N'datetime', N'smalldatetime') THEN CAST(3 AS smallint)
+        WHEN t.name = N'date' THEN CAST(1 AS smallint)
+        WHEN t.name IN (N'time', N'datetimeoffset') THEN CAST(0 AS smallint)
+        ELSE CAST(NULL AS smallint) END AS smallint) AS odbc_sql_datetime_sub,
+    CAST(CASE WHEN t.name = N'nvarchar' THEN CAST(c.max_length AS int) WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int) WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'char', N'nchar', N'binary') THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(2147483646 AS int)
+        WHEN t.name = N'xml' THEN CAST(0 AS int)
+        WHEN t.name = N'sql_variant' THEN CAST(8000 AS int)
+        ELSE CAST(NULL AS int) END AS int) AS CHAR_OCTET_LENGTH,
+    CAST(CASE WHEN t.name = N'nvarchar' THEN CAST(c.max_length AS int) WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int) WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'char', N'nchar', N'binary') THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(2147483646 AS int)
+        WHEN t.name = N'xml' THEN CAST(0 AS int)
+        WHEN t.name = N'sql_variant' THEN CAST(8000 AS int)
+        ELSE CAST(NULL AS int) END AS int) AS odbc_char_octet_length,
     CAST(c.column_id AS int) AS ORDINAL_POSITION,
     CAST(CASE WHEN c.is_nullable = 1 THEN N'YES' ELSE N'NO' END AS varchar(254)) AS IS_NULLABLE,
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'int' AND c.is_nullable = 0 THEN CAST(56 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'int' THEN CAST(38 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bigint' THEN CAST(108 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'decimal', N'numeric') THEN CAST(106 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(39 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'text') THEN CAST(39 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' THEN CAST(37 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bit' THEN CAST(50 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'uniqueidentifier' THEN CAST(37 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(0 AS tinyint)
+        WHEN t.name = N'int' AND c.is_nullable = 0 THEN CAST(56 AS tinyint)
+        WHEN t.name = N'int' THEN CAST(38 AS tinyint)
+        WHEN t.name = N'bigint' THEN CAST(108 AS tinyint)
+        WHEN t.name IN (N'decimal', N'numeric') THEN CAST(106 AS tinyint)
+        WHEN t.name = N'nvarchar' THEN CAST(39 AS tinyint)
+        WHEN t.name = N'varchar' THEN CAST(39 AS tinyint)
+        WHEN t.name = N'varbinary' THEN CAST(37 AS tinyint)
+        WHEN t.name = N'bit' THEN CAST(50 AS tinyint)
+        WHEN t.name = N'uniqueidentifier' THEN CAST(37 AS tinyint)
+        WHEN t.name = N'datetime2' THEN CAST(0 AS tinyint)
+        WHEN t.name = N'smallint' AND c.is_nullable = 0 THEN CAST(52 AS tinyint)
+        WHEN t.name = N'smallint' THEN CAST(38 AS tinyint)
+        WHEN t.name = N'tinyint' AND c.is_nullable = 0 THEN CAST(48 AS tinyint)
+        WHEN t.name = N'tinyint' THEN CAST(38 AS tinyint)
+        WHEN t.name IN (N'char', N'nchar') AND c.is_nullable = 0 THEN CAST(47 AS tinyint)
+        WHEN t.name IN (N'char', N'nchar') THEN CAST(39 AS tinyint)
+        WHEN t.name = N'sql_variant' THEN CAST(39 AS tinyint)
+        WHEN t.name = N'datetime' AND c.is_nullable = 0 THEN CAST(61 AS tinyint)
+        WHEN t.name = N'datetime' THEN CAST(111 AS tinyint)
+        WHEN t.name = N'smalldatetime' AND c.is_nullable = 0 THEN CAST(58 AS tinyint)
+        WHEN t.name = N'smalldatetime' THEN CAST(111 AS tinyint)
+        WHEN t.name IN (N'date', N'time', N'datetimeoffset', N'xml') THEN CAST(0 AS tinyint)
+        WHEN t.name = N'float' AND c.is_nullable = 0 THEN CAST(62 AS tinyint)
+        WHEN t.name = N'float' THEN CAST(109 AS tinyint)
+        WHEN t.name = N'real' AND c.is_nullable = 0 THEN CAST(59 AS tinyint)
+        WHEN t.name = N'real' THEN CAST(109 AS tinyint)
+        WHEN t.name = N'money' AND c.is_nullable = 0 THEN CAST(60 AS tinyint)
+        WHEN t.name = N'money' THEN CAST(110 AS tinyint)
+        WHEN t.name = N'smallmoney' AND c.is_nullable = 0 THEN CAST(122 AS tinyint)
+        WHEN t.name = N'smallmoney' THEN CAST(110 AS tinyint)
+        WHEN t.name = N'binary' AND c.is_nullable = 0 THEN CAST(45 AS tinyint)
+        WHEN t.name = N'binary' THEN CAST(37 AS tinyint)
+        WHEN t.name = N'image' THEN CAST(34 AS tinyint)
+        WHEN t.name IN (N'text', N'ntext') THEN CAST(35 AS tinyint)
         ELSE CAST(0 AS tinyint)
     END AS tinyint) AS SS_DATA_TYPE,
     CAST(0 AS smallint) AS SS_IS_SPARSE,
@@ -1366,6 +1620,7 @@ SELECT
     CAST(NULL AS nvarchar(128)) AS SS_XML_SCHEMACOLLECTION_NAME,
     c.object_id AS object_id
 FROM sys.all_columns c
+JOIN sys.types t ON t.user_type_id = c.user_type_id
 WHERE c.is_computed = 0
   AND c.object_id IN (SELECT o.object_id FROM sys.all_objects o WHERE o.type IN (N'U', N'V'))
     ) col_src
@@ -1412,7 +1667,7 @@ SELECT
     CAST(OBJECT_NAME(c.object_id) AS nvarchar(128)) AS TABLE_NAME,
     CAST(c.name AS nvarchar(128)) AS COLUMN_NAME,
     CAST(CASE WHEN @ODBCVer = 3 THEN
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
@@ -1424,10 +1679,28 @@ SELECT
             WHEN N'datetime2' THEN CAST(93 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(93 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(93 AS smallint)
+            WHEN N'date' THEN CAST(91 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     ELSE
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
@@ -1439,106 +1712,222 @@ SELECT
             WHEN N'datetime2' THEN CAST(11 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(11 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(11 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     END AS smallint) AS DATA_TYPE,
     CAST(CASE WHEN @ODBCVer = 3 THEN
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
             WHEN N'numeric' THEN CAST(2 AS smallint)
             WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-            WHEN N'varchar' THEN CAST(CASE WHEN c.max_length = -1 THEN CAST(12 AS smallint) ELSE CAST(-1 AS smallint) END AS smallint)
+            WHEN N'varchar' THEN CAST(12 AS smallint)
             WHEN N'text' THEN CAST(-1 AS smallint)
             WHEN N'varbinary' THEN CAST(-3 AS smallint)
             WHEN N'datetime2' THEN CAST(93 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(93 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(93 AS smallint)
+            WHEN N'date' THEN CAST(91 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     ELSE
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
             WHEN N'numeric' THEN CAST(2 AS smallint)
             WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-            WHEN N'varchar' THEN CAST(CASE WHEN c.max_length = -1 THEN CAST(12 AS smallint) ELSE CAST(-1 AS smallint) END AS smallint)
+            WHEN N'varchar' THEN CAST(12 AS smallint)
             WHEN N'text' THEN CAST(-1 AS smallint)
             WHEN N'varbinary' THEN CAST(-3 AS smallint)
             WHEN N'datetime2' THEN CAST(11 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(11 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(11 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     END AS smallint) AS odbc_data_type,
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar') AND c.max_length = -1 THEN N'varchar'
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'numeric' THEN N'numeric'
-        ELSE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        WHEN t.name IN (N'varchar') AND c.max_length = -1 THEN N'varchar'
+        WHEN t.name = N'numeric' THEN N'numeric'
+        ELSE t.name
     END AS nvarchar(128)) AS TYPE_NAME,
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar') AND c.max_length = -1 THEN N'varchar'
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'numeric' THEN N'numeric'
-        ELSE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        WHEN t.name IN (N'varchar') AND c.max_length = -1 THEN N'varchar'
+        WHEN t.name = N'numeric' THEN N'numeric'
+        ELSE t.name
     END AS nvarchar(128)) AS odbc_type_name,
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(c.[precision] AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length / 2 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(23 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bit' THEN CAST(1 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'uniqueidentifier' THEN CAST(36 AS int)
+        WHEN t.name IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'nvarchar' THEN CAST(c.max_length / 2 AS int)
+        WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
+        WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name = N'datetime2' THEN CAST(23 AS int)
+        WHEN t.name = N'bit' THEN CAST(1 AS int)
+        WHEN t.name = N'uniqueidentifier' THEN CAST(36 AS int)
+        WHEN t.name IN (N'smallint', N'tinyint', N'money', N'smallmoney') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'char' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'nchar' THEN CAST(c.max_length / 2 AS int)
+        WHEN t.name IN (N'datetime', N'smalldatetime', N'date', N'time', N'datetimeoffset') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'float' THEN CAST(CASE WHEN @ODBCVer = 3 THEN 53 ELSE 15 END AS int)
+        WHEN t.name = N'real' THEN CAST(CASE WHEN @ODBCVer = 3 THEN 24 ELSE 7 END AS int)
+        WHEN t.name = N'binary' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(1073741823 AS int)
+        WHEN t.name IN (N'xml', N'sql_variant') THEN CAST(0 AS int)
         ELSE CAST(0 AS int)
     END AS int) AS [PRECISION],
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(c.[precision] AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length / 2 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(23 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bit' THEN CAST(1 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'uniqueidentifier' THEN CAST(36 AS int)
+        WHEN t.name IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'nvarchar' THEN CAST(c.max_length / 2 AS int)
+        WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
+        WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name = N'datetime2' THEN CAST(23 AS int)
+        WHEN t.name = N'bit' THEN CAST(1 AS int)
+        WHEN t.name = N'uniqueidentifier' THEN CAST(36 AS int)
+        WHEN t.name IN (N'smallint', N'tinyint', N'money', N'smallmoney') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'char' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'nchar' THEN CAST(c.max_length / 2 AS int)
+        WHEN t.name IN (N'datetime', N'smalldatetime', N'date', N'time', N'datetimeoffset') THEN CAST(c.[precision] AS int)
+        WHEN t.name = N'float' THEN CAST(CASE WHEN @ODBCVer = 3 THEN 53 ELSE 15 END AS int)
+        WHEN t.name = N'real' THEN CAST(CASE WHEN @ODBCVer = 3 THEN 24 ELSE 7 END AS int)
+        WHEN t.name = N'binary' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(1073741823 AS int)
+        WHEN t.name IN (N'xml', N'sql_variant') THEN CAST(0 AS int)
         ELSE CAST(0 AS int)
     END AS int) AS odbc_precision,
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'int' THEN CAST(4 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bigint' THEN CAST(8 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'decimal', N'numeric') THEN CAST(5 + (c.[precision] + 3) / 2 + (c.[precision] + 9) / 10 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(16 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bit' THEN CAST(1 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'uniqueidentifier' THEN CAST(16 AS int)
+        WHEN t.name = N'int' THEN CAST(4 AS int)
+        WHEN t.name = N'bigint' THEN CAST(8 AS int)
+        WHEN t.name IN (N'decimal', N'numeric') THEN CAST(5 + (c.[precision] + 3) / 2 + (c.[precision] + 9) / 10 AS int)
+        WHEN t.name = N'nvarchar' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
+        WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name = N'datetime2' THEN CAST(16 AS int)
+        WHEN t.name = N'bit' THEN CAST(1 AS int)
+        WHEN t.name = N'uniqueidentifier' THEN CAST(16 AS int)
+        WHEN t.name = N'smallint' THEN CAST(2 AS int)
+        WHEN t.name = N'tinyint' THEN CAST(1 AS int)
+        WHEN t.name = N'char' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'nchar' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'datetime', N'smalldatetime') THEN CAST(16 AS int)
+        WHEN t.name = N'date' THEN CAST(6 AS int)
+        WHEN t.name = N'time' THEN CAST(12 AS int)
+        WHEN t.name = N'float' THEN CAST(8 AS int)
+        WHEN t.name = N'real' THEN CAST(4 AS int)
+        WHEN t.name = N'money' THEN CAST(21 AS int)
+        WHEN t.name = N'smallmoney' THEN CAST(12 AS int)
+        WHEN t.name = N'binary' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(2147483646 AS int)
+        WHEN t.name = N'datetimeoffset' THEN CAST(20 AS int)
+        WHEN t.name = N'xml' THEN CAST(0 AS int)
+        WHEN t.name = N'sql_variant' THEN CAST(8000 AS int)
         ELSE CAST(0 AS int)
     END AS int) AS [LENGTH],
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'int' THEN CAST(4 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bigint' THEN CAST(8 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'decimal', N'numeric') THEN CAST(5 + (c.[precision] + 3) / 2 + (c.[precision] + 9) / 10 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(16 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bit' THEN CAST(1 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'uniqueidentifier' THEN CAST(16 AS int)
+        WHEN t.name = N'int' THEN CAST(4 AS int)
+        WHEN t.name = N'bigint' THEN CAST(8 AS int)
+        WHEN t.name IN (N'decimal', N'numeric') THEN CAST(5 + (c.[precision] + 3) / 2 + (c.[precision] + 9) / 10 AS int)
+        WHEN t.name = N'nvarchar' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int)
+        WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name = N'datetime2' THEN CAST(16 AS int)
+        WHEN t.name = N'bit' THEN CAST(1 AS int)
+        WHEN t.name = N'uniqueidentifier' THEN CAST(16 AS int)
+        WHEN t.name = N'smallint' THEN CAST(2 AS int)
+        WHEN t.name = N'tinyint' THEN CAST(1 AS int)
+        WHEN t.name = N'char' THEN CAST(c.max_length AS int)
+        WHEN t.name = N'nchar' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'datetime', N'smalldatetime') THEN CAST(16 AS int)
+        WHEN t.name = N'date' THEN CAST(6 AS int)
+        WHEN t.name = N'time' THEN CAST(12 AS int)
+        WHEN t.name = N'float' THEN CAST(8 AS int)
+        WHEN t.name = N'real' THEN CAST(4 AS int)
+        WHEN t.name = N'money' THEN CAST(21 AS int)
+        WHEN t.name = N'smallmoney' THEN CAST(12 AS int)
+        WHEN t.name = N'binary' THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(2147483646 AS int)
+        WHEN t.name = N'datetimeoffset' THEN CAST(20 AS int)
+        WHEN t.name = N'xml' THEN CAST(0 AS int)
+        WHEN t.name = N'sql_variant' THEN CAST(8000 AS int)
         ELSE CAST(0 AS int)
     END AS int) AS odbc_length,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'int', N'bigint') THEN CAST(0 AS smallint) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'decimal', N'numeric') THEN CAST(c.scale AS smallint) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(c.scale AS smallint) ELSE CAST(NULL AS smallint) END AS smallint) AS SCALE,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(10 AS smallint) ELSE CAST(NULL AS smallint) END AS smallint) AS odbc_scale,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'int', N'bigint', N'decimal', N'numeric') THEN CAST(10 AS smallint) ELSE CAST(NULL AS smallint) END AS smallint) AS RADIX,
+    CAST(CASE WHEN t.name IN (N'int', N'bigint') THEN CAST(0 AS smallint) WHEN t.name IN (N'decimal', N'numeric') THEN CAST(c.scale AS smallint) WHEN t.name = N'datetime2' THEN CAST(c.scale AS smallint)
+        WHEN t.name IN (N'smallint', N'tinyint') THEN CAST(0 AS smallint)
+        WHEN t.name IN (N'money', N'smallmoney') THEN CAST(c.scale AS smallint)
+        WHEN t.name IN (N'datetime', N'smalldatetime', N'date', N'time', N'datetimeoffset') THEN CAST(c.scale AS smallint)
+        ELSE CAST(NULL AS smallint) END AS smallint) AS SCALE,
+    CAST(CASE WHEN t.name IN (N'int', N'bigint', N'decimal', N'numeric', N'smallint', N'tinyint', N'money', N'smallmoney', N'sql_variant') THEN CAST(10 AS smallint)
+        WHEN t.name IN (N'float', N'real') THEN CAST(CASE WHEN @ODBCVer = 3 THEN 2 ELSE 10 END AS smallint)
+        ELSE CAST(NULL AS smallint) END AS smallint) AS odbc_scale,
+    CAST(CASE WHEN t.name IN (N'int', N'bigint', N'decimal', N'numeric', N'smallint', N'tinyint', N'money', N'smallmoney', N'sql_variant') THEN CAST(10 AS smallint)
+        WHEN t.name IN (N'float', N'real') THEN CAST(CASE WHEN @ODBCVer = 3 THEN 2 ELSE 10 END AS smallint)
+        ELSE CAST(NULL AS smallint) END AS smallint) AS RADIX,
     CAST(CASE WHEN c.is_nullable = 1 THEN CAST(1 AS smallint) ELSE CAST(0 AS smallint) END AS smallint) AS NULLABLE,
     CAST(NULL AS varchar(254)) AS REMARKS,
     CAST(NULL AS nvarchar(4000)) AS COLUMN_DEF,
     CAST(CASE WHEN @ODBCVer = 3 THEN
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
@@ -1550,10 +1939,28 @@ SELECT
             WHEN N'datetime2' THEN CAST(9 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(9 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(9 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     ELSE
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
@@ -1565,58 +1972,152 @@ SELECT
             WHEN N'datetime2' THEN CAST(9 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(9 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(9 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     END AS smallint) AS SQL_DATA_TYPE,
     CAST(CASE WHEN @ODBCVer = 3 THEN
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
             WHEN N'numeric' THEN CAST(2 AS smallint)
             WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-            WHEN N'varchar' THEN CAST(CASE WHEN c.max_length = -1 THEN CAST(12 AS smallint) ELSE CAST(-1 AS smallint) END AS smallint)
+            WHEN N'varchar' THEN CAST(12 AS smallint)
             WHEN N'text' THEN CAST(-1 AS smallint)
             WHEN N'varbinary' THEN CAST(-3 AS smallint)
             WHEN N'datetime2' THEN CAST(9 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(9 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(9 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     ELSE
-        CASE (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END)
+        CASE t.name
             WHEN N'int' THEN CAST(4 AS smallint)
             WHEN N'bigint' THEN CAST(-5 AS smallint)
             WHEN N'decimal' THEN CAST(3 AS smallint)
             WHEN N'numeric' THEN CAST(2 AS smallint)
             WHEN N'nvarchar' THEN CAST(-9 AS smallint)
-            WHEN N'varchar' THEN CAST(CASE WHEN c.max_length = -1 THEN CAST(12 AS smallint) ELSE CAST(-1 AS smallint) END AS smallint)
+            WHEN N'varchar' THEN CAST(12 AS smallint)
             WHEN N'text' THEN CAST(-1 AS smallint)
             WHEN N'varbinary' THEN CAST(-3 AS smallint)
             WHEN N'datetime2' THEN CAST(9 AS smallint)
             WHEN N'bit' THEN CAST(-7 AS smallint)
             WHEN N'uniqueidentifier' THEN CAST(-11 AS smallint)
+            WHEN N'smallint' THEN CAST(5 AS smallint)
+            WHEN N'tinyint' THEN CAST(-6 AS smallint)
+            WHEN N'char' THEN CAST(1 AS smallint)
+            WHEN N'nchar' THEN CAST(-8 AS smallint)
+            WHEN N'datetime' THEN CAST(9 AS smallint)
+            WHEN N'smalldatetime' THEN CAST(9 AS smallint)
+            WHEN N'date' THEN CAST(9 AS smallint)
+            WHEN N'time' THEN CAST(-154 AS smallint)
+            WHEN N'float' THEN CAST(6 AS smallint)
+            WHEN N'real' THEN CAST(7 AS smallint)
+            WHEN N'money' THEN CAST(3 AS smallint)
+            WHEN N'smallmoney' THEN CAST(3 AS smallint)
+            WHEN N'binary' THEN CAST(-2 AS smallint)
+            WHEN N'image' THEN CAST(-4 AS smallint)
+            WHEN N'ntext' THEN CAST(-10 AS smallint)
+            WHEN N'datetimeoffset' THEN CAST(-155 AS smallint)
+            WHEN N'xml' THEN CAST(-152 AS smallint)
+            WHEN N'sql_variant' THEN CAST(-150 AS smallint)
             ELSE CAST(0 AS smallint)
         END
     END AS smallint) AS odbc_sql_data_type,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(3 AS smallint) ELSE CAST(NULL AS smallint) END AS smallint) AS odbc_sql_datetime_sub,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length AS int) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int) ELSE CAST(NULL AS int) END AS int) AS CHAR_OCTET_LENGTH,
-    CAST(CASE WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(c.max_length AS int) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int) WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int) ELSE CAST(NULL AS int) END AS int) AS odbc_char_octet_length,
+    CAST(CASE WHEN t.name = N'datetime2' THEN CAST(3 AS smallint)
+        WHEN t.name IN (N'datetime', N'smalldatetime') THEN CAST(3 AS smallint)
+        WHEN t.name = N'date' THEN CAST(1 AS smallint)
+        WHEN t.name IN (N'time', N'datetimeoffset') THEN CAST(0 AS smallint)
+        ELSE CAST(NULL AS smallint) END AS smallint) AS odbc_sql_datetime_sub,
+    CAST(CASE WHEN t.name = N'nvarchar' THEN CAST(c.max_length AS int) WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int) WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'char', N'nchar', N'binary') THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(2147483646 AS int)
+        WHEN t.name = N'xml' THEN CAST(0 AS int)
+        WHEN t.name = N'sql_variant' THEN CAST(8000 AS int)
+        ELSE CAST(NULL AS int) END AS int) AS CHAR_OCTET_LENGTH,
+    CAST(CASE WHEN t.name = N'nvarchar' THEN CAST(c.max_length AS int) WHEN t.name = N'varchar' AND c.max_length = -1 THEN CAST(0 AS int)
+        WHEN t.name = N'varbinary' AND c.max_length = -1 THEN CAST(2147483647 AS int) WHEN t.name IN (N'varchar', N'varbinary') THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'char', N'nchar', N'binary') THEN CAST(c.max_length AS int)
+        WHEN t.name IN (N'image', N'text') THEN CAST(2147483647 AS int)
+        WHEN t.name = N'ntext' THEN CAST(2147483646 AS int)
+        WHEN t.name = N'xml' THEN CAST(0 AS int)
+        WHEN t.name = N'sql_variant' THEN CAST(8000 AS int)
+        ELSE CAST(NULL AS int) END AS int) AS odbc_char_octet_length,
     CAST(c.column_id AS int) AS ORDINAL_POSITION,
     CAST(CASE WHEN c.is_nullable = 1 THEN N'YES' ELSE N'NO' END AS varchar(254)) AS IS_NULLABLE,
     CAST(CASE
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'int' AND c.is_nullable = 0 THEN CAST(56 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'int' THEN CAST(38 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bigint' THEN CAST(108 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'decimal', N'numeric') THEN CAST(106 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'nvarchar' THEN CAST(39 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) IN (N'varchar', N'text') THEN CAST(39 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'varbinary' THEN CAST(37 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'bit' THEN CAST(50 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'uniqueidentifier' THEN CAST(37 AS tinyint)
-        WHEN (CASE c.user_type_id WHEN 56 THEN N'int' WHEN 127 THEN N'bigint' WHEN 106 THEN N'decimal' WHEN 108 THEN N'numeric' WHEN 231 THEN N'nvarchar' WHEN 167 THEN N'varchar' WHEN 165 THEN N'varbinary' WHEN 42 THEN N'datetime2' WHEN 104 THEN N'bit' WHEN 36 THEN N'uniqueidentifier' ELSE N'' END) = N'datetime2' THEN CAST(0 AS tinyint)
+        WHEN t.name = N'int' AND c.is_nullable = 0 THEN CAST(56 AS tinyint)
+        WHEN t.name = N'int' THEN CAST(38 AS tinyint)
+        WHEN t.name = N'bigint' THEN CAST(108 AS tinyint)
+        WHEN t.name IN (N'decimal', N'numeric') THEN CAST(106 AS tinyint)
+        WHEN t.name = N'nvarchar' THEN CAST(39 AS tinyint)
+        WHEN t.name = N'varchar' THEN CAST(39 AS tinyint)
+        WHEN t.name = N'varbinary' THEN CAST(37 AS tinyint)
+        WHEN t.name = N'bit' THEN CAST(50 AS tinyint)
+        WHEN t.name = N'uniqueidentifier' THEN CAST(37 AS tinyint)
+        WHEN t.name = N'datetime2' THEN CAST(0 AS tinyint)
+        WHEN t.name = N'smallint' AND c.is_nullable = 0 THEN CAST(52 AS tinyint)
+        WHEN t.name = N'smallint' THEN CAST(38 AS tinyint)
+        WHEN t.name = N'tinyint' AND c.is_nullable = 0 THEN CAST(48 AS tinyint)
+        WHEN t.name = N'tinyint' THEN CAST(38 AS tinyint)
+        WHEN t.name IN (N'char', N'nchar') AND c.is_nullable = 0 THEN CAST(47 AS tinyint)
+        WHEN t.name IN (N'char', N'nchar') THEN CAST(39 AS tinyint)
+        WHEN t.name = N'sql_variant' THEN CAST(39 AS tinyint)
+        WHEN t.name = N'datetime' AND c.is_nullable = 0 THEN CAST(61 AS tinyint)
+        WHEN t.name = N'datetime' THEN CAST(111 AS tinyint)
+        WHEN t.name = N'smalldatetime' AND c.is_nullable = 0 THEN CAST(58 AS tinyint)
+        WHEN t.name = N'smalldatetime' THEN CAST(111 AS tinyint)
+        WHEN t.name IN (N'date', N'time', N'datetimeoffset', N'xml') THEN CAST(0 AS tinyint)
+        WHEN t.name = N'float' AND c.is_nullable = 0 THEN CAST(62 AS tinyint)
+        WHEN t.name = N'float' THEN CAST(109 AS tinyint)
+        WHEN t.name = N'real' AND c.is_nullable = 0 THEN CAST(59 AS tinyint)
+        WHEN t.name = N'real' THEN CAST(109 AS tinyint)
+        WHEN t.name = N'money' AND c.is_nullable = 0 THEN CAST(60 AS tinyint)
+        WHEN t.name = N'money' THEN CAST(110 AS tinyint)
+        WHEN t.name = N'smallmoney' AND c.is_nullable = 0 THEN CAST(122 AS tinyint)
+        WHEN t.name = N'smallmoney' THEN CAST(110 AS tinyint)
+        WHEN t.name = N'binary' AND c.is_nullable = 0 THEN CAST(45 AS tinyint)
+        WHEN t.name = N'binary' THEN CAST(37 AS tinyint)
+        WHEN t.name = N'image' THEN CAST(34 AS tinyint)
+        WHEN t.name IN (N'text', N'ntext') THEN CAST(35 AS tinyint)
         ELSE CAST(0 AS tinyint)
     END AS tinyint) AS SS_DATA_TYPE,
     CAST(0 AS smallint) AS SS_IS_SPARSE,
@@ -1631,6 +2132,7 @@ SELECT
     CAST(NULL AS nvarchar(128)) AS SS_XML_SCHEMACOLLECTION_NAME,
     c.object_id AS object_id
 FROM sys.all_columns c
+JOIN sys.types t ON t.user_type_id = c.user_type_id
 WHERE c.is_computed = 0
   AND c.object_id IN (SELECT o.object_id FROM sys.all_objects o WHERE o.type IN (N'U', N'V'))
     ) col_src
@@ -1777,6 +2279,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(action, ProcAction::Template { .. }));
+    }
+
+    #[test]
+    fn bind_one_accepts_null() {
+        // Each spec is called with a value of `Value::Null` and a mismatched `arg.ty`
+        // (`int_ty()`), to isolate the check that reads the value from the one that reads
+        // the declared type.
+        let null = Value::Null;
+        let mismatched = int_ty();
+
+        let unicode_spec = SP_TABLES_PARAMS[2]; // @table_qualifier: unicode
+        assert_eq!(unicode_spec.canonical, "@table_qualifier");
+        assert!(unicode_spec.unicode);
+        let bound = bind_one(unicode_spec, &arg(None, &mismatched, &null)).unwrap();
+        assert_eq!(bound.value, Value::Null);
+
+        let int_spec = SP_COLUMNS_100_EXTRA[0]; // @NameScope: int_param
+        assert_eq!(int_spec.canonical, "@NameScope");
+        assert!(int_spec.int_param);
+        let bound = bind_one(int_spec, &arg(None, &nvarchar_ty(), &null)).unwrap();
+        assert_eq!(bound.value, Value::Null);
+
+        let bit_spec = SP_COLUMNS_100_EXTRA[1]; // @fUsePattern: bit_param
+        assert_eq!(bit_spec.canonical, "@fUsePattern");
+        assert!(bit_spec.bit_param);
+        let bound = bind_one(bit_spec, &arg(None, &nvarchar_ty(), &null)).unwrap();
+        assert_eq!(bound.value, Value::Null);
     }
 
     #[test]

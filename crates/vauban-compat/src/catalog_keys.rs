@@ -596,13 +596,18 @@ fn bind_catalog_params(
 }
 
 fn bind_one(spec: ParamSpec, arg: &ProcArg<'_>) -> SqlResult<ProcParam> {
-    if spec.unicode && !is_unicode_text(arg.ty) {
+    // A literal `NULL` carries no type of its own; the checks below skip `arg.ty` for a
+    // `NULL` value, so it binds to a `unicode`, `int_param` or `bit_param` slot without a
+    // type error (`bind_one_accepts_null` below).
+    let is_null = matches!(arg.value, Value::Null);
+    if spec.unicode && !is_null && !is_unicode_text(arg.ty) {
         return Err(SqlError::procedure_expects_type(
             spec.canonical,
             "ntext/nchar/nvarchar",
         ));
     }
     if spec.int_param
+        && !is_null
         && !matches!(
             arg.ty.ty,
             SqlType::Int | SqlType::SmallInt | SqlType::TinyInt
@@ -610,7 +615,10 @@ fn bind_one(spec: ParamSpec, arg: &ProcArg<'_>) -> SqlResult<ProcParam> {
     {
         return Err(SqlError::procedure_expects_type(spec.canonical, "int"));
     }
-    if spec.bit_param && !matches!(arg.ty.ty, SqlType::Bit | SqlType::Int | SqlType::TinyInt) {
+    if spec.bit_param
+        && !is_null
+        && !matches!(arg.ty.ty, SqlType::Bit | SqlType::Int | SqlType::TinyInt)
+    {
         return Err(SqlError::procedure_expects_type(spec.canonical, "bit"));
     }
     Ok(ProcParam {
@@ -1157,6 +1165,10 @@ mod tests {
         TypeInfo::new(SqlType::NVarChar(Len::Max), false)
     }
 
+    fn int_ty() -> TypeInfo {
+        TypeInfo::new(SqlType::Int, false)
+    }
+
     fn arg<'a>(name: Option<&'a str>, ty: &'a TypeInfo, value: &'a Value) -> ProcArg<'a> {
         ProcArg {
             name,
@@ -1165,6 +1177,45 @@ mod tests {
             output: false,
             default: false,
         }
+    }
+
+    #[test]
+    fn bind_one_accepts_null() {
+        // Each spec is called with a value of `Value::Null` and a mismatched `arg.ty`
+        // (`int_ty()`), to isolate the check that reads the value from the one that reads
+        // the declared type.
+        let null = Value::Null;
+        let mismatched = int_ty();
+
+        let unicode_spec = SP_PKEYS_PARAMS[0]; // @table_name: unicode
+        assert_eq!(unicode_spec.canonical, "@table_name");
+        assert!(unicode_spec.unicode);
+        let bound = bind_one(unicode_spec, &arg(None, &mismatched, &null)).unwrap();
+        assert_eq!(bound.value, Value::Null);
+
+        let int_spec = SP_SPECIAL_COLUMNS_PARAMS[6]; // @odbcver: int_param
+        assert_eq!(int_spec.canonical, "@odbcver");
+        assert!(int_spec.int_param);
+        let bound = bind_one(int_spec, &arg(None, &nvarchar_ty(), &null)).unwrap();
+        assert_eq!(bound.value, Value::Null);
+
+        // No `bit_param` parameter is declared anywhere in this file's `const` tables, so
+        // the spec is built directly to cover the third shape `bind_one` checks.
+        let bit_spec = ParamSpec {
+            canonical: "@bit_test",
+            aliases: &["@bit_test"],
+            required: false,
+            unicode: false,
+            int_param: false,
+            bit_param: true,
+            char_param: false,
+            default_null: false,
+            default_int: None,
+            default_bit: Some(false),
+            default_char: None,
+        };
+        let bound = bind_one(bit_spec, &arg(None, &nvarchar_ty(), &null)).unwrap();
+        assert_eq!(bound.value, Value::Null);
     }
 
     #[test]
