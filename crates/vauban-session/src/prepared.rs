@@ -19,6 +19,7 @@ use crate::procedures::{BatchProcOutcome, ProcFinish};
 use crate::rpc::{ProcAction, ProcParam};
 use crate::sink::ResultSink;
 use crate::state::SessionState;
+use crate::statements::{statement_fragment, statement_line};
 
 const DEFAULT_SCHEMA: &str = "dbo";
 
@@ -447,71 +448,6 @@ fn exact_numeric(decl: &DataType) -> SqlResult<SqlType> {
             .map_err(|_| SqlError::cannot_find_data_type(1, &decl.name))?,
         scale: u8::try_from(scale).map_err(|_| SqlError::cannot_find_data_type(1, &decl.name))?,
     })
-}
-
-fn statement_line(stmt: &Statement) -> u32 {
-    statement_span(stmt).line
-}
-
-fn statement_span(stmt: &Statement) -> vauban_parser::Span {
-    match stmt {
-        Statement::Select(statement) => statement.span,
-        Statement::Insert(statement) => statement.span,
-        Statement::Update(statement) => statement.span,
-        Statement::Delete(statement) => statement.span,
-        Statement::Merge(statement) => statement.span,
-        Statement::CreateDatabase(statement) => statement.span,
-        Statement::AlterDatabase(statement) => statement.span,
-        Statement::CreateTable(statement) => statement.span,
-        Statement::AlterTable(statement) => statement.span,
-        Statement::CreateIndex(statement) => statement.span,
-        Statement::DropIndex(statement) => statement.span,
-        Statement::CreateProcedure(statement) => statement.span,
-        Statement::CreateFunction(statement) => statement.span,
-        Statement::CreateView(statement) => statement.span,
-        Statement::CreateTrigger(statement) => statement.span,
-        Statement::CreateSequence(statement) => statement.span,
-        Statement::Declare(statement) => statement.span,
-        Statement::Set(statement) => statement.span,
-        Statement::SetOption(statement) => statement.span,
-        Statement::Execute(statement) => statement.span,
-        Statement::Waitfor(statement) => statement.span,
-        Statement::RaiseError(statement) => statement.span,
-        Statement::Cursor(statement) => statement.span,
-        Statement::Grant(statement) => statement.span,
-        Statement::Break(span) | Statement::Continue(span) => *span,
-        Statement::Truncate { span, .. }
-        | Statement::DropDatabase { span, .. }
-        | Statement::Use { span, .. }
-        | Statement::DropTable { span, .. }
-        | Statement::DropProcedure { span, .. }
-        | Statement::DropFunction { span, .. }
-        | Statement::DropView { span, .. }
-        | Statement::DropTrigger { span, .. }
-        | Statement::DropSequence { span, .. }
-        | Statement::If { span, .. }
-        | Statement::While { span, .. }
-        | Statement::Block { span, .. }
-        | Statement::Return { span, .. }
-        | Statement::Print { span, .. }
-        | Statement::BeginTransaction { span, .. }
-        | Statement::Commit { span, .. }
-        | Statement::Rollback { span, .. }
-        | Statement::Save { span, .. }
-        | Statement::TryCatch { span, .. }
-        | Statement::Throw { span, .. }
-        | Statement::Goto { span, .. }
-        | Statement::Label { span, .. } => *span,
-    }
-}
-
-fn statement_fragment<'a>(batch: &'a str, stmt: &Statement, next: Option<&Statement>) -> &'a str {
-    let span = statement_span(stmt);
-    let start = span.offset as usize;
-    let end = next
-        .map(statement_span)
-        .map_or(batch.len(), |next_span| next_span.offset as usize);
-    batch.get(start..end).unwrap_or(batch)
 }
 
 fn run_nested_tracked(

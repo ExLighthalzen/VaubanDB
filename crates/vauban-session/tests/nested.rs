@@ -371,6 +371,39 @@ fn error_line_is_relative_to_the_nested_text() {
     assert_eq!(err.line, 2);
 }
 
+/// A `DECLARE` of a type the binder does not know fails while the nested text is bound,
+/// and the number leaves on the line the `DECLARE` was written on, not on the first line
+/// of that text.
+#[test]
+fn a_binding_error_of_a_declare_carries_the_line_of_its_statement() {
+    let text = "SELECT 1;\nDECLARE @x nosuchtype;";
+    let mut sink = Recording::default();
+    let outcome = session()
+        .run_nested(text, &[], &mut sink)
+        .expect("nested completes");
+    assert!(outcome.failed);
+    let err = only_error(&sink.0);
+    assert_eq!(err.number, 2715);
+    assert_eq!(err.line, 2);
+}
+
+/// What a call raises is located in the text the call ran: an `EXEC sp_executesql` on
+/// the third line of the text, whose parameterized text reads a parameter the call
+/// leaves unbound, answers on line **1**, the first line of the text the call ran, and
+/// not on the line the `EXEC` sits on.
+#[test]
+fn an_error_of_a_call_keeps_the_line_of_the_text_it_ran() {
+    let text = "SELECT 1;\n\nEXEC sp_executesql N'SELECT @a AS n', N'@a int';";
+    let mut sink = Recording::default();
+    let outcome = session()
+        .run_nested(text, &[], &mut sink)
+        .expect("nested completes");
+    assert!(outcome.failed);
+    let err = only_error(&sink.0);
+    assert_eq!(err.number, 137);
+    assert_eq!(err.line, 1);
+}
+
 #[test]
 fn empty_text_emits_done_proc_and_return_status() {
     let mut sink = Recording::default();

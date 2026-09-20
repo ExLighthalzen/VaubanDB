@@ -131,6 +131,10 @@ use crate::server::Engine;
 use crate::set_options::{SetOutcome, apply_set_statement};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
+use crate::statements::{
+    INTERNAL_ERROR, at_statement, statement_clears_last_error, statement_fragment, statement_line,
+    statement_span, statement_text, use_name_line,
+};
 use crate::txn_session::{self, StatementTxn};
 use vauban_binder::{
     BatchVariables, BindContext, BoundExecute, BoundStatement, DdlStatement, OutputSchema,
@@ -143,24 +147,8 @@ use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
 use vauban_txn::IsolationLevel;
 
-/// Number of the generic internal error (`errors`, `InternalError` → `SqlError`): the
-/// binder answers it for each statement that is not implemented yet.
-const INTERNAL_ERROR: u32 = 50000;
-
 /// Default schema of a login, `dbo` until `catalog` knows better.
 const DEFAULT_SCHEMA: &str = "dbo";
-
-/// The numbers that come out of `executor::execute` with a line of their own to keep.
-///
-/// 127 (`TOP` row count below zero) and 1060 (`TOP` row count `NULL`) are the two checks
-/// the executor performs whose line SQL Server counts on the **row-count expression** of
-/// the `TOP` rather than on the statement (module header). `executor` already puts that
-/// line on them, so [`at_statement`] steps aside.
-///
-/// These two are not a class: 1062 and 1031, raised while the very same `TOP` clause is
-/// compiled, answer the last line of the statement and the first line of the select list
-/// respectively on SQL Server, and neither of those is the row count (module header).
-const COMPILED_WITH_THE_STATEMENT: [u32; 2] = [127, 1060];
 
 /// The state and the execution of one connection after its login.
 pub struct Session {
@@ -1002,288 +990,13 @@ fn catalog_changed(prepared: &PreparedStatement, tail: &[Statement]) -> bool {
     }
 }
 
-/// Whether a successful statement resets `@@ERROR` to `0`. A bare `DECLARE` with no
-/// initializer on any item leaves the previous error in place
-/// (`tests/session_variables.rs`, `last_error_is_cleared_by_a_successful_statement`).
-fn statement_clears_last_error(stmt: &PhysicalStatement) -> bool {
-    match stmt {
-        PhysicalStatement::Declare(declarations) => declarations
-            .iter()
-            .all(|declaration| declaration.value.is_some()),
-        _ => true,
-    }
-}
-
-/// The 1-based line the statement starts on, in the text of the batch, or 0 for a variant
-/// this function has no case for.
-///
-/// # Which variants have a case, and why
-///
-/// A `SELECT` ([`PhysicalStatement::Query`]), the DDL of databases, tables and indexes
-/// ([`PhysicalStatement::Ddl`]), `USE` ([`PhysicalStatement::Use`]) and `INSERT`
-/// ([`PhysicalStatement::Insert`]). These are the statements
-/// whose run-time errors reach [`at_statement`], and whose fragment
-/// [`Session::bind_batch`] pads with `line - 1` newlines before rebinding it, so that a
-/// binding error lands on its line of the batch instead of line 1. A variant without a
-/// case answers 0, which means "no line to offer" and makes [`at_statement`] leave the
-/// error alone.
-///
-/// # The line answered for these numbers is the **statement**'s
-///
-/// As on SQL Server, with the failing node on a line below the one the statement starts
-/// on, so that the two hypotheses answer differently
-/// (`a_run_time_ddl_error_carries_the_line_of_its_statement`,
-/// `a_binding_error_of_a_ddl_statement_carries_the_line_of_its_statement`):
-///
-/// | batch | statement | failing node | answer |
-/// |---|:-:|:-:|:-:|
-/// | `SELECT 1;` / `DROP TABLE` / `dbo.s16nosuch6;` | 2 | 3 | **2** (3701) |
-/// | `CREATE TABLE dbo.s16v` / `(a int);`, twice | 3 | 3 | **3** (2714) |
-/// | `SELECT 1;` / `CREATE TABLE dbo.s16w` / `(a nosuchtype);` | 2 | 3 | **2** (2715) |
-/// | `SELECT 1;` / `CREATE TABLE dbo.s16x` / `(a int,` / `a int);` | 2 | 4 | **2** (2705) |
-/// | `SELECT 1;` / `USE` / `nosuchdatabase_s16;` | 2 | 3 | **3** (911) |
-///
-/// The last row is the exception, and the reason `USE` keeps a case here rather than being
-/// left at 0: 911 answers the line of the **name**. It stays out of [`at_statement`], the
-/// way [`COMPILED_WITH_THE_STATEMENT`] keeps 127 and 1060 out of it, but for a different
-/// reason: 911 is raised while the batch is **bound**
-/// ([`Session::bind_batch`]), with the line [`use_name_line`] counts, and the execution of
-/// a `USE` raises nothing (`executor` answers `NoRows`). What the case here buys for a
-/// `USE` is the line of its INFO 5701, which is the **statement**'s (line 2 where 911
-/// answers 3, rustdoc of [`Session::switch_database`]), and the padding of the fragment,
-/// which is what puts 2715 and 2705 on their own line
-/// (`a_binding_error_of_a_ddl_statement_carries_the_line_of_its_statement`).
-fn statement_line(stmt: &Statement) -> u32 {
-    match stmt {
-        Statement::Select(_)
-        | Statement::CreateDatabase(_)
-        | Statement::DropDatabase { .. }
-        | Statement::CreateTable(_)
-        | Statement::AlterTable(_)
-        | Statement::DropTable { .. }
-        | Statement::CreateIndex(_)
-        | Statement::DropIndex(_)
-        | Statement::AlterDatabase(_)
-        | Statement::Use { .. }
-        | Statement::Insert(_)
-        | Statement::Update(_)
-        | Statement::Delete(_)
-        | Statement::BeginTransaction { .. }
-        | Statement::Commit { .. }
-        | Statement::Rollback { .. }
-        | Statement::Save { .. } => statement_span(stmt).line,
-        _ => 0,
-    }
-}
-
-/// Number of bytes of the `USE` keyword, the first token of the statement
-/// [`use_name_line`] walks.
-const USE_KEYWORD_LEN: usize = "USE".len();
-
-/// The 1-based line the **name** of a `USE` statement starts on, in `text`, which is the
-/// line SQL Server puts on the 911 of a database that is not there.
-///
-/// `Ident` carries no span (`parser`, `ast/expr.rs`), so the line is counted here, from the
-/// span of the statement: past the `USE` keyword, then through the trivia — spaces, line
-/// comments, block comments, nested or not — up to the first byte of the name.
-///
-/// # The rule, on the shapes that separate it from its neighbours
-///
-/// Each shape puts the name on a different line from the statement, so "the name's line"
-/// and "the statement's line" answer differently; the first also separates it from "the
-/// line the statement ends on":
-///
-/// | batch | statement | name | end | answer |
-/// |---|:-:|:-:|:-:|:-:|
-/// | `SELECT 1;` / `USE` / `  d` / `;` | 2 | 3 | 4 | **3** |
-/// | `SELECT 1;` / `USE /* c` / `  c */ d;` | 2 | 3 | 3 | **3** |
-/// | `SELECT 1;` / `USE` / `-- a comment` / `  d;` | 2 | 4 | 4 | **4** |
-/// | `SELECT 1;` / `USE [d` / `e];` | 2 | 2 | 3 | **2** |
-/// | `SELECT 1;` / `USE /* a /* b` / `b */ a */` / `  d;` | 2 | 4 | 4 | **4** |
-/// | `SELECT 1;` / `USE` / `` / `` / `  d;` | 2 | 5 | 5 | **5** |
-/// | `USE d;` | 1 | 1 | 1 | **1** |
-///
-/// The fourth shape is the one that says the answer is where the name **starts** and not
-/// where it ends: a delimited name spread over two lines answers the line of its `[`. The
-/// fifth is why the depth of a block comment is counted rather than its first `*/`: a
-/// scan that stopped at `b */` would have answered 3. The last is the witness, where the
-/// three hypotheses agree. Pinned by
-/// `use_name_line_is_the_line_the_name_starts_on` and, end to end,
-/// `use_of_an_unknown_database_is_911_on_the_line_of_the_name`.
-fn use_name_line(text: &str, stmt: &Statement) -> u32 {
-    let span = statement_span(stmt);
-    let start = span.offset as usize;
-    let Some(body) = text
-        .get(start..start + span.len as usize)
-        .and_then(|body| body.get(USE_KEYWORD_LEN..))
-    else {
-        return span.line;
-    };
-    let bytes = body.as_bytes();
-    let mut line = span.line;
-    let mut at = 0;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\n' => {
-                line += 1;
-                at += 1;
-            }
-            byte if byte.is_ascii_whitespace() => at += 1,
-            b'-' if bytes.get(at + 1) == Some(&b'-') => {
-                // A line comment runs to the end of its line; the newline itself is counted
-                // by the arm above, on the next turn.
-                at += 2;
-                while at < bytes.len() && bytes[at] != b'\n' {
-                    at += 1;
-                }
-            }
-            b'/' if bytes.get(at + 1) == Some(&b'*') => {
-                // Block comments nest in T-SQL, as the parser reads them (module header of
-                // `parser`, `lexer.rs`): the depth is counted, not the first `*/`.
-                let mut depth = 1usize;
-                at += 2;
-                while at < bytes.len() && depth > 0 {
-                    match bytes[at] {
-                        b'\n' => line += 1,
-                        b'/' if bytes.get(at + 1) == Some(&b'*') => {
-                            depth += 1;
-                            at += 1;
-                        }
-                        b'*' if bytes.get(at + 1) == Some(&b'/') => {
-                            depth -= 1;
-                            at += 1;
-                        }
-                        _ => {}
-                    }
-                    at += 1;
-                }
-            }
-            // The first byte that is neither space nor comment opens the name.
-            _ => return line,
-        }
-    }
-    line
-}
-
-/// Puts the line of the failing statement on a run-time error, over the line of the
-/// sub-expression the executor put there.
-///
-/// Overriding rather than filling is the point: the executor answers a line for every
-/// error it raises, and that line is the right one only when the statement fits on one
-/// line. Three errors are left as they are:
-///
-/// - the internal error 50000, which names a hole in this engine and not a place in the
-///   query (`executor`, `errors.rs`, keeps it at line 0);
-/// - 127 and 1060, the two compilation checks the executor performs late, whose line SQL
-///   Server counts on the `TOP` row count and not on the statement
-///   ([`COMPILED_WITH_THE_STATEMENT`]);
-/// - any error at all when `line` is 0, which means the caller has no line to offer.
-fn at_statement(err: SqlError, line: u32) -> SqlError {
-    if line == 0
-        || err.number == INTERNAL_ERROR
-        || COMPILED_WITH_THE_STATEMENT.contains(&err.number)
-    {
-        return err;
-    }
-    err.with_line(line)
-}
-
-/// The text of `stmt` as the client wrote it, cut out of the batch by the span of the
-/// statement, or re-rendered from the AST when the variant carries no span this function
-/// knows.
-///
-/// Only the two variants that need their text have a case here: a `SET` option, which
-/// `set_options.rs` recognises from the text, and `WAITFOR`, which the fake engine still serves.
-/// `Display` is the fall-back rather than an error because it round-trips through the
-/// parser (`parser`, `display`), so a statement rendered this way is still the same one.
-fn statement_text(batch: &str, stmt: &Statement) -> String {
-    let span = statement_span(stmt);
-    let start = span.offset as usize;
-    batch
-        .get(start..start + span.len as usize)
-        .map_or_else(|| stmt.to_string(), str::to_owned)
-}
-
-/// Exact source from this statement through its separator and trailing trivia.
-/// Keeping that suffix preserves errors which SQL Server locates on a semicolon below the
-/// expression rather than on the expression itself.
-fn statement_fragment<'a>(batch: &'a str, stmt: &Statement, next: Option<&Statement>) -> &'a str {
-    let span = statement_span(stmt);
-    let start = span.offset as usize;
-    let end = next
-        .map(statement_span)
-        .map_or(batch.len(), |next_span| next_span.offset as usize);
-    batch.get(start..end).unwrap_or(batch)
-}
-
-/// Position of every statement variant. Keeping this match exhaustive makes a new parser
-/// construct break compilation instead of silently rebuilding the whole batch as one statement.
-fn statement_span(stmt: &Statement) -> vauban_parser::Span {
-    match stmt {
-        Statement::Select(statement) => statement.span,
-        Statement::Insert(statement) => statement.span,
-        Statement::Update(statement) => statement.span,
-        Statement::Delete(statement) => statement.span,
-        Statement::Merge(statement) => statement.span,
-        Statement::CreateDatabase(statement) => statement.span,
-        Statement::AlterDatabase(statement) => statement.span,
-        Statement::CreateTable(statement) => statement.span,
-        Statement::AlterTable(statement) => statement.span,
-        Statement::CreateIndex(statement) => statement.span,
-        Statement::DropIndex(statement) => statement.span,
-        Statement::CreateProcedure(statement) => statement.span,
-        Statement::CreateFunction(statement) => statement.span,
-        Statement::CreateView(statement) => statement.span,
-        Statement::CreateTrigger(statement) => statement.span,
-        Statement::CreateSequence(statement) => statement.span,
-        Statement::Declare(statement) => statement.span,
-        Statement::Set(statement) => statement.span,
-        Statement::SetOption(statement) => statement.span,
-        Statement::Execute(statement) => statement.span,
-        Statement::Waitfor(statement) => statement.span,
-        Statement::RaiseError(statement) => statement.span,
-        Statement::Cursor(statement) => statement.span,
-        Statement::Grant(statement) => statement.span,
-        Statement::Break(span) | Statement::Continue(span) => *span,
-        Statement::Truncate { span, .. }
-        | Statement::DropDatabase { span, .. }
-        | Statement::Use { span, .. }
-        | Statement::DropTable { span, .. }
-        | Statement::DropProcedure { span, .. }
-        | Statement::DropFunction { span, .. }
-        | Statement::DropView { span, .. }
-        | Statement::DropTrigger { span, .. }
-        | Statement::DropSequence { span, .. }
-        | Statement::If { span, .. }
-        | Statement::While { span, .. }
-        | Statement::Block { span, .. }
-        | Statement::Return { span, .. }
-        | Statement::Print { span, .. }
-        | Statement::BeginTransaction { span, .. }
-        | Statement::Commit { span, .. }
-        | Statement::Rollback { span, .. }
-        | Statement::Save { span, .. }
-        | Statement::TryCatch { span, .. }
-        | Statement::Throw { span, .. }
-        | Statement::Goto { span, .. }
-        | Statement::Label { span, .. } => *span,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use vauban_errors::InfoMessage;
-    use vauban_parser::ParseOptions;
     use vauban_storage::MemoryStorage;
     use vauban_tds::EnvChange;
     use vauban_types::{SqlType, TypeInfo, Value};
-
-    fn parse(text: &str) -> Vec<Statement> {
-        parse_batch(text, &ParseOptions::default())
-            .expect("the text parses")
-            .statements
-    }
 
     /// What a batch sent to its sink, reduced to what the tests below assert on.
     ///
@@ -1389,108 +1102,6 @@ mod tests {
             .commit(handle)
             .expect("the reading transaction commits");
         found
-    }
-
-    #[test]
-    fn statement_text_is_the_text_the_client_wrote() {
-        let text = "SET nocount on;\nWAITFOR DELAY '00:00:01'";
-        let statements = parse(text);
-        assert_eq!(statement_text(text, &statements[0]), "SET nocount on");
-        assert_eq!(
-            statement_text(text, &statements[1]),
-            "WAITFOR DELAY '00:00:01'"
-        );
-    }
-
-    #[test]
-    fn statement_text_preserves_the_select_source() {
-        let text = "select  1";
-        let statements = parse(text);
-        assert_eq!(statement_text(text, &statements[0]), text);
-    }
-
-    #[test]
-    fn statement_fragment_keeps_the_separator_and_its_line() {
-        let text = "SELECT 1\n;\nSELECT 2";
-        let statements = parse(text);
-        assert_eq!(
-            statement_fragment(text, &statements[0], statements.get(1)),
-            "SELECT 1\n;\n"
-        );
-    }
-
-    #[test]
-    fn statement_line_is_the_line_of_the_first_token() {
-        // The `SELECT` of the second statement is on line 3, its select list on line 4.
-        let text = "SELECT 1;\n\n SELECT\n 1 / 0;";
-        let statements = parse(text);
-        assert_eq!(statement_line(&statements[0]), 1);
-        assert_eq!(statement_line(&statements[1]), 3);
-        // A comment before the statement is trivia: the line is the keyword's.
-        let text = "SELECT 1;\n-- a comment on its own line\nSELECT\n1 / 0;";
-        assert_eq!(statement_line(&parse(text)[1]), 3);
-        // Two statements on one line share it.
-        assert_eq!(statement_line(&parse("SELECT 1; SELECT\n1 / 0;")[1]), 1);
-    }
-
-    #[test]
-    fn statement_line_of_a_variant_without_a_case_is_zero() {
-        assert_eq!(statement_line(&parse("SET nocount on")[0]), 0);
-    }
-
-    /// The DDL variants, `USE`, `INSERT`, `UPDATE` and `DELETE` answer the line of their
-    /// first token, like a `SELECT`.
-    ///
-    /// Each statement below starts on line 2 and spreads over line 3: a case that read the
-    /// last line of the statement would answer 3, and a missing case 0, which is what the
-    /// three tests of the DDL lines answer with `_ => 0` put back.
-    #[test]
-    fn statement_line_covers_the_ddl_variants_and_use() {
-        for text in [
-            "SELECT 1;\nCREATE TABLE dbo.t\n  (a int);",
-            "SELECT 1;\nDROP TABLE\n  dbo.t;",
-            "SELECT 1;\nCREATE DATABASE\n  d;",
-            "SELECT 1;\nDROP DATABASE\n  d;",
-            "SELECT 1;\nCREATE INDEX ix ON dbo.t\n  (a);",
-            "SELECT 1;\nDROP INDEX ix ON\n  dbo.t;",
-            "SELECT 1;\nUSE\n  d;",
-            "SELECT 1;\nINSERT INTO dbo.t\n  (a) VALUES (1);",
-            "SELECT 1;\nUPDATE dbo.t\n  SET a = 1;",
-            "SELECT 1;\nDELETE FROM\n  dbo.t;",
-            "SELECT 1;\nDELETE\n  dbo.t WHERE a = 1;",
-        ] {
-            assert_eq!(statement_line(&parse(text)[1]), 2, "{text}");
-        }
-    }
-
-    #[test]
-    fn at_statement_overrides_the_line_of_the_sub_expression() {
-        let raised_on_line_4 = SqlError::divide_by_zero().with_line(4);
-        assert_eq!(at_statement(raised_on_line_4, 3).line, 3);
-    }
-
-    #[test]
-    fn at_statement_without_a_line_changes_nothing() {
-        let raised_on_line_4 = SqlError::divide_by_zero().with_line(4);
-        assert_eq!(at_statement(raised_on_line_4, 0).line, 4);
-    }
-
-    #[test]
-    fn an_internal_error_still_carries_no_line() {
-        let bug = SqlError::from(vauban_errors::InternalError::Bug("x".to_owned()));
-        let wrapped = at_statement(bug, 3);
-        assert_eq!(wrapped.number, INTERNAL_ERROR);
-        assert_eq!(wrapped.line, 0);
-    }
-
-    #[test]
-    fn the_two_compilation_checks_keep_their_own_line() {
-        // `SELECT` on line 3, `TOP (-1)` on line 4: SQL Server answers 4 for both numbers.
-        assert_eq!(
-            at_statement(SqlError::top_negative().with_line(4), 3).line,
-            4
-        );
-        assert_eq!(at_statement(SqlError::top_null().with_line(4), 3).line, 4);
     }
 
     #[test]
@@ -1754,8 +1365,7 @@ mod tests {
     }
 
     /// A **run-time** error of a DDL statement carries the line its statement starts on,
-    /// which [`at_statement`] puts there from the case [`statement_line`] has for the DDL
-    /// variants.
+    /// which [`at_statement`] puts there from [`statement_line`].
     ///
     /// Both batches open with a comment on line 1. Each puts the failing node below the
     /// first line of its statement, which is what tells "the statement's line" from "the
@@ -1765,8 +1375,8 @@ mod tests {
     /// - the second `CREATE TABLE dbo.s16v` on line 4, its column list on line 5 -> **4**
     ///   (2714).
     ///
-    /// Without the DDL cases of [`statement_line`], both answer 0, the "no line to offer"
-    /// of [`at_statement`], and a client reads `Line 0`.
+    /// With no line to offer, [`at_statement`] leaves the error as the executor raised
+    /// it, and a client reads the line of the failing node instead of the statement's.
     #[test]
     fn a_run_time_ddl_error_carries_the_line_of_its_statement() {
         let engine = engine();
@@ -2143,26 +1753,5 @@ mod tests {
             after_use.databases.is_empty(),
             "the binding error stops the batch before the ENVCHANGE"
         );
-    }
-
-    /// [`use_name_line`] on the shapes of its table, without the chain around it: the
-    /// trivia between `USE` and its name — spaces, a line comment, a block comment, a
-    /// nested block comment — is counted, and the answer is where the name starts.
-    #[test]
-    fn use_name_line_is_the_line_the_name_starts_on() {
-        for (text, line) in [
-            ("USE d;", 1),
-            ("SELECT 1;\nUSE\n  d\n;", 3),
-            ("SELECT 1;\nUSE /* c\n  c */ d;", 3),
-            ("SELECT 1;\nUSE\n-- a comment\n  d;", 4),
-            ("SELECT 1;\nUSE [d\ne];", 2),
-            ("SELECT 1;\nUSE /* a /* b\nb */ a */\n d;", 4),
-            ("SELECT 1;\nUSE\n\n\n  d;", 5),
-        ] {
-            let statements = parse(text);
-            let stmt = statements.last().expect("the batch has a statement");
-            assert!(matches!(stmt, Statement::Use { .. }), "{text}");
-            assert_eq!(use_name_line(text, stmt), line, "{text}");
-        }
     }
 }

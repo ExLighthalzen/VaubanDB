@@ -299,12 +299,13 @@ enum Tok {
         cur_cmd: u16,
         row_count: u64,
     },
-    /// ERROR with `Number`, `State`, `Class` and `MsgText`.
+    /// ERROR with `Number`, `State`, `Class`, `MsgText` and `LineNumber`.
     Error {
         number: u32,
         state: u8,
         class: u8,
         message: String,
+        line: u32,
     },
     /// INFO, ENVCHANGE or LOGINACK, by type: not inspected here.
     Other(u8),
@@ -399,13 +400,18 @@ fn tokens(payload: &[u8]) -> Vec<Tok> {
                 let body = &payload[pos + 2..pos + 2 + len];
                 pos += 2 + len;
                 out.push(if kind == TOKEN_ERROR {
-                    // Number (4), State (1), Class (1), MsgText (US_VARCHAR).
+                    // Number (4), State (1), Class (1), MsgText (US_VARCHAR), ServerName
+                    // and ProcName (B_VARCHAR), LineNumber (4) ([MS-TDS] 2.2.7.10).
                     let chars = usize::from(u16_at(body, 6));
+                    let mut at = 8 + 2 * chars;
+                    at += 1 + 2 * usize::from(body[at]);
+                    at += 1 + 2 * usize::from(body[at]);
                     Tok::Error {
                         number: u32::from_le_bytes(body[0..4].try_into().unwrap()),
                         state: body[4],
                         class: body[5],
                         message: utf16_at(body, 8, chars),
+                        line: u32::from_le_bytes(body[at..at + 4].try_into().unwrap()),
                     }
                 } else {
                     Tok::Other(kind)
@@ -559,6 +565,7 @@ async fn a_syntax_error_gets_102_and_the_connection_stays_usable() {
                 state: 1,
                 class: 15,
                 message: SqlError::incorrect_syntax_near("SELEC", 1).message,
+                line: 1,
             },
             Tok::Done {
                 status: DONE_ERROR,
@@ -593,6 +600,7 @@ async fn commit_outside_a_transaction_gets_3902_and_the_connection_stays_usable(
                     .expect("3902 is in the catalogue")
                     .template
                     .to_owned(),
+                line: 0,
             },
             Tok::Done {
                 status: DONE_ERROR,
@@ -701,6 +709,7 @@ async fn two_bare_defaults_are_8148_over_the_wire() {
                 state: 0,
                 class: 16,
                 message: SqlError::multiple_column_defaults("a", "dbo.t").message,
+                line: 1,
             },
             Tok::Done {
                 status: DONE_ERROR,
@@ -867,6 +876,81 @@ async fn if_while_read_variables_set_earlier_over_the_wire() {
         while_toks.contains(&Tok::Row(vec![2])),
         "WHILE ran twice: {while_toks:?}"
     );
+
+    drop(client);
+    running.stop().await;
+}
+
+/// Line the first ERROR of `toks` left with.
+fn first_error_line(toks: &[Tok]) -> u32 {
+    toks.iter()
+        .find_map(|token| match token {
+            Tok::Error { line, .. } => Some(*line),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the response carries an error: {toks:?}"))
+}
+
+/// A `DECLARE` of a type the binder does not know fails while the batch is bound, and the
+/// number leaves on the line the `DECLARE` was written on, not on the first line of the
+/// batch.
+#[tokio::test]
+async fn a_binding_error_of_a_declare_carries_the_line_of_its_statement() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let response = batch(&mut client, "SELECT 1;\nDECLARE @x nosuchtype;").await;
+    let toks = tokens(&response.payload);
+    assert!(
+        matches!(toks.first(), Some(Tok::Error { number: 2715, .. })),
+        "a batch that fails to bind opens with its error: {toks:?}"
+    );
+    assert_eq!(first_error_line(&toks), 2);
+
+    drop(client);
+    running.stop().await;
+}
+
+/// A `PRINT` of a variable no `DECLARE` introduced fails while the batch is bound too,
+/// and the number leaves on the line the `PRINT` was written on.
+///
+/// The blank line between the two statements is what makes the shape a vector: the
+/// `PRINT` is the second statement of the batch and sits on its third line, so "line 1",
+/// "the rank of the statement" and "the line the statement starts on" answer 1, 2 and 3.
+#[tokio::test]
+async fn a_binding_error_of_a_print_carries_the_line_of_its_statement() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let response = batch(&mut client, "SELECT 1;\n\nPRINT @v;").await;
+    let toks = tokens(&response.payload);
+    assert!(
+        matches!(toks.first(), Some(Tok::Error { number: 137, .. })),
+        "a batch that fails to bind opens with its error: {toks:?}"
+    );
+    assert_eq!(first_error_line(&toks), 3);
+
+    drop(client);
+    running.stop().await;
+}
+
+/// An `EXEC` of a name no procedure carries answers 2812 on the **first** line of the
+/// batch, where the line the `EXEC` sits on would be the closer answer: an `EXEC` offers
+/// no line of its own, and that is what leaves the error of a call that does run on the
+/// line of the text the call ran (rustdoc of `statement_line`).
+#[tokio::test]
+async fn an_exec_of_an_unknown_procedure_answers_on_the_first_line() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let response = batch(&mut client, "SELECT 1;\n\nEXEC dbo.nosuchprocedure;").await;
+    let toks = tokens(&response.payload);
+    assert!(
+        toks.iter()
+            .any(|token| matches!(token, Tok::Error { number: 2812, .. })),
+        "{toks:?}"
+    );
+    assert_eq!(first_error_line(&toks), 1);
 
     drop(client);
     running.stop().await;

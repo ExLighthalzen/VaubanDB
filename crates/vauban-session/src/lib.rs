@@ -13,6 +13,7 @@
 //! | `state.rs`, `set_options.rs` | per-session state and `SET` options |
 //! | `sink.rs` | `ResultSink` and its TDS implementation |
 //! | `batch.rs`, `fake_engine.rs` | batch and RPC dispatch, the `WAITFOR DELAY` fallback |
+//! | `statements.rs` | span, fragment and line of one statement inside the text it sits in |
 //! | `cancel.rs` | ATTENTION handling |
 //! | `disconnect.rs` | connection teardown and ATTENTION cleanup |
 //! | `eval_context.rs` | `EvalContext` of the session for `sysfn` |
@@ -36,6 +37,7 @@ mod server;
 mod set_options;
 mod sink;
 mod state;
+mod statements;
 mod txn_request;
 mod txn_session;
 

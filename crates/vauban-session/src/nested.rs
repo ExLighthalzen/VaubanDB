@@ -21,16 +21,14 @@ use crate::rpc::{ProcAction, ProcArg, ProcParam, StaticResultColumn};
 use crate::set_options::{SetOutcome, apply_set_statement, sync_exec_session};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
+use crate::statements::{
+    INTERNAL_ERROR, at_statement, statement_clears_last_error, statement_fragment, statement_line,
+    statement_span, statement_text, use_name_line,
+};
 use crate::txn_session::{self, StatementTxn};
-
-/// Number of the generic internal error (`errors`, `InternalError` → `SqlError`).
-const INTERNAL_ERROR: u32 = 50000;
 
 /// Default schema of a login, `dbo` until `catalog` knows better.
 const DEFAULT_SCHEMA: &str = "dbo";
-
-/// The two `TOP` row-count errors whose line the executor already places correctly.
-const COMPILED_WITH_THE_STATEMENT: [u32; 2] = [127, 1060];
 
 /// One parameter of a nested batch, declared before the text is bound.
 #[derive(Debug, Clone, PartialEq)]
@@ -1042,169 +1040,6 @@ fn catalog_changed(prepared: &PreparedStatement, tail: &[Statement]) -> bool {
             ..
         } => crate::batch::batch_has_alter_table(tail),
         _ => false,
-    }
-}
-
-fn statement_clears_last_error(stmt: &PhysicalStatement) -> bool {
-    match stmt {
-        PhysicalStatement::Declare(declarations) => declarations
-            .iter()
-            .all(|declaration| declaration.value.is_some()),
-        _ => true,
-    }
-}
-
-fn at_statement(err: SqlError, line: u32) -> SqlError {
-    if line == 0
-        || err.number == INTERNAL_ERROR
-        || COMPILED_WITH_THE_STATEMENT.contains(&err.number)
-    {
-        return err;
-    }
-    err.with_line(line)
-}
-
-fn statement_line(stmt: &Statement) -> u32 {
-    match stmt {
-        Statement::Select(_)
-        | Statement::CreateDatabase(_)
-        | Statement::DropDatabase { .. }
-        | Statement::CreateTable(_)
-        | Statement::AlterTable(_)
-        | Statement::DropTable { .. }
-        | Statement::CreateIndex(_)
-        | Statement::DropIndex(_)
-        | Statement::AlterDatabase(_)
-        | Statement::Use { .. }
-        | Statement::Insert(_)
-        | Statement::Update(_)
-        | Statement::Delete(_)
-        | Statement::BeginTransaction { .. }
-        | Statement::Commit { .. }
-        | Statement::Rollback { .. }
-        | Statement::Save { .. } => statement_span(stmt).line,
-        _ => 0,
-    }
-}
-
-const USE_KEYWORD_LEN: usize = "USE".len();
-
-fn use_name_line(text: &str, stmt: &Statement) -> u32 {
-    let span = statement_span(stmt);
-    let start = span.offset as usize;
-    let Some(body) = text
-        .get(start..start + span.len as usize)
-        .and_then(|body| body.get(USE_KEYWORD_LEN..))
-    else {
-        return span.line;
-    };
-    let bytes = body.as_bytes();
-    let mut line = span.line;
-    let mut at = 0;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\n' => {
-                line += 1;
-                at += 1;
-            }
-            byte if byte.is_ascii_whitespace() => at += 1,
-            b'-' if bytes.get(at + 1) == Some(&b'-') => {
-                at += 2;
-                while at < bytes.len() && bytes[at] != b'\n' {
-                    at += 1;
-                }
-            }
-            b'/' if bytes.get(at + 1) == Some(&b'*') => {
-                let mut depth = 1usize;
-                at += 2;
-                while at < bytes.len() && depth > 0 {
-                    match bytes[at] {
-                        b'\n' => line += 1,
-                        b'/' if bytes.get(at + 1) == Some(&b'*') => {
-                            depth += 1;
-                            at += 1;
-                        }
-                        b'*' if bytes.get(at + 1) == Some(&b'/') => {
-                            depth -= 1;
-                            at += 1;
-                        }
-                        _ => {}
-                    }
-                    at += 1;
-                }
-            }
-            _ => return line,
-        }
-    }
-    line
-}
-
-fn statement_text(batch: &str, stmt: &Statement) -> String {
-    let span = statement_span(stmt);
-    let start = span.offset as usize;
-    batch
-        .get(start..start + span.len as usize)
-        .map_or_else(|| stmt.to_string(), str::to_owned)
-}
-
-fn statement_fragment<'a>(batch: &'a str, stmt: &Statement, next: Option<&Statement>) -> &'a str {
-    let span = statement_span(stmt);
-    let start = span.offset as usize;
-    let end = next
-        .map(statement_span)
-        .map_or(batch.len(), |next_span| next_span.offset as usize);
-    batch.get(start..end).unwrap_or(batch)
-}
-
-fn statement_span(stmt: &Statement) -> vauban_parser::Span {
-    match stmt {
-        Statement::Select(statement) => statement.span,
-        Statement::Insert(statement) => statement.span,
-        Statement::Update(statement) => statement.span,
-        Statement::Delete(statement) => statement.span,
-        Statement::Merge(statement) => statement.span,
-        Statement::CreateDatabase(statement) => statement.span,
-        Statement::AlterDatabase(statement) => statement.span,
-        Statement::CreateTable(statement) => statement.span,
-        Statement::AlterTable(statement) => statement.span,
-        Statement::CreateIndex(statement) => statement.span,
-        Statement::DropIndex(statement) => statement.span,
-        Statement::CreateProcedure(statement) => statement.span,
-        Statement::CreateFunction(statement) => statement.span,
-        Statement::CreateView(statement) => statement.span,
-        Statement::CreateTrigger(statement) => statement.span,
-        Statement::CreateSequence(statement) => statement.span,
-        Statement::Declare(statement) => statement.span,
-        Statement::Set(statement) => statement.span,
-        Statement::SetOption(statement) => statement.span,
-        Statement::Execute(statement) => statement.span,
-        Statement::Waitfor(statement) => statement.span,
-        Statement::RaiseError(statement) => statement.span,
-        Statement::Cursor(statement) => statement.span,
-        Statement::Grant(statement) => statement.span,
-        Statement::Break(span) | Statement::Continue(span) => *span,
-        Statement::Truncate { span, .. }
-        | Statement::DropDatabase { span, .. }
-        | Statement::Use { span, .. }
-        | Statement::DropTable { span, .. }
-        | Statement::DropProcedure { span, .. }
-        | Statement::DropFunction { span, .. }
-        | Statement::DropView { span, .. }
-        | Statement::DropTrigger { span, .. }
-        | Statement::DropSequence { span, .. }
-        | Statement::If { span, .. }
-        | Statement::While { span, .. }
-        | Statement::Block { span, .. }
-        | Statement::Return { span, .. }
-        | Statement::Print { span, .. }
-        | Statement::BeginTransaction { span, .. }
-        | Statement::Commit { span, .. }
-        | Statement::Rollback { span, .. }
-        | Statement::Save { span, .. }
-        | Statement::TryCatch { span, .. }
-        | Statement::Throw { span, .. }
-        | Statement::Goto { span, .. }
-        | Statement::Label { span, .. } => *span,
     }
 }
 

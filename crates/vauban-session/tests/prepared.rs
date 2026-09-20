@@ -388,6 +388,85 @@ fn unprepare_rpc(handle: i32) -> Rpc {
     }
 }
 
+/// Sink that keeps the errors whole, where [`Recording`] keeps their number alone.
+#[derive(Default)]
+struct ErrorLines(Vec<SqlError>);
+
+impl ResultSink for ErrorLines {
+    fn columns(&mut self, _cols: &[ColumnMeta]) -> SqlResult<()> {
+        Ok(())
+    }
+    fn row(&mut self, _row: &[Value]) -> SqlResult<()> {
+        Ok(())
+    }
+    fn done(&mut self, _rowcount: Option<u64>, _more: bool) -> SqlResult<()> {
+        Ok(())
+    }
+    fn info(&mut self, _msg: &InfoMessage) -> SqlResult<()> {
+        Ok(())
+    }
+    fn error(&mut self, err: &SqlError) -> SqlResult<()> {
+        self.0.push(err.clone());
+        Ok(())
+    }
+    fn env_change(&mut self, _change: &EnvChange) -> SqlResult<()> {
+        Ok(())
+    }
+    fn return_value(&mut self, _name: &str, _ty: &TypeInfo, _value: &Value) -> SqlResult<()> {
+        Ok(())
+    }
+    fn return_status(&mut self, _status: i32) -> SqlResult<()> {
+        Ok(())
+    }
+}
+
+/// `sp_prepexec` of `text`, with one `int` parameter the text is free to ignore.
+fn prepexec_rpc_of(text: &str) -> Rpc {
+    let mut rpc = prepexec_rpc(1);
+    rpc.params[2].value = nvarchar(text);
+    rpc
+}
+
+/// A `DECLARE` of a type the binder does not know fails while the prepared text is bound,
+/// and the number leaves on the line the `DECLARE` was written on, not on the first line
+/// of that text.
+#[test]
+fn a_binding_error_of_a_declare_carries_the_line_of_its_statement() {
+    let mut sink = ErrorLines::default();
+    session()
+        .run_rpc(
+            &prepexec_rpc_of("SELECT 1;\nDECLARE @x nosuchtype;"),
+            &mut sink,
+        )
+        .expect("the prepare answers");
+    let err = sink
+        .0
+        .iter()
+        .find(|err| err.number == 2715)
+        .expect("the unknown type is 2715");
+    assert_eq!(err.line, 2);
+}
+
+/// A `PRINT` of a variable no `DECLARE` introduced fails while the prepared text is
+/// bound, and the number leaves on the line the `PRINT` was written on.
+///
+/// The blank line between the two statements is what makes the shape a vector: the
+/// `PRINT` is the second statement of the text and sits on its third line, so "line 1",
+/// "the rank of the statement" and "the line the statement starts on" answer 1, 2 and 3.
+#[test]
+fn a_binding_error_of_a_print_carries_the_line_of_its_statement() {
+    let mut sink = ErrorLines::default();
+    session()
+        .run_rpc(&prepexec_rpc_of("SELECT 1;\n\nPRINT @v;"), &mut sink)
+        .expect("the prepare answers");
+    let err = sink
+        .0
+        .iter()
+        .find(|err| err.number == 137)
+        .expect("the undeclared variable is 137");
+    assert_eq!(err.line, 3);
+}
+
 #[test]
 fn execute_replays_with_new_values() {
     let mut session = session();
