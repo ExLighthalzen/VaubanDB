@@ -17,6 +17,12 @@ mod tests;
 /// binder answers it for each statement that is not implemented yet.
 pub(crate) const INTERNAL_ERROR: u32 = 50000;
 
+/// Number of the error the binder answers for a table, view or object the catalogue does
+/// not hold (`errors`, `SqlError::invalid_object_name`). It is the one number a batch does
+/// not treat as a compilation error: the statement that raised it is bound again when the
+/// batch reaches it (`batch.rs`, `PreparedStatement::Deferred`).
+pub(crate) const INVALID_OBJECT_NAME: u32 = 208;
+
 /// The numbers that come out of `executor::execute` with a line of their own to keep.
 ///
 /// 127 (`TOP` row count below zero) and 1060 (`TOP` row count `NULL`) are the two checks

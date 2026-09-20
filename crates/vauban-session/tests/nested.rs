@@ -454,6 +454,87 @@ fn two_level_nesting_keeps_scopes_separate() {
     assert_eq!(only_error(&missing_sink.0).number, 137);
 }
 
+/// A table created earlier in the nested text is read by the statements after it: the
+/// `INSERT` and the `SELECT` are deferred when the text is bound and resolved when the text
+/// reaches them. Three DONEINPROC and one row.
+#[test]
+fn a_table_created_earlier_in_the_nested_text_is_read_by_the_rest_of_it() {
+    let (outcome, events) = run_nested(
+        &mut session(),
+        "CREATE TABLE dbo.n1 (n int); INSERT dbo.n1 VALUES (7); SELECT n FROM dbo.n1;",
+        &[],
+    );
+    assert!(!outcome.failed, "{:?}", events.0);
+    assert_eq!(only_row(&events.0), 7);
+    assert_eq!(
+        events
+            .0
+            .iter()
+            .filter(|event| matches!(event, Event::DoneInProc(_, _)))
+            .count(),
+        3,
+        "{:?}",
+        events.0
+    );
+}
+
+/// The counter-proof: the same `SELECT` written before the `CREATE TABLE` answers 208 when
+/// the text reaches it, on its own line, after the row of the `SELECT 1`; the text stops
+/// there.
+#[test]
+fn a_select_before_the_create_in_a_nested_text_is_208_at_run_time() {
+    let (outcome, events) = run_nested(
+        &mut session(),
+        "SELECT 1;\nSELECT * FROM dbo.n2;\nCREATE TABLE dbo.n2 (a int);\nSELECT 2;",
+        &[],
+    );
+    assert!(outcome.failed);
+    let err = only_error(&events.0);
+    assert_eq!(err.number, 208);
+    assert_eq!(err.line, 2);
+    let rows: Vec<&Event> = events
+        .0
+        .iter()
+        .filter(|event| matches!(event, Event::Row(_)))
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", events.0);
+    assert_eq!(only_row(&events.0), 1);
+}
+
+/// Through `sp_executesql` from a batch: the nested text creates, inserts and reads in one
+/// go, and a table the nested text created is read by the calling batch afterwards.
+#[test]
+fn a_table_created_by_sp_executesql_is_read_by_the_calling_batch() {
+    let mut session = session();
+    let mut sink = Recording::default();
+    session
+        .run_batch(
+            "EXEC sp_executesql N'CREATE TABLE dbo.n3 (n int); INSERT dbo.n3 VALUES (9); SELECT n FROM dbo.n3;';",
+            &mut sink,
+        )
+        .expect("the batch completes");
+    assert!(
+        !sink.0.iter().any(|event| matches!(event, Event::Error(_))),
+        "{:?}",
+        sink.0
+    );
+    assert_eq!(only_row(&sink.0), 9);
+
+    let mut sink = Recording::default();
+    session
+        .run_batch(
+            "EXEC sp_executesql N'CREATE TABLE dbo.n4 (n int)'; INSERT dbo.n4 VALUES (4); SELECT n FROM dbo.n4;",
+            &mut sink,
+        )
+        .expect("the batch completes");
+    assert!(
+        !sink.0.iter().any(|event| matches!(event, Event::Error(_))),
+        "{:?}",
+        sink.0
+    );
+    assert_eq!(only_row(&sink.0), 4);
+}
+
 fn minimal_login_tokens() -> Vec<Token> {
     vec![
         Token::EnvChange(EnvChange::Database {

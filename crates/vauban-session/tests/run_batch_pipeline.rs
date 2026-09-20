@@ -523,6 +523,210 @@ fn an_unsupported_statement_keeps_its_precise_binding_error() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Deferred name resolution: 208 is resolved when the statement runs
+// ---------------------------------------------------------------------------------------
+
+/// The events of `events` that are DONEs, in order.
+fn dones(events: &[Event]) -> Vec<(Option<u64>, bool)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Done(count, more) => Some((*count, *more)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The number of result sets of `events`, one per COLMETADATA.
+fn result_sets(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, Event::Columns(_)))
+        .count()
+}
+
+#[test]
+fn a_table_created_earlier_in_the_batch_is_read_by_the_rest_of_it() {
+    // The shape of a migration script sent as one batch: the `INSERT` and the `SELECT`
+    // name a table the catalogue does not hold when the batch is bound. Both are bound when
+    // the batch reaches them, after the `CREATE TABLE` committed: one row, no error, and the
+    // DONE of each statement in order (the DONE of an `INSERT` carries no count at this
+    // layer, in one batch as in two).
+    let events =
+        run("CREATE TABLE dbo.m1 (a int); INSERT INTO dbo.m1 VALUES (1); SELECT * FROM dbo.m1;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+    assert_eq!(columns(&events, 0)[0].name, "a");
+    assert_eq!(
+        dones(&events),
+        vec![(None, true), (None, true), (Some(1), false)],
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn a_table_created_by_an_exec_is_read_by_the_rest_of_the_batch() {
+    // The `CREATE TABLE` runs in the nested batch of the `EXEC`; the `INSERT` and the
+    // `SELECT` of the calling batch are deferred and see it.
+    let events = run(
+        "EXEC('CREATE TABLE dbo.s3 (n int)'); INSERT dbo.s3 VALUES (42); SELECT n FROM dbo.s3;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(42)]], "{events:#?}");
+    assert_eq!(columns(&events, 0)[0].name, "n");
+}
+
+#[test]
+fn a_select_before_the_create_is_208_at_run_time() {
+    // The counter-proof of the deferral: the same statement written **before** the
+    // `CREATE TABLE` answers 208 when the batch reaches it, on the line the statement
+    // starts on (2, the `FROM` being on line 3), with no result set of its own. The
+    // `SELECT 1` before it has sent its row, which a compilation error would have
+    // silenced; 208 is batch-scoped, so the `CREATE TABLE` and the `SELECT 2` do not run.
+    let mut session = session();
+    for (batch, name) in [
+        (
+            "SELECT 1;\nSELECT *\n  FROM dbo.s4;\nCREATE TABLE dbo.s4 (a int);\nSELECT 2;",
+            "s4",
+        ),
+        (
+            "SELECT 1;\nINSERT dbo.s4b\n  VALUES (1);\nCREATE TABLE dbo.s4b (a int);\nSELECT 2;",
+            "s4b",
+        ),
+    ] {
+        let (events, result) = run_on(&mut session, batch);
+        result.expect("the batch reports its error through the sink");
+        let err = only_error(&events);
+        assert_eq!(err.number, 208, "{batch:?}: {err:?}");
+        assert_eq!(err.severity, 16, "{batch:?}: {err:?}");
+        assert_eq!(err.line, 2, "{batch:?}: {err:?}");
+        assert_eq!(
+            rows(&events),
+            vec![vec![Value::I32(1)]],
+            "{batch:?}: {events:#?}"
+        );
+        assert_eq!(result_sets(&events), 1, "{batch:?}: {events:#?}");
+        assert_eq!(
+            dones(&events),
+            vec![(Some(1), true), (None, false)],
+            "{batch:?}: {events:#?}"
+        );
+        assert_eq!(session.state().last_error, 208);
+
+        // The `CREATE TABLE` after the failing statement did not run: the table is still
+        // missing for the next batch.
+        let (again, _) = run_on(&mut session, &format!("SELECT 1 FROM dbo.{name};"));
+        assert_eq!(only_error(&again).number, 208, "{name}: {again:#?}");
+    }
+}
+
+#[test]
+fn a_drop_then_a_select_on_the_dropped_table_is_208_at_run_time() {
+    // The table is created by the batch, so the `SELECT` is deferred; when the batch
+    // reaches it the `DROP TABLE` has run, and the binding of that moment answers 208 on
+    // the line of the `SELECT`, after the row of the `SELECT 1`, and no `2`.
+    let events = run(
+        "CREATE TABLE dbo.s5 (a int);\nSELECT 1;\nDROP TABLE dbo.s5;\nSELECT * FROM dbo.s5;\nSELECT 2;",
+    );
+    let err = only_error(&events);
+    assert_eq!(err.number, 208, "{err:?}");
+    assert_eq!(err.line, 4, "{err:?}");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+    assert_eq!(result_sets(&events), 1, "{events:#?}");
+    assert_eq!(events.last(), Some(&Event::Done(None, false)));
+}
+
+#[test]
+fn a_deferred_statement_raises_207_when_it_runs() {
+    // The table is missing when the batch is bound, so the whole statement is deferred,
+    // column check included: the 207 falls when the batch reaches the statement, after the
+    // row of the `SELECT 1`, and stops the batch. The counter-proof is the second batch:
+    // once the table exists before the batch, the same 207 is a compilation error and the
+    // `SELECT 1` sends nothing (`a_compilation_error_silences_the_whole_batch` on a
+    // statement without a table).
+    let mut session = session();
+    let (events, _) = run_on(
+        &mut session,
+        "SELECT 1; CREATE TABLE dbo.s6 (a int); SELECT nosuch FROM dbo.s6; SELECT 2;",
+    );
+    let err = only_error(&events);
+    assert_eq!(err.number, 207, "{err:?}");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+    assert_eq!(result_sets(&events), 1, "{events:#?}");
+    assert_eq!(events.last(), Some(&Event::Done(None, false)));
+
+    let (events, _) = run_on(
+        &mut session,
+        "SELECT 1; SELECT nosuch FROM dbo.s6; SELECT 2;",
+    );
+    assert_eq!(only_error(&events).number, 207, "{events:#?}");
+    assert!(rows(&events).is_empty(), "{events:#?}");
+    assert_eq!(result_sets(&events), 0, "{events:#?}");
+}
+
+#[test]
+fn a_deferred_statement_in_a_false_if_raises_nothing() {
+    // The `IF` names the table in its branch, so it is deferred as a whole and bound again
+    // once the table exists; its false branch never runs. The `SELECT 2` follows.
+    let events = run("CREATE TABLE dbo.s8 (a int); IF 1 = 0 SELECT * FROM dbo.s8; SELECT 2;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(2)]], "{events:#?}");
+    assert_eq!(result_sets(&events), 1, "{events:#?}");
+}
+
+#[test]
+fn a_deferred_statement_reads_the_catalogue_of_its_own_transaction() {
+    // Inside `BEGIN TRAN`, the `CREATE TABLE` is not committed when the `INSERT` and the
+    // `SELECT` are bound: the catalogue is read through the session transaction, which
+    // sees it. The `SELECT @@TRANCOUNT` after the `COMMIT` reads 0.
+    let events = run(
+        "BEGIN TRAN; CREATE TABLE dbo.s9 (a int); INSERT INTO dbo.s9 VALUES (3); \
+         SELECT * FROM dbo.s9; COMMIT; SELECT @@TRANCOUNT;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(3)], vec![Value::I32(0)]],
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn a_deferred_statement_posts_its_row_count_and_reads_the_variables_before_it() {
+    // `@@ROWCOUNT` after a deferred `INSERT` of two rows is 2, and a deferred `INSERT` reads
+    // a variable declared before it in the batch.
+    let events = run(
+        "CREATE TABLE dbo.s10 (a int); INSERT INTO dbo.s10 VALUES (1), (2); SELECT @@ROWCOUNT;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(2)]], "{events:#?}");
+
+    let events = run(
+        "DECLARE @v int = 5; CREATE TABLE dbo.s11 (a int); INSERT dbo.s11 VALUES (@v); SELECT a FROM dbo.s11;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(5)]], "{events:#?}");
+}
+
+// ---------------------------------------------------------------------------------------
 // `SET` statements
 // ---------------------------------------------------------------------------------------
 

@@ -22,8 +22,8 @@ use crate::set_options::{SetOutcome, apply_set_statement, sync_exec_session};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
 use crate::statements::{
-    INTERNAL_ERROR, at_statement, statement_clears_last_error, statement_fragment, statement_line,
-    statement_span, statement_text, use_name_line,
+    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, statement_clears_last_error,
+    statement_fragment, statement_line, statement_span, statement_text, use_name_line,
 };
 use crate::txn_session::{self, StatementTxn};
 
@@ -98,6 +98,15 @@ enum PreparedStatement {
         statement: PhysicalStatement,
         database: String,
         line: u32,
+    },
+    /// A statement whose binding answered 208 while the text was prepared, bound again
+    /// when the text reaches it (`batch.rs`, `PreparedStatement::Deferred`, for the
+    /// rule; here it is what makes `EXEC('CREATE TABLE dbo.t (n int); INSERT dbo.t VALUES
+    /// (1); SELECT n FROM dbo.t;')` answer a row).
+    Deferred {
+        padded: String,
+        raw: String,
+        variables: BatchVariables,
     },
 }
 
@@ -295,69 +304,23 @@ impl Session {
             let line = statement_line(original);
             let source = statement_fragment(text, original, statements.get(index + 1));
             let padded = format!("{}{}", "\n".repeat(line.saturating_sub(1) as usize), source);
-            let reparsed = parse_batch(&padded, &state.options.parse_options())?;
-            let [statement] = reparsed.statements.as_slice() else {
-                return Err(SqlError::from(InternalError::Bug(
-                    "one statement reparsed as a different statement count".to_owned(),
-                )));
-            };
-
-            let options = state.binder_options();
-            let ctx = BindContext {
-                text: &padded,
-                catalog: Some(snapshot),
-                database: &state.database,
-                default_schema: DEFAULT_SCHEMA,
-                variables: batch_variables,
-                options,
-            };
-            let bound = match vauban_binder::bind(statement, &ctx) {
-                Ok(bound) => bound,
-                Err(error)
-                    if error.number == INTERNAL_ERROR
-                        && matches!(statement, Statement::Waitfor(_)) =>
-                {
-                    prepared.push(PreparedStatement::Fallback { text: raw, error });
-                    continue;
-                }
+            let one = match self.bind_one_nested(&padded, raw, snapshot, state, batch_variables) {
+                Ok(one) => one,
+                Err(error) if error.number == INVALID_OBJECT_NAME => PreparedStatement::Deferred {
+                    padded,
+                    raw: statement_text(text, original),
+                    variables: batch_variables.clone(),
+                },
                 Err(error) => return Err(error),
             };
-            if let BoundStatement::Declare(declarations) = &bound {
-                for declaration in declarations {
-                    batch_variables.declare(&declaration.name, declaration.ty.clone())?;
-                }
-            }
-
-            let indexes = StorageIndexes(self.engine().storage.as_ref());
-            let physical = vauban_planner::plan(bound, &PlanContext { catalog: &indexes })
-                .map_err(|error| at_statement(error, statement_line(statement)))?;
-
-            let eval = SessionEvalContext::new(state, Some(snapshot));
-            let mut exec = ExecContext::scalar(&eval, state.options.to_binder());
-            vauban_executor::compile(&physical, &mut exec)
-                .map_err(|error| at_statement(error, statement_line(statement)))?;
-
-            if let PhysicalStatement::Use { database } = &physical {
-                let found = snapshot
-                    .database(database)
-                    .map(|target| target.name.clone())
-                    .ok_or_else(|| {
-                        SqlError::database_not_found(database)
-                            .with_line(use_name_line(&padded, statement))
-                    })?;
-                state.database = found.clone();
-                prepared.push(PreparedStatement::Use {
-                    statement: physical,
-                    database: found,
-                    line,
-                });
+            let counts = matches!(
+                one,
+                PreparedStatement::Bound { .. } | PreparedStatement::Deferred { .. }
+            );
+            prepared.push(one);
+            if !counts {
                 continue;
             }
-
-            prepared.push(PreparedStatement::Bound {
-                statement: physical,
-                line: statement_line(statement),
-            });
             if let Some(remaining) = &mut limit {
                 *remaining = remaining.saturating_sub(1);
                 if *remaining == 0 {
@@ -366,6 +329,114 @@ impl Session {
             }
         }
         Ok(prepared)
+    }
+
+    /// Reparses, binds, plans and compile-checks one statement of a nested text against
+    /// `snapshot` (`batch.rs`, `Session::bind_one`, for the rule).
+    fn bind_one_nested(
+        &self,
+        padded: &str,
+        raw: String,
+        snapshot: &CatalogSnapshot,
+        state: &mut SessionState,
+        batch_variables: &mut BatchVariables,
+    ) -> SqlResult<PreparedStatement> {
+        let reparsed = parse_batch(padded, &state.options.parse_options())?;
+        let [statement] = reparsed.statements.as_slice() else {
+            return Err(SqlError::from(InternalError::Bug(
+                "one statement reparsed as a different statement count".to_owned(),
+            )));
+        };
+        let line = statement_line(statement);
+
+        let options = state.binder_options();
+        let ctx = BindContext {
+            text: padded,
+            catalog: Some(snapshot),
+            database: &state.database,
+            default_schema: DEFAULT_SCHEMA,
+            variables: batch_variables,
+            options,
+        };
+        let bound = match vauban_binder::bind(statement, &ctx) {
+            Ok(bound) => bound,
+            Err(error)
+                if error.number == INTERNAL_ERROR && matches!(statement, Statement::Waitfor(_)) =>
+            {
+                return Ok(PreparedStatement::Fallback { text: raw, error });
+            }
+            Err(error) => return Err(error),
+        };
+        if let BoundStatement::Declare(declarations) = &bound {
+            for declaration in declarations {
+                batch_variables.declare(&declaration.name, declaration.ty.clone())?;
+            }
+        }
+
+        let indexes = StorageIndexes(self.engine().storage.as_ref());
+        let physical = vauban_planner::plan(bound, &PlanContext { catalog: &indexes })
+            .map_err(|error| at_statement(error, line))?;
+
+        let eval = SessionEvalContext::new(state, Some(snapshot));
+        let mut exec = ExecContext::scalar(&eval, state.options.to_binder());
+        vauban_executor::compile(&physical, &mut exec)
+            .map_err(|error| at_statement(error, line))?;
+
+        if let PhysicalStatement::Use { database } = &physical {
+            let found = snapshot
+                .database(database)
+                .map(|target| target.name.clone())
+                .ok_or_else(|| {
+                    SqlError::database_not_found(database)
+                        .with_line(use_name_line(padded, statement))
+                })?;
+            state.database = found.clone();
+            return Ok(PreparedStatement::Use {
+                statement: physical,
+                database: found,
+                line,
+            });
+        }
+
+        Ok(PreparedStatement::Bound {
+            statement: physical,
+            line,
+        })
+    }
+
+    /// Binds a deferred statement of a nested text against the catalogue of this moment,
+    /// through the transaction of the nested state when one is open and through one of its
+    /// own otherwise (`batch.rs`, `Session::bind_deferred`, for the rule).
+    fn bind_nested_deferred(
+        &self,
+        padded: &str,
+        raw: &str,
+        variables: &BatchVariables,
+        nested_state: &SessionState,
+    ) -> SqlResult<PreparedStatement> {
+        let mut state = nested_state.clone();
+        let mut variables = variables.clone();
+        if let Some(session_txn) = &nested_state.txn {
+            let snapshot = self.engine().catalog.snapshot(&session_txn.handle);
+            return self.bind_one_nested(
+                padded,
+                raw.to_owned(),
+                &snapshot,
+                &mut state,
+                &mut variables,
+            );
+        }
+        let binding = self.engine().txn.begin(IsolationLevel::ReadCommitted);
+        let snapshot = self.engine().catalog.snapshot(&binding);
+        let bound = self.bind_one_nested(
+            padded,
+            raw.to_owned(),
+            &snapshot,
+            &mut state,
+            &mut variables,
+        );
+        self.engine().txn.commit(binding)?;
+        bound
     }
 
     fn run_nested_prepared(
@@ -409,6 +480,35 @@ impl Session {
             return self.fall_back_nested(text, error, sink, outcome);
         }
 
+        // A deferred statement is bound now and run like the statement it turned out to
+        // be. A binding that fails now is a run-time error of the statement, batch-scoped
+        // or not according to its number (`batch.rs`, `Session::run_deferred`).
+        if let PreparedStatement::Deferred {
+            padded,
+            raw,
+            variables,
+        } = prepared
+        {
+            return match self.bind_nested_deferred(padded, raw, variables, nested_state) {
+                Ok(bound) => self.run_nested_prepared(&bound, more, nested_state, sink, outcome),
+                Err(err) if self.cancel_handle().is_cancelled() => Err(err),
+                Err(err) => {
+                    nested_state.last_error = err.number;
+                    sink.error(&err)?;
+                    outcome.failed = true;
+                    let continues = more
+                        && !nested_state.options.xact_abort
+                        && err.batch_scope() == BatchErrorScope::Statement;
+                    if continues {
+                        sink.done_in_proc(None, true)?;
+                        Ok(Flow::Continue)
+                    } else {
+                        Ok(Flow::Stop)
+                    }
+                }
+            };
+        }
+
         let (bound, line, target) = match prepared {
             PreparedStatement::Bound { statement, line } => (statement, *line, None),
             PreparedStatement::Use {
@@ -416,8 +516,10 @@ impl Session {
                 database,
                 line,
             } => (statement, *line, Some(database.as_str())),
-            PreparedStatement::Set { .. } | PreparedStatement::Fallback { .. } => {
-                unreachable!("SET and fallback were handled above")
+            PreparedStatement::Set { .. }
+            | PreparedStatement::Fallback { .. }
+            | PreparedStatement::Deferred { .. } => {
+                unreachable!("SET, fallback and deferred were handled above")
             }
         };
 
