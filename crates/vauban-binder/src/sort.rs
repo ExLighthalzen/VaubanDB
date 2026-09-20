@@ -230,6 +230,7 @@ fn bind_order_by_set_op(
                     index: i,
                     name: col.name.clone(),
                     ty: col.ty.clone(),
+                    depth: 0,
                 }),
                 ty: col.ty.clone(),
                 line: 1,

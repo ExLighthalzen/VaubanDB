@@ -33,6 +33,7 @@ fn source(alias: &str) -> Source {
         index: 0,
         name: "a".to_owned(),
         ty: TypeInfo::new(SqlType::Int, false),
+        depth: 0,
     }];
     Source::new(alias, Some(&name(&["dbo", "t"])), &columns, "dbo", "master")
 }

@@ -37,6 +37,7 @@ fn binding(index: usize) -> ColumnBinding {
         index,
         name: format!("c{index}"),
         ty: int(),
+        depth: 0,
     }
 }
 
@@ -412,6 +413,7 @@ fn residual_filters_after_the_key_match() {
                     index: 2,
                     name: "build_c1".to_owned(),
                     ty: int(),
+                    depth: 0,
                 }),
                 ty: int(),
                 line: 1,
@@ -563,6 +565,7 @@ fn case_insensitive_key_matches_under_the_default_collation() {
             index,
             name: format!("c{index}"),
             ty: varchar(),
+            depth: 0,
         }
     }
 

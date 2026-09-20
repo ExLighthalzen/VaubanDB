@@ -356,6 +356,7 @@ pub(crate) fn execute_select_into(
             index,
             name: col.name.clone(),
             ty: col.ty.clone(),
+            depth: 0,
         })
         .collect();
     let insert = PhysicalInsert {

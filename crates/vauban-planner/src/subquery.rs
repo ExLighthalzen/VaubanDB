@@ -4,11 +4,11 @@
 //! # Correlation
 //!
 //! A subquery plan is **correlated** when an expression inside it holds a
-//! [`ColumnRef`](vauban_binder::BoundExprKind::ColumnRef) to a column of a table the
-//! subquery does not read. The binder keeps the [`ColumnId`](vauban_catalog::ColumnId)
-//! of the column referenced; the planner collects the ids of each column the inner
-//! [`Scan`](vauban_binder::LogicalPlan::Scan) and [`Join`](vauban_binder::LogicalPlan::Join)
-//! exposes and treats a reference outside that set as outer, including one written in a
+//! [`ColumnRef`](vauban_binder::BoundExprKind::ColumnRef) to a column of a query that
+//! encloses it. The binder writes on each reference the number of queries between the
+//! reader and the column ([`ColumnBinding::depth`](vauban_binder::ColumnBinding::depth)):
+//! the planner treats a reference whose depth reaches past the subquery as outer,
+//! including one written in a
 //! [`Aggregate`](vauban_binder::LogicalPlan::Aggregate) `group_by` or aggregate argument, a
 //! [`Sort`](vauban_binder::LogicalPlan::Sort) key, a [`Limit`](vauban_binder::LogicalPlan::Limit)
 //! `top` expression, or a [`Values`](vauban_binder::LogicalPlan::Values) row
@@ -27,13 +27,10 @@
 //! other silently pairs the wrong plan to the wrong node
 //! (`tests/subquery.rs`, `subplans_follow_the_expression_order`).
 
-use std::collections::HashSet;
-
 use vauban_binder::{
     BoundExpr, BoundExprKind, BoundProjection, CompareOp, LogicalOp, LogicalPlan, OutputColumn,
     OutputSchema,
 };
-use vauban_catalog::ColumnId;
 use vauban_errors::SqlResult;
 use vauban_types::{SqlType, TypeInfo};
 
@@ -415,127 +412,101 @@ fn project_node(plan: &LogicalPlan) -> Option<&LogicalPlan> {
     }
 }
 
-/// True when `plan` reads a column its own scans do not expose.
+/// True when `plan` reads a column of a query that encloses it: a `ColumnRef` whose
+/// `depth` reaches past `plan`, the subqueries nested inside `plan` counted
+/// (`tests/subquery.rs`, `exists_on_a_second_table_with_the_same_column_id_is_correlated`,
+/// `a_nested_reference_to_the_enclosing_query_is_not_correlated`).
 fn is_correlated(plan: &LogicalPlan) -> bool {
-    let local = local_column_ids(plan);
-    plan_holds_external_column(plan, &local)
+    plan_holds_external_column(plan, 0)
 }
 
-/// Each [`ColumnId`](vauban_catalog::ColumnId) a scan or join inside `plan` exposes.
-fn local_column_ids(plan: &LogicalPlan) -> HashSet<ColumnId> {
-    let mut ids = HashSet::new();
-    collect_local_column_ids(plan, &mut ids);
-    ids
-}
-
-fn collect_local_column_ids(plan: &LogicalPlan, ids: &mut HashSet<ColumnId>) {
-    match plan {
-        LogicalPlan::Scan { columns, .. } => {
-            for binding in columns {
-                ids.insert(binding.column);
-            }
-        }
-        LogicalPlan::Join { left, right, .. } => {
-            collect_local_column_ids(left, ids);
-            collect_local_column_ids(right, ids);
-        }
-        LogicalPlan::Filter { input, predicate } => {
-            collect_local_column_ids(input, ids);
-            let _ = predicate;
-        }
-        LogicalPlan::Project { input, .. }
-        | LogicalPlan::Limit { input, .. }
-        | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Subquery { input, .. } => collect_local_column_ids(input, ids),
-        LogicalPlan::Distinct(input) => collect_local_column_ids(input, ids),
-        LogicalPlan::OneRow | LogicalPlan::Values { .. } | LogicalPlan::SetOp { .. } => {}
-    }
-}
-
-fn plan_holds_external_column(plan: &LogicalPlan, local: &HashSet<ColumnId>) -> bool {
+/// `level` is the number of subqueries descended into below the plan under test: a
+/// reference of `depth` 1 met one level down names a column of that plan, not of what
+/// encloses it. A derived table is not a level: it cannot name a column outside itself.
+fn plan_holds_external_column(plan: &LogicalPlan, level: u8) -> bool {
     match plan {
         LogicalPlan::Filter { input, predicate } => {
-            plan_holds_external_column(input, local) || expr_holds_external_column(predicate, local)
+            plan_holds_external_column(input, level) || expr_holds_external_column(predicate, level)
         }
         LogicalPlan::Project { input, exprs, .. } => {
-            plan_holds_external_column(input, local)
+            plan_holds_external_column(input, level)
                 || exprs
                     .iter()
-                    .any(|proj| expr_holds_external_column(&proj.expr, local))
+                    .any(|proj| expr_holds_external_column(&proj.expr, level))
         }
         LogicalPlan::Limit { input, top } => {
-            plan_holds_external_column(input, local) || expr_holds_external_column(&top.expr, local)
+            plan_holds_external_column(input, level) || expr_holds_external_column(&top.expr, level)
         }
-        LogicalPlan::Subquery { input, .. } => plan_holds_external_column(input, local),
+        LogicalPlan::Subquery { input, .. } => plan_holds_external_column(input, level),
         LogicalPlan::Aggregate {
             input,
             group_by,
             aggregates,
             ..
         } => {
-            plan_holds_external_column(input, local)
+            plan_holds_external_column(input, level)
                 || group_by
                     .iter()
-                    .any(|key| expr_holds_external_column(key, local))
+                    .any(|key| expr_holds_external_column(key, level))
                 || aggregates.iter().any(|call| {
                     call.arg
                         .as_ref()
-                        .is_some_and(|arg| expr_holds_external_column(arg, local))
+                        .is_some_and(|arg| expr_holds_external_column(arg, level))
                 })
         }
         LogicalPlan::Sort { input, keys, .. } => {
-            plan_holds_external_column(input, local)
+            plan_holds_external_column(input, level)
                 || keys
                     .iter()
-                    .any(|key| expr_holds_external_column(&key.expr, local))
+                    .any(|key| expr_holds_external_column(&key.expr, level))
         }
         LogicalPlan::Values { rows, .. } => rows
             .iter()
             .flatten()
-            .any(|expr| expr_holds_external_column(expr, local)),
-        LogicalPlan::Distinct(input) => plan_holds_external_column(input, local),
+            .any(|expr| expr_holds_external_column(expr, level)),
+        LogicalPlan::Distinct(input) => plan_holds_external_column(input, level),
         LogicalPlan::Join {
             left, right, on, ..
         } => {
-            plan_holds_external_column(left, local)
-                || plan_holds_external_column(right, local)
+            plan_holds_external_column(left, level)
+                || plan_holds_external_column(right, level)
                 || on
                     .as_ref()
-                    .is_some_and(|pred| expr_holds_external_column(pred, local))
+                    .is_some_and(|pred| expr_holds_external_column(pred, level))
         }
         LogicalPlan::Scan { .. } | LogicalPlan::OneRow => false,
         LogicalPlan::SetOp { .. } => false,
     }
 }
 
-fn expr_holds_external_column(expr: &BoundExpr, local: &HashSet<ColumnId>) -> bool {
+fn expr_holds_external_column(expr: &BoundExpr, level: u8) -> bool {
     match &expr.kind {
-        BoundExprKind::ColumnRef(binding) => !local.contains(&binding.column),
+        BoundExprKind::ColumnRef(binding) => binding.depth > level,
         BoundExprKind::Exists(plan) | BoundExprKind::ScalarSubquery(plan) => {
-            plan_holds_external_column(plan, local)
+            plan_holds_external_column(plan, level.saturating_add(1))
         }
         BoundExprKind::InSubquery { expr, plan, .. } => {
-            expr_holds_external_column(expr, local) || plan_holds_external_column(plan, local)
+            expr_holds_external_column(expr, level)
+                || plan_holds_external_column(plan, level.saturating_add(1))
         }
         BoundExprKind::Negate(inner)
         | BoundExprKind::BitNot(inner)
         | BoundExprKind::Not(inner)
         | BoundExprKind::IsNull { expr: inner, .. }
         | BoundExprKind::Convert { expr: inner, .. }
-        | BoundExprKind::Collate { expr: inner } => expr_holds_external_column(inner, local),
+        | BoundExprKind::Collate { expr: inner } => expr_holds_external_column(inner, level),
         BoundExprKind::Arith { left, right, .. }
         | BoundExprKind::Compare { left, right, .. }
         | BoundExprKind::Logical { left, right, .. } => {
-            expr_holds_external_column(left, local) || expr_holds_external_column(right, local)
+            expr_holds_external_column(left, level) || expr_holds_external_column(right, level)
         }
         BoundExprKind::In {
             expr: tested, list, ..
         } => {
-            expr_holds_external_column(tested, local)
+            expr_holds_external_column(tested, level)
                 || list
                     .iter()
-                    .any(|item| expr_holds_external_column(item, local))
+                    .any(|item| expr_holds_external_column(item, level))
         }
         BoundExprKind::Like {
             expr: tested,
@@ -543,11 +514,11 @@ fn expr_holds_external_column(expr: &BoundExpr, local: &HashSet<ColumnId>) -> bo
             escape,
             ..
         } => {
-            expr_holds_external_column(tested, local)
-                || expr_holds_external_column(pattern, local)
+            expr_holds_external_column(tested, level)
+                || expr_holds_external_column(pattern, level)
                 || escape
                     .as_deref()
-                    .is_some_and(|item| expr_holds_external_column(item, local))
+                    .is_some_and(|item| expr_holds_external_column(item, level))
         }
         BoundExprKind::Case {
             operand,
@@ -556,18 +527,18 @@ fn expr_holds_external_column(expr: &BoundExpr, local: &HashSet<ColumnId>) -> bo
         } => {
             operand
                 .as_deref()
-                .is_some_and(|item| expr_holds_external_column(item, local))
+                .is_some_and(|item| expr_holds_external_column(item, level))
                 || arms.iter().any(|arm| {
-                    expr_holds_external_column(&arm.when, local)
-                        || expr_holds_external_column(&arm.then, local)
+                    expr_holds_external_column(&arm.when, level)
+                        || expr_holds_external_column(&arm.then, level)
                 })
                 || else_
                     .as_deref()
-                    .is_some_and(|item| expr_holds_external_column(item, local))
+                    .is_some_and(|item| expr_holds_external_column(item, level))
         }
         BoundExprKind::Function { args, .. } => args
             .iter()
-            .any(|arg| expr_holds_external_column(arg, local)),
+            .any(|arg| expr_holds_external_column(arg, level)),
         BoundExprKind::Literal(_) | BoundExprKind::Variable { .. } => false,
     }
 }

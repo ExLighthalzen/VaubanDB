@@ -146,6 +146,7 @@ pub(crate) fn source_columns(schema: &OutputSchema) -> Vec<ColumnBinding> {
             index: position,
             name: column.name.clone(),
             ty: column.ty.clone(),
+            depth: 0,
         })
         .collect()
 }

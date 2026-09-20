@@ -156,6 +156,7 @@ fn scan_table(fixture: &Fixture, handle: &TxnHandle, name: &str) -> Vec<Vec<Valu
             index,
             name: column.name.clone(),
             ty: column.ty.clone(),
+            depth: 0,
         })
         .collect();
     let schema = OutputSchema {

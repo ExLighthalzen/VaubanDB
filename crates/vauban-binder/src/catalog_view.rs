@@ -205,6 +205,7 @@ fn columns_of(columns: &[ColumnMeta]) -> Vec<ColumnBinding> {
             index: usize::from(column.ordinal),
             name: column.name.clone(),
             ty: column.ty.clone(),
+            depth: 0,
         })
         .collect()
 }

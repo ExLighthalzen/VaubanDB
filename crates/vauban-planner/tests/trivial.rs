@@ -41,6 +41,7 @@ fn id_binding() -> ColumnBinding {
         index: 0,
         name: "id".to_owned(),
         ty: int_type(),
+        depth: 0,
     }
 }
 

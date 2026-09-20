@@ -226,6 +226,7 @@ impl Fixture {
                 index: *index,
                 name: format!("c{index}"),
                 ty: self.columns[*index].clone(),
+                depth: 0,
             })
             .collect()
     }

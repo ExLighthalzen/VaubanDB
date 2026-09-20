@@ -598,6 +598,7 @@ mod tests {
                 index,
                 name: format!("c{index}"),
                 ty: TypeInfo::new(SqlType::Int, true),
+                depth: 0,
             }),
             ty: TypeInfo::new(SqlType::Int, true),
             line: 1,

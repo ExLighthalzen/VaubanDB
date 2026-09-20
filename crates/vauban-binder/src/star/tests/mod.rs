@@ -115,6 +115,7 @@ fn column(id: ColumnId, index: usize, name: &str, ty: SqlType, nullable: bool) -
         index,
         name: name.to_owned(),
         ty: TypeInfo::new(ty, nullable),
+        depth: 0,
     }
 }
 

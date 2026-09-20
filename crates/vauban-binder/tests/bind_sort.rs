@@ -52,6 +52,7 @@ fn column(id: i32, index: usize, name: &str, ty: TypeInfo) -> ColumnBinding {
         index,
         name: name.to_owned(),
         ty,
+        depth: 0,
     }
 }
 

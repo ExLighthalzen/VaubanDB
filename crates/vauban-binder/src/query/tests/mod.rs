@@ -37,6 +37,7 @@ fn a_column_keeps_its_written_name_and_an_expression_has_none() {
             index: 0,
             name: "a".to_owned(),
             ty: TypeInfo::new(SqlType::Int, false),
+            depth: 0,
         }),
         ty: TypeInfo::new(SqlType::Int, false),
         line: 1,

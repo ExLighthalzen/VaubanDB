@@ -61,6 +61,7 @@ fn binding(
         index,
         name: name.to_owned(),
         ty: TypeInfo::new(ty, nullable),
+        depth: 0,
     }
 }
 
@@ -178,6 +179,138 @@ fn a_correlated_column_207_without_the_outer_table() {
     // Unqualified when neither scope has the column → 207.
     let error = error_of("SELECT 1 WHERE EXISTS (SELECT nosuch FROM b)");
     assert_eq!(error.number, 207, "{}", error.message);
+}
+
+// ---------------------------------------------------------------------------------------
+// Scope depth of a column reference
+// ---------------------------------------------------------------------------------------
+
+/// Each `ColumnRef` of `plan`, as `(name, depth)`, in a depth-first walk that descends
+/// into the nested subqueries: what the tests on `depth` read off a bound plan.
+fn column_depths(plan: &LogicalPlan) -> Vec<(String, u8)> {
+    fn from_expr(expr: &vauban_binder::BoundExpr, out: &mut Vec<(String, u8)>) {
+        match &expr.kind {
+            BoundExprKind::ColumnRef(binding) => out.push((binding.name.clone(), binding.depth)),
+            BoundExprKind::Exists(inner) | BoundExprKind::ScalarSubquery(inner) => {
+                from_plan(inner, out);
+            }
+            BoundExprKind::InSubquery { expr, plan, .. } => {
+                from_expr(expr, out);
+                from_plan(plan, out);
+            }
+            BoundExprKind::Compare { left, right, .. }
+            | BoundExprKind::Logical { left, right, .. }
+            | BoundExprKind::Arith { left, right, .. } => {
+                from_expr(left, out);
+                from_expr(right, out);
+            }
+            BoundExprKind::Convert { expr, .. } | BoundExprKind::Not(expr) => from_expr(expr, out),
+            BoundExprKind::Literal(_) => {}
+            other => panic!("the walk does not descend into {other:?}"),
+        }
+    }
+    fn from_plan(plan: &LogicalPlan, out: &mut Vec<(String, u8)>) {
+        match plan {
+            LogicalPlan::Project { input, exprs, .. } => {
+                for projection in exprs {
+                    from_expr(&projection.expr, out);
+                }
+                from_plan(input, out);
+            }
+            LogicalPlan::Filter { input, predicate } => {
+                from_expr(predicate, out);
+                from_plan(input, out);
+            }
+            LogicalPlan::Aggregate { input, .. } => from_plan(input, out),
+            LogicalPlan::Scan { .. } | LogicalPlan::OneRow => {}
+            other => panic!("the walk does not descend into {other:?}"),
+        }
+    }
+    let mut out = Vec::new();
+    from_plan(plan, &mut out);
+    out
+}
+
+/// `z.k` and `x.k` are the same column of the same table, read at the same index: the
+/// reference written in the subquery to the column of the enclosing query has `depth` 1,
+/// the one to the column of its own `FROM` has `depth` 0. The `x.k` of the outer select
+/// list and the unnamed slot of the `COUNT(*)` have `depth` 0 as well.
+#[test]
+fn an_outer_column_carries_its_scope_depth() {
+    let plan = bind_with("SELECT x.k, (SELECT COUNT(*) FROM a z WHERE z.k > x.k) FROM a x")
+        .expect("the correlated subquery binds");
+    let depths = column_depths(&plan);
+    assert_eq!(
+        depths,
+        vec![
+            ("k".to_owned(), 0),
+            (String::new(), 0),
+            ("k".to_owned(), 0),
+            ("k".to_owned(), 1),
+        ],
+        "{plan:#?}"
+    );
+    // The counter-proof on `column` and `index`: the two references of the inner
+    // predicate are identical on both.
+    let LogicalPlan::Project { exprs, .. } = &plan else {
+        panic!("root is not a Project: {plan:?}");
+    };
+    let BoundExprKind::ScalarSubquery(inner) = &exprs[1].expr.kind else {
+        panic!("second item is not a scalar subquery: {:?}", exprs[1]);
+    };
+    let LogicalPlan::Project { input, .. } = inner.as_ref() else {
+        panic!("inner root is not a Project: {inner:?}");
+    };
+    let LogicalPlan::Aggregate { input, .. } = input.as_ref() else {
+        panic!("inner input is not an Aggregate: {input:?}");
+    };
+    let LogicalPlan::Filter { predicate, .. } = input.as_ref() else {
+        panic!("the aggregate reads no Filter: {input:?}");
+    };
+    let BoundExprKind::Compare { left, right, .. } = &predicate.kind else {
+        panic!("the predicate is not a comparison: {predicate:?}");
+    };
+    let (BoundExprKind::ColumnRef(z), BoundExprKind::ColumnRef(x)) = (&left.kind, &right.kind)
+    else {
+        panic!("the comparison is not between two columns: {predicate:?}");
+    };
+    assert_eq!((z.column, z.index), (x.column, x.index));
+    assert_eq!((z.depth, x.depth), (0, 1));
+}
+
+/// Two subqueries down, a column of the outermost query has `depth` 2, one of the middle
+/// query `depth` 1, and one of the innermost `FROM` `depth` 0.
+#[test]
+fn a_column_two_queries_up_has_depth_two() {
+    let plan = bind_with(
+        "SELECT x.k FROM a x WHERE EXISTS (SELECT 1 FROM a y WHERE y.k = x.k \
+         AND EXISTS (SELECT 1 FROM a z WHERE z.k > y.k AND z.c = x.c))",
+    )
+    .expect("the nested correlated subqueries bind");
+    let depths = column_depths(&plan);
+    assert_eq!(
+        depths,
+        vec![
+            ("k".to_owned(), 0),
+            ("k".to_owned(), 0),
+            ("k".to_owned(), 1),
+            ("k".to_owned(), 0),
+            ("k".to_owned(), 1),
+            ("c".to_owned(), 0),
+            ("c".to_owned(), 2),
+        ],
+        "{plan:#?}"
+    );
+}
+
+/// A subquery without a `FROM` is one query too: `x.k` read from `(SELECT x.k)` has
+/// `depth` 1, and from `(SELECT (SELECT x.k))` `depth` 2.
+#[test]
+fn a_subquery_without_a_from_counts_as_one_level() {
+    let plan = bind_with("SELECT (SELECT x.k) FROM a x").expect("binds");
+    assert_eq!(column_depths(&plan), vec![("k".to_owned(), 1)], "{plan:#?}");
+    let plan = bind_with("SELECT (SELECT (SELECT x.k)) FROM a x").expect("binds");
+    assert_eq!(column_depths(&plan), vec![("k".to_owned(), 2)], "{plan:#?}");
 }
 
 // ---------------------------------------------------------------------------------------

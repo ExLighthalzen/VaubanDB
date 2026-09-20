@@ -36,6 +36,16 @@ fn binding_a(name: &str, column_id: i32, index: usize) -> ColumnBinding {
         index,
         name: name.to_owned(),
         ty: int_type(),
+        depth: 0,
+    }
+}
+
+/// A reference to a column of `a` written inside a subquery of the query over `a`: one
+/// query up.
+fn outer_a(name: &str, column_id: i32, index: usize) -> ColumnBinding {
+    ColumnBinding {
+        depth: 1,
+        ..binding_a(name, column_id, index)
     }
 }
 
@@ -45,6 +55,7 @@ fn binding_b(name: &str, column_id: i32, index: usize) -> ColumnBinding {
         index,
         name: name.to_owned(),
         ty: int_type(),
+        depth: 0,
     }
 }
 
@@ -386,7 +397,7 @@ fn not_in_stays_a_subquery_eval() {
 fn exists_grouped_on_an_outer_column_stays_correlated() {
     let inner = LogicalPlan::Aggregate {
         input: Box::new(scan_b()),
-        group_by: vec![column(binding_a("k", 1, 0))],
+        group_by: vec![column(outer_a("k", 1, 0))],
         aggregates: Vec::new(),
         schema: schema(&["k"]),
     };
@@ -398,7 +409,7 @@ fn exists_ordered_on_an_outer_column_stays_correlated() {
     let inner = LogicalPlan::Sort {
         input: Box::new(scan_b()),
         keys: vec![SortKey {
-            expr: column(binding_a("k", 1, 0)),
+            expr: column(outer_a("k", 1, 0)),
             desc: false,
             collation: None,
         }],
@@ -409,7 +420,7 @@ fn exists_ordered_on_an_outer_column_stays_correlated() {
 #[test]
 fn exists_values_over_an_outer_column_stays_correlated() {
     let inner = LogicalPlan::Values {
-        rows: vec![vec![column(binding_a("k", 1, 0))]],
+        rows: vec![vec![column(outer_a("k", 1, 0))]],
         schema: schema(&["k"]),
     };
     assert_correlated_exists(inner);
@@ -420,7 +431,7 @@ fn exists_max_on_an_outer_column_stays_correlated() {
     let inner = LogicalPlan::Aggregate {
         input: Box::new(scan_b()),
         group_by: Vec::new(),
-        aggregates: vec![max_on(binding_a("k", 1, 0))],
+        aggregates: vec![max_on(outer_a("k", 1, 0))],
         schema: schema(&["m"]),
     };
     assert_correlated_exists(inner);
@@ -442,7 +453,7 @@ fn exists_top_on_an_outer_column_stays_correlated() {
     let inner = LogicalPlan::Limit {
         input: Box::new(scan_b()),
         top: BoundTop {
-            expr: column(binding_a("k", 1, 0)),
+            expr: column(outer_a("k", 1, 0)),
             percent: false,
             with_ties: false,
         },
@@ -491,7 +502,7 @@ fn correlation_walk_covers_every_bound_expr_holder() {
                 predicate: compare(
                     CompareOp::Eq,
                     column(binding_b("k", 11, 0)),
-                    column(binding_a("k", 1, 0)),
+                    column(outer_a("k", 1, 0)),
                 ),
             },
         ),
@@ -500,7 +511,7 @@ fn correlation_walk_covers_every_bound_expr_holder() {
             LogicalPlan::Project {
                 input: Box::new(scan_b()),
                 exprs: vec![BoundProjection {
-                    expr: column(binding_a("k", 1, 0)),
+                    expr: column(outer_a("k", 1, 0)),
                     name: "k".to_owned(),
                 }],
                 schema: schema(&["k"]),
@@ -511,7 +522,7 @@ fn correlation_walk_covers_every_bound_expr_holder() {
             LogicalPlan::Limit {
                 input: Box::new(scan_b()),
                 top: BoundTop {
-                    expr: column(binding_a("k", 1, 0)),
+                    expr: column(outer_a("k", 1, 0)),
                     percent: false,
                     with_ties: false,
                 },
@@ -526,7 +537,7 @@ fn correlation_walk_covers_every_bound_expr_holder() {
                 on: Some(compare(
                     CompareOp::Eq,
                     column(binding_b("k", 11, 0)),
-                    column(binding_a("k", 1, 0)),
+                    column(outer_a("k", 1, 0)),
                 )),
                 schema: schema(&["k", "k"]),
             },
@@ -535,7 +546,7 @@ fn correlation_walk_covers_every_bound_expr_holder() {
             "Aggregate.group_by",
             LogicalPlan::Aggregate {
                 input: Box::new(scan_b()),
-                group_by: vec![column(binding_a("k", 1, 0))],
+                group_by: vec![column(outer_a("k", 1, 0))],
                 aggregates: Vec::new(),
                 schema: schema(&["k"]),
             },
@@ -545,7 +556,7 @@ fn correlation_walk_covers_every_bound_expr_holder() {
             LogicalPlan::Aggregate {
                 input: Box::new(scan_b()),
                 group_by: Vec::new(),
-                aggregates: vec![max_on(binding_a("k", 1, 0))],
+                aggregates: vec![max_on(outer_a("k", 1, 0))],
                 schema: schema(&["m"]),
             },
         ),
@@ -554,7 +565,7 @@ fn correlation_walk_covers_every_bound_expr_holder() {
             LogicalPlan::Sort {
                 input: Box::new(scan_b()),
                 keys: vec![SortKey {
-                    expr: column(binding_a("k", 1, 0)),
+                    expr: column(outer_a("k", 1, 0)),
                     desc: false,
                     collation: None,
                 }],
@@ -563,7 +574,7 @@ fn correlation_walk_covers_every_bound_expr_holder() {
         (
             "Values.rows",
             LogicalPlan::Values {
-                rows: vec![vec![column(binding_a("k", 1, 0))]],
+                rows: vec![vec![column(outer_a("k", 1, 0))]],
                 schema: schema(&["k"]),
             },
         ),
@@ -624,7 +635,7 @@ fn correlated_exists_is_evaluated_per_row() {
         predicate: compare(
             CompareOp::Eq,
             column(binding_b("k", 11, 0)),
-            column(binding_a("k", 1, 0)),
+            column(outer_a("k", 1, 0)),
         ),
     };
     let filtered = LogicalPlan::Filter {
@@ -656,6 +667,103 @@ fn correlated_exists_is_evaluated_per_row() {
         ),
         "expected Semi join, got {planned:?}"
     );
+}
+
+/// A scan of `b` whose first column carries the identifier of the first column of `a`:
+/// the identifier alone does not tell the two tables apart.
+fn scan_b_numbered_like_a() -> LogicalPlan {
+    LogicalPlan::Scan {
+        table: TABLE_B,
+        columns: vec![binding_b("k", 1, 0), binding_b("c", 2, 1)],
+        alias: "b".to_owned(),
+        schema: schema(&["k", "c"]),
+        hints: LockHints::default(),
+    }
+}
+
+/// `EXISTS (SELECT 1 FROM b WHERE b.k = a.k)` where `a.k` and `b.k` share `column`,
+/// `index` and `name`: the depth of the reference to `a.k` is what makes the subquery
+/// correlated. With that depth at 0, the same shape is a plain semi-join.
+#[test]
+fn exists_on_a_second_table_with_the_same_column_id_is_correlated() {
+    let correlated = LogicalPlan::Filter {
+        input: Box::new(project_scan(scan_b_numbered_like_a())),
+        predicate: compare(
+            CompareOp::Eq,
+            column(binding_b("k", 1, 0)),
+            column(outer_a("k", 1, 0)),
+        ),
+    };
+    assert_correlated_exists(correlated);
+
+    let local_only = LogicalPlan::Filter {
+        input: Box::new(project_scan(scan_b_numbered_like_a())),
+        predicate: compare(
+            CompareOp::Eq,
+            column(binding_b("k", 1, 0)),
+            column(binding_a("k", 1, 0)),
+        ),
+    };
+    assert_uncorrelated_exists(local_only);
+}
+
+/// `(SELECT b.c FROM b WHERE b.k = a.k)` where `a.k` and `b.k` share `column`, `index`
+/// and `name` is evaluated per row, not cached: `correlated` is true on the subplan.
+#[test]
+fn a_scalar_subquery_on_a_second_table_with_the_same_column_id_is_not_cached() {
+    let inner = LogicalPlan::Project {
+        input: Box::new(LogicalPlan::Filter {
+            input: Box::new(scan_b_numbered_like_a()),
+            predicate: compare(
+                CompareOp::Eq,
+                column(binding_b("k", 1, 0)),
+                column(outer_a("k", 1, 0)),
+            ),
+        }),
+        exprs: vec![BoundProjection {
+            expr: column(binding_b("c", 2, 1)),
+            name: "c".to_owned(),
+        }],
+        schema: schema(&["c"]),
+    };
+    let query = LogicalPlan::Project {
+        input: Box::new(scan_a()),
+        exprs: vec![BoundProjection {
+            expr: scalar(inner),
+            name: "x".to_owned(),
+        }],
+        schema: schema(&["x"]),
+    };
+    let planned = plan_with(&FakeCatalog::new(), query);
+    let subplans = subplans_in(&planned);
+    assert_eq!(subplans.len(), 1);
+    assert!(
+        subplans[0].correlated,
+        "expected correlated: true, got {planned:?}"
+    );
+}
+
+/// A reference met two subqueries down is classified against the subquery it lands in:
+/// `depth` 1 from the innermost query names a column of the middle one, which stays
+/// uncorrelated with respect to `a`; `depth` 2 reaches `a` and correlates the middle one.
+#[test]
+fn a_nested_reference_to_the_enclosing_query_is_not_correlated() {
+    let middle_over = |depth: u8| LogicalPlan::Filter {
+        input: Box::new(project_scan(scan_b())),
+        predicate: exists(LogicalPlan::Filter {
+            input: Box::new(project_scan(scan_b())),
+            predicate: compare(
+                CompareOp::Eq,
+                column(binding_b("k", 11, 0)),
+                column(ColumnBinding {
+                    depth,
+                    ..binding_b("k", 11, 0)
+                }),
+            ),
+        }),
+    };
+    assert_uncorrelated_exists(middle_over(1));
+    assert_correlated_exists(middle_over(2));
 }
 
 #[test]

@@ -45,6 +45,7 @@ fn column(name: &str, index: usize) -> ColumnBinding {
         index,
         name: name.to_owned(),
         ty: TypeInfo::new(SqlType::Int, true),
+        depth: 0,
     }
 }
 

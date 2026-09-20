@@ -604,6 +604,7 @@ impl Grouping {
                 index,
                 name: slot_name(index),
                 ty: column.ty,
+                depth: 0,
             })
             .collect();
         Scope::over(Source::new(
@@ -625,6 +626,7 @@ impl Grouping {
                 index,
                 name: slot_name(index),
                 ty: ty.clone(),
+                depth: 0,
             }),
             ty,
             line,

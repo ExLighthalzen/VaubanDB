@@ -65,7 +65,7 @@ use vauban_types::{
     implicit_result_type,
 };
 
-use crate::bound::{BoundCaseArm, BoundExpr, BoundExprKind, CompareOp, LogicalOp};
+use crate::bound::{BoundCaseArm, BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LogicalOp};
 use crate::call::{
     bind_cast, bind_convert, bind_function, bind_niladic, bind_variable_function, is_untyped_null,
 };
@@ -155,6 +155,21 @@ impl Scope {
     /// The scope of the enclosing query, `None` at the top.
     pub(crate) fn parent(&self) -> Option<&Scope> {
         self.parent.as_deref()
+    }
+
+    /// The scope a nested query chains to: the parent of `self` when `self` is an empty
+    /// wrapper around one, `self` otherwise.
+    ///
+    /// `subquery.rs` hands the scope of the enclosing query over inside an empty scope,
+    /// and `query.rs` chains the scope of the nested `FROM` to what it receives. Dropping
+    /// the wrapper keeps one link of the chain per query, which is what
+    /// [`ColumnBinding::depth`](crate::ColumnBinding::depth) counts: a query without a
+    /// `FROM` is an empty scope too, and it keeps its link.
+    pub(crate) fn unwrapped(&self) -> &Scope {
+        match &self.parent {
+            Some(parent) if self.sources.is_empty() => parent,
+            _ => self,
+        }
     }
 }
 
@@ -438,7 +453,8 @@ fn contains_invalid_niladic(expr: &Expr) -> bool {
 ///    prefix naming the **current** database binds (`star::Source::matches` decides);
 /// 3. a name the source answers to is a [`BoundExprKind::ColumnRef`] over the
 ///    [`ColumnBinding`](crate::ColumnBinding) the catalogue gave the `Scan`, its `index`
-///    unchanged;
+///    unchanged and its `depth` set to the number of parent scopes climbed to reach the
+///    source (0 in the scope of the reader, 1 in the enclosing query, and so on);
 /// 4. anything else is error **207** (`SELECT c;`, severity 16, state 1), on the line of
 ///    the reference — including a name reached through a qualifier that *does* name the
 ///    source, which SQL Server answers 207 to and not 4104.
@@ -463,19 +479,20 @@ fn bind_column(column: &ColumnRef, scope: &Scope) -> SqlResult<BoundExpr> {
         None => SqlError::invalid_column_name(&column.name.value).with_line(line),
     };
     // Walk the scope chain: try the current scope first, then its parent, and so on.
+    // `depth` counts the parents climbed: one link of the chain is one enclosing query
+    // (`query.rs`, `bind_query_spec`), so the count is the number of queries between the
+    // reader and the source of the column.
     let mut current = Some(scope);
+    let mut depth: u8 = 0;
     while let Some(sc) = current {
         let Some(found) = lookup(sc.sources(), column.qualifier.as_ref(), &column.name.value)
         else {
             // If a qualifier was written, a failure means the source named by the
             // qualifier does not exist in this scope: try the parent.
-            if column.qualifier.is_some() {
-                current = sc.parent();
-                continue;
-            }
             // Without a qualifier, an absent source means the scope is empty or the
-            // column is unknown: try the parent.
+            // column is unknown: try the parent as well.
             current = sc.parent();
+            depth = depth.saturating_add(1);
             continue;
         };
         return match found {
@@ -483,7 +500,10 @@ fn bind_column(column: &ColumnRef, scope: &Scope) -> SqlResult<BoundExpr> {
             // on the column alone: the prefix was bound, the name was not.
             Lookup::One(binding) => Ok(BoundExpr {
                 ty: binding.ty.clone(),
-                kind: BoundExprKind::ColumnRef(binding.clone()),
+                kind: BoundExprKind::ColumnRef(ColumnBinding {
+                    depth,
+                    ..binding.clone()
+                }),
                 line,
             }),
             Lookup::Absent => {

@@ -36,6 +36,7 @@ fn col_binding(index: usize, name: &str, ty: TypeInfo) -> ColumnBinding {
         index,
         name: name.to_owned(),
         ty,
+        depth: 0,
     }
 }
 

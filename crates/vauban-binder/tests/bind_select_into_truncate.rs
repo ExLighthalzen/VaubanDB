@@ -28,6 +28,7 @@ fn column(
         index,
         name: name.to_owned(),
         ty: TypeInfo::new(ty, nullable),
+        depth: 0,
     }
 }
 

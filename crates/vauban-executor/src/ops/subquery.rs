@@ -430,6 +430,7 @@ fn aggregate_row_bindings(
             index,
             name: schema.columns[index].name.clone(),
             ty: schema.columns[index].ty.clone(),
+            depth: 0,
         });
     }
     bindings

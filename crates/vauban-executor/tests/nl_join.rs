@@ -41,6 +41,7 @@ fn binding(index: usize) -> ColumnBinding {
         index,
         name: format!("c{index}"),
         ty: int_ty(),
+        depth: 0,
     }
 }
 
@@ -503,6 +504,7 @@ fn filter_over_a_cross_join_compares_both_sides() {
             index,
             name: format!("c{index}"),
             ty: int_ty(),
+            depth: 0,
         }
     }
 
@@ -579,6 +581,7 @@ fn column_binding(column: i32, index: usize) -> ColumnBinding {
         index,
         name: format!("c{index}"),
         ty: int_ty(),
+        depth: 0,
     }
 }
 
@@ -598,6 +601,7 @@ fn join_column_ref(column: i32, index: usize) -> BoundExpr {
             // Join-wide bindings keep the inner scan name; only the index shifts.
             name: "c0".to_owned(),
             ty: int_ty(),
+            depth: 0,
         }),
         ty: int_ty(),
         line: 1,
@@ -814,6 +818,7 @@ impl SelfJoinFixture {
             index,
             name: name.to_owned(),
             ty: int_ty(),
+            depth: 0,
         };
         PhysicalPlan::TableScan {
             table: self.table,
@@ -838,6 +843,7 @@ impl SelfJoinFixture {
                 index,
                 name: name.to_owned(),
                 ty: int_ty(),
+                depth: 0,
             }),
             ty: int_ty(),
             line: 1,

@@ -212,6 +212,7 @@ fn bind_query_spec(
                     index: i,
                     name: col.name.clone(),
                     ty: col.ty.clone(),
+                    depth: 0,
                 })
                 .collect();
             Scope::over(Source::new(
@@ -239,8 +240,10 @@ fn bind_query_spec(
         (None, _, None) => Scope::empty(),
     };
     // Chain the scope to the parent, so that a subquery can reference columns of the
-    // enclosing query.
-    let scope = scope.inside(parent.clone());
+    // enclosing query. The parent arrives wrapped in an empty scope (`subquery.rs`); the
+    // wrapper is dropped so that each link of the chain is one query, the unit
+    // `ColumnBinding::depth` counts.
+    let scope = scope.inside(parent.unwrapped().clone());
     if let Some(condition) = &spec.where_ {
         // An aggregate in a `WHERE` is error 147, before the clause is bound: `aggregate.rs`
         // owns the rule and the line it is reported on.

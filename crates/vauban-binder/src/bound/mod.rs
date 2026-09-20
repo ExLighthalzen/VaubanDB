@@ -617,6 +617,17 @@ pub struct ColumnBinding {
     pub name: String,
     /// Type of the column, nullability and collation included.
     pub ty: TypeInfo,
+    /// How many queries up the column lives: 0 for a column of the query that reads it,
+    /// 1 for a column of the enclosing query, 2 for the query above that one.
+    ///
+    /// Neither `column` nor `index` tells a correlated reference apart from a local one:
+    /// in `SELECT x.a, (SELECT COUNT(*) FROM t1 z WHERE z.a > x.a) FROM t1 x`, `z.a` and
+    /// `x.a` name the first column of the same table, so they share `column`, `index`
+    /// and `name`. Two tables whose first columns share an identifier are just as
+    /// indistinguishable. The binder counts the scopes it climbs to resolve the name
+    /// (`tests/bind_subquery.rs`, `an_outer_column_carries_its_scope_depth`); the planner
+    /// classifies a subquery as correlated when a reference inside it reaches past it.
+    pub depth: u8,
 }
 
 /// The columns a plan node produces, in order.

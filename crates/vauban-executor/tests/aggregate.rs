@@ -41,6 +41,7 @@ fn binding(index: usize, ty: &TypeInfo) -> ColumnBinding {
         index,
         name: format!("c{index}"),
         ty: ty.clone(),
+        depth: 0,
     }
 }
 
@@ -479,6 +480,7 @@ fn having_filters_groups() {
                 index: 1,
                 name: "a0".to_owned(),
                 ty: int_nn(),
+                depth: 0,
             }),
             ty: int_nn(),
             line: 1,

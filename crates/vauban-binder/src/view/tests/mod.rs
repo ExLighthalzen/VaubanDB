@@ -200,6 +200,7 @@ fn columns(items: &[(i32, usize, &str, SqlType, bool)]) -> Vec<ColumnBinding> {
             index: *index,
             name: (*name).to_owned(),
             ty: TypeInfo::new(*ty, *nullable),
+            depth: 0,
         })
         .collect()
 }

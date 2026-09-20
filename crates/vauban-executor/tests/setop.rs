@@ -115,6 +115,7 @@ fn binding() -> ColumnBinding {
         index: 0,
         name: "v".to_owned(),
         ty: int_t(),
+        depth: 0,
     }
 }
 

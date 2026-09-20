@@ -376,6 +376,7 @@ mod tests {
                 index: 0,
                 name: "a".to_owned(),
                 ty: ty.clone(),
+                depth: 0,
             }],
             alias: "t".to_owned(),
             schema: OutputSchema {

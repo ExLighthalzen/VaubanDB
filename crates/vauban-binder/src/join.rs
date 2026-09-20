@@ -351,6 +351,7 @@ fn derived_source(plan: &LogicalPlan, ctx: &BindContext<'_>) -> SqlResult<Source
             index: i,
             name: col.name.clone(),
             ty: col.ty.clone(),
+            depth: 0,
         })
         .collect();
     Ok(Source::new(

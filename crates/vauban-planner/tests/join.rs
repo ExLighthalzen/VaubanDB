@@ -37,6 +37,7 @@ fn binding_a(name: &str, index: usize) -> ColumnBinding {
         index,
         name: name.to_owned(),
         ty: int_type(),
+        depth: 0,
     }
 }
 
@@ -46,6 +47,7 @@ fn binding_b(name: &str, index: usize) -> ColumnBinding {
         index: 2 + index,
         name: name.to_owned(),
         ty: int_type(),
+        depth: 0,
     }
 }
 
@@ -500,6 +502,7 @@ fn comma_join_equality_in_the_where_stays_filter_over_cross() {
                         } else {
                             int_type()
                         },
+                        depth: 0,
                     })
                     .collect(),
                 kind: vauban_binder::ResolvedTableKind::Table,

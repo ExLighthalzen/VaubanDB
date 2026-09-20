@@ -76,6 +76,7 @@ fn binding(index: usize) -> ColumnBinding {
         index,
         name: format!("c{index}"),
         ty: int_t(),
+        depth: 0,
     }
 }
 

@@ -28,6 +28,7 @@ fn column(id: i32, index: usize, name: &str, ty: SqlType, nullable: bool) -> Col
         index,
         name: name.to_owned(),
         ty: TypeInfo::new(ty, nullable),
+        depth: 0,
     }
 }
 

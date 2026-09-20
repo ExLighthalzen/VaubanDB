@@ -65,6 +65,7 @@ fn column(id: ColumnId, index: usize, name: &str, nullable: bool) -> ColumnBindi
         index,
         name: name.to_owned(),
         ty: TypeInfo::new(SqlType::Int, nullable),
+        depth: 0,
     }
 }
 

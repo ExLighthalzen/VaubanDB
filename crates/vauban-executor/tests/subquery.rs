@@ -37,6 +37,7 @@ fn binding(table_offset: i32, index: usize) -> ColumnBinding {
         index,
         name: format!("c{index}"),
         ty: int_ty(true),
+        depth: 0,
     }
 }
 

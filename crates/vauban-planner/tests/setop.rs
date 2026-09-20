@@ -47,6 +47,7 @@ fn binding(name: &str) -> ColumnBinding {
         index: 0,
         name: name.to_owned(),
         ty: int_type(),
+        depth: 0,
     }
 }
 

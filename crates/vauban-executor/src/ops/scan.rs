@@ -239,6 +239,7 @@ mod tests {
                 index: *index,
                 name: format!("c{index}"),
                 ty: TypeInfo::new(SqlType::Int, true),
+                depth: 0,
             })
             .collect();
         let schema = OutputSchema {
