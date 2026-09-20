@@ -767,3 +767,217 @@ fn correlated_exists_with_a_cross_join_filter_inside() {
         "only outer rows with a matching pair in the cross product stay"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Self-joins: the same table under two aliases
+// ---------------------------------------------------------------------------------------
+
+/// A two-column table read twice: both scans carry the same column identifiers and names,
+/// so only the index in the concatenated row tells one alias from the other.
+struct SelfJoinFixture {
+    storage: Arc<dyn Storage>,
+    txn: TransactionManager,
+    table: TableId,
+}
+
+impl SelfJoinFixture {
+    /// Rows `(1, 10)` and `(2, 20)`.
+    fn new() -> Self {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let db = storage
+            .create_database("mydb")
+            .expect("the database is new");
+        let shape = TableShape {
+            columns: vec![int_ty(), int_ty()],
+            clustered_key: None,
+        };
+        let table = storage.create_table(db, &shape).expect("table");
+        let txn = TransactionManager::new(Arc::clone(&storage));
+        for (a, b) in [(1, 10), (2, 20)] {
+            let h = txn.begin(IsolationLevel::ReadCommitted);
+            storage
+                .insert(h.id, table, &StorageRow(vec![Value::I32(a), Value::I32(b)]))
+                .expect("insert");
+            txn.commit(h).expect("commit");
+        }
+        Self {
+            storage,
+            txn,
+            table,
+        }
+    }
+
+    /// The scan of one alias: column ids 1 and 2, names `a` and `b`, row-local indices.
+    fn scan(&self, alias: &str) -> PhysicalPlan {
+        let column = |id: i32, index: usize, name: &str| ColumnBinding {
+            column: ColumnId(id),
+            index,
+            name: name.to_owned(),
+            ty: int_ty(),
+        };
+        PhysicalPlan::TableScan {
+            table: self.table,
+            columns: vec![column(1, 0, "a"), column(2, 1, "b")],
+            alias: alias.to_owned(),
+            schema: schema_of(&["a", "b"]),
+            hints: LockHints::default(),
+        }
+    }
+
+    /// A reference to a column of the concatenated join row: `x.a` is index 0, `x.b` 1,
+    /// `y.a` 2 and `y.b` 3, with the column id and name of the underlying scan.
+    fn join_ref(index: usize) -> BoundExpr {
+        let (id, name) = if index.is_multiple_of(2) {
+            (1, "a")
+        } else {
+            (2, "b")
+        };
+        BoundExpr {
+            kind: BoundExprKind::ColumnRef(ColumnBinding {
+                column: ColumnId(id),
+                index,
+                name: name.to_owned(),
+                ty: int_ty(),
+            }),
+            ty: int_ty(),
+            line: 1,
+        }
+    }
+
+    fn join(&self, kind: PhysicalJoinKind, on: Option<BoundExpr>) -> PhysicalPlan {
+        PhysicalPlan::NestedLoopJoin {
+            outer: Box::new(self.scan("x")),
+            inner: Box::new(self.scan("y")),
+            kind,
+            on,
+            schema: schema_of(&["a", "b", "a", "b"]),
+        }
+    }
+
+    fn project(input: PhysicalPlan, indices: &[usize]) -> PhysicalPlan {
+        PhysicalPlan::Project {
+            input: Box::new(input),
+            exprs: indices
+                .iter()
+                .map(|index| vauban_binder::BoundProjection {
+                    expr: Self::join_ref(*index),
+                    name: format!("c{index}"),
+                })
+                .collect(),
+            schema: schema_of(&vec!["c"; indices.len()]),
+        }
+    }
+
+    fn run(&self, plan: PhysicalPlan) -> Vec<Row> {
+        let eval = StaticContext::default();
+        let snap = self
+            .txn
+            .statement_snapshot(&self.txn.begin(IsolationLevel::ReadCommitted));
+        let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_engine(
+            self.storage.as_ref(),
+            &self.txn,
+            &snap,
+        );
+        let (_, set) =
+            execute_collect(&PhysicalStatement::Query(plan), &mut ctx).expect("the plan runs");
+        let mut rows = set.rows;
+        rows.sort_by_key(|row| {
+            row.iter()
+                .map(|value| match value {
+                    Value::I32(v) => *v,
+                    _ => -1,
+                })
+                .collect::<Vec<_>>()
+        });
+        rows
+    }
+}
+
+fn ints(values: &[i32]) -> Row {
+    values.iter().map(|v| Value::I32(*v)).collect()
+}
+
+/// `SELECT x.a, y.a, x.b, y.b FROM t x CROSS JOIN t y`: the projection reads the second
+/// alias past the first one, not a copy of the first one.
+#[test]
+fn self_cross_join_projects_both_aliases() {
+    let f = SelfJoinFixture::new();
+    let plan = SelfJoinFixture::project(f.join(PhysicalJoinKind::Cross, None), &[0, 2, 1, 3]);
+    assert_eq!(
+        f.run(plan),
+        vec![
+            ints(&[1, 1, 10, 10]),
+            ints(&[1, 2, 10, 20]),
+            ints(&[2, 1, 20, 10]),
+            ints(&[2, 2, 20, 20]),
+        ],
+        "each pair of the product keeps both sides"
+    );
+}
+
+/// `SELECT x.a, y.a FROM t x, t y WHERE x.a <> y.a`: the filter and the projection read
+/// the same `y`.
+#[test]
+fn self_comma_join_filter_and_projection_read_the_same_side() {
+    let f = SelfJoinFixture::new();
+    let predicate = BoundExpr {
+        kind: BoundExprKind::Compare {
+            op: CompareOp::Ne,
+            left: Box::new(SelfJoinFixture::join_ref(0)),
+            right: Box::new(SelfJoinFixture::join_ref(2)),
+        },
+        ty: TypeInfo::new(SqlType::Bit, true),
+        line: 1,
+    };
+    let filter = PhysicalPlan::Filter {
+        input: Box::new(f.join(PhysicalJoinKind::Cross, None)),
+        predicate,
+    };
+    let plan = SelfJoinFixture::project(filter, &[0, 2]);
+    assert_eq!(
+        f.run(plan),
+        vec![ints(&[1, 2]), ints(&[2, 1])],
+        "the rows that pass the filter show the two distinct sides"
+    );
+}
+
+/// `SELECT x.a, y.a FROM t x JOIN t y ON x.a < y.a`: an inner self-join with an `ON`.
+#[test]
+fn self_inner_join_on_an_inequality() {
+    let f = SelfJoinFixture::new();
+    let on = BoundExpr {
+        kind: BoundExprKind::Compare {
+            op: CompareOp::Lt,
+            left: Box::new(SelfJoinFixture::join_ref(0)),
+            right: Box::new(SelfJoinFixture::join_ref(2)),
+        },
+        ty: TypeInfo::new(SqlType::Bit, true),
+        line: 1,
+    };
+    let plan = SelfJoinFixture::project(f.join(PhysicalJoinKind::Inner, Some(on)), &[0, 2]);
+    assert_eq!(f.run(plan), vec![ints(&[1, 2])]);
+}
+
+/// `SELECT x.a, y.a, y.b FROM t x LEFT JOIN t y ON x.a < y.a`: the row of `x` without a
+/// match is padded on the `y` side.
+#[test]
+fn self_left_join_pads_the_second_alias() {
+    let f = SelfJoinFixture::new();
+    let on = BoundExpr {
+        kind: BoundExprKind::Compare {
+            op: CompareOp::Lt,
+            left: Box::new(SelfJoinFixture::join_ref(0)),
+            right: Box::new(SelfJoinFixture::join_ref(2)),
+        },
+        ty: TypeInfo::new(SqlType::Bit, true),
+        line: 1,
+    };
+    let plan = SelfJoinFixture::project(f.join(PhysicalJoinKind::Left, Some(on)), &[0, 2, 3]);
+    assert_eq!(
+        f.run(plan),
+        vec![
+            ints(&[1, 2, 20]),
+            vec![Value::I32(2), Value::Null, Value::Null],
+        ]
+    );
+}

@@ -519,3 +519,80 @@ fn semi_join_emits_the_outer_row_once() {
     let (_outcome, anti_rows) = f.run(anti).expect("anti semi join");
     assert_eq!(anti_rows.len(), 1);
 }
+
+/// `SELECT o.c, i.c FROM o CROSS JOIN i WHERE EXISTS (SELECT 1 FROM t WHERE t.c = o.c)`:
+/// the correlated subquery in the `WHERE` reads the outer side of the cross join, and the
+/// rows that pass still carry the inner side of the concatenated row.
+#[test]
+fn correlated_exists_over_a_cross_join_keeps_both_sides() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let db = storage
+        .create_database("mydb")
+        .expect("the database is new");
+    let shape = TableShape {
+        columns: vec![int_ty(true)],
+        clustered_key: None,
+    };
+    let outer_table = storage.create_table(db, &shape).expect("outer");
+    let inner_table = storage.create_table(db, &shape).expect("inner");
+    let third_table = storage.create_table(db, &shape).expect("third");
+    let txn = TransactionManager::new(Arc::clone(&storage));
+    let insert = |table: TableId, value: i32| {
+        let h = txn.begin(IsolationLevel::ReadCommitted);
+        storage
+            .insert(h.id, table, &StorageRow(vec![Value::I32(value)]))
+            .expect("insert");
+        txn.commit(h).expect("commit");
+    };
+    insert(outer_table, 1);
+    insert(outer_table, 2);
+    insert(inner_table, 10);
+    insert(inner_table, 20);
+    insert(third_table, 2);
+    insert(third_table, 20);
+
+    let cross = PhysicalPlan::NestedLoopJoin {
+        outer: Box::new(scan(outer_table, 1)),
+        inner: Box::new(scan(inner_table, 10)),
+        kind: PhysicalJoinKind::Cross,
+        on: None,
+        schema: schema_of(&["c0", "c0"], int_ty(true)),
+    };
+    let third = BoundExpr {
+        kind: BoundExprKind::ColumnRef(binding(30, 0)),
+        ty: int_ty(true),
+        line: 7,
+    };
+    let subquery = filter(scan(third_table, 30), eq(third, outer_col(0)));
+    let plan = filter(
+        subquery_eval(
+            cross,
+            exists(subquery.clone()),
+            vec![subplan(subquery.clone(), true)],
+        ),
+        exists(subquery),
+    );
+
+    let eval = StaticContext::default();
+    let snap = txn.statement_snapshot(&txn.begin(IsolationLevel::ReadCommitted));
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_engine(
+        storage.as_ref(),
+        &txn,
+        &snap,
+    );
+    let (_, set) = execute_collect(&PhysicalStatement::Query(plan), &mut ctx)
+        .expect("the correlated exists over the cross join runs");
+    let pairs: Vec<(Value, Value)> = set
+        .rows
+        .into_iter()
+        .map(|row| (row[0].clone(), row[1].clone()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            (Value::I32(2), Value::I32(10)),
+            (Value::I32(2), Value::I32(20)),
+        ],
+        "the outer row the third table holds pairs with each inner row"
+    );
+}

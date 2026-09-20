@@ -10,6 +10,16 @@
 //! When the inner sub-tree is an [`IndexSeek`](crate::ops::seek::IndexSeek) whose bounds
 //! reference the outer row, the join pushes the outer row into the context before opening
 //! the inner, so that `eval_expr` resolves the column references against it.
+//!
+//! # Inner scan bindings
+//!
+//! A cross or semi join without `on` drives its inner input with scan-local bindings
+//! pushed on the context (`SubqueryLocalsSource::JoinInnerScan`), so that an expression
+//! inside the inner tree reads the inner row by scan-local position. Those bindings are
+//! pushed around each `open` and `next` of the inner operator and popped before the join
+//! hands a row upward: the `on`, and the operators above the join, read the concatenated
+//! row by index, which is what tells two aliases of one table apart
+//! (`tests/nl_join.rs`, `self_cross_join_projects_both_aliases`).
 
 use vauban_binder::{BoundExpr, BoundExprKind, ColumnBinding, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
@@ -37,8 +47,6 @@ pub enum Phase<'a> {
         outer_row: Row,
         /// Whether at least one match was found (for `LEFT`).
         had_match: bool,
-        /// Whether [`NestedLoopJoin::push_inner_correlation`] ran for this outer row.
-        inner_correlation: bool,
     },
     /// Walking the materialised inner rows for the current outer row (`RIGHT`, `FULL`).
     ScanningMaterialised {
@@ -130,22 +138,40 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
 }
 
 impl<'a> NestedLoopJoin<'a> {
-    fn push_inner_correlation(ctx: &mut ExecContext<'a>, inner_plan: &PhysicalPlan) -> bool {
-        if ctx.subquery_locals().is_some() {
-            return false;
+    /// Whether the inner input is driven with scan-local bindings: `on` is absent for a
+    /// cross join and when the planner folds the predicate into an inner
+    /// [`IndexSeek`](crate::ops::seek::IndexSeek). Cross and semi joins push inner scan
+    /// bindings; inner and left joins read the concatenated row by index.
+    fn drives_inner_with_scan_bindings(&self) -> bool {
+        self.on.is_none()
+            && matches!(
+                self.kind,
+                PhysicalJoinKind::Cross | PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi
+            )
+    }
+
+    /// Runs one call on the inner operator with the scan-local bindings of the inner plan
+    /// pushed on the context, and pops them before returning, so that the bindings are
+    /// visible to the inner tree alone and not to the `on` nor to the operators above the
+    /// join. Nothing is pushed under a frame already on the context (a correlated
+    /// subquery evaluating this join), nor when the join reads its inner by index.
+    fn with_inner_scan_bindings<R>(
+        ctx: &mut ExecContext<'a>,
+        inner_plan: &PhysicalPlan,
+        push: bool,
+        f: impl FnOnce(&mut ExecContext<'a>) -> SqlResult<R>,
+    ) -> SqlResult<R> {
+        if !push || ctx.subquery_locals().is_some() {
+            return f(ctx);
         }
         ctx.push_subquery_locals(
             SubqueryLocalsSource::JoinInnerScan,
             local_column_ids(inner_plan),
             scan_column_bindings(inner_plan),
         );
-        true
-    }
-
-    fn pop_inner_correlation(ctx: &mut ExecContext<'a>, pushed: bool) {
-        if pushed {
-            ctx.pop_subquery_locals();
-        }
+        let result = f(ctx);
+        ctx.pop_subquery_locals();
+        result
     }
 
     /// Evaluates `on` on the combined row, or answers `Some(true)` for a cross join.
@@ -276,6 +302,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
     }
 
     fn next(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<Option<Row>> {
+        let scan_bindings = self.drives_inner_with_scan_bindings();
         loop {
             match &mut self.phase {
                 Phase::Done => return Ok(None),
@@ -318,7 +345,6 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                     inner,
                     outer_row,
                     had_match,
-                    inner_correlation,
                 } => {
                     let outer_width = self.outer_width;
                     let inner_width = self.inner_width;
@@ -326,7 +352,13 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                         self.kind,
                         PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi
                     );
-                    match inner.next(ctx)? {
+                    let next = Self::with_inner_scan_bindings(
+                        ctx,
+                        &self.inner_plan,
+                        scan_bindings,
+                        |ctx| inner.next(ctx),
+                    )?;
+                    match next {
                         Some(inner_row) => {
                             let holds = match self.kind {
                                 PhysicalJoinKind::Cross => true,
@@ -345,7 +377,6 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 *had_match = true;
                                 if self.kind == PhysicalJoinKind::Semi {
                                     inner.close();
-                                    Self::pop_inner_correlation(ctx, *inner_correlation);
                                     let _ = ctx.pop_outer();
                                     let row = outer_row.clone();
                                     self.phase = Phase::NeedOuter;
@@ -353,7 +384,6 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 }
                                 if self.kind == PhysicalJoinKind::AntiSemi {
                                     inner.close();
-                                    Self::pop_inner_correlation(ctx, *inner_correlation);
                                     let _ = ctx.pop_outer();
                                     self.phase = Phase::NeedOuter;
                                     continue;
@@ -375,7 +405,6 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                         None => {
                             // Inner exhausted.
                             inner.close();
-                            Self::pop_inner_correlation(ctx, *inner_correlation);
                             let _ = ctx.pop_outer();
                             let matched = *had_match;
                             Self::note_outer_done(
@@ -457,28 +486,17 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 | PhysicalJoinKind::Inner
                                 | PhysicalJoinKind::Left => {
                                     ctx.push_outer(row.clone(), self.outer_bindings.clone());
-                                    // `on` is absent for a cross join and when the planner folds
-                                    // the predicate into an inner [`IndexSeek`]. Cross and semi
-                                    // joins push inner scan bindings; inner/left filters still
-                                    // index the concatenated join row.
-                                    let inner_correlation = if self.on.is_none()
-                                        && matches!(
-                                            self.kind,
-                                            PhysicalJoinKind::Cross
-                                                | PhysicalJoinKind::Semi
-                                                | PhysicalJoinKind::AntiSemi
-                                        ) {
-                                        Self::push_inner_correlation(ctx, &self.inner_plan)
-                                    } else {
-                                        false
-                                    };
                                     let mut inner = build_operator(&self.inner_plan)?;
-                                    inner.open(ctx)?;
+                                    Self::with_inner_scan_bindings(
+                                        ctx,
+                                        &self.inner_plan,
+                                        scan_bindings,
+                                        |ctx| inner.open(ctx),
+                                    )?;
                                     self.phase = Phase::Scanning {
                                         inner,
                                         outer_row: row,
                                         had_match: false,
-                                        inner_correlation,
                                     };
                                 }
                             }
