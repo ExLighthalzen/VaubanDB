@@ -124,6 +124,13 @@ pub enum AlterTable {
     AddColumn {
         /// Column to append.
         column: Box<ColumnDef>,
+        /// The name written on the column's `DEFAULT` (`CONSTRAINT df DEFAULT 0`), `None` for
+        /// an unnamed one or for a column without a default. [`ColumnDef::default`] has no
+        /// field for a name, so `alter_table`'s `plan_change` reads this one to register the
+        /// default under the name the client chose, the way `create_table` does for a
+        /// column-level `CONSTRAINT df DEFAULT 0` (`crates/vauban-catalog/src/constraints.rs`,
+        /// `apply_table_constraints`).
+        default_name: Option<String>,
     },
     /// `DROP COLUMN`.
     DropColumn {

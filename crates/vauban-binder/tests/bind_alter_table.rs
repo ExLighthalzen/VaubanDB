@@ -159,12 +159,17 @@ fn indexed_catalog() -> Tables {
 #[test]
 fn add_column_binds() {
     let action = alter("ALTER TABLE dbo.t ADD c int NULL;", &catalog());
-    let AlterTable::AddColumn { column } = action else {
+    let AlterTable::AddColumn {
+        column,
+        default_name,
+    } = action
+    else {
         panic!("expected AddColumn");
     };
     assert_eq!(column.name, "c");
     assert_eq!(column.ty.ty, SqlType::Int);
     assert!(column.ty.nullable);
+    assert_eq!(default_name, None, "no DEFAULT is written here");
 }
 
 #[test]
@@ -294,11 +299,48 @@ fn drop_unknown_constraint_is_3728() {
 #[test]
 fn add_not_null_without_default_binds() {
     let action = alter("ALTER TABLE dbo.t ADD c int NOT NULL;", &catalog());
-    let AlterTable::AddColumn { column } = action else {
+    let AlterTable::AddColumn {
+        column,
+        default_name,
+    } = action
+    else {
         panic!("expected AddColumn");
     };
     assert!(!column.ty.nullable);
     assert!(column.default.is_none());
+    assert_eq!(default_name, None);
+}
+
+#[test]
+fn add_column_with_a_named_default_keeps_its_name() {
+    // `CONSTRAINT df_c DEFAULT (7)` written on the added column: `ColumnDef::default` has no
+    // field for a name, so `bind_add_columns` carries it apart, in `AddColumn::default_name`
+    // (`crates/vauban-binder/src/alter.rs`, `column_def`), for
+    // `vauban_catalog::Catalog::alter_table` to register the `DEFAULT` under that name instead
+    // of generating one (`crates/vauban-catalog/src/alter.rs`, `plan_change`).
+    let action = alter(
+        "ALTER TABLE dbo.t ADD c int NULL CONSTRAINT df_c DEFAULT (7);",
+        &catalog(),
+    );
+    let AlterTable::AddColumn {
+        column,
+        default_name,
+    } = action
+    else {
+        panic!("expected AddColumn");
+    };
+    assert_eq!(column.name, "c");
+    assert!(column.default.is_some(), "the expression is still there");
+    assert_eq!(default_name.as_deref(), Some("df_c"));
+}
+
+#[test]
+fn add_column_with_an_unnamed_default_carries_no_name() {
+    let action = alter("ALTER TABLE dbo.t ADD c int NULL DEFAULT (7);", &catalog());
+    let AlterTable::AddColumn { default_name, .. } = action else {
+        panic!("expected AddColumn");
+    };
+    assert_eq!(default_name, None);
 }
 
 #[test]

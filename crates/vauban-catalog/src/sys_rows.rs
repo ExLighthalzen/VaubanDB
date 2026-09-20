@@ -32,9 +32,8 @@
 //!
 //! # Bound: what this file does not write
 //!
-//! The `CHECK` and `DEFAULT` tables of `views/sys_constraints.rs` are not in the list of
-//! [`rows_of`]. The rows are not written again when the instance restarts either — the store
-//! of `table.rs` is in memory and is not reloaded.
+//! The rows are not written again when the instance restarts — the store of `table.rs` is in
+//! memory and is not reloaded.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -152,15 +151,17 @@ fn constraint_names_for(
     if !stashed.is_empty() {
         return Ok(stashed.clone());
     }
-    stored_foreign_key_names(catalog, txn, table)
+    stored_constraint_names(catalog, txn, table)
 }
 
 /// The rows each internal table carries about `table`, in the order of the files of `views/`.
 ///
 /// The list is the one both [`write`] and [`remove`] walk: a table added here is written at
 /// `CREATE` and removed at `DROP` by that single edit (unit test
-/// `every_internal_table_of_the_list_is_one_the_bootstrap_created` checks the seventeen names
-/// against `bootstrap::internal_table_defs`).
+/// `every_internal_table_of_the_list_is_one_the_bootstrap_created` checks the nineteen names
+/// against `bootstrap::internal_table_defs`). [`sys_tables::OBJECTS_TABLE`] is named twice —
+/// once for `table`'s own row, once for the rows of its constraints — which the test counts
+/// once, the two entries writing into the same physical table.
 ///
 /// # Errors
 ///
@@ -183,6 +184,22 @@ fn rows_of(
                 sys_tables::objects_columns::OBJECT_ID,
             ),
             rows: sys_tables::dated_object_rows(one, create_date, modify_date)?,
+        },
+        Rows {
+            // The same internal table as above, one more row per `FOREIGN KEY`, `CHECK` and
+            // `DEFAULT` of `table`: matched by `parent_object_id`, there being no `object_id`
+            // column of `table`'s own identifier on these rows.
+            name: sys_tables::OBJECTS_TABLE,
+            owner: Owner::Object(
+                sys_tables::objects_columns::DATABASE_ID,
+                sys_tables::objects_columns::PARENT_OBJECT_ID,
+            ),
+            rows: sys_tables::constraint_object_rows(
+                one,
+                constraint_names,
+                create_date,
+                modify_date,
+            )?,
         },
         Rows {
             name: sys_tables::COLUMNS_TABLE,
@@ -295,6 +312,22 @@ fn rows_of(
             rows: sys_constraints::foreign_key_column_rows(one)?,
         },
         Rows {
+            name: sys_constraints::CHECK_CONSTRAINTS_TABLE,
+            owner: Owner::Object(
+                sys_constraints::constraint_columns::DATABASE_ID,
+                sys_constraints::constraint_columns::PARENT_OBJECT_ID,
+            ),
+            rows: sys_constraints::check_constraint_rows(one, constraint_names)?,
+        },
+        Rows {
+            name: sys_constraints::DEFAULT_CONSTRAINTS_TABLE,
+            owner: Owner::Object(
+                sys_constraints::constraint_columns::DATABASE_ID,
+                sys_constraints::constraint_columns::PARENT_OBJECT_ID,
+            ),
+            rows: sys_constraints::default_constraint_rows(one, constraint_names)?,
+        },
+        Rows {
             name: info_schema_constraints::TABLE_CONSTRAINTS_TABLE,
             owner: Owner::Named(
                 info_schema_constraints::table_constraints_columns::DATABASE_ID,
@@ -379,7 +412,7 @@ pub(crate) fn remove(
         days: 0,
         ticks_300th: 0,
     });
-    let names = stored_foreign_key_names(catalog, txn, table)?;
+    let names = stored_constraint_names(catalog, txn, table)?;
     for described in rows_of(
         catalog,
         txn,
@@ -421,7 +454,7 @@ pub(crate) fn rewrite(
 ) -> SqlResult<()> {
     let modify = transaction_datetime(catalog, txn)?;
     let create = object_create_date(catalog, txn, table)?.unwrap_or_else(|| modify.clone());
-    let mut names = stored_foreign_key_names(catalog, txn, table)?;
+    let mut names = stored_constraint_names(catalog, txn, table)?;
     names.extend(stashed_constraint_names());
     remove(catalog, txn, table, indexes)?;
     for described in rows_of(catalog, txn, table, indexes, &create, &modify, &names)? {
@@ -470,7 +503,7 @@ fn object_create_date(
 }
 
 /// Internal tables that carry a `database_id` column and the position of that column.
-const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 19] = [
+const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 21] = [
     (DATABASES_TABLE, databases_columns::DATABASE_ID),
     (SCHEMAS_TABLE, schemas_columns::DATABASE_ID),
     (
@@ -530,6 +563,14 @@ const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 19] = [
         sys_constraints::foreign_key_columns_columns::DATABASE_ID,
     ),
     (
+        sys_constraints::CHECK_CONSTRAINTS_TABLE,
+        sys_constraints::constraint_columns::DATABASE_ID,
+    ),
+    (
+        sys_constraints::DEFAULT_CONSTRAINTS_TABLE,
+        sys_constraints::constraint_columns::DATABASE_ID,
+    ),
+    (
         info_schema_constraints::TABLE_CONSTRAINTS_TABLE,
         info_schema_constraints::table_constraints_columns::DATABASE_ID,
     ),
@@ -543,37 +584,62 @@ const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 19] = [
     ),
 ];
 
-/// The `name` each foreign key of `table` carries in [`sys_constraints::FOREIGN_KEYS_TABLE`].
+/// The three internal tables a `FOREIGN KEY`, a `CHECK` and a `DEFAULT` are named in, with the
+/// position of `database_id`, `object_id`, `name` and `parent_object_id` on a row of each —
+/// [`sys_constraints::foreign_keys_columns`] and [`sys_constraints::constraint_columns`] agree
+/// on the four positions (unit test `the_three_constraint_tables_share_their_name_columns`),
+/// which is what lets [`stored_constraint_names`] read the three with one loop.
+const CONSTRAINT_NAME_TABLES: [(&str, usize, usize, usize, usize); 3] = [
+    (
+        sys_constraints::FOREIGN_KEYS_TABLE,
+        sys_constraints::foreign_keys_columns::DATABASE_ID,
+        sys_constraints::foreign_keys_columns::OBJECT_ID,
+        sys_constraints::foreign_keys_columns::NAME,
+        sys_constraints::foreign_keys_columns::PARENT_OBJECT_ID,
+    ),
+    (
+        sys_constraints::CHECK_CONSTRAINTS_TABLE,
+        sys_constraints::constraint_columns::DATABASE_ID,
+        sys_constraints::constraint_columns::OBJECT_ID,
+        sys_constraints::constraint_columns::NAME,
+        sys_constraints::constraint_columns::PARENT_OBJECT_ID,
+    ),
+    (
+        sys_constraints::DEFAULT_CONSTRAINTS_TABLE,
+        sys_constraints::constraint_columns::DATABASE_ID,
+        sys_constraints::constraint_columns::OBJECT_ID,
+        sys_constraints::constraint_columns::NAME,
+        sys_constraints::constraint_columns::PARENT_OBJECT_ID,
+    ),
+];
+
+/// The `name` each `FOREIGN KEY`, `CHECK` and `DEFAULT` of `table` carries in its own internal
+/// table ([`CONSTRAINT_NAME_TABLES`]).
 ///
 /// Read before a [`rewrite`] removes those rows so a named constraint keeps its name when
 /// the table store cannot be locked again.
-fn stored_foreign_key_names(
+fn stored_constraint_names(
     catalog: &Catalog,
     txn: &TxnHandle,
     table: &TableMeta,
 ) -> SqlResult<BTreeMap<ObjectId, String>> {
-    let id = table_id(catalog, sys_constraints::FOREIGN_KEYS_TABLE)?;
     let database = database_id(table.database)?;
-    let owner = Owner::Object(
-        sys_constraints::foreign_keys_columns::DATABASE_ID,
-        sys_constraints::foreign_keys_columns::PARENT_OBJECT_ID,
-    );
     let mut names = BTreeMap::new();
-    for (_, values) in scan(catalog, txn, id)? {
-        if !owner.matches(&values.0, table, database, &BTreeSet::new()) {
-            continue;
+    for (table_name, database_col, object_col, name_col, parent_col) in CONSTRAINT_NAME_TABLES {
+        let id = table_id(catalog, table_name)?;
+        let owner = Owner::Object(database_col, parent_col);
+        for (_, values) in scan(catalog, txn, id)? {
+            if !owner.matches(&values.0, table, database, &BTreeSet::new()) {
+                continue;
+            }
+            let Some(&Value::I32(object)) = values.0.get(object_col) else {
+                continue;
+            };
+            let Some(Value::String(text)) = values.0.get(name_col) else {
+                continue;
+            };
+            names.insert(ObjectId(object), text.text.clone());
         }
-        let Some(&Value::I32(object)) = values
-            .0
-            .get(sys_constraints::foreign_keys_columns::OBJECT_ID)
-        else {
-            continue;
-        };
-        let Some(Value::String(text)) = values.0.get(sys_constraints::foreign_keys_columns::NAME)
-        else {
-            continue;
-        };
-        names.insert(ObjectId(object), text.text.clone());
     }
     Ok(names)
 }
@@ -691,6 +757,25 @@ mod tests {
     }
 
     #[test]
+    fn the_three_constraint_tables_share_their_name_columns() {
+        // The claim `CONSTRAINT_NAME_TABLES`'s documentation makes: the `database_id`,
+        // `object_id`, `name` and `parent_object_id` of the three tables sit at the same four
+        // positions, so `stored_constraint_names` reads each of them with the same `Owner`
+        // shape and the same two field reads, checked here on the three entries of the table.
+        for (_, database_col, object_col, name_col, parent_col) in CONSTRAINT_NAME_TABLES {
+            assert_eq!(
+                (database_col, object_col, name_col, parent_col),
+                (
+                    sys_constraints::foreign_keys_columns::DATABASE_ID,
+                    sys_constraints::foreign_keys_columns::OBJECT_ID,
+                    sys_constraints::foreign_keys_columns::NAME,
+                    sys_constraints::foreign_keys_columns::PARENT_OBJECT_ID,
+                )
+            );
+        }
+    }
+
+    #[test]
     fn every_internal_table_of_the_list_is_one_the_bootstrap_created() {
         let described: Vec<String> = internal_table_defs()
             .expect("the internal tables")
@@ -712,11 +797,17 @@ mod tests {
             sys_extra::ALLOCATION_UNITS_TABLE,
             sys_constraints::FOREIGN_KEYS_TABLE,
             sys_constraints::FOREIGN_KEY_COLUMNS_TABLE,
+            sys_constraints::CHECK_CONSTRAINTS_TABLE,
+            sys_constraints::DEFAULT_CONSTRAINTS_TABLE,
             info_schema_constraints::TABLE_CONSTRAINTS_TABLE,
             info_schema_constraints::KEY_COLUMN_USAGE_TABLE,
             info_schema_constraints::REFERENTIAL_CONSTRAINTS_TABLE,
         ];
-        assert_eq!(listed.len(), 17, "the seventeen tables of the module list");
+        assert_eq!(
+            listed.len(),
+            19,
+            "the nineteen distinct tables of the module list"
+        );
         for name in listed {
             assert!(
                 described.contains(&name.to_owned()),

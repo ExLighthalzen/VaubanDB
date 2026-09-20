@@ -37,7 +37,13 @@
 //! and [`column_rows`] — a user table gives one row of type `U ` and one row per column
 //! (unit test `user_table_has_object_and_column_rows`). The internal `vauban_sys_*` tables of
 //! `master` are written at bootstrap with type `S ` / `SYSTEM_TABLE` (unit test
-//! `internal_tables_are_system_tables_in_sys_objects`).
+//! `internal_tables_are_system_tables_in_sys_objects`). Each `FOREIGN KEY`, `CHECK` and
+//! `DEFAULT` constraint of a table adds one more row, of type `F `, `C ` or `D ` and
+//! `parent_object_id` the table's own identifier, built by [`constraint_object_rows`] from the
+//! same [`ConstraintMeta`] `views/sys_constraints.rs` reads for the constraint's own view
+//! (unit test `constraint_object_rows_carries_the_three_kinds`); a `PRIMARY KEY` or a `UNIQUE`
+//! adds none, `sys.key_constraints` (`views/sys_indexes.rs`) not keying its rows by an
+//! `object_id` of this range.
 //!
 //! What that leaves aside: a fresh SQL Server database answers 111 rows to
 //! `SELECT COUNT(*) FROM sys.objects` — 72 of type `S `, 36 of type `IT`, 3 of type `SQ`,
@@ -53,6 +59,8 @@
 //! those rows into `storage` at each DDL, and the binder expands the text of a view in
 //! place of its name.
 
+use std::collections::BTreeMap;
+
 use vauban_errors::{InternalError, SqlResult};
 use vauban_storage::{DbId, Row};
 use vauban_txn::TxnHandle;
@@ -61,7 +69,9 @@ use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 use crate::bootstrap::{self, DEFAULT_COLLATION_NAME, SYSTEM_DATABASES, SYSTEM_SCHEMAS};
 use crate::catalog::Catalog;
 use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
-use crate::meta::{ColumnMeta, QualifiedName, TableMeta};
+use crate::ids::ObjectId;
+use crate::meta::{ColumnMeta, ConstraintMeta, QualifiedName, TableMeta};
+use crate::views::sys_constraints;
 
 /// Internal table of the schema-scoped objects, read by `sys.objects` and `sys.tables`.
 ///
@@ -102,6 +112,27 @@ const SYSTEM_TABLE_TYPE: &str = "S ";
 
 /// The `type_desc` that goes with [`SYSTEM_TABLE_TYPE`].
 const SYSTEM_TABLE_TYPE_DESC: &str = "SYSTEM_TABLE";
+
+/// `sys.objects.type` of a `FOREIGN KEY`, as `views/sys_constraints.rs` writes it in
+/// `sys.foreign_keys`.
+const FOREIGN_KEY_OBJECT_TYPE: &str = "F ";
+
+/// The `type_desc` that goes with [`FOREIGN_KEY_OBJECT_TYPE`].
+const FOREIGN_KEY_OBJECT_TYPE_DESC: &str = "FOREIGN_KEY_CONSTRAINT";
+
+/// `sys.objects.type` of a `CHECK`, as `views/sys_constraints.rs` writes it in
+/// `sys.check_constraints`.
+const CHECK_OBJECT_TYPE: &str = "C ";
+
+/// The `type_desc` that goes with [`CHECK_OBJECT_TYPE`].
+const CHECK_OBJECT_TYPE_DESC: &str = "CHECK_CONSTRAINT";
+
+/// `sys.objects.type` of a `DEFAULT`, as `views/sys_constraints.rs` writes it in
+/// `sys.default_constraints`.
+const DEFAULT_OBJECT_TYPE: &str = "D ";
+
+/// The `type_desc` that goes with [`DEFAULT_OBJECT_TYPE`].
+const DEFAULT_OBJECT_TYPE_DESC: &str = "DEFAULT_CONSTRAINT";
 
 /// The `schema_id` written for a schema the bootstrap does not know.
 ///
@@ -494,6 +525,104 @@ pub(crate) fn write_internal_object_rows(
     Ok(())
 }
 
+/// The rows of [`OBJECTS_TABLE`] for the `FOREIGN KEY`, `CHECK` and `DEFAULT` constraints of
+/// `tables`: one per constraint, `parent_object_id` its table (module documentation, unit test
+/// `constraint_object_rows_carries_the_three_kinds`).
+///
+/// The identifier, the kind and the generated name of each constraint are read the same way
+/// `views/sys_constraints.rs` reads them for its own three views — `position` is the index of
+/// the constraint in `table.constraints`, shared by the two readers so a name they both fall
+/// back on (no entry in `names`) is the same string on both sides. `names` gives the written
+/// name of a constraint that has one, as [`sys_constraints::check_constraint_rows`] reads it.
+///
+/// # Errors
+///
+/// Those of [`dated_object_rows`].
+pub(crate) fn constraint_object_rows(
+    tables: &[TableMeta],
+    names: &BTreeMap<ObjectId, String>,
+    create_date: &Value,
+    modify_date: &Value,
+) -> SqlResult<Vec<Row>> {
+    let mut rows = Vec::new();
+    for table in tables {
+        let database = database_id(table.database)?;
+        for (position, constraint) in table.constraints.iter().enumerate() {
+            let Some((object, ty, ty_desc, generated)) =
+                constraint_object_kind(table, constraint, position)
+            else {
+                continue;
+            };
+            let name = names.get(&object).map(String::as_str).unwrap_or(&generated);
+            rows.push(Row(vec![
+                Value::I32(database),
+                Value::I32(object.0),
+                text(name),
+                Value::I32(schema_id(&table.schema)),
+                Value::I32(table.id.0),
+                text(ty),
+                text(ty_desc),
+                Value::Bit(false),
+                create_date.clone(),
+                modify_date.clone(),
+                Value::I32(0),
+            ]));
+        }
+    }
+    Ok(rows)
+}
+
+/// The identifier, `type`, `type_desc` and generated name [`constraint_object_rows`] publishes
+/// for `constraint`, `None` for a `PRIMARY KEY` or a `UNIQUE` — backed by an index rather than
+/// carrying an [`ObjectId`] of their own (module documentation).
+fn constraint_object_kind(
+    table: &TableMeta,
+    constraint: &ConstraintMeta,
+    position: usize,
+) -> Option<(ObjectId, &'static str, &'static str, String)> {
+    match constraint {
+        ConstraintMeta::PrimaryKey(_) | ConstraintMeta::Unique(_) => None,
+        ConstraintMeta::ForeignKey {
+            constraint: object,
+            columns,
+            ..
+        } => Some((
+            *object,
+            FOREIGN_KEY_OBJECT_TYPE,
+            FOREIGN_KEY_OBJECT_TYPE_DESC,
+            sys_constraints::generated_constraint_name(
+                "FK",
+                table,
+                sys_constraints::single_column(table, columns),
+                position,
+            ),
+        )),
+        ConstraintMeta::Check {
+            constraint: object, ..
+        } => Some((
+            *object,
+            CHECK_OBJECT_TYPE,
+            CHECK_OBJECT_TYPE_DESC,
+            sys_constraints::generated_constraint_name("CK", table, None, position),
+        )),
+        ConstraintMeta::Default {
+            constraint: object,
+            column,
+            ..
+        } => Some((
+            *object,
+            DEFAULT_OBJECT_TYPE,
+            DEFAULT_OBJECT_TYPE_DESC,
+            sys_constraints::generated_constraint_name(
+                "DF",
+                table,
+                sys_constraints::column_name(table, *column),
+                position,
+            ),
+        )),
+    }
+}
+
 /// The rows of [`COLUMNS_TABLE`] for `tables`: one per column, in `column_id` order within
 /// each table.
 ///
@@ -818,6 +947,7 @@ fn text(value: &str) -> Value {
 mod tests {
     use std::sync::Arc;
 
+    use vauban_parser::{Expr, Literal, RefAction, Span};
     use vauban_storage::{MemoryStorage, Storage, TableId};
     use vauban_txn::{IsolationLevel, TransactionManager};
 
@@ -1982,6 +2112,110 @@ mod tests {
             SYSTEM_SCHEMAS
                 .iter()
                 .all(|(_, id, _)| *id != UNKNOWN_SCHEMA_ID)
+        );
+    }
+
+    #[test]
+    fn constraint_object_rows_carries_the_three_kinds() {
+        // A table with the four kinds of constraint: the three that carry an `ObjectId` of
+        // their own get a row here, `PRIMARY KEY` does not (module documentation, asserted
+        // below on the length of `rows`).
+        let placeholder = Expr::Literal(Literal::Null, Span::EMPTY);
+        let mut target = TableMeta {
+            id: ObjectId(1_000_100),
+            storage_id: TableId(9),
+            database: DbId(1),
+            schema: "dbo".to_owned(),
+            name: "tbl015_codes".to_owned(),
+            columns: vec![ColumnMeta {
+                id: crate::ids::ColumnId(1),
+                name: "id".to_owned(),
+                ty: TypeInfo::new(SqlType::Int, false),
+                ordinal: 0,
+                default: None,
+                identity: None,
+                computed: None,
+            }],
+            clustered: None,
+            constraints: Vec::new(),
+        };
+        target
+            .constraints
+            .push(ConstraintMeta::PrimaryKey(vauban_storage::IndexId(1)));
+        target.constraints.push(ConstraintMeta::ForeignKey {
+            constraint: ObjectId(1_000_101),
+            system_named: true,
+            columns: vec![crate::ids::ColumnId(1)],
+            referenced_table: ObjectId(1_000_042),
+            referenced_columns: vec![crate::ids::ColumnId(1)],
+            referenced_index: vauban_storage::IndexId(1),
+            on_delete: RefAction::NoAction,
+            on_update: RefAction::NoAction,
+        });
+        target.constraints.push(ConstraintMeta::Check {
+            constraint: ObjectId(1_000_102),
+            system_named: false,
+            expr: placeholder.clone(),
+            definition: "(1)".to_owned(),
+        });
+        target.constraints.push(ConstraintMeta::Default {
+            constraint: ObjectId(1_000_103),
+            system_named: false,
+            column: crate::ids::ColumnId(1),
+            expr: placeholder,
+        });
+        let names = BTreeMap::from([(ObjectId(1_000_102), "ck_written".to_owned())]);
+
+        let rows = constraint_object_rows(
+            std::slice::from_ref(&target),
+            &names,
+            &Value::Null,
+            &Value::Null,
+        )
+        .expect("rows");
+
+        assert_eq!(rows.len(), 3, "the primary key adds no row here");
+        let by_type: Vec<(Option<String>, Option<String>, Option<String>)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    rendered(&row.0[objects_columns::TYPE]),
+                    rendered(&row.0[objects_columns::PARENT_OBJECT_ID]),
+                    rendered(&row.0[objects_columns::NAME]),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_type,
+            vec![
+                (
+                    Some(FOREIGN_KEY_OBJECT_TYPE.to_owned()),
+                    Some("1000100".to_owned()),
+                    // No entry in `names`: the generated shape.
+                    Some(sys_constraints::generated_constraint_name(
+                        "FK",
+                        &target,
+                        Some("id"),
+                        1
+                    ))
+                ),
+                (
+                    Some(CHECK_OBJECT_TYPE.to_owned()),
+                    Some("1000100".to_owned()),
+                    // An entry in `names`: the written name, not the generated one.
+                    Some("ck_written".to_owned())
+                ),
+                (
+                    Some(DEFAULT_OBJECT_TYPE.to_owned()),
+                    Some("1000100".to_owned()),
+                    Some(sys_constraints::generated_constraint_name(
+                        "DF",
+                        &target,
+                        Some("id"),
+                        3
+                    ))
+                ),
+            ]
         );
     }
 }

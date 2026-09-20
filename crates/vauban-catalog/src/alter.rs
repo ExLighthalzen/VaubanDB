@@ -244,10 +244,13 @@ fn plan_change(
 ) -> SqlResult<AlterPlan> {
     let (mut keys, preserved) = split_constraints(store, old)?;
     let statement_indexes = statement_index_defs(store, old);
-    let add = Vec::new();
+    let mut add = Vec::new();
     let mut column_id_watermark = max_column_id_used(store, old);
     let columns = match change {
-        AlterTable::AddColumn { column } => {
+        AlterTable::AddColumn {
+            column,
+            default_name,
+        } => {
             refuse_duplicate_column(old, &column.name)?;
             if !column.ty.nullable
                 && column.default.is_none()
@@ -274,10 +277,27 @@ fn plan_change(
                 name: column.name.clone(),
                 ty: column.ty.clone(),
                 ordinal,
+                // Kept here (not only on the `ConstraintDef::Default` pushed below) because
+                // `copy_visible_rows`, above in `copy_table`, backfills the existing rows from
+                // `plan.columns` before `apply_table_constraints` runs
+                // (`crates/vauban-executor/tests/ddl_alter.rs`,
+                // `add_column_with_default_fills_existing_rows`).
                 default: column.default.clone(),
                 identity: column.identity,
                 computed: column.computed.clone(),
             });
+            if let Some(expr) = &column.default {
+                // Registered under `default_name` (or generated when `None`) so the object
+                // and the row of `sys.default_constraints` carry the name the client wrote,
+                // instead of falling to the bare, always-generated-name path of
+                // `apply_table_constraints` (`tests/alter.rs`,
+                // `add_column_with_a_named_default_keeps_its_name`).
+                add.push(ConstraintDef::Default {
+                    name: default_name.clone(),
+                    column: column.name.clone(),
+                    expr: expr.clone(),
+                });
+            }
             columns
         }
         AlterTable::DropColumn { name } => {
@@ -438,26 +458,18 @@ fn copy_table(
         let mut store = table::store(catalog);
         index::apply_table_keys(catalog, txn, &mut store, &keys, &mut meta)?;
         meta.constraints.extend(plan.preserved.clone());
+        // `plan.add` carries the `DEFAULT` of a column `ADD COLUMN` just appended, named or
+        // not (`plan_change`): one call, so its named loop marks the column before the bare
+        // loop that follows in the same pass would otherwise register it a second time under
+        // a generated name (`tests/alter.rs`, `add_column_with_a_named_default_keeps_its_name`;
+        // `crates/vauban-executor/tests/ddl_alter.rs`,
+        // `add_column_with_default_fills_existing_rows`, which needs `ColumnMeta::default`
+        // already set on `plan.columns` for the backfill `copy_visible_rows` did above).
         crate::constraints::apply_table_constraints(
             &mut store,
-            &build_table_def(old, &plan.columns, &[], &[]),
+            &build_table_def(old, &plan.columns, &[], &plan.add),
             &mut meta,
         )?;
-        if !plan.add.is_empty() {
-            let def = build_table_def(old, &plan.columns, &[], &plan.add);
-            crate::constraints::apply_table_constraints(&mut store, &def, &mut meta)?;
-        }
-        for constraint in &plan.add {
-            if let ConstraintDef::Default { column, expr, .. } = constraint
-                && let Some(meta_column) = meta
-                    .columns
-                    .iter_mut()
-                    .find(|candidate| candidate.name.eq_ignore_ascii_case(column))
-                && meta_column.default.is_none()
-            {
-                meta_column.default = Some(expr.clone());
-            }
-        }
         crate::sys_rows::rewrite(catalog, txn, &meta, &store.indexes)?;
     }
     Ok((meta, plan.statement_indexes.clone()))

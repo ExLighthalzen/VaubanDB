@@ -132,9 +132,10 @@ fn bind_add_columns(
         err.state = DUPLICATE_COLUMN_2705_ALTER_TABLE_STATE;
         return Err(err.with_line(span.line));
     }
-    let def = column_def(column, position, span)?;
+    let (def, default_name) = column_def(column, position, span)?;
     Ok(AlterTable::AddColumn {
         column: Box::new(def),
+        default_name,
     })
 }
 
@@ -372,7 +373,20 @@ fn table_constraint_def(
     }
 }
 
-fn column_def(column: &AstColumnDef, position: u32, span: &Span) -> SqlResult<ColumnDef> {
+/// Binds one column of an `ALTER TABLE … ADD`, and the name written on its `DEFAULT`, if any.
+///
+/// A `CONSTRAINT df DEFAULT 0` keeps `df`: [`bind_add_columns`] carries it apart from
+/// [`ColumnDef::default`], which has no field for a name, to
+/// [`AlterTable::AddColumn::default_name`](vauban_catalog::AlterTable), the way
+/// `vauban_catalog::Catalog::alter_table` reads it (`crates/vauban-catalog/src/alter.rs`,
+/// `plan_change`) — the same split `crates/vauban-binder/src/ddl.rs`'s `column_of` makes for
+/// `CREATE TABLE` between [`ColumnDef::default`] and a named [`vauban_catalog::ConstraintDef::Default`]
+/// (unit test `add_column_with_a_named_default_keeps_its_name`).
+fn column_def(
+    column: &AstColumnDef,
+    position: u32,
+    span: &Span,
+) -> SqlResult<(ColumnDef, Option<String>)> {
     if column.computed.is_some() {
         return Err(SqlError::from(InternalError::Bug(format!(
             "bind_alter_table: the computed column '{}' is not implemented yet",
@@ -384,12 +398,14 @@ fn column_def(column: &AstColumnDef, position: u32, span: &Span) -> SqlResult<Co
         .map_err(|err| on_statement(err, span))?;
     let mut nullable = true;
     let mut default = None;
+    let mut default_name = None;
     for constraint in &column.constraints {
         match &constraint.kind {
             ColumnConstraintKind::Null => nullable = true,
             ColumnConstraintKind::NotNull => nullable = false,
             ColumnConstraintKind::Default(expr) if default.is_none() => {
-                default = Some(expr.clone())
+                default = Some(expr.clone());
+                default_name = constraint.name.as_ref().map(|ident| ident.value.clone());
             }
             ColumnConstraintKind::PrimaryKey { .. }
             | ColumnConstraintKind::Unique { .. }
@@ -405,18 +421,21 @@ fn column_def(column: &AstColumnDef, position: u32, span: &Span) -> SqlResult<Co
     if let Some(collation) = &column.collation {
         info.collation = Some(Collation::parse(collation).map_err(|err| on_statement(err, span))?);
     }
-    Ok(ColumnDef {
-        name: column.name.value.clone(),
-        ty: info,
-        default,
-        identity: column.identity.as_ref().map(|identity| IdentitySpec {
-            seed: identity.seed.unwrap_or(IdentitySpec::default().seed),
-            increment: identity
-                .increment
-                .unwrap_or(IdentitySpec::default().increment),
-        }),
-        computed: column.computed.clone(),
-    })
+    Ok((
+        ColumnDef {
+            name: column.name.value.clone(),
+            ty: info,
+            default,
+            identity: column.identity.as_ref().map(|identity| IdentitySpec {
+                seed: identity.seed.unwrap_or(IdentitySpec::default().seed),
+                increment: identity
+                    .increment
+                    .unwrap_or(IdentitySpec::default().increment),
+            }),
+            computed: column.computed.clone(),
+        },
+        default_name,
+    ))
 }
 
 /// The referenced table is resolved like a `FROM` table: the current database and the

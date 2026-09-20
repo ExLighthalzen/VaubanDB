@@ -124,6 +124,7 @@ fn add_column_keeps_object_id_and_rows() {
             meta.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("c", SqlType::Int, true)),
+                default_name: None,
             },
         )
         .expect("alter_table");
@@ -193,6 +194,7 @@ fn dropped_table_is_deferred_to_commit() {
             meta.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("c", SqlType::Int, true)),
+                default_name: None,
             },
         )
         .expect("alter_table");
@@ -247,6 +249,7 @@ fn alter_rollback_restores_the_old_shape() {
             meta.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("c", SqlType::Int, true)),
+                default_name: None,
             },
         )
         .expect("alter_table");
@@ -281,6 +284,7 @@ fn add_not_null_without_default_follows_the_measure() {
             empty_table.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("b", SqlType::Int, false)),
+                default_name: None,
             },
         )
         .expect("ALTER TABLE empty_t ADD b int NOT NULL;");
@@ -302,6 +306,7 @@ fn add_not_null_without_default_follows_the_measure() {
             notempty.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("b", SqlType::Int, false)),
+                default_name: None,
             },
         )
         .expect_err("ALTER TABLE notempty ADD b int NOT NULL;");
@@ -367,6 +372,7 @@ fn drop_last_column_then_add_uses_high_water() {
             without_b.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("d", SqlType::Int, true)),
+                default_name: None,
             },
         )
         .expect("add d");
@@ -407,6 +413,7 @@ fn drop_last_of_three_then_add_uses_high_water() {
             without_c.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("d", SqlType::Int, true)),
+                default_name: None,
             },
         )
         .expect("add d");
@@ -450,6 +457,7 @@ fn the_high_water_of_a_closed_catalogue_does_not_number_the_next_one() {
             without_c.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("d", SqlType::Int, true)),
+                default_name: None,
             },
         )
         .expect("add d");
@@ -476,6 +484,7 @@ fn the_high_water_of_a_closed_catalogue_does_not_number_the_next_one() {
             without_b.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("d", SqlType::Int, true)),
+                default_name: None,
             },
         )
         .expect("add d");
@@ -515,6 +524,7 @@ fn add_after_drop_does_not_reuse_freed_column_id() {
             without_b.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("d", SqlType::Int, true)),
+                default_name: None,
             },
         )
         .expect("add d");
@@ -918,6 +928,7 @@ fn add_column_default_then_drop_is_5074() {
             meta.id,
             &AlterTable::AddColumn {
                 column: Box::new(with_default),
+                default_name: None,
             },
         )
         .expect("add b");
@@ -974,6 +985,7 @@ fn identity_counter_survives_the_copy() {
             meta.id,
             &AlterTable::AddColumn {
                 column: Box::new(column("note", SqlType::NVarChar(Len::Fixed(10)), true)),
+                default_name: None,
             },
         )
         .expect("alter_table");

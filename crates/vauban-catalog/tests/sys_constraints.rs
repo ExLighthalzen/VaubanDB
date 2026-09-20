@@ -138,14 +138,17 @@ fn the_bootstrap_creates_the_four_internal_tables_of_this_file() {
 }
 
 #[test]
-fn a_created_table_with_a_default_leaves_the_internal_tables_untouched_for_now() {
-    // The boundary `src/views/sys_constraints.rs` states: `create_table` keeps its
-    // `TableMeta` in the store of `table.rs`, and `sys_rows.rs` does not write
-    // `default_constraint_rows` into `storage` yet. Persisting them turns the zero below
-    // into 1.
+fn a_created_table_with_a_default_writes_the_default_constraints_row() {
+    // `sys_rows.rs` writes `default_constraint_rows` alongside `check_constraint_rows`: a
+    // column-level `DEFAULT` gains a row in one of the two tables of `constraint_shape()`,
+    // the other — `sys.check_constraints`' — staying at zero.
     let (catalog, storage, txn) = instance();
-    let defaults = tables_shaped(&storage, &constraint_shape());
-    assert_eq!(defaults.len(), 2);
+    let constraint_tables = tables_shaped(&storage, &constraint_shape());
+    assert_eq!(constraint_tables.len(), 2);
+    let before: Vec<usize> = constraint_tables
+        .iter()
+        .map(|&table| row_count(&storage, &txn, table))
+        .collect();
 
     let handle = txn.begin(IsolationLevel::ReadCommitted);
     let meta = catalog
@@ -170,9 +173,275 @@ fn a_created_table_with_a_default_leaves_the_internal_tables_untouched_for_now()
     // The catalogue kept the expression on the column, which is what the rows of
     // `sys.default_constraints` are built from.
     assert_eq!(meta.columns[1].default, Some(integer("0")));
-    for table in defaults {
-        assert_eq!(row_count(&storage, &txn, table), 0);
+    let after: Vec<usize> = constraint_tables
+        .iter()
+        .map(|&table| row_count(&storage, &txn, table))
+        .collect();
+    let gained = after.iter().zip(&before).filter(|(a, b)| a > b).count();
+    assert_eq!(gained, 1, "one of the two tables gains the DEFAULT's row");
+    let total_before: usize = before.iter().sum();
+    let total_after: usize = after.iter().sum();
+    assert_eq!(total_after, total_before + 1);
+}
+
+/// The shape of the internal table `sys.objects` and `sys.tables` read
+/// (`src/views/sys_tables.rs`, `objects_columns`): 11 columns.
+fn objects_shape() -> Vec<TypeInfo> {
+    vec![
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), false),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::Char(Len::Fixed(2)), false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(60)), false),
+        TypeInfo::new(SqlType::Bit, false),
+        TypeInfo::new(SqlType::DateTime, false),
+        TypeInfo::new(SqlType::DateTime, false),
+        TypeInfo::new(SqlType::Int, false),
+    ]
+}
+
+/// `PRIMARY KEY` over the columns given, clustered.
+fn primary_key(columns: &[&str]) -> ConstraintDef {
+    ConstraintDef::PrimaryKey {
+        name: None,
+        columns: columns
+            .iter()
+            .map(|column| SortedColumn {
+                column: (*column).to_owned(),
+                descending: false,
+            })
+            .collect(),
+        clustered: true,
     }
+}
+
+/// `FOREIGN KEY (columns) REFERENCES master.dbo.<referenced> (referenced_columns)`, named.
+fn foreign_key(
+    name: &str,
+    columns: &[&str],
+    referenced: &str,
+    referenced_columns: &[&str],
+) -> ConstraintDef {
+    ConstraintDef::ForeignKey {
+        name: Some(name.to_owned()),
+        columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+        referenced: QualifiedName {
+            database: "master".to_owned(),
+            schema: "dbo".to_owned(),
+            name: referenced.to_owned(),
+        },
+        referenced_columns: referenced_columns
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect(),
+        on_delete: vauban_parser::RefAction::NoAction,
+        on_update: vauban_parser::RefAction::NoAction,
+    }
+}
+
+/// The `(type, name)` pairs `sys.objects` carries for `parent`, sorted — how a test that
+/// cannot read `objects_columns` by name reaches its `type` and `name` columns (module
+/// documentation).
+fn object_kinds_of(
+    storage: &Arc<dyn Storage>,
+    txn: &Arc<TransactionManager>,
+    table: TableId,
+    parent: i32,
+) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = rows(storage, txn, table)
+        .into_iter()
+        .filter(|row| int_at(row, 4) == parent)
+        .map(|row| (text_at(&row, 5), text_at(&row, 2)))
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn create_table_writes_a_row_per_kind_in_sys_objects_and_in_its_own_view() {
+    // A table with the three kinds `sys_rows.rs` now writes a `sys.objects` row for —
+    // `FOREIGN KEY`, `CHECK`, `DEFAULT` — plus the table's own `U ` row and its parent's:
+    // five new rows of `sys.objects`, one each of `sys.foreign_keys`, `sys.check_constraints`
+    // and `sys.default_constraints` (module documentation, `src/views/sys_tables.rs`,
+    // `src/views/sys_constraints.rs`).
+    let (catalog, storage, txn) = instance();
+    let objects_table = tables_shaped(&storage, &objects_shape())
+        .pop()
+        .expect("one sys.objects table");
+    let fk_table = tables_shaped(&storage, &foreign_keys_shape())
+        .pop()
+        .expect("one sys.foreign_keys table");
+    let constraint_tables = tables_shaped(&storage, &constraint_shape());
+    let objects_before = row_count(&storage, &txn, objects_table);
+    let fk_before = row_count(&storage, &txn, fk_table);
+    let constraint_before: usize = constraint_tables
+        .iter()
+        .map(|&table| row_count(&storage, &txn, table))
+        .sum();
+
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let parent = catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl015_parent",
+                vec![column("id", SqlType::Int, None)],
+                vec![primary_key(&["id"])],
+            ),
+        )
+        .expect("the parent table");
+    let child = catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl015_child",
+                vec![
+                    column("id", SqlType::Int, None),
+                    column("amount", SqlType::Int, None),
+                    column("parent_id", SqlType::Int, None),
+                ],
+                vec![
+                    ConstraintDef::Check {
+                        name: Some("ck_tbl015".to_owned()),
+                        expr: integer("1"),
+                    },
+                    named_default("df_tbl015", "amount", "0"),
+                    foreign_key("fk_tbl015", &["parent_id"], "tbl015_parent", &["id"]),
+                ],
+            ),
+        )
+        .expect("the child table and its three constraints");
+    txn.commit(handle).expect("commit");
+
+    assert_eq!(
+        row_count(&storage, &txn, objects_table),
+        objects_before + 5,
+        "two table rows, one FOREIGN KEY, one CHECK, one DEFAULT"
+    );
+    assert_eq!(row_count(&storage, &txn, fk_table), fk_before + 1);
+    let constraint_after: usize = constraint_tables
+        .iter()
+        .map(|&table| row_count(&storage, &txn, table))
+        .sum();
+    assert_eq!(
+        constraint_after,
+        constraint_before + 2,
+        "one CHECK, one DEFAULT"
+    );
+
+    let kinds = object_kinds_of(&storage, &txn, objects_table, child.id.0);
+    assert_eq!(
+        kinds,
+        vec![
+            ("C ".to_owned(), "ck_tbl015".to_owned()),
+            ("D ".to_owned(), "df_tbl015".to_owned()),
+            ("F ".to_owned(), "fk_tbl015".to_owned()),
+        ]
+    );
+    // The parent carries no constraint row of its own: its `PRIMARY KEY` is not one of the
+    // three kinds `sys.objects` gets a row for here (module documentation).
+    assert_eq!(
+        object_kinds_of(&storage, &txn, objects_table, parent.id.0),
+        Vec::new()
+    );
+}
+
+#[test]
+fn drop_constraint_then_drop_table_remove_the_rows_again() {
+    // The other half of the test above: what `CREATE TABLE` wrote,
+    // `ALTER TABLE … DROP CONSTRAINT` and `DROP TABLE` take back.
+    let (catalog, storage, txn) = instance();
+    let objects_table = tables_shaped(&storage, &objects_shape())
+        .pop()
+        .expect("one sys.objects table");
+    let fk_table = tables_shaped(&storage, &foreign_keys_shape())
+        .pop()
+        .expect("one sys.foreign_keys table");
+    let constraint_tables = tables_shaped(&storage, &constraint_shape());
+    let objects_before = row_count(&storage, &txn, objects_table);
+    let fk_before = row_count(&storage, &txn, fk_table);
+    let constraint_before: usize = constraint_tables
+        .iter()
+        .map(|&table| row_count(&storage, &txn, table))
+        .sum();
+
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let parent = catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl016_parent",
+                vec![column("id", SqlType::Int, None)],
+                vec![primary_key(&["id"])],
+            ),
+        )
+        .expect("the parent table");
+    let child = catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl016_child",
+                vec![
+                    column("id", SqlType::Int, None),
+                    column("amount", SqlType::Int, None),
+                    column("parent_id", SqlType::Int, None),
+                ],
+                vec![
+                    ConstraintDef::Check {
+                        name: Some("ck_tbl016".to_owned()),
+                        expr: integer("1"),
+                    },
+                    named_default("df_tbl016", "amount", "0"),
+                    foreign_key("fk_tbl016", &["parent_id"], "tbl016_parent", &["id"]),
+                ],
+            ),
+        )
+        .expect("the child table and its three constraints");
+    txn.commit(handle).expect("commit");
+
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    catalog
+        .alter_table(
+            &handle,
+            child.id,
+            &AlterTable::DropConstraint {
+                name: "ck_tbl016".to_owned(),
+            },
+        )
+        .expect("drop the CHECK");
+    txn.commit(handle).expect("commit");
+    assert_eq!(
+        object_kinds_of(&storage, &txn, objects_table, child.id.0),
+        vec![
+            ("D ".to_owned(), "df_tbl016".to_owned()),
+            ("F ".to_owned(), "fk_tbl016".to_owned()),
+        ],
+        "the CHECK's row is gone from sys.objects, the other two stay"
+    );
+
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    catalog.drop_table(&handle, child.id).expect("drop_table");
+    txn.commit(handle).expect("commit");
+
+    assert_eq!(
+        object_kinds_of(&storage, &txn, objects_table, child.id.0),
+        Vec::new(),
+        "DROP TABLE takes the remaining constraint rows with it"
+    );
+    assert_eq!(
+        row_count(&storage, &txn, objects_table),
+        objects_before + 1,
+        "the parent's own row is all that is left"
+    );
+    assert_eq!(row_count(&storage, &txn, fk_table), fk_before);
+    let constraint_after: usize = constraint_tables
+        .iter()
+        .map(|&table| row_count(&storage, &txn, table))
+        .sum();
+    assert_eq!(constraint_after, constraint_before);
+    assert!(object_kinds_of(&storage, &txn, objects_table, parent.id.0).is_empty());
 }
 
 #[test]
@@ -701,6 +970,109 @@ fn alter_drop_constraint_removes_foreign_key_rows() {
 }
 
 #[test]
+fn alter_table_add_check_constraint_writes_its_row() {
+    // The `ALTER TABLE … ADD CONSTRAINT` origin of a `CHECK`, alongside `CREATE TABLE`'s
+    // (`create_table_writes_a_row_per_kind_in_sys_objects_and_in_its_own_view`) and `DROP`'s
+    // (`drop_constraint_then_drop_table_remove_the_rows_again`).
+    let (catalog, storage, txn) = instance();
+    let objects_table = tables_shaped(&storage, &objects_shape())
+        .pop()
+        .expect("one sys.objects table");
+    let constraint_tables = tables_shaped(&storage, &constraint_shape());
+
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let target = catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl017_alter_check",
+                vec![column("amount", SqlType::Int, None)],
+                Vec::new(),
+            ),
+        )
+        .expect("create_table");
+    catalog
+        .alter_table(
+            &handle,
+            target.id,
+            &AlterTable::AddConstraint {
+                constraint: Box::new(ConstraintDef::Check {
+                    name: Some("ck_tbl017".to_owned()),
+                    expr: integer("1"),
+                }),
+            },
+        )
+        .expect("add check");
+    txn.commit(handle).expect("commit");
+
+    assert_eq!(
+        object_kinds_of(&storage, &txn, objects_table, target.id.0),
+        vec![("C ".to_owned(), "ck_tbl017".to_owned())]
+    );
+    let row = constraint_tables
+        .iter()
+        .flat_map(|&table| rows(&storage, &txn, table))
+        .find(|row| int_at(row, 4) == target.id.0)
+        .expect("the row of the CHECK");
+    assert_eq!(text_at(&row, 2), "ck_tbl017");
+    assert!(
+        !bit_at(&row, 7),
+        "a name was written, is_system_named is false"
+    );
+}
+
+#[test]
+fn alter_table_add_column_with_a_named_default_writes_its_row() {
+    // The `ALTER TABLE … ADD` origin of a `DEFAULT`, the only one served (a standalone `ADD
+    // DEFAULT … FOR col` is refused as not implemented yet): a named default written on the
+    // added column keeps its name instead of falling to the generated shape
+    // (`crates/vauban-catalog/src/alter.rs`, `plan_change`).
+    let (catalog, storage, txn) = instance();
+    let objects_table = tables_shaped(&storage, &objects_shape())
+        .pop()
+        .expect("one sys.objects table");
+    let constraint_tables = tables_shaped(&storage, &constraint_shape());
+
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let target = catalog
+        .create_table(
+            &handle,
+            &table(
+                "tbl018_alter_default",
+                vec![column("id", SqlType::Int, None)],
+                Vec::new(),
+            ),
+        )
+        .expect("create_table");
+    catalog
+        .alter_table(
+            &handle,
+            target.id,
+            &AlterTable::AddColumn {
+                column: Box::new(column("amount", SqlType::Int, Some(integer("7")))),
+                default_name: Some("df_tbl018".to_owned()),
+            },
+        )
+        .expect("add column with a named default");
+    txn.commit(handle).expect("commit");
+
+    assert_eq!(
+        object_kinds_of(&storage, &txn, objects_table, target.id.0),
+        vec![("D ".to_owned(), "df_tbl018".to_owned())]
+    );
+    let row = constraint_tables
+        .iter()
+        .flat_map(|&table| rows(&storage, &txn, table))
+        .find(|row| int_at(row, 4) == target.id.0)
+        .expect("the row of the DEFAULT");
+    assert_eq!(text_at(&row, 2), "df_tbl018");
+    assert!(
+        !bit_at(&row, 7),
+        "a name was written, is_system_named is false"
+    );
+}
+
+#[test]
 fn a_rolled_back_create_table_with_a_foreign_key_leaves_no_row() {
     let (catalog, storage, txn) = instance();
     let fk = fk_table(&storage);
@@ -792,5 +1164,12 @@ fn text_at(row: &[vauban_types::Value], position: usize) -> String {
     match row.get(position) {
         Some(vauban_types::Value::String(text)) => text.text.clone(),
         other => panic!("column {position} is not text: {other:?}"),
+    }
+}
+
+fn bit_at(row: &[vauban_types::Value], position: usize) -> bool {
+    match row.get(position) {
+        Some(vauban_types::Value::Bit(value)) => *value,
+        other => panic!("column {position} is not a bit: {other:?}"),
     }
 }
