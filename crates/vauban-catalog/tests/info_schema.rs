@@ -16,6 +16,112 @@ use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager};
 use vauban_types::{Len, SqlType, TypeInfo};
 
+/// The column names a `SELECT` text of `views/` publishes, in order: the last identifier of
+/// each comma-separated item.
+fn published_columns(definition: &str) -> Vec<String> {
+    definition
+        .split("\n  FROM ")
+        .next()
+        .expect("a FROM clause")
+        .trim_start_matches("SELECT ")
+        .split(",\n       ")
+        .map(|item| {
+            item.rsplit(' ')
+                .next()
+                .unwrap_or_else(|| panic!("{item} names its column"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The ordered column names of `INFORMATION_SCHEMA.ROUTINES` in SQL Server 2022.
+const PUBLISHED_ROUTINES_COLUMNS: [&str; 51] = [
+    "SPECIFIC_CATALOG",
+    "SPECIFIC_SCHEMA",
+    "SPECIFIC_NAME",
+    "ROUTINE_CATALOG",
+    "ROUTINE_SCHEMA",
+    "ROUTINE_NAME",
+    "ROUTINE_TYPE",
+    "MODULE_CATALOG",
+    "MODULE_SCHEMA",
+    "MODULE_NAME",
+    "UDT_CATALOG",
+    "UDT_SCHEMA",
+    "UDT_NAME",
+    "DATA_TYPE",
+    "CHARACTER_MAXIMUM_LENGTH",
+    "CHARACTER_OCTET_LENGTH",
+    "COLLATION_CATALOG",
+    "COLLATION_SCHEMA",
+    "COLLATION_NAME",
+    "CHARACTER_SET_CATALOG",
+    "CHARACTER_SET_SCHEMA",
+    "CHARACTER_SET_NAME",
+    "NUMERIC_PRECISION",
+    "NUMERIC_PRECISION_RADIX",
+    "NUMERIC_SCALE",
+    "DATETIME_PRECISION",
+    "INTERVAL_TYPE",
+    "INTERVAL_PRECISION",
+    "TYPE_UDT_CATALOG",
+    "TYPE_UDT_SCHEMA",
+    "TYPE_UDT_NAME",
+    "SCOPE_CATALOG",
+    "SCOPE_SCHEMA",
+    "SCOPE_NAME",
+    "MAXIMUM_CARDINALITY",
+    "DTD_IDENTIFIER",
+    "ROUTINE_BODY",
+    "ROUTINE_DEFINITION",
+    "EXTERNAL_NAME",
+    "EXTERNAL_LANGUAGE",
+    "PARAMETER_STYLE",
+    "IS_DETERMINISTIC",
+    "SQL_DATA_ACCESS",
+    "IS_NULL_CALL",
+    "SQL_PATH",
+    "SCHEMA_LEVEL_ROUTINE",
+    "MAX_DYNAMIC_RESULT_SETS",
+    "IS_USER_DEFINED_CAST",
+    "IS_IMPLICITLY_INVOCABLE",
+    "CREATED",
+    "LAST_ALTERED",
+];
+
+/// The ordered column names of `INFORMATION_SCHEMA.PARAMETERS`.
+const PUBLISHED_PARAMETERS_COLUMNS: [&str; 29] = [
+    "SPECIFIC_CATALOG",
+    "SPECIFIC_SCHEMA",
+    "SPECIFIC_NAME",
+    "ORDINAL_POSITION",
+    "PARAMETER_MODE",
+    "IS_RESULT",
+    "AS_LOCATOR",
+    "PARAMETER_NAME",
+    "DATA_TYPE",
+    "CHARACTER_MAXIMUM_LENGTH",
+    "CHARACTER_OCTET_LENGTH",
+    "COLLATION_CATALOG",
+    "COLLATION_SCHEMA",
+    "COLLATION_NAME",
+    "CHARACTER_SET_CATALOG",
+    "CHARACTER_SET_SCHEMA",
+    "CHARACTER_SET_NAME",
+    "NUMERIC_PRECISION",
+    "NUMERIC_PRECISION_RADIX",
+    "NUMERIC_SCALE",
+    "DATETIME_PRECISION",
+    "INTERVAL_TYPE",
+    "INTERVAL_PRECISION",
+    "USER_DEFINED_TYPE_CATALOG",
+    "USER_DEFINED_TYPE_SCHEMA",
+    "USER_DEFINED_TYPE_NAME",
+    "SCOPE_CATALOG",
+    "SCOPE_SCHEMA",
+    "SCOPE_NAME",
+];
+
 /// A bootstrapped catalogue over a fresh `MemoryStorage`, with its storage and its manager.
 fn instance() -> (Catalog, Arc<dyn Storage>, Arc<TransactionManager>) {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
@@ -119,6 +225,33 @@ fn the_bootstrap_creates_the_two_internal_tables_of_this_file() {
         // `the_two_internal_tables_hold_no_row_at_bootstrap`). SQL Server answers 0 to
         // `SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES` on a fresh database as well.
         assert_eq!(row_count(&storage, &txn, table), 0);
+    }
+}
+
+#[test]
+fn info_schema_routines_and_parameters_shape() {
+    // `ROUTINES` and `PARAMETERS` have no internal table of their own worth reaching by
+    // shape (module documentation, `src/views/info_schema.rs`, section "`ROUTINES` and
+    // `PARAMETERS`, entirely literal"): their column names are read from the view text
+    // `CatalogSnapshot::view_definition` hands back instead.
+    let (catalog, _storage, txn) = instance();
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = catalog.snapshot(&handle);
+    for (name, published) in [
+        ("ROUTINES", &PUBLISHED_ROUTINES_COLUMNS[..]),
+        ("PARAMETERS", &PUBLISHED_PARAMETERS_COLUMNS[..]),
+    ] {
+        let object = snapshot
+            .resolve_object("master", Some("INFORMATION_SCHEMA"), name, "dbo")
+            .unwrap_or_else(|| panic!("INFORMATION_SCHEMA.{name} resolves"));
+        let definition = snapshot
+            .view_definition(object.id)
+            .unwrap_or_else(|| panic!("INFORMATION_SCHEMA.{name} carries a definition"));
+        assert!(
+            !definition.to_ascii_uppercase().contains("JOIN"),
+            "INFORMATION_SCHEMA.{name}: {definition}"
+        );
+        assert_eq!(published_columns(definition), published, "{name}");
     }
 }
 

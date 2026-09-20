@@ -1,13 +1,17 @@
-//! `INFORMATION_SCHEMA.TABLES`, `INFORMATION_SCHEMA.COLUMNS` and `INFORMATION_SCHEMA.SCHEMATA`.
+//! `INFORMATION_SCHEMA.TABLES`, `INFORMATION_SCHEMA.COLUMNS`, `INFORMATION_SCHEMA.SCHEMATA`,
+//! `INFORMATION_SCHEMA.ROUTINES` and `INFORMATION_SCHEMA.PARAMETERS`.
 //!
 //! # The shape of the views
 //!
-//! The column list of each of the three views — names, order, types — is the one SQL Server
-//! 2022 publishes: 4, 23 and 6 columns. The unit tests below freeze the three vectors of
-//! names and compare them with the text this file builds
+//! The column list of each of the first three views — names, order, types — is the one SQL
+//! Server 2022 publishes: 4, 23 and 6 columns. The unit tests below freeze the three vectors
+//! of names and compare them with the text this file builds
 //! (`information_schema_tables_columns_match_the_published_list` and its two neighbours),
 //! and the nullability declared on each internal column is the published nullability of the
-//! view column it feeds (`the_declared_nullability_is_the_published_one`).
+//! view column it feeds (`the_declared_nullability_is_the_published_one`). `ROUTINES` (51
+//! columns) and `PARAMETERS` (29) are described the same way, the column list frozen by
+//! `information_schema_routines_and_parameters_shape` (section "`ROUTINES` and `PARAMETERS`,
+//! read bare" below).
 //!
 //! # Two internal tables, and the table of the schemas for the third view
 //!
@@ -30,6 +34,18 @@
 //! definition filters on `database_id = DB_ID()`, as the other files of `views/` do. A
 //! database a client creates receives the three schemas of `SYSTEM_SCHEMAS` from
 //! `database.rs`, so `SCHEMATA` answers there too.
+//!
+//! # `ROUTINES` and `PARAMETERS`, read bare
+//!
+//! No `CREATE PROCEDURE` is served, the same reason `views/sys_routines.rs` gives for
+//! `sys.procedures`, `sql_modules` and `sys.parameters`. [`ROUTINES_TABLE`] and
+//! [`PARAMETERS_TABLE`] therefore carry no row, but every published column is declared on the
+//! table and read by name rather than written as a `CAST` literal: a literal read back
+//! through a system view answers the nullable TDS token (`bitn`, `datetimen`) instead of the
+//! fixed one a `NOT NULL` declaration would carry, where a bare read of a declared column
+//! does not have that problem (`views/sys_routines.rs`, section "Why a real column and not a
+//! literal"). Declaring the column is the shape this file already uses for [`TABLES_TABLE`]
+//! and [`COLUMNS_TABLE`], kept here for the two new tables too.
 //!
 //! # Read columns and literal columns
 //!
@@ -112,7 +128,15 @@ pub(crate) const TABLES_TABLE: &str = "vauban_is_tables";
 /// Internal table of the columns, read by `INFORMATION_SCHEMA.COLUMNS`.
 pub(crate) const COLUMNS_TABLE: &str = "vauban_is_columns";
 
-/// The schema the three views of this file live in, created by the bootstrap in each database.
+/// Internal table behind `INFORMATION_SCHEMA.ROUTINES`: `database_id` and the 51 published
+/// columns, no `CREATE PROCEDURE` served so no row ever written (section "`ROUTINES` and
+/// `PARAMETERS`, read bare").
+pub(crate) const ROUTINES_TABLE: &str = "vauban_is_routines";
+
+/// Internal table behind `INFORMATION_SCHEMA.PARAMETERS`. See [`ROUTINES_TABLE`].
+pub(crate) const PARAMETERS_TABLE: &str = "vauban_is_parameters";
+
+/// The schema the five views of this file live in, created by the bootstrap in each database.
 const VIEW_SCHEMA: &str = "INFORMATION_SCHEMA";
 
 /// The type of a `sysname` column, `nvarchar(128)`.
@@ -260,12 +284,484 @@ const SCHEMATA_VIEW: [(&str, &str); 6] = [
     ),
 ];
 
+/// The published columns of `INFORMATION_SCHEMA.ROUTINES`: `(published name, internal
+/// column, type, nullable)`, in the published order. No `CREATE PROCEDURE` is served, so
+/// [`ROUTINES_TABLE`] carries no row, but each column is declared on it and read bare rather
+/// than written as a literal (`views/sys_routines.rs`, section "Why a real column and not a
+/// literal"). The internal names are the lower-case published ones, as
+/// [`tables_table_columns`] and [`columns_table_columns`] already do; [`PARAMETERS_COLUMNS`]
+/// is a table of its own, so the two column lists do not have to differ where the published
+/// names happen to match (`COLLATION_NAME` and its neighbours).
+const ROUTINES_COLUMNS: [(&str, &str, SqlType, bool); 51] = [
+    (
+        "SPECIFIC_CATALOG",
+        "specific_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SPECIFIC_SCHEMA",
+        "specific_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SPECIFIC_NAME",
+        "specific_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        false,
+    ),
+    (
+        "ROUTINE_CATALOG",
+        "routine_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "ROUTINE_SCHEMA",
+        "routine_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "ROUTINE_NAME",
+        "routine_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        false,
+    ),
+    (
+        "ROUTINE_TYPE",
+        "routine_type",
+        SqlType::NVarChar(Len::Fixed(20)),
+        true,
+    ),
+    (
+        "MODULE_CATALOG",
+        "module_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "MODULE_SCHEMA",
+        "module_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "MODULE_NAME",
+        "module_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "UDT_CATALOG",
+        "udt_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "UDT_SCHEMA",
+        "udt_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "UDT_NAME",
+        "udt_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "DATA_TYPE",
+        "data_type",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "CHARACTER_MAXIMUM_LENGTH",
+        "character_maximum_length",
+        SqlType::Int,
+        true,
+    ),
+    (
+        "CHARACTER_OCTET_LENGTH",
+        "character_octet_length",
+        SqlType::Int,
+        true,
+    ),
+    (
+        "COLLATION_CATALOG",
+        "collation_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "COLLATION_SCHEMA",
+        "collation_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "COLLATION_NAME",
+        "collation_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "CHARACTER_SET_CATALOG",
+        "character_set_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "CHARACTER_SET_SCHEMA",
+        "character_set_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "CHARACTER_SET_NAME",
+        "character_set_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "NUMERIC_PRECISION",
+        "numeric_precision",
+        SqlType::TinyInt,
+        true,
+    ),
+    (
+        "NUMERIC_PRECISION_RADIX",
+        "numeric_precision_radix",
+        SqlType::SmallInt,
+        true,
+    ),
+    ("NUMERIC_SCALE", "numeric_scale", SqlType::Int, true),
+    (
+        "DATETIME_PRECISION",
+        "datetime_precision",
+        SqlType::SmallInt,
+        true,
+    ),
+    (
+        "INTERVAL_TYPE",
+        "interval_type",
+        SqlType::NVarChar(Len::Fixed(30)),
+        true,
+    ),
+    (
+        "INTERVAL_PRECISION",
+        "interval_precision",
+        SqlType::SmallInt,
+        true,
+    ),
+    (
+        "TYPE_UDT_CATALOG",
+        "type_udt_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "TYPE_UDT_SCHEMA",
+        "type_udt_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "TYPE_UDT_NAME",
+        "type_udt_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SCOPE_CATALOG",
+        "scope_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SCOPE_SCHEMA",
+        "scope_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SCOPE_NAME",
+        "scope_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "MAXIMUM_CARDINALITY",
+        "maximum_cardinality",
+        SqlType::BigInt,
+        true,
+    ),
+    (
+        "DTD_IDENTIFIER",
+        "dtd_identifier",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "ROUTINE_BODY",
+        "routine_body",
+        SqlType::NVarChar(Len::Fixed(30)),
+        true,
+    ),
+    (
+        "ROUTINE_DEFINITION",
+        "routine_definition",
+        SqlType::NVarChar(Len::Fixed(4000)),
+        true,
+    ),
+    (
+        "EXTERNAL_NAME",
+        "external_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "EXTERNAL_LANGUAGE",
+        "external_language",
+        SqlType::NVarChar(Len::Fixed(30)),
+        true,
+    ),
+    (
+        "PARAMETER_STYLE",
+        "parameter_style",
+        SqlType::NVarChar(Len::Fixed(30)),
+        true,
+    ),
+    (
+        "IS_DETERMINISTIC",
+        "is_deterministic",
+        SqlType::NVarChar(Len::Fixed(10)),
+        true,
+    ),
+    (
+        "SQL_DATA_ACCESS",
+        "sql_data_access",
+        SqlType::NVarChar(Len::Fixed(30)),
+        true,
+    ),
+    (
+        "IS_NULL_CALL",
+        "is_null_call",
+        SqlType::NVarChar(Len::Fixed(10)),
+        true,
+    ),
+    (
+        "SQL_PATH",
+        "sql_path",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SCHEMA_LEVEL_ROUTINE",
+        "schema_level_routine",
+        SqlType::NVarChar(Len::Fixed(10)),
+        true,
+    ),
+    (
+        "MAX_DYNAMIC_RESULT_SETS",
+        "max_dynamic_result_sets",
+        SqlType::SmallInt,
+        true,
+    ),
+    (
+        "IS_USER_DEFINED_CAST",
+        "is_user_defined_cast",
+        SqlType::NVarChar(Len::Fixed(10)),
+        true,
+    ),
+    (
+        "IS_IMPLICITLY_INVOCABLE",
+        "is_implicitly_invocable",
+        SqlType::NVarChar(Len::Fixed(10)),
+        true,
+    ),
+    ("CREATED", "created", SqlType::DateTime, false),
+    ("LAST_ALTERED", "last_altered", SqlType::DateTime, false),
+];
+
+/// The published columns of `INFORMATION_SCHEMA.PARAMETERS`, in the published order. See
+/// [`ROUTINES_COLUMNS`].
+const PARAMETERS_COLUMNS: [(&str, &str, SqlType, bool); 29] = [
+    (
+        "SPECIFIC_CATALOG",
+        "specific_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SPECIFIC_SCHEMA",
+        "specific_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SPECIFIC_NAME",
+        "specific_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        false,
+    ),
+    ("ORDINAL_POSITION", "ordinal_position", SqlType::Int, false),
+    (
+        "PARAMETER_MODE",
+        "parameter_mode",
+        SqlType::NVarChar(Len::Fixed(10)),
+        true,
+    ),
+    (
+        "IS_RESULT",
+        "is_result",
+        SqlType::NVarChar(Len::Fixed(10)),
+        true,
+    ),
+    (
+        "AS_LOCATOR",
+        "as_locator",
+        SqlType::NVarChar(Len::Fixed(10)),
+        true,
+    ),
+    (
+        "PARAMETER_NAME",
+        "parameter_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "DATA_TYPE",
+        "data_type",
+        SqlType::NVarChar(Len::Fixed(128)),
+        false,
+    ),
+    (
+        "CHARACTER_MAXIMUM_LENGTH",
+        "character_maximum_length",
+        SqlType::Int,
+        true,
+    ),
+    (
+        "CHARACTER_OCTET_LENGTH",
+        "character_octet_length",
+        SqlType::Int,
+        true,
+    ),
+    (
+        "COLLATION_CATALOG",
+        "collation_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "COLLATION_SCHEMA",
+        "collation_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "COLLATION_NAME",
+        "collation_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "CHARACTER_SET_CATALOG",
+        "character_set_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "CHARACTER_SET_SCHEMA",
+        "character_set_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "CHARACTER_SET_NAME",
+        "character_set_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "NUMERIC_PRECISION",
+        "numeric_precision",
+        SqlType::TinyInt,
+        true,
+    ),
+    (
+        "NUMERIC_PRECISION_RADIX",
+        "numeric_precision_radix",
+        SqlType::SmallInt,
+        true,
+    ),
+    ("NUMERIC_SCALE", "numeric_scale", SqlType::Int, true),
+    (
+        "DATETIME_PRECISION",
+        "datetime_precision",
+        SqlType::SmallInt,
+        true,
+    ),
+    (
+        "INTERVAL_TYPE",
+        "interval_type",
+        SqlType::NVarChar(Len::Fixed(30)),
+        true,
+    ),
+    (
+        "INTERVAL_PRECISION",
+        "interval_precision",
+        SqlType::SmallInt,
+        true,
+    ),
+    (
+        "USER_DEFINED_TYPE_CATALOG",
+        "user_defined_type_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "USER_DEFINED_TYPE_SCHEMA",
+        "user_defined_type_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "USER_DEFINED_TYPE_NAME",
+        "user_defined_type_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SCOPE_CATALOG",
+        "scope_catalog",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SCOPE_SCHEMA",
+        "scope_schema",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+    (
+        "SCOPE_NAME",
+        "scope_name",
+        SqlType::NVarChar(Len::Fixed(128)),
+        true,
+    ),
+];
+
 /// The internal tables this file describes: the tables and the columns.
 ///
-/// The bootstrap creates them in `master`, with their views. Their `rows` are empty: the rows of a
+/// The bootstrap creates them in `master`, with their views. Their `rows` start empty: the rows of a
 /// user table are built from the `*Meta` of the catalogue by [`table_rows`] and [`column_rows`].
 /// The third view, `SCHEMATA`, reads the table of the schemas of `bootstrap.rs` and travels with
-/// [`TABLES_TABLE`] (module documentation).
+/// [`TABLES_TABLE`] (module documentation). [`ROUTINES_TABLE`] and [`PARAMETERS_TABLE`] have no
+/// row writer (module documentation, section "`ROUTINES` and `PARAMETERS`, read bare").
 pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
     vec![
         InternalTableDef {
@@ -295,7 +791,56 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
                 &definition(&COLUMNS_VIEW, COLUMNS_TABLE, Some("database_id = DB_ID()")),
             ),
         },
+        InternalTableDef {
+            name: ROUTINES_TABLE.to_owned(),
+            columns: wide_table_columns(&ROUTINES_COLUMNS),
+            clustered_key: None,
+            rows: Vec::new(),
+            views: views_of(
+                "ROUTINES",
+                &definition(
+                    &view_items(&ROUTINES_COLUMNS),
+                    ROUTINES_TABLE,
+                    Some("database_id = DB_ID()"),
+                ),
+            ),
+        },
+        InternalTableDef {
+            name: PARAMETERS_TABLE.to_owned(),
+            columns: wide_table_columns(&PARAMETERS_COLUMNS),
+            clustered_key: None,
+            rows: Vec::new(),
+            views: views_of(
+                "PARAMETERS",
+                &definition(
+                    &view_items(&PARAMETERS_COLUMNS),
+                    PARAMETERS_TABLE,
+                    Some("database_id = DB_ID()"),
+                ),
+            ),
+        },
     ]
+}
+
+/// The columns of [`ROUTINES_TABLE`] or [`PARAMETERS_TABLE`]: `database_id`, the filter of
+/// its view, then the published columns of `published` in order.
+fn wide_table_columns(published: &[(&str, &str, SqlType, bool)]) -> Vec<InternalColumnDef> {
+    let mut columns = vec![column("database_id", SqlType::Int, false)];
+    columns.extend(
+        published
+            .iter()
+            .map(|&(_, name, ty, nullable)| column(name, ty, nullable)),
+    );
+    columns
+}
+
+/// The `(published name, internal column)` pairs [`definition`] needs, read off
+/// [`ROUTINES_COLUMNS`] or [`PARAMETERS_COLUMNS`].
+fn view_items<'a>(published: &'a [(&'a str, &'a str, SqlType, bool)]) -> Vec<(&'a str, &'a str)> {
+    published
+        .iter()
+        .map(|&(published, internal, _, _)| (published, internal))
+        .collect()
 }
 
 /// The rows of [`TABLES_TABLE`]: one per table, of type [`BASE_TABLE_TYPE`].
@@ -667,6 +1212,94 @@ mod tests {
         "DEFAULT_CHARACTER_SET_CATALOG",
         "DEFAULT_CHARACTER_SET_SCHEMA",
         "DEFAULT_CHARACTER_SET_NAME",
+    ];
+
+    /// The ordered column names of `INFORMATION_SCHEMA.ROUTINES`.
+    const PUBLISHED_ROUTINES_COLUMNS: [&str; 51] = [
+        "SPECIFIC_CATALOG",
+        "SPECIFIC_SCHEMA",
+        "SPECIFIC_NAME",
+        "ROUTINE_CATALOG",
+        "ROUTINE_SCHEMA",
+        "ROUTINE_NAME",
+        "ROUTINE_TYPE",
+        "MODULE_CATALOG",
+        "MODULE_SCHEMA",
+        "MODULE_NAME",
+        "UDT_CATALOG",
+        "UDT_SCHEMA",
+        "UDT_NAME",
+        "DATA_TYPE",
+        "CHARACTER_MAXIMUM_LENGTH",
+        "CHARACTER_OCTET_LENGTH",
+        "COLLATION_CATALOG",
+        "COLLATION_SCHEMA",
+        "COLLATION_NAME",
+        "CHARACTER_SET_CATALOG",
+        "CHARACTER_SET_SCHEMA",
+        "CHARACTER_SET_NAME",
+        "NUMERIC_PRECISION",
+        "NUMERIC_PRECISION_RADIX",
+        "NUMERIC_SCALE",
+        "DATETIME_PRECISION",
+        "INTERVAL_TYPE",
+        "INTERVAL_PRECISION",
+        "TYPE_UDT_CATALOG",
+        "TYPE_UDT_SCHEMA",
+        "TYPE_UDT_NAME",
+        "SCOPE_CATALOG",
+        "SCOPE_SCHEMA",
+        "SCOPE_NAME",
+        "MAXIMUM_CARDINALITY",
+        "DTD_IDENTIFIER",
+        "ROUTINE_BODY",
+        "ROUTINE_DEFINITION",
+        "EXTERNAL_NAME",
+        "EXTERNAL_LANGUAGE",
+        "PARAMETER_STYLE",
+        "IS_DETERMINISTIC",
+        "SQL_DATA_ACCESS",
+        "IS_NULL_CALL",
+        "SQL_PATH",
+        "SCHEMA_LEVEL_ROUTINE",
+        "MAX_DYNAMIC_RESULT_SETS",
+        "IS_USER_DEFINED_CAST",
+        "IS_IMPLICITLY_INVOCABLE",
+        "CREATED",
+        "LAST_ALTERED",
+    ];
+
+    /// The ordered column names of `INFORMATION_SCHEMA.PARAMETERS`.
+    const PUBLISHED_PARAMETERS_COLUMNS: [&str; 29] = [
+        "SPECIFIC_CATALOG",
+        "SPECIFIC_SCHEMA",
+        "SPECIFIC_NAME",
+        "ORDINAL_POSITION",
+        "PARAMETER_MODE",
+        "IS_RESULT",
+        "AS_LOCATOR",
+        "PARAMETER_NAME",
+        "DATA_TYPE",
+        "CHARACTER_MAXIMUM_LENGTH",
+        "CHARACTER_OCTET_LENGTH",
+        "COLLATION_CATALOG",
+        "COLLATION_SCHEMA",
+        "COLLATION_NAME",
+        "CHARACTER_SET_CATALOG",
+        "CHARACTER_SET_SCHEMA",
+        "CHARACTER_SET_NAME",
+        "NUMERIC_PRECISION",
+        "NUMERIC_PRECISION_RADIX",
+        "NUMERIC_SCALE",
+        "DATETIME_PRECISION",
+        "INTERVAL_TYPE",
+        "INTERVAL_PRECISION",
+        "USER_DEFINED_TYPE_CATALOG",
+        "USER_DEFINED_TYPE_SCHEMA",
+        "USER_DEFINED_TYPE_NAME",
+        "SCOPE_CATALOG",
+        "SCOPE_SCHEMA",
+        "SCOPE_NAME",
     ];
 
     /// `(view, internal column, nullable)` as `sys.dm_exec_describe_first_result_set` publishes
@@ -1133,6 +1766,8 @@ mod tests {
                 column("name", SYSNAME, false),
                 column("principal_id", SqlType::Int, true),
             ],
+            "ROUTINES" => wide_table_columns(&ROUTINES_COLUMNS),
+            "PARAMETERS" => wide_table_columns(&PARAMETERS_COLUMNS),
             other => panic!("{other} is not a view of this file"),
         }
     }
@@ -1227,6 +1862,37 @@ mod tests {
             published_columns(&definition_of("SCHEMATA")),
             PUBLISHED_SCHEMATA_COLUMNS
         );
+    }
+
+    #[test]
+    fn information_schema_routines_and_parameters_shape() {
+        assert_eq!(
+            published_columns(&definition_of("ROUTINES")),
+            PUBLISHED_ROUTINES_COLUMNS
+        );
+        assert_eq!(
+            published_columns(&definition_of("PARAMETERS")),
+            PUBLISHED_PARAMETERS_COLUMNS
+        );
+        // Counter-proof: a column missing from the text would shorten the vector rather than
+        // leave a hole, so a mismatched length alone would not show which index moved.
+        assert_eq!(select_items(&definition_of("ROUTINES")).len(), 51);
+        assert_eq!(select_items(&definition_of("PARAMETERS")).len(), 29);
+    }
+
+    #[test]
+    fn every_column_of_routines_and_parameters_is_read_bare() {
+        // No `CAST` item: every published column is declared on the internal table and read
+        // by name (module documentation, section "`ROUTINES` and `PARAMETERS`, read bare"),
+        // the reason `views/sys_routines.rs` gives for its own three views.
+        for view in ["ROUTINES", "PARAMETERS"] {
+            for (expression, column) in select_items(&definition_of(view)) {
+                assert!(
+                    !expression.contains("CAST("),
+                    "INFORMATION_SCHEMA.{view}.{column}: {expression}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1365,7 +2031,10 @@ mod tests {
         // The 13 items that read no internal column, sorted by view then column: the three
         // `DB_NAME()` (`TABLE_CATALOG` in two views, `CATALOG_NAME` in the third), the nine
         // `NULL`s and the `iso_1` of `SCHEMATA`. Their values are the ones the module
-        // documentation lists.
+        // documentation lists. `ROUTINES` and `PARAMETERS` read every published column bare,
+        // the design `views/sys_routines.rs` also follows, so none of their items join this
+        // enumeration (counter-proof:
+        // `every_column_of_routines_and_parameters_is_read_bare`).
         let mut literals: Vec<(String, String, String)> = Vec::new();
         for (view, definition) in definitions() {
             let read: Vec<String> = columns_of(&view)
@@ -1434,7 +2103,7 @@ mod tests {
                 ));
             }
         }
-        for wanted in ["TABLES", "COLUMNS", "SCHEMATA"] {
+        for wanted in ["TABLES", "COLUMNS", "SCHEMATA", "ROUTINES", "PARAMETERS"] {
             let installed: Vec<&(String, String, String, String)> = copies
                 .iter()
                 .filter(|(name, _, _, _)| name == wanted)
@@ -1459,7 +2128,7 @@ mod tests {
                 "the four copies of {wanted} share their text: {texts:?}"
             );
         }
-        assert_eq!(copies.len(), 3 * SYSTEM_DATABASES.len());
+        assert_eq!(copies.len(), 5 * SYSTEM_DATABASES.len());
     }
 
     #[test]

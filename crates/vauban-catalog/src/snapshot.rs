@@ -564,7 +564,7 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
 ///
 /// The order is the one `installed_system_views` of `views/sys_extra.rs` numbers its rows of
 /// `vauban_sys_all_objects` in, so that the identifier of a view is the same on the two
-/// sides (unit test `system_view_ids_match_sys_all_objects`): the five files of `views/`
+/// sides (unit test `system_view_ids_match_sys_all_objects`): the six files of `views/`
 /// other than
 /// `sys_extra.rs`, in the order `views::internal_tables()` lists them, then the two views of
 /// the tables of the bootstrap (`views::sys_core::bootstrap_views`, which `bootstrap.rs` reads
@@ -573,14 +573,15 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
 /// follow the new ones (module documentation, section "The identifiers of the system views
 /// are the rows of `sys.all_objects`").
 fn described_views() -> Vec<SystemViewDef> {
-    let of_the_five_files = [
+    let of_the_six_files = [
         views::sys_tables::internal_tables(),
         views::sys_core::internal_tables(),
         views::sys_indexes::internal_tables(),
         views::info_schema::internal_tables(),
         views::sys_constraints::internal_tables(),
+        views::sys_routines::internal_tables(),
     ];
-    let mut described: Vec<SystemViewDef> = of_the_five_files
+    let mut described: Vec<SystemViewDef> = of_the_six_files
         .into_iter()
         .flatten()
         .flat_map(|table| table.views)
@@ -1035,6 +1036,32 @@ mod tests {
         );
     }
 
+    /// The number of distinct system views [`described_views`] describes, deduced from
+    /// [`views::internal_tables`] instead of a literal a change to `views/` has to find and
+    /// edit by hand: the distinct `(schema, name)` pairs `views::internal_tables()` carries —
+    /// every file of `views/` except the two views `bootstrap.rs` owns, `sys.databases` and
+    /// `sys.schemas` — plus those two.
+    ///
+    /// Counter-proof: a file registered in [`described_views`] (or in
+    /// `views/sys_extra.rs`, `installed_system_views`) without being registered in
+    /// `views::internal_tables()`, or the reverse, moves this count away from `names.len()`
+    /// below and turns the test red, where a literal would stay silently short.
+    fn distinct_system_view_count() -> usize {
+        let mut names: Vec<(String, String)> = views::internal_tables()
+            .into_iter()
+            .flat_map(|table| table.views)
+            .map(|view| {
+                (
+                    view.name.schema.to_ascii_lowercase(),
+                    view.name.name.to_ascii_lowercase(),
+                )
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names.len() + 2 // `sys.databases` and `sys.schemas`, owned by `bootstrap.rs`
+    }
+
     #[test]
     fn the_described_views_are_those_of_the_files() {
         let described = described_views();
@@ -1043,18 +1070,11 @@ mod tests {
             .iter()
             .map(|object| format!("{}.{}", object.name.schema, object.name.name))
             .collect();
-        // `views/sys_tables.rs` is read first, then `views/sys_core.rs`; the two views of the
-        // tables of the bootstrap sit at ranks 16 and 17, before the seven of
-        // `views/sys_extra.rs`, which are the last described.
+        // `views/sys_tables.rs` is read first, then `views/sys_core.rs`.
         let leading: Vec<&String> = names.iter().take(4).collect();
         assert_eq!(
             leading,
             vec!["sys.objects", "sys.tables", "sys.columns", "sys.types"]
-        );
-        assert_eq!(
-            names.get(15..17),
-            Some(["sys.databases".to_owned(), "sys.schemas".to_owned()].as_slice()),
-            "-16 and -17, as the rows of `vauban_sys_all_objects` number them"
         );
         let trailing: Vec<&String> = names.iter().rev().take(8).collect();
         assert_eq!(
@@ -1070,18 +1090,21 @@ mod tests {
                 "sys.database_files",
             ]
         );
-        // The seven files of `views/` are filled, for 30 distinct names, each described once per
-        // system database, which is what the `views_of` of those files does: 120 descriptions.
+        // The files of `views/` are filled, each name described once per system database,
+        // which is what the `views_of` of those files does.
         assert_eq!(described.len(), names.len() * SYSTEM_DATABASES.len());
         assert_eq!(named_once(&names), names, "a name is described twice");
-        assert_eq!(names.len(), 30);
-        assert_eq!(described.len(), 120);
-        // The identifiers are negative and run from -1 without a hole, so two views of the
-        // 29 do not share one: the rank rule numbers the distinct names (module
-        // documentation, section "The identifiers of the system views are the rows of
-        // `sys.all_objects`").
+        assert_eq!(
+            names.len(),
+            distinct_system_view_count(),
+            "a file of `views/` is registered in `described_views` without being registered \
+             in `views::internal_tables()`, or the reverse"
+        );
+        // The identifiers are negative and run from -1 without a hole, so two views do not
+        // share one: the rank rule numbers the distinct names (module documentation, section
+        // "The identifiers of the system views are the rows of `sys.all_objects`").
         let ids: Vec<i32> = objects.iter().map(|object| object.id.0).collect();
-        let by_rank: Vec<i32> = (1..=i32::try_from(names.len()).expect("29 fits in an i32"))
+        let by_rank: Vec<i32> = (1..=i32::try_from(names.len()).expect("fits in an i32"))
             .map(|rank| -rank)
             .collect();
         assert_eq!(ids, by_rank);
@@ -1113,7 +1136,11 @@ mod tests {
             .collect();
         let of_the_rows = described_system_view_rows();
         assert_eq!(of_the_snapshot, of_the_rows);
-        assert_eq!(of_the_snapshot.len(), 30, "{of_the_snapshot:?}");
+        assert_eq!(
+            of_the_snapshot.len(),
+            distinct_system_view_count(),
+            "{of_the_snapshot:?}"
+        );
         // Counter-proof that the comparison reads something: the rows are there, negative,
         // and the first of them is the one of `sys.objects`.
         assert_eq!(
@@ -1123,7 +1150,7 @@ mod tests {
         );
         assert_eq!(
             of_the_rows.last().map(|&(id, _, _)| id),
-            Some(-30),
+            Some(-i32::try_from(distinct_system_view_count()).expect("fits in an i32")),
             "{of_the_rows:?}"
         );
     }

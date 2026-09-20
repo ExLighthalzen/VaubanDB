@@ -104,7 +104,9 @@ use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 use crate::bootstrap::{DATABASES_TABLE, SCHEMAS_TABLE, SYSTEM_DATABASES, SYSTEM_SCHEMAS};
 use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
 use crate::meta::{QualifiedName, TableMeta};
-use crate::views::{dm_exec, info_schema, sys_constraints, sys_core, sys_indexes, sys_tables};
+use crate::views::{
+    dm_exec, info_schema, sys_constraints, sys_core, sys_indexes, sys_routines, sys_tables,
+};
 
 /// Internal table of the objects of a database, system views included, read by
 /// `sys.all_objects` and `sys.views`.
@@ -644,7 +646,7 @@ fn own_views() -> Vec<SystemViewDef> {
 ///
 /// A view is installed in each of the four system databases under the same name, so the list
 /// keeps the first copy of each `(schema, name)` pair: a row of [`ALL_OBJECTS_TABLE`] whose
-/// `database_id` is `NULL` stands for the four (module documentation). The other five files
+/// `database_id` is `NULL` stands for the four (module documentation). The other six files
 /// are read through their own `internal_tables()`, which this one does not call on itself —
 /// `own` is what [`own_views`] built — and `sys.databases` / `sys.schemas` through
 /// [`crate::views::sys_core::bootstrap_views`], those two views being carried by the tables
@@ -657,6 +659,7 @@ fn installed_system_views(own: &[SystemViewDef]) -> Vec<QualifiedName> {
         sys_indexes::internal_tables(),
         info_schema::internal_tables(),
         sys_constraints::internal_tables(),
+        sys_routines::internal_tables(),
     ];
     let of_the_bootstrap = [
         sys_core::bootstrap_views(DATABASES_TABLE),

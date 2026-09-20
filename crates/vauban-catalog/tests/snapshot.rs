@@ -68,7 +68,7 @@ fn text(value: &str) -> Value {
 /// `the_internal_tables_are_numbered_from_their_position` of `src/snapshot.rs`, which is where
 /// `bootstrap::internal_table_defs` is reachable; here it is written out, so that a table
 /// added to `views/` is added to this list too.
-const INTERNAL_TABLES: [&str; 23] = [
+const INTERNAL_TABLES: [&str; 28] = [
     "vauban_sys_objects",
     "vauban_sys_columns",
     "vauban_sys_types",
@@ -78,6 +78,8 @@ const INTERNAL_TABLES: [&str; 23] = [
     "vauban_sys_identity_columns",
     "vauban_is_tables",
     "vauban_is_columns",
+    "vauban_is_routines",
+    "vauban_is_parameters",
     "vauban_sys_foreign_keys",
     "vauban_sys_foreign_key_columns",
     "vauban_sys_check_constraints",
@@ -90,6 +92,9 @@ const INTERNAL_TABLES: [&str; 23] = [
     "vauban_sys_extended_properties",
     "vauban_sys_configurations",
     "vauban_sys_os_info",
+    "vauban_sys_procedures",
+    "vauban_sys_sql_modules",
+    "vauban_sys_parameters",
     "vauban_sys_databases",
     "vauban_sys_schemas",
 ];
@@ -969,7 +974,11 @@ fn system_view_ids_are_the_negative_ones_of_sys_all_objects() {
     let snapshot = catalog.snapshot(&handle);
 
     // `views/sys_tables.rs` is read first, then `views/sys_core.rs`, and the two views of the
-    // tables of the bootstrap sit at -16 and -17, before the seven of `views/sys_extra.rs`.
+    // tables of the bootstrap sit at -21 and -22, before the seven of `views/sys_extra.rs`
+    // (module documentation of `src/snapshot.rs`, section "The identifiers of the system
+    // views are the rows of `sys.all_objects`": a view added to any of the files ahead of the
+    // bootstrap pair moves these ranks, most recently the three of `views/sys_routines.rs` and
+    // the two `ROUTINES` / `PARAMETERS` of `views/info_schema.rs`).
     let ranked: Vec<(ObjectId, &str)> = [
         "objects",
         "tables",
@@ -990,10 +999,10 @@ fn system_view_ids_are_the_negative_ones_of_sys_all_objects() {
             (ObjectId(-2), "tables"),
             (ObjectId(-3), "columns"),
             (ObjectId(-4), "types"),
-            (ObjectId(-16), "databases"),
-            (ObjectId(-17), "schemas"),
-            (ObjectId(-18), "all_objects"),
-            (ObjectId(-24), "master_files"),
+            (ObjectId(-21), "databases"),
+            (ObjectId(-22), "schemas"),
+            (ObjectId(-23), "all_objects"),
+            (ObjectId(-29), "master_files"),
         ]
     );
     // Two snapshots of two transactions give the same identifiers: the rank is read from the
@@ -1184,10 +1193,9 @@ fn vauban_sys_databases_resolves_to_a_table_with_its_columns() {
 
 #[test]
 fn every_described_internal_table_resolves() {
-    // The twenty-two tables of `INTERNAL_TABLES`, each resolved from `master`: twenty-two tables,
-    // twenty-two identifiers, numbered from 100_000 by the position of the description
-    // (`src/snapshot.rs`). A user table of the same catalogue carries none of those
-    // identifiers.
+    // The tables of `INTERNAL_TABLES`, each resolved from `master`: as many identifiers as
+    // tables, numbered from 100_000 by the position of the description (`src/snapshot.rs`). A
+    // user table of the same catalogue carries none of those identifiers.
     let (catalog, manager) = instance();
     database(&catalog, &manager, "d");
     let user_in_d = table(&catalog, &manager, &def("d", "dbo", "t"));
@@ -1218,16 +1226,17 @@ fn every_described_internal_table_resolves() {
         })
         .collect();
     assert_eq!(resolved, numbered, "numbered by the position of the table");
-    // Distinct from one another and from the two user tables: twenty-four identifiers for
-    // twenty-four tables.
+    // Distinct from one another and from the two user tables.
     let mut ids: Vec<i32> = resolved.iter().map(|&(id, _)| id.0).collect();
     ids.extend([user_in_d.id.0, user_in_master.id.0]);
     let mut once = ids.clone();
     once.sort_unstable();
     once.dedup();
-    assert_eq!(once.len(), 25, "{ids:?}");
+    assert_eq!(once.len(), INTERNAL_TABLES.len() + 2, "{ids:?}");
     assert!(
-        ids.iter().take(22).all(|&id| id < user_in_master.id.0),
+        ids.iter()
+            .take(INTERNAL_TABLES.len())
+            .all(|&id| id < user_in_master.id.0),
         "{ids:?}"
     );
 }
