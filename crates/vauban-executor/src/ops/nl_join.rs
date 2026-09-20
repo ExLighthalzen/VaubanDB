@@ -153,15 +153,16 @@ impl<'a> NestedLoopJoin<'a> {
     /// Runs one call on the inner operator with the scan-local bindings of the inner plan
     /// pushed on the context, and pops them before returning, so that the bindings are
     /// visible to the inner tree alone and not to the `on` nor to the operators above the
-    /// join. Nothing is pushed under a frame already on the context (a correlated
-    /// subquery evaluating this join), nor when the join reads its inner by index.
+    /// join. The frame goes on top of the one a correlated subquery evaluating this join
+    /// pushed, which gets back its place once the call returns; nothing is pushed when
+    /// the join reads its inner by index.
     fn with_inner_scan_bindings<R>(
         ctx: &mut ExecContext<'a>,
         inner_plan: &PhysicalPlan,
         push: bool,
         f: impl FnOnce(&mut ExecContext<'a>) -> SqlResult<R>,
     ) -> SqlResult<R> {
-        if !push || ctx.subquery_locals().is_some() {
+        if !push {
             return f(ctx);
         }
         ctx.push_subquery_locals(

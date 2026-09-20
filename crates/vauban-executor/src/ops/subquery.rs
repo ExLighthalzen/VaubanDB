@@ -1,5 +1,15 @@
 //! `SubqueryEval`: outer-row context and uncorrelated subquery caching for expressions
 //! that hold subqueries.
+//!
+//! # The row a correlated subquery reads
+//!
+//! Each evaluation of a subquery plan ([`eval_scalar_plan`], [`eval_exists_plan`],
+//! [`eval_in_subquery_plan`]) pushes the row it is evaluated over as the row of the
+//! enclosing query ([`ExecContext::push_query_row`]) and pops it after. Inside the plan,
+//! a reference with [`ColumnBinding::depth`] 1 reads that row, a reference with depth 2
+//! the row pushed by the evaluation that encloses this one, even when the inner plan
+//! scans the table of the enclosing query under another alias (`tests/subquery.rs`,
+//! `correlated_exists_two_levels_deep_over_the_same_table`).
 
 use std::collections::HashSet;
 
@@ -106,37 +116,51 @@ pub(crate) fn eval_subplan_slot(
             return Ok(cached);
         }
         let value = if exists {
-            eval_exists_plan(&subplan.plan, ctx, row, None)?
+            eval_exists_plan(&subplan.plan, ctx, row)?
         } else {
-            eval_scalar_plan(&subplan.plan, row, ctx, Some(line), None)?
+            eval_scalar_plan(&subplan.plan, row, ctx, Some(line))?
         };
         ctx.store_subquery_cache(slot, value.clone());
         return Ok(value);
     }
     if exists {
-        eval_exists_plan(&subplan.plan, ctx, row, None)
+        eval_exists_plan(&subplan.plan, ctx, row)
     } else {
-        eval_scalar_plan(&subplan.plan, row, ctx, Some(line), None)
+        eval_scalar_plan(&subplan.plan, row, ctx, Some(line))
     }
 }
 
 /// A scalar subquery: `NULL` on zero rows, the single column on one row, 512 beyond.
+/// `row` is the row of the enclosing query, read by the references at depth 1.
 pub(crate) fn eval_scalar_plan(
     plan: &PhysicalPlan,
     row: Option<&Row>,
     ctx: &mut ExecContext<'_>,
     line: Option<u32>,
-    source_plan: Option<&PhysicalPlan>,
 ) -> SqlResult<Value> {
+    with_enclosing_row(plan, row, ctx, |ctx| {
+        eval_scalar_plan_inner(plan, ctx, line)
+    })
+}
+
+/// Runs `f` with `row` pushed as the row of the query that encloses `plan`, and the
+/// columns of `plan` pushed as the local ones. The correlation stacks are brought back
+/// to where they stood before, which also drops what a `SubqueryEval` of `plan` left
+/// when `f` closed it before its input was exhausted
+/// ([`ExecContext::unwind_to`]).
+fn with_enclosing_row(
+    plan: &PhysicalPlan,
+    row: Option<&Row>,
+    ctx: &mut ExecContext<'_>,
+    f: impl FnOnce(&mut ExecContext<'_>) -> SqlResult<Value>,
+) -> SqlResult<Value> {
+    let mark = ctx.correlation_mark();
     let locals = local_column_ids(plan);
     let bindings = scan_column_bindings(plan);
     ctx.push_subquery_locals(SubqueryLocalsSource::CorrelatedPlan, locals, bindings);
-    let pushed = push_enclosing_outer(ctx, row, source_plan.or(Some(plan)));
-    let result = eval_scalar_plan_inner(plan, ctx, line);
-    if pushed {
-        let _ = ctx.pop_outer();
-    }
-    ctx.pop_subquery_locals();
+    ctx.push_query_row(row);
+    let result = f(ctx);
+    ctx.unwind_to(mark);
     result
 }
 
@@ -168,23 +192,16 @@ fn eval_scalar_plan_inner(
         .ok_or_else(|| bug("subquery plan produced a row with no column"))
 }
 
-/// `EXISTS`: true on the first row, false on an empty input.
+/// `EXISTS`: true on the first row, false on an empty input. `enclosing` is the row of
+/// the enclosing query, read by the references at depth 1.
 pub(crate) fn eval_exists_plan(
     plan: &PhysicalPlan,
     ctx: &mut ExecContext<'_>,
     enclosing: Option<&Row>,
-    source_plan: Option<&PhysicalPlan>,
 ) -> SqlResult<Value> {
-    let locals = local_column_ids(plan);
-    let bindings = scan_column_bindings(plan);
-    ctx.push_subquery_locals(SubqueryLocalsSource::CorrelatedPlan, locals, bindings);
-    let pushed = push_enclosing_outer(ctx, enclosing, source_plan.or(Some(plan)));
-    let result = eval_exists_plan_inner(plan, ctx);
-    if pushed {
-        let _ = ctx.pop_outer();
-    }
-    ctx.pop_subquery_locals();
-    result
+    with_enclosing_row(plan, enclosing, ctx, |ctx| {
+        eval_exists_plan_inner(plan, ctx)
+    })
 }
 
 fn eval_exists_plan_inner(plan: &PhysicalPlan, ctx: &mut ExecContext<'_>) -> SqlResult<Value> {
@@ -210,16 +227,9 @@ pub(crate) fn eval_in_subquery_plan(
         .collation
         .unwrap_or(vauban_types::Collation::DEFAULT);
     let tested = eval_expr(tested, row, ctx)?;
-    let locals = local_column_ids(plan);
-    let bindings = scan_column_bindings(plan);
-    ctx.push_subquery_locals(SubqueryLocalsSource::CorrelatedPlan, locals, bindings);
-    let pushed = push_enclosing_outer(ctx, row, None);
-    let result = eval_in_subquery_plan_inner(plan, tested, ctx, line, collation);
-    if pushed {
-        let _ = ctx.pop_outer();
-    }
-    ctx.pop_subquery_locals();
-    result
+    with_enclosing_row(plan, row, ctx, |ctx| {
+        eval_in_subquery_plan_inner(plan, tested, ctx, line, collation)
+    })
 }
 
 fn eval_in_subquery_plan_inner(
@@ -292,30 +302,6 @@ pub(crate) fn eval_subquery_expr(
         }
         _ => Err(bug("eval_subquery_expr: not a subquery node")),
     }
-}
-
-/// Pushes `row` when it carries columns an nested correlated plan must read.
-fn push_enclosing_outer(
-    ctx: &mut ExecContext<'_>,
-    row: Option<&Row>,
-    source_plan: Option<&PhysicalPlan>,
-) -> bool {
-    let Some(row) = row else {
-        return false;
-    };
-    if ctx
-        .outer_rows()
-        .last()
-        .is_some_and(|top| top.as_slice() == row)
-    {
-        return false;
-    }
-    let bindings = source_plan.map_or_else(Vec::new, scan_column_bindings);
-    if bindings.is_empty() {
-        return false;
-    }
-    ctx.push_outer(row.clone(), bindings);
-    true
 }
 
 /// Scan bindings describing how each position of a plan's row is laid out.

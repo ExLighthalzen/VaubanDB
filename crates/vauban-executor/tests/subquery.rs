@@ -597,3 +597,222 @@ fn correlated_exists_over_a_cross_join_keeps_both_sides() {
         "the outer row the third table holds pairs with each inner row"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// SQL text through the whole chain: parse, bind, plan, execute
+// ---------------------------------------------------------------------------------------
+
+/// A bootstrapped catalogue over an in-memory storage, for tests written as SQL text.
+struct SqlFixture {
+    storage: Arc<dyn Storage>,
+    txn: Arc<TransactionManager>,
+    catalog: vauban_catalog::Catalog,
+}
+
+impl SqlFixture {
+    fn new() -> Self {
+        vauban_sysfn::register_builtins();
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let txn = Arc::new(TransactionManager::new(Arc::clone(&storage)));
+        let catalog = vauban_catalog::Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn))
+            .expect("the catalogue boots on a fresh storage");
+        Self {
+            storage,
+            txn,
+            catalog,
+        }
+    }
+
+    /// Parses, binds, plans and executes each statement of `text`, each in a transaction
+    /// of its own, and hands back the rows of the last one.
+    fn run(&self, text: &str) -> Vec<Row> {
+        let batch = vauban_parser::parse_batch(text, &vauban_parser::ParseOptions::default())
+            .expect("the text parses");
+        let mut last = Vec::new();
+        for statement in &batch.statements {
+            let handle = self.txn.begin(IsolationLevel::ReadCommitted);
+            let snapshot = self.catalog.snapshot(&handle);
+            let mut bind_ctx = vauban_binder::BindContext::scalar(text, SessionOptions::default());
+            bind_ctx.catalog = Some(&snapshot);
+            let bound = vauban_binder::bind(statement, &bind_ctx).expect("the statement binds");
+            let planned = vauban_planner::plan(
+                bound,
+                &vauban_planner::PlanContext {
+                    catalog: &vauban_planner::NoIndexes,
+                },
+            )
+            .expect("the statement plans");
+            let snap = self.txn.statement_snapshot(&handle);
+            let eval = StaticContext::default();
+            let mut ctx = ExecContext::scalar(&eval, SessionOptions::default())
+                .with_engine(self.storage.as_ref(), &self.txn, &snap)
+                .with_catalog(&self.catalog)
+                .with_handle(&handle);
+            let (_, set) = execute_collect(&planned, &mut ctx).expect("the statement runs");
+            self.txn.commit(handle).expect("the transaction commits");
+            last = set.rows;
+        }
+        last
+    }
+}
+
+fn i32s(rows: &[&[i32]]) -> Vec<Row> {
+    rows.iter()
+        .map(|row| row.iter().map(|v| Value::I32(*v)).collect())
+        .collect()
+}
+
+fn seeded() -> SqlFixture {
+    let f = SqlFixture::new();
+    for ddl in [
+        "CREATE TABLE t1 (a int);",
+        "CREATE TABLE t2 (a int);",
+        "CREATE TABLE t3 (k int, v int);",
+        "CREATE TABLE t (k int);",
+        "CREATE TABLE i (k int);",
+        "INSERT INTO t1 VALUES (1), (2), (3);",
+        "INSERT INTO t2 VALUES (1), (2);",
+        "INSERT INTO t3 VALUES (1, 10), (2, 20), (3, 30);",
+        "INSERT INTO t VALUES (1), (2);",
+        "INSERT INTO i VALUES (1), (3);",
+    ] {
+        f.run(ddl);
+    }
+    f
+}
+
+/// `x.a` and `z.a` are the same column of the same table under two aliases: the
+/// subquery counts the rows of `z` above the row of `x`, not above itself.
+#[test]
+fn correlated_scalar_over_the_same_table_reads_the_enclosing_row() {
+    let f = seeded();
+    let rows =
+        f.run("SELECT x.a, (SELECT COUNT(*) FROM t1 z WHERE z.a > x.a) FROM t1 x ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[1, 2], &[2, 1], &[3, 0]]));
+}
+
+/// The inner `t t` hides the outer `t`; `i.k` is the column of the enclosing row.
+#[test]
+fn correlated_exists_over_the_same_table_under_a_cross_join() {
+    let f = seeded();
+    let rows = f.run("SELECT t.k, i.k FROM t CROSS JOIN i WHERE EXISTS (SELECT 1 FROM t t WHERE t.k = i.k) ORDER BY t.k, i.k;");
+    assert_eq!(rows, i32s(&[&[1, 1], &[2, 1]]));
+}
+
+/// The outer reference names the second alias of a cross self join.
+#[test]
+fn correlated_scalar_reads_the_second_alias_of_a_cross_self_join() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a, y.a, (SELECT COUNT(*) FROM t3 w WHERE w.k > y.a) FROM t1 x CROSS JOIN t1 y ORDER BY x.a, y.a;");
+    assert_eq!(
+        rows,
+        i32s(&[
+            &[1, 1, 2],
+            &[1, 2, 1],
+            &[1, 3, 0],
+            &[2, 1, 2],
+            &[2, 2, 1],
+            &[2, 3, 0],
+            &[3, 1, 2],
+            &[3, 2, 1],
+            &[3, 3, 0]
+        ])
+    );
+}
+
+/// Two tables whose first column carries the same identifier and name: the outer
+/// reference is the second one.
+#[test]
+fn correlated_scalar_reads_the_second_table_with_the_same_column_id() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a, o.a, (SELECT w.v FROM t3 w WHERE w.k = o.a) FROM t1 x CROSS JOIN t2 o ORDER BY x.a, o.a;");
+    assert_eq!(
+        rows,
+        i32s(&[
+            &[1, 1, 10],
+            &[1, 2, 20],
+            &[2, 1, 10],
+            &[2, 2, 20],
+            &[3, 1, 10],
+            &[3, 2, 20]
+        ])
+    );
+}
+
+/// A cross self join inside a correlated subquery keeps `p` and `q` apart.
+#[test]
+fn cross_self_join_inside_a_correlated_scalar_keeps_both_aliases() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a, (SELECT COUNT(*) FROM t1 p CROSS JOIN t1 q WHERE p.a < q.a AND q.a >= x.a) FROM t1 x ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[1, 3], &[2, 3], &[3, 2]]));
+}
+
+/// Two levels: `y.a` reads the middle query, `x.a` the outermost one.
+#[test]
+fn correlated_exists_two_levels_deep_over_the_same_table() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a FROM t1 x WHERE EXISTS (SELECT 1 FROM t1 y WHERE y.a = x.a AND EXISTS (SELECT 1 FROM t1 z WHERE z.a > y.a)) ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[1], &[2]]));
+}
+
+/// `IN` over the same table with an outer reference in its `WHERE`.
+#[test]
+fn correlated_in_over_the_same_table_reads_the_enclosing_row() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a FROM t1 x WHERE x.a IN (SELECT z.a + 1 FROM t1 z WHERE z.a < x.a) ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[2], &[3]]));
+}
+
+/// Two tables whose first column carries the same identifier under two names, crossed
+/// inside an uncorrelated scalar subquery: `q.k` is a column of the subquery, not of the
+/// enclosing row.
+#[test]
+fn uncorrelated_cross_join_of_two_tables_inside_a_scalar_counts_its_pairs() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a, (SELECT COUNT(*) FROM t1 p CROSS JOIN t3 q WHERE p.a < q.k) FROM t1 x ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[1, 3], &[2, 3], &[3, 3]]));
+}
+
+/// The same cross join with an outer reference on the second table.
+#[test]
+fn cross_join_of_two_tables_inside_a_correlated_scalar_reads_each_side() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a, (SELECT COUNT(*) FROM t1 p CROSS JOIN t3 q WHERE q.k >= x.a) FROM t1 x ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[1, 9], &[2, 6], &[3, 3]]));
+    let rows = f.run("SELECT x.a, (SELECT COUNT(*) FROM t1 p CROSS JOIN t3 q WHERE p.a < q.k AND q.v >= x.a) FROM t1 x ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[1, 3], &[2, 3], &[3, 3]]));
+}
+
+/// A reference two queries up while the query in between holds no outer reference of
+/// its own: the middle evaluation still counts as one level.
+#[test]
+fn a_reference_two_queries_up_skips_a_middle_query_without_one() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a FROM t1 x WHERE EXISTS (SELECT 1 FROM t1 y WHERE EXISTS (SELECT 1 FROM t1 z WHERE z.a = x.a AND y.a = 2)) ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[1], &[2], &[3]]));
+}
+
+/// An `EXISTS` that stops at its first row leaves the `SubqueryEval` of its plan
+/// unexhausted: the second `EXISTS` of the predicate still takes its own plan.
+#[test]
+fn a_second_subquery_after_a_nested_exists_takes_its_own_plan() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a FROM t1 x WHERE EXISTS (SELECT 1 FROM t1 y WHERE y.a = x.a AND EXISTS (SELECT 1 FROM t1 z WHERE z.a > y.a)) AND EXISTS (SELECT 1 FROM t1 w WHERE w.a = x.a + 1) ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[1], &[2]]));
+}
+
+/// A derived table crossed with a table inside a correlated scalar: the derived
+/// column and the outer column are told apart.
+#[test]
+fn derived_table_crossed_inside_a_correlated_scalar_reads_the_enclosing_row() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a, (SELECT MAX(d.a) FROM t1 p CROSS JOIN (SELECT a FROM t1) d WHERE d.a < x.a AND p.a = x.a) FROM t1 x ORDER BY x.a;");
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::I32(1), Value::Null],
+            vec![Value::I32(2), Value::I32(1)],
+            vec![Value::I32(3), Value::I32(2)],
+        ]
+    );
+}

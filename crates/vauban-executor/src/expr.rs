@@ -197,32 +197,29 @@ pub fn eval_expr(
         // reference is to an outer row pushed by a correlated join, in which case the
         // outer rows of the context are consulted instead.
         BoundExprKind::ColumnRef(binding) => {
-            if binding.column == SLOT_COLUMN_ID {
-                let row = if let Some(row) = row {
-                    row
-                } else {
-                    ctx.outer_rows().last().ok_or_else(|| {
-                        bug(&format!(
-                            "eval_expr: column `{}` is evaluated without a row",
-                            binding.name
-                        ))
-                    })?
-                };
-                return ctx.read_local_column(row, binding);
+            // A column of an enclosing query is read from the outer-row stack before the
+            // current row is looked at: the row of the subquery may carry a column of the
+            // same identifier and name (`tests/subquery.rs`,
+            // `correlated_scalar_over_the_same_table_reads_the_enclosing_row`).
+            if binding.depth > 0 && binding.column != SLOT_COLUMN_ID {
+                return ctx.read_outer_column(binding);
             }
             let row = if let Some(row) = row {
                 row
             } else {
-                ctx.outer_rows().last().ok_or_else(|| {
+                ctx.last_outer_row().ok_or_else(|| {
                     bug(&format!(
                         "eval_expr: column `{}` is evaluated without a row",
                         binding.name
                     ))
                 })?
             };
+            if binding.column == SLOT_COLUMN_ID {
+                return ctx.read_local_column(row, binding);
+            }
             if ctx.subquery_locals().is_some() {
-                if ctx.column_is_outer(binding.column, &binding.name) {
-                    return ctx.read_outer_column(binding.column, &binding.name);
+                if ctx.column_is_outer(binding) {
+                    return ctx.read_outer_column(binding);
                 }
                 return ctx.read_local_column(row, binding);
             }
