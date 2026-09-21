@@ -48,9 +48,17 @@ pub struct NestedParam {
 pub struct NestedOutcome {
     /// Final values of the `output` parameters, in declaration order.
     pub outputs: Vec<(String, Value)>,
-    /// `RETURN` status, `0` when the text did not `RETURN`.
+    /// `RETURN` status: the value of an explicit `RETURN`, `0` on a text that ran to its end
+    /// without one, and the number of the error that stopped the text otherwise, whether
+    /// that error kept the text from compiling at all or stopped it partway through
+    /// (`tests/nested.rs`, `return_status_is_the_error_number_after_a_runtime_error` and
+    /// `return_status_is_the_error_number_after_a_compile_error`).
     pub return_status: i32,
-    /// `@@ROWCOUNT` at the end of the nested text.
+    /// `@@ROWCOUNT` once the text is done: what its last executed statement left, unchanged
+    /// from the value the caller held when a compile-time error kept every statement of the
+    /// text from running, `0` when a statement started running and then raised an error
+    /// (`tests/nested.rs`, `rowcount_reflects_the_last_row_count_of_the_nested_text` and
+    /// `rowcount_is_zero_after_a_runtime_error_and_unchanged_after_a_compile_error`).
     pub rowcount: i64,
     /// `true` when an error stopped the text before it finished.
     pub failed: bool,
@@ -141,7 +149,12 @@ impl Session {
         let result = self.run_nested_body(text, params, &mut nested_state, sink, &mut outcome);
 
         outcome.outputs = collect_outputs(params, self.exec());
-        outcome.rowcount = self.exec().rowcount;
+        // `nested_state.rowcount` is the value each statement posts for `@@ROWCOUNT`
+        // (`run_nested_prepared`, below); `self.exec().rowcount` is scratch the executor
+        // resets ahead of a statement and a bare `SET` writes back to
+        // (`vauban_executor::control`), so it does not carry a `SELECT`'s row count out of
+        // this call (`tests/nested.rs`, `rowcount_reflects_the_last_row_count_of_the_nested_text`).
+        outcome.rowcount = nested_state.rowcount;
 
         if nested_state.trancount != trancount_before {
             let err = SqlError::transaction_count_after_execute(
@@ -505,6 +518,7 @@ impl Session {
                         sink.done_in_proc(None, true)?;
                         Ok(Flow::Continue)
                     } else {
+                        outcome.return_status = err.number as i32;
                         Ok(Flow::Stop)
                     }
                 }
@@ -577,6 +591,10 @@ impl Session {
             }
             Ok(ExecOutcome::Return(code)) => {
                 outcome.return_status = code;
+                // `RETURN` is the last statement that ran, and it counts no row: `@@ROWCOUNT`
+                // leaves the text at 0 whatever the statement before it counted
+                // (`tests/nested.rs`, `rowcount_is_zero_after_a_text_that_ends_with_return`).
+                nested_state.rowcount = 0;
                 Ok(Flow::Stop)
             }
             Ok(ExecOutcome::Cancelled) => Err(SqlError::from(InternalError::Bug(
@@ -614,6 +632,8 @@ impl Session {
                 nested_state.last_error = err.number;
                 sink.error(&err)?;
                 outcome.failed = true;
+                outcome.return_status = err.number as i32;
+                nested_state.rowcount = 0;
                 Ok(Flow::Stop)
             }
             Err(err) => {
@@ -621,13 +641,18 @@ impl Session {
                 nested_state.last_error = err.number;
                 sink.error(&err)?;
                 outcome.failed = true;
+                nested_state.rowcount = 0;
                 let continues = more
                     && !nested_state.options.xact_abort
                     && err.batch_scope() == BatchErrorScope::Statement;
                 if continues {
+                    // The rest of the text still runs: a `RETURN` or a later error, not this
+                    // one, decides the status this call leaves
+                    // (`tests/nested.rs`, `return_status_is_zero_after_a_statement_scoped_error_the_text_recovers_from`).
                     sink.done_in_proc(None, true)?;
                     Ok(Flow::Continue)
                 } else {
+                    outcome.return_status = err.number as i32;
                     Ok(Flow::Stop)
                 }
             }
@@ -672,6 +697,7 @@ impl Session {
         outcome: &mut NestedOutcome,
     ) -> SqlResult<()> {
         outcome.failed = true;
+        outcome.return_status = err.number as i32;
         sink.error(err)?;
         Ok(())
     }
@@ -683,6 +709,7 @@ impl Session {
         outcome: &mut NestedOutcome,
     ) -> SqlResult<()> {
         outcome.failed = true;
+        outcome.return_status = err.number as i32;
         sink.error(err)?;
         Ok(())
     }
@@ -921,6 +948,14 @@ impl Session {
             nested_state.options.xact_abort,
             wrapper.last_error(),
         );
+        if !continues {
+            // A `RETURN` or a failure of the call this text made carries out to this text's
+            // own status exactly when nothing after it still runs: a call that fails but
+            // lets the rest of the text go on leaves the final status to what runs after it
+            // instead (`tests/nested.rs`,
+            // `return_status_of_a_two_level_call_is_zero_when_the_text_recovers_after_it`).
+            outcome.return_status = inner.return_status;
+        }
         Ok(if continues {
             Flow::Continue
         } else {

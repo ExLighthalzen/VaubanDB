@@ -442,6 +442,140 @@ fn an_error_of_a_call_keeps_the_line_of_the_text_it_ran() {
     assert_eq!(err.line, 1);
 }
 
+/// `@@ROWCOUNT` at the end of the call is the row count of the nested text's own last
+/// statement: one row, no row, or three, not the `0` a fresh statement starts on.
+#[test]
+fn rowcount_reflects_the_last_row_count_of_the_nested_text() {
+    let (one, _) = run_nested(&mut session(), "SELECT 1 AS n", &[]);
+    assert_eq!(one.rowcount, 1, "{one:?}");
+
+    let (none, _) = run_nested(&mut session(), "SELECT 1 AS n WHERE 1 = 0", &[]);
+    assert_eq!(none.rowcount, 0, "{none:?}");
+
+    let (three, _) = run_nested(
+        &mut session(),
+        "CREATE TABLE dbo.n5 (n int); INSERT dbo.n5 VALUES (1), (2), (3); SELECT n FROM dbo.n5;",
+        &[],
+    );
+    assert_eq!(three.rowcount, 3, "{three:?}");
+}
+
+/// A text that ends with `RETURN` leaves `@@ROWCOUNT` at 0: the `RETURN` is the last statement
+/// that ran, and it counts no row, whatever the `SELECT` before it counted.
+#[test]
+fn rowcount_is_zero_after_a_text_that_ends_with_return() {
+    let (bare, _) = run_nested(&mut session(), "RETURN", &[]);
+    assert_eq!(bare.rowcount, 0, "{bare:?}");
+
+    let (after_rows, _) = run_nested(
+        &mut session(),
+        "CREATE TABLE dbo.n7 (n int); INSERT dbo.n7 VALUES (1), (2), (3); SELECT n FROM dbo.n7; RETURN;",
+        &[],
+    );
+    assert_eq!(after_rows.rowcount, 0, "{after_rows:?}");
+    assert_eq!(after_rows.return_status, 0, "{after_rows:?}");
+}
+
+/// A statement that never runs because its text failed to compile leaves `@@ROWCOUNT` at
+/// whatever the caller already held; a statement that started running and then raised a
+/// run-time error resets it to `0` instead.
+#[test]
+fn rowcount_is_zero_after_a_runtime_error_and_unchanged_after_a_compile_error() {
+    let seed = "CREATE TABLE dbo.n6 (n int); INSERT dbo.n6 VALUES (1), (2), (3);";
+
+    let mut runtime = session();
+    run_batch(&mut runtime, seed);
+    assert_eq!(runtime.state().rowcount, 3);
+    let (after_runtime_error, _) = run_nested(&mut runtime, "SELECT 1/0", &[]);
+    assert!(after_runtime_error.failed);
+    assert_eq!(after_runtime_error.rowcount, 0, "{after_runtime_error:?}");
+
+    let mut compile = session();
+    run_batch(&mut compile, seed);
+    assert_eq!(compile.state().rowcount, 3);
+    let (after_compile_error, _) = run_nested(&mut compile, "SELECT @nope", &[]);
+    assert!(after_compile_error.failed);
+    assert_eq!(after_compile_error.rowcount, 3, "{after_compile_error:?}");
+}
+
+/// A run-time error that stops the whole nested text leaves its own number as the return
+/// status of the call, read back by the caller through `EXEC @r = sp_executesql`.
+#[test]
+fn return_status_is_the_error_number_after_a_runtime_error() {
+    let (outcome, _) = run_nested(&mut session(), "SELECT 1/0", &[]);
+    assert!(outcome.failed);
+    assert_eq!(outcome.return_status, 8134);
+}
+
+/// A text that never compiles answers the same way: the return status is the number of the
+/// error that kept it from running, not `0`.
+#[test]
+fn return_status_is_the_error_number_after_a_compile_error() {
+    let (outcome, _) = run_nested(&mut session(), "SELECT @nope", &[]);
+    assert!(outcome.failed);
+    assert_eq!(outcome.return_status, 137);
+}
+
+/// A statement-scoped error the text recovers from does not leave its number behind: once
+/// a later statement of the same text runs to completion, the return status reads `0`, as
+/// if the error had not happened.
+#[test]
+fn return_status_is_zero_after_a_statement_scoped_error_the_text_recovers_from() {
+    let (outcome, events) = run_nested(&mut session(), "SELECT 1/0; SELECT 5;", &[]);
+    assert_eq!(error_numbers(&events.0), vec![8134]);
+    assert_eq!(outcome.return_status, 0, "{outcome:?}");
+}
+
+/// A nested text that never compiles because of a syntax error still lets the caller batch
+/// run its next statement, the same family as `a_208_in_an_exec_lets_the_caller_continue`:
+/// nothing of the text ran, so nothing there needed the caller to stop.
+#[test]
+fn a_156_syntax_error_in_a_nested_text_lets_the_caller_continue() {
+    let events = run_batch(
+        &mut session(),
+        "DECLARE @r int; EXEC @r = sp_executesql N'SELECT FROM', N''; SELECT @r AS n;",
+    );
+    assert_eq!(only_row(&events.0), 156);
+}
+
+/// A nested text is a batch, not a procedure: `RETURN` with a value inside one fails to
+/// compile (178), and the caller still runs its next statement.
+#[test]
+fn a_178_return_with_a_value_in_a_nested_text_lets_the_caller_continue() {
+    let events = run_batch(
+        &mut session(),
+        "DECLARE @r int; EXEC @r = sp_executesql N'RETURN 5', N''; SELECT @r AS n;",
+    );
+    assert_eq!(only_row(&events.0), 178);
+}
+
+/// A text whose only statement is a call to another `sp_executesql` that fails leaves that
+/// call's own status as its own: `outcome.return_status` used to stay at its default `0`
+/// (`finish_nested_procedure_flow` copied `rowcount` from the inner call but not
+/// `return_status`), even though the caller already read the right `@@ROWCOUNT` and the
+/// right error.
+#[test]
+fn return_status_of_a_two_level_call_propagates_up() {
+    let (outcome, _) = run_nested(&mut session(), "EXEC sp_executesql N'SELECT 1/0', N''", &[]);
+    assert!(outcome.failed);
+    assert_eq!(outcome.return_status, 8134, "{outcome:?}");
+}
+
+/// The same failing call, followed by a statement of the outer text that runs to
+/// completion: the final status is `0`, as if the inner failure had not happened, the same
+/// rule `return_status_is_zero_after_a_statement_scoped_error_the_text_recovers_from`
+/// applies to a plain statement.
+#[test]
+fn return_status_of_a_two_level_call_is_zero_when_the_text_recovers_after_it() {
+    let (outcome, events) = run_nested(
+        &mut session(),
+        "EXEC sp_executesql N'SELECT 1/0', N''; SELECT 5;",
+        &[],
+    );
+    assert_eq!(error_numbers(&events.0), vec![8134]);
+    assert_eq!(outcome.return_status, 0, "{outcome:?}");
+}
+
 #[test]
 fn empty_text_emits_done_proc_and_return_status() {
     let mut sink = Recording::default();

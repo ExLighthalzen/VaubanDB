@@ -132,6 +132,33 @@ fn batch_sp_executesql_with_output_writes_the_caller_variable() {
 }
 
 #[test]
+fn rowcount_after_sp_executesql_is_the_row_count_of_its_last_statement() {
+    let events =
+        run("EXEC sp_executesql N'SELECT 1 AS n', N''; SELECT @@ROWCOUNT AS rc, @@ERROR AS err;");
+    assert!(
+        events.0.iter().any(|event| matches!(
+            event,
+            Event::Row(values) if values == &[Value::I32(1), Value::I32(0)]
+        )),
+        "{:?}",
+        events.0
+    );
+}
+
+#[test]
+fn return_status_after_a_failing_sp_executesql_is_the_error_number() {
+    let events = run("DECLARE @r int; EXEC @r = sp_executesql N'SELECT 1/0', N''; SELECT @r AS n;");
+    assert!(
+        events
+            .0
+            .iter()
+            .any(|event| matches!(event, Event::Row(values) if values == &[Value::I32(8134)])),
+        "{:?}",
+        events.0
+    );
+}
+
+#[test]
 fn exec_literal_select_returns_one_row() {
     let events = run("EXEC('SELECT 1 AS n');");
     assert!(events.0.contains(&Event::Columns));
@@ -148,6 +175,28 @@ fn exec_null_text_emits_no_row() {
     let events = run("DECLARE @t nvarchar(100) = NULL; EXEC(@t);");
     assert!(
         !events.0.iter().any(|event| matches!(event, Event::Row(_))),
+        "{:?}",
+        events.0
+    );
+}
+
+#[test]
+fn rowcount_after_exec_of_a_literal_select_is_the_row_count_of_its_last_statement() {
+    // The row count the caller reads back after `EXEC('…')` returns matches what the same
+    // text leaves when it runs through `sp_executesql` instead
+    // (`rowcount_after_sp_executesql_is_the_row_count_of_its_last_statement`, this file).
+    let events = run("EXEC('SELECT 1 AS n'); SELECT @@ROWCOUNT;");
+    let rows: Vec<&Vec<Value>> = events
+        .0
+        .iter()
+        .filter_map(|event| match event {
+            Event::Row(values) => Some(values),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![&vec![Value::I32(1)], &vec![Value::I32(1)]],
         "{:?}",
         events.0
     );

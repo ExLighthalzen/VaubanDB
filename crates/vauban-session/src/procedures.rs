@@ -330,10 +330,14 @@ fn batch_continues(session: &Session, more: bool, failed: bool, error_number: u3
 }
 
 /// A statement of a nested text that fails to compile stops the whole text before any of it
-/// runs: on the shapes checked, none of these numbers stops the caller
-/// (`tests/nested.rs`, `a_208_in_an_exec_lets_the_caller_continue` and its siblings for the
-/// other numbers of this list).
-const NESTED_TEXT_COMPILATION_ERRORS: [u32; 7] = [102, 137, 206, 207, 208, 2812, 4104];
+/// runs, and the caller goes on. The numbers pinned by `tests/nested.rs` are 208
+/// (`a_208_in_an_exec_lets_the_caller_continue` and its siblings for 206, 207 and 2812), 156
+/// (`a_156_syntax_error_in_a_nested_text_lets_the_caller_continue`) and 178
+/// (`a_178_return_with_a_value_in_a_nested_text_lets_the_caller_continue`); 102, 103, 132,
+/// 133, 137, 1038 and 4104 are listed on the same rule without a test of their own.
+const NESTED_TEXT_COMPILATION_ERRORS: [u32; 13] = [
+    102, 103, 132, 133, 137, 156, 178, 206, 207, 208, 1038, 2812, 4104,
+];
 
 /// Whether the batch that issued `EXEC('…')` or `sp_executesql` runs its next statement once
 /// the nested text this call ran is done.
