@@ -8,7 +8,10 @@
 //! `delete_without_from_binds`, `delete_from_binds`, `update_with_where_filters_the_scan`).
 //! Each `SET c = e` becomes one entry of `assignments`: the [`ColumnBinding`] of `c` as the
 //! catalogue holds it, and `e` under a [`BoundExprKind::Convert`] towards the type of `c`
-//! (`update_inserts_convert_to_column_type`). The columns of the target are in scope on the
+//! (`update_inserts_convert_to_column_type`) — except when `c` is a bounded `varchar`,
+//! `nvarchar` or `varbinary` and `e` is already of the matching family, where `e` keeps its
+//! own type instead, so the assignment still knows how long the value really is. The
+//! columns of the target are in scope on the
 //! right side of a `SET` and in the `WHERE`: `SET a = a + 1` reads the old value of `a`.
 //! A compound operator is desugared before binding, as
 //! `variables.rs` does for `SET @x += e`: `SET a += 1` binds as `SET a = a + 1`
@@ -68,7 +71,7 @@ use vauban_parser::{
     AssignOp, AssignTarget, Assignment, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement, Expr,
     Ident, Literal, ObjectName, TableRef, UpdateStatement,
 };
-use vauban_types::{TypeInfo, Value, implicit_result_type};
+use vauban_types::{Len, SqlType, TypeInfo, Value, implicit_result_type};
 
 use crate::bound::{
     BoundExpr, BoundExprKind, BoundStatement, ColumnBinding, DeletePlan, LogicalPlan, UpdatePlan,
@@ -440,11 +443,14 @@ fn compound_operator(op: AssignOp) -> Option<AstBinaryOp> {
 }
 
 /// `value` under the `Convert` towards the type of its column, after the check of the
-/// pair.
+/// pair — except when the column is a bounded `varchar`, `nvarchar` or `varbinary` and
+/// `value` is already of the matching family, where `value` is answered unchanged: the
+/// assignment that follows checks its length once it knows it, rather than narrowing it
+/// here (`a_string_keeps_its_own_length_into_a_bounded_character_column`).
 ///
-/// The `NULL` literal converts to any column: it has no type of its own. The node keeps
-/// the nullability of the value: the `NOT NULL` of the column is checked where the row is
-/// written, not here.
+/// The `NULL` literal converts to any column: it has no type of its own, so it is not
+/// the exception above. The node keeps the nullability of the value: the `NOT NULL` of the
+/// column is checked where the row is written, not here.
 ///
 /// # Errors
 ///
@@ -455,6 +461,9 @@ fn converted(value: BoundExpr, target: &TypeInfo, line: u32) -> SqlResult<BoundE
         return Err(
             SqlError::operand_type_clash(value.ty.ty.name(), target.ty.name()).with_line(line),
         );
+    }
+    if !untyped_null && keeps_its_own_length(&value.ty, target) {
+        return Ok(value);
     }
     let ty = TypeInfo {
         ty: target.ty,
@@ -471,6 +480,21 @@ fn converted(value: BoundExpr, target: &TypeInfo, line: u32) -> SqlResult<BoundE
         ty,
         line,
     })
+}
+
+/// Whether a value of type `source` keeps its own length instead of being narrowed to
+/// `target` while the assignment is bound: true for a string reaching a bounded `varchar`
+/// or `nvarchar`, or a binary reaching a bounded `varbinary`. A narrower fixed
+/// `char`/`nchar`, an unbounded target, or a value of a different family keeps narrowing
+/// here, unaffected.
+fn keeps_its_own_length(source: &TypeInfo, target: &TypeInfo) -> bool {
+    match &target.ty {
+        SqlType::VarChar(Len::Fixed(_)) | SqlType::NVarChar(Len::Fixed(_)) => source.ty.is_string(),
+        SqlType::VarBinary(Len::Fixed(_)) => {
+            matches!(source.ty, SqlType::Binary(_) | SqlType::VarBinary(_))
+        }
+        _ => false,
+    }
 }
 
 /// The parts of a column reference joined by dots, as message 4104 prints them: the

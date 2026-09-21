@@ -38,6 +38,17 @@
 //! (`incompatible_type_between_two_rows_names_the_rows`). A conversion that is legal and
 //! fails on a value (`'abc'` into an `int`) is not an error here.
 //!
+//! A bounded `varchar`, `nvarchar` or `varbinary` column is the one exception: a value
+//! already of a matching family (a string into either character target, a binary value
+//! into the binary one) keeps its own type instead of the column's, so the row still
+//! carries how long the value really is when the executor assigns it
+//! (`a_string_keeps_its_own_length_into_a_bounded_character_column`,
+//! `a_binary_keeps_its_own_length_into_a_bounded_binary_column`). The schema of the
+//! `Values` node then carries that same reconciled type for the position, rather than the
+//! column's (`two_rows_of_different_lengths_share_the_wider_type_in_the_schema`). Any
+//! other pair — a narrower fixed `char`/`nchar`, an unbounded target, or a value of a
+//! different family — keeps converting here as before.
+//!
 //! The plan of an `INSERT … SELECT` is kept as `bind_select` built it: its columns are
 //! checked against the target columns the same way, and the executor converts each value
 //! it reads from it (`insert_select_binds_a_plan`).
@@ -97,7 +108,7 @@ use vauban_parser::{
     Expr, Ident, InsertSource, InsertStatement, Literal, ObjectName, QueryBody, SelectStatement,
     TableRef,
 };
-use vauban_types::{TypeInfo, Value, implicit_result_type};
+use vauban_types::{Len, SqlType, TypeInfo, Value, implicit_result_type};
 
 use crate::bound::{
     BoundExpr, BoundExprKind, BoundStatement, ColumnBinding, InsertPlan, LogicalPlan, OutputColumn,
@@ -132,7 +143,7 @@ pub(crate) fn bind_insert(
     let source = match &stmt.source {
         InsertSource::DefaultValues => Source {
             columns: Vec::new(),
-            plan: values_of(vec![Vec::new()], &[]),
+            plan: values_of(vec![Vec::new()], &[], &[]),
         },
         InsertSource::Values(rows) => {
             bind_values(rows, columns.clone(), listed, &target, line, ctx)?
@@ -526,8 +537,8 @@ fn bind_values(
         }
         bound_rows.push(bound_row);
     }
-    let converted = convert_rows(bound_rows, &kept, line)?;
-    let plan = values_of(converted, &kept);
+    let (converted, schema_types) = convert_rows(bound_rows, &kept, line)?;
+    let plan = values_of(converted, &kept, &schema_types);
     Ok(Source {
         columns: kept,
         plan,
@@ -592,7 +603,9 @@ fn check_pair(value: &TypeInfo, target: &TypeInfo, line: u32) -> SqlResult<()> {
 }
 
 /// Wraps each value of each row in the `Convert` towards its column, after the check of
-/// the types (module documentation, "The conversion towards the column").
+/// the types (module documentation, "The conversion towards the column"). Answers, beside
+/// the rows, the type each position of the `Values` node reports in its schema: the
+/// column's in general, or, for the one exception, the type the rows share instead.
 ///
 /// # Errors
 ///
@@ -601,21 +614,55 @@ fn convert_rows(
     rows: Vec<Vec<BoundExpr>>,
     columns: &[ColumnBinding],
     line: u32,
-) -> SqlResult<Vec<Vec<BoundExpr>>> {
+) -> SqlResult<(Vec<Vec<BoundExpr>>, Vec<TypeInfo>)> {
+    let mut schema_types = Vec::with_capacity(columns.len());
+    let mut keeps_length = Vec::with_capacity(columns.len());
     for (position, column) in columns.iter().enumerate() {
-        if let Some(common) = common_value_type(&rows, position, line)? {
-            check_pair(&common, &column.ty, line)?;
+        let common = common_value_type(&rows, position, line)?;
+        if let Some(common) = &common {
+            check_pair(common, &column.ty, line)?;
         }
+        let keep = common
+            .as_ref()
+            .is_some_and(|common| keeps_its_own_length(common, &column.ty));
+        schema_types.push(match &common {
+            Some(common) if keep => common.clone(),
+            _ => column.ty.clone(),
+        });
+        keeps_length.push(keep);
     }
-    Ok(rows
+    let rows = rows
         .into_iter()
         .map(|row| {
             row.into_iter()
                 .zip(columns)
-                .map(|(value, column)| convert_to(value, &column.ty))
+                .enumerate()
+                .map(|(position, (value, column))| {
+                    if keeps_length[position] {
+                        value
+                    } else {
+                        convert_to(value, &column.ty)
+                    }
+                })
                 .collect()
         })
-        .collect())
+        .collect();
+    Ok((rows, schema_types))
+}
+
+/// Whether a value of type `source` keeps its own length instead of being narrowed to
+/// `target` while the row is bound: true for a string reaching a bounded `varchar` or
+/// `nvarchar`, or a binary reaching a bounded `varbinary`. The assignment that follows
+/// checks the length for real once it has it; a narrower fixed `char`/`nchar`, an
+/// unbounded target, or a value of a different family keeps narrowing here, unaffected.
+fn keeps_its_own_length(source: &TypeInfo, target: &TypeInfo) -> bool {
+    match &target.ty {
+        SqlType::VarChar(Len::Fixed(_)) | SqlType::NVarChar(Len::Fixed(_)) => source.ty.is_string(),
+        SqlType::VarBinary(Len::Fixed(_)) => {
+            matches!(source.ty, SqlType::Binary(_) | SqlType::VarBinary(_))
+        }
+        _ => false,
+    }
 }
 
 /// The type the expressions written at `position` in each row of a `VALUES` row
@@ -674,16 +721,22 @@ fn convert_to(value: BoundExpr, target: &TypeInfo) -> BoundExpr {
     }
 }
 
-/// The `Values` node of `rows`, its schema the names and types of `columns`.
-fn values_of(rows: Vec<Vec<BoundExpr>>, columns: &[ColumnBinding]) -> LogicalPlan {
+/// The `Values` node of `rows`, its schema the names of `columns` paired with `types`
+/// (`convert_rows`, which decides one type per position).
+fn values_of(
+    rows: Vec<Vec<BoundExpr>>,
+    columns: &[ColumnBinding],
+    types: &[TypeInfo],
+) -> LogicalPlan {
     LogicalPlan::Values {
         rows,
         schema: OutputSchema {
             columns: columns
                 .iter()
-                .map(|column| OutputColumn {
+                .zip(types)
+                .map(|(column, ty)| OutputColumn {
                     name: column.name.clone(),
-                    ty: column.ty.clone(),
+                    ty: ty.clone(),
                 })
                 .collect(),
         },

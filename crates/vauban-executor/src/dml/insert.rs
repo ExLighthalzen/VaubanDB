@@ -43,6 +43,17 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
     };
 
     let mut root = build_operator(&stmt.source)?;
+    // The type each position of the source really holds: the column's type in general,
+    // but for a value that reached the column already of a matching string or binary
+    // family, the type of the value itself, still at its own length. `assign_value` reads
+    // it from here rather than from `stmt.columns`, whose `.ty` names the column, not the
+    // value.
+    let source_types: Vec<TypeInfo> = root
+        .schema()
+        .columns
+        .iter()
+        .map(|column| column.ty.clone())
+        .collect();
 
     let rows: Vec<Row> = if stmt.spool {
         let mut materialised: Vec<Row> = Vec::new();
@@ -71,6 +82,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
             let (id, identity) = write_one(
                 row,
                 stmt,
+                &source_types,
                 &col_metas,
                 &table_name,
                 &table_meta,
@@ -98,6 +110,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
             let (id, identity) = write_one(
                 &row,
                 stmt,
+                &source_types,
                 &col_metas,
                 &table_name,
                 &table_meta,
@@ -137,6 +150,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
 fn write_one(
     row: &[Value],
     stmt: &PhysicalInsert,
+    source_types: &[TypeInfo],
     col_metas: &[ColumnMeta],
     table_name: &str,
     table_meta: &vauban_catalog::TableMeta,
@@ -156,8 +170,14 @@ fn write_one(
         let ordinal = binding.index;
         let src = &row[i];
         let col_meta = &col_metas[ordinal];
-        let converted = assign_value(src.clone(), &binding.ty, col_meta, table_name, "INSERT")
-            .map_err(|e| at(e, 0))?;
+        let converted = assign_value(
+            src.clone(),
+            &source_types[i],
+            col_meta,
+            table_name,
+            "INSERT",
+        )
+        .map_err(|e| at(e, 0))?;
         if col_meta.identity.is_some() {
             explicit_identity = Some(identity_as_i64(&converted, col_meta)?);
         }

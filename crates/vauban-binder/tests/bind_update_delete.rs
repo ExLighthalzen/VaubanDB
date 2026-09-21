@@ -300,6 +300,21 @@ fn update_inserts_convert_to_column_type() {
     assert_eq!(plan.assignments[0].1.ty.ty, SqlType::Int);
 }
 
+/// `b` is a bounded `nvarchar`; a string reaching it — of either character set — keeps
+/// its own type instead of being wrapped in a `Convert` towards the column's, so the
+/// assignment still knows how long the value really is (module documentation).
+#[test]
+fn a_string_keeps_its_own_length_into_a_bounded_character_column() {
+    let plan = update_of("UPDATE dbo.t SET b = 'abc';");
+    let (b, value) = &plan.assignments[0];
+    assert_eq!(b.name, "b");
+    assert!(
+        !matches!(value.kind, BoundExprKind::Convert { .. }),
+        "{value:?}"
+    );
+    assert_eq!(value.ty.ty, SqlType::VarChar(Len::Fixed(3)));
+}
+
 /// `WHERE` filters the `Scan`, and its columns are the target's, with or without the
 /// table name as qualifier.
 #[test]
@@ -346,11 +361,18 @@ fn a_compound_assignment_reads_the_column() {
     assert!(reads_column(expr, "a"));
     assert_eq!(value.ty.ty, SqlType::Int);
 
+    // `b` is a bounded `nvarchar`, and the concatenation is already the matching family:
+    // it keeps its own length instead of being wrapped towards the column's, so the
+    // assignment still sees the eleven characters `b + N'y'` can produce.
     let plan = update_of("UPDATE dbo.t SET b += N'y';");
     assert!(reads_column(&plan.assignments[0].1, "b"));
+    assert!(!matches!(
+        plan.assignments[0].1.kind,
+        BoundExprKind::Convert { .. }
+    ));
     assert_eq!(
         plan.assignments[0].1.ty.ty,
-        SqlType::NVarChar(Len::Fixed(10))
+        SqlType::NVarChar(Len::Fixed(11))
     );
 
     // Counter-proof: a plain `=` reads nothing of the column.

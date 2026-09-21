@@ -13,7 +13,7 @@ use vauban_errors::{SqlError, SqlResult};
 use vauban_executor::{ExecContext, eval_expr};
 use vauban_sysfn::StaticContext;
 use vauban_types::{
-    BinaryOp, Decimal, LiteralKind, SqlString, SqlType, TypeInfo, Value, binary_op_type,
+    BinaryOp, Decimal, Len, LiteralKind, SqlString, SqlType, TypeInfo, Value, binary_op_type,
     parse_literal,
 };
 
@@ -558,4 +558,21 @@ fn a_variable_is_an_internal_error() {
         line: 1,
     };
     assert_eq!(err(&variable).number, 50000);
+}
+
+#[test]
+fn a_convert_towards_a_shorter_varchar_truncates_without_an_error() {
+    // `DECLARE @v varchar(2) = 'abc';` wraps the initializer in a plain `Convert` towards
+    // the declared type, the same shape as the arithmetic ones above: this file evaluates
+    // it exactly as it stands, truncated, with no error. Assigning a value too long for a
+    // column raises 2628 instead (`tests/insert.rs`, `tests/update.rs`); a variable is not
+    // a column, and this shape is unaffected by that check.
+    let target = TypeInfo::new(SqlType::VarChar(Len::Fixed(2)), true);
+    let declared = convert(str_lit("abc"), target);
+    assert_eq!(
+        v(&declared),
+        Value::String(SqlString {
+            text: "ab".to_owned()
+        })
+    );
 }

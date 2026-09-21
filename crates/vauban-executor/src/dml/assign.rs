@@ -26,9 +26,11 @@ pub(crate) fn assign_value(
     convert(&value, from, &col.ty, None)
 }
 
-/// Refuses an assignment that would silently cut a string or binary value to the column
-/// length. Explicit `CAST`/`CONVERT` already applied the cut in `types::convert` before
-/// the value reaches here.
+/// Refuses an assignment that would silently cut a string or binary value to the column's
+/// length. `value` and `from` are what the caller means to write, at the length it still
+/// has: a written `CAST`/`CONVERT` has already narrowed both to the type it named, so
+/// `from` reports that narrower length here, and assigning its result to a still shorter
+/// column keeps raising 2628.
 fn refuse_truncation(
     value: &Value,
     from: &TypeInfo,
@@ -56,13 +58,25 @@ fn refuse_truncation(
     let limit = usize::from(max_len.0);
     let (too_long, truncated_display) = match (max_len.1, &full) {
         (Payload::Chars, Value::String(s)) => {
-            let count = s.text.chars().count();
+            // Trailing spaces past the column's length are cut in silence, like a
+            // `CAST`: what is left once they are trimmed decides whether the value is
+            // too long. `'ABCDEFGHIJ   '` into a `varchar(10)` writes `'ABCDEFGHIJ'`,
+            // no error, because the ten letters alone already fit.
+            let content = s.text.trim_end_matches(' ').chars().count();
             (
-                count > limit,
+                content > limit,
                 s.text.chars().take(limit).collect::<String>(),
             )
         }
-        (Payload::Bytes, Value::Bytes(b)) => (b.len() > limit, String::new()),
+        (Payload::Bytes, Value::Bytes(b)) => {
+            // Trailing zero bytes past the column's length are cut in silence, the
+            // binary counterpart of the trailing spaces above: `0x01020000` into a
+            // `varbinary(2)` writes `0x0102`, no error, because the two significant
+            // bytes alone already fit.
+            let trailing_zeros = b.iter().rev().take_while(|&&byte| byte == 0).count();
+            let content = b.len() - trailing_zeros;
+            (content > limit, String::new())
+        }
         _ => return Ok(()),
     };
     if too_long {

@@ -11,6 +11,7 @@
 //! | `td` | `a int NOT NULL`, `d int NOT NULL`, `n int NULL` |
 //! | `tc` | `a int NOT NULL`, `c int` computed |
 //! | `tx` | `u uniqueidentifier NULL`, `dt date NULL` |
+//! | `ts` | `s varchar(5) NULL`, `bin varbinary(5) NULL` |
 //! | `v` | a view |
 //!
 //! The bound nodes derive no `PartialEq`: a shape is checked by pattern matching, a type by
@@ -103,6 +104,13 @@ impl CatalogView for Tables {
                 vec![
                     column(1, 0, "u", SqlType::UniqueIdentifier, true),
                     column(2, 1, "dt", SqlType::Date, true),
+                ],
+            )),
+            "ts" => Some(table(
+                7,
+                vec![
+                    column(1, 0, "s", SqlType::VarChar(Len::Fixed(5)), true),
+                    column(2, 1, "bin", SqlType::VarBinary(Len::Fixed(5)), true),
                 ],
             )),
             "v" => Some(ResolvedTable {
@@ -235,12 +243,22 @@ fn insert_values_two_rows_binds() {
         let (to, from) = convert_of(&row[0]);
         assert_eq!(to.ty, int());
         assert_eq!(from.ty, int(), "an int literal is converted all the same");
-        let (to, from) = convert_of(&row[1]);
-        assert_eq!(to.ty, nvarchar10());
-        assert_eq!(from.ty, SqlType::NVarChar(Len::Fixed(1)));
+        // `b` is a bounded `nvarchar`, and a string reaching it keeps its own type
+        // instead of being wrapped in a `Convert` towards the column's (module
+        // documentation, "The conversion towards the column").
+        assert!(
+            !matches!(row[1].kind, BoundExprKind::Convert { .. }),
+            "{:?}",
+            row[1]
+        );
+        assert_eq!(row[1].ty.ty, SqlType::NVarChar(Len::Fixed(1)));
     }
     assert_eq!(plan.source.schema().columns.len(), 2);
-    assert_eq!(plan.source.schema().columns[1].ty.ty, nvarchar10());
+    assert_eq!(
+        plan.source.schema().columns[1].ty.ty,
+        SqlType::NVarChar(Len::Fixed(1)),
+        "the schema reports the length the two rows share, not the column's"
+    );
 }
 
 #[test]
@@ -255,8 +273,54 @@ fn insert_without_column_list_uses_catalog_order() {
         ["b", "a"],
         "a written list keeps its order"
     );
-    let (to, _) = convert_of(&rows(&listed.source)[0][0]);
-    assert_eq!(to.ty, nvarchar10());
+    let value = &rows(&listed.source)[0][0];
+    assert!(!matches!(value.kind, BoundExprKind::Convert { .. }));
+    assert_eq!(value.ty.ty, SqlType::NVarChar(Len::Fixed(1)));
+}
+
+/// A string reaching a bounded `varchar` keeps its own type; a value of a different
+/// family, or a target that is not one of the three bounded types, still converts here
+/// (module documentation, "The conversion towards the column").
+#[test]
+fn a_string_keeps_its_own_length_into_a_bounded_character_column() {
+    let plan = insert("INSERT INTO dbo.ts (s) VALUES ('abc');");
+    let value = &rows(&plan.source)[0][0];
+    assert!(
+        !matches!(value.kind, BoundExprKind::Convert { .. }),
+        "{value:?}"
+    );
+    assert_eq!(value.ty.ty, SqlType::VarChar(Len::Fixed(3)));
+
+    // An `int` reaching the same column is a different family: it still converts.
+    let plan = insert("INSERT INTO dbo.ts (s) VALUES (1);");
+    let (to, from) = convert_of(&rows(&plan.source)[0][0]);
+    assert_eq!(to.ty, SqlType::VarChar(Len::Fixed(5)));
+    assert_eq!(from.ty, int());
+}
+
+/// A binary value reaching a bounded `varbinary` keeps its own type, the same way a
+/// string does for a bounded character target.
+#[test]
+fn a_binary_keeps_its_own_length_into_a_bounded_binary_column() {
+    let plan = insert("INSERT INTO dbo.ts (bin) VALUES (0x0102030405060708);");
+    let value = &rows(&plan.source)[0][0];
+    assert!(
+        !matches!(value.kind, BoundExprKind::Convert { .. }),
+        "{value:?}"
+    );
+    assert_eq!(value.ty.ty, SqlType::VarBinary(Len::Fixed(8)));
+}
+
+/// Two rows of different lengths at the same position share the wider of the two in the
+/// schema of the `Values` node, the same reconciliation `common_value_type` already
+/// applies to check the pair against the column.
+#[test]
+fn two_rows_of_different_lengths_share_the_wider_type_in_the_schema() {
+    let plan = insert("INSERT INTO dbo.ts (s) VALUES ('ab'), ('abcde');");
+    assert_eq!(
+        plan.source.schema().columns[0].ty.ty,
+        SqlType::VarChar(Len::Fixed(5))
+    );
 }
 
 #[test]

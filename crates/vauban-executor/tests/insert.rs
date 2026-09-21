@@ -5,14 +5,16 @@ use std::slice;
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LockHints, OutputColumn, OutputSchema,
-    SessionOptions,
+    BindContext, BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LockHints, NoVariables,
+    OutputColumn, OutputSchema, SessionOptions, bind,
 };
 use vauban_catalog::{Catalog, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, TableDef};
 use vauban_errors::SqlResult;
 use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSet, execute_collect};
-use vauban_parser::{BinaryOp, Expr, Literal, Span, UnaryOp};
-use vauban_planner::{PhysicalInsert, PhysicalPlan, PhysicalStatement};
+use vauban_parser::{BinaryOp, Expr, Literal, ParseOptions, Span, UnaryOp, parse_batch};
+use vauban_planner::{
+    NoIndexes, PhysicalInsert, PhysicalPlan, PhysicalStatement, PlanContext, plan,
+};
 use vauban_storage::{MemoryStorage, TableId};
 use vauban_sysfn::StaticContext;
 use vauban_txn::{IsolationLevel, TransactionManager, TxnHandle};
@@ -170,6 +172,36 @@ impl Fixture {
             .with_handle(handle)
             .with_session(session);
         execute_collect(stmt, &mut ctx)
+    }
+
+    /// Parses, binds against this fixture's own catalogue, plans and executes one
+    /// statement of `text`: the full chain a client's SQL takes, rather than the
+    /// hand-built `PhysicalInsert` the rest of this file uses. `insert_one` gives the
+    /// executor a row already at the type of its column; this instead lets the binder
+    /// decide what the row looks like, which is the one place the length of a string or
+    /// binary value can be lost before an assignment ever checks it.
+    fn run_sql(&mut self, text: &str) -> SqlResult<(ExecOutcome, RowSet)> {
+        let batch = parse_batch(text, &ParseOptions::default()).expect("the statement parses");
+        assert_eq!(batch.statements.len(), 1, "one statement");
+        let physical = {
+            let snap = self.catalog.snapshot(&self.handle);
+            let bind_ctx = BindContext {
+                text,
+                catalog: Some(&snap),
+                database: "master",
+                default_schema: "dbo",
+                variables: &NoVariables,
+                options: SessionOptions::default(),
+            };
+            let bound = bind(&batch.statements[0], &bind_ctx)?;
+            plan(
+                bound,
+                &PlanContext {
+                    catalog: &NoIndexes,
+                },
+            )?
+        };
+        self.run(&physical)
     }
 
     /// Every row of `table`, read through the columns `bindings` names.
@@ -758,6 +790,28 @@ fn string_too_long_for_a_varchar_column_is_2628() {
     assert!(f.read(table, &[code]).is_empty(), "nothing was written");
 }
 
+/// A plain `INSERT … VALUES` of a string literal, taken through `run_sql` rather than
+/// `insert_one`: the binder decides what the row looks like here, which is the shape
+/// that must still raise 2628 rather than writing the first two characters.
+#[test]
+fn a_string_literal_too_long_for_a_varchar_column_is_2628_through_the_binder() {
+    let mut f = Fixture::new();
+    let table = f.create(
+        "insert_trunc_literal",
+        vec![column("c", varchar(2, false), None)],
+    );
+
+    let err = f
+        .run_sql("INSERT INTO dbo.insert_trunc_literal VALUES ('abc');")
+        .expect_err("three characters do not fit varchar(2)");
+    assert_eq!(err.number, 2628);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 1);
+
+    let c = col_binding(0, "c", varchar(2, false));
+    assert!(f.read(table, &[c]).is_empty(), "nothing was written");
+}
+
 #[test]
 fn string_too_long_for_an_nvarchar_column_is_2628() {
     let mut f = Fixture::new();
@@ -798,6 +852,24 @@ fn binary_too_long_for_a_varbinary_column_is_2628() {
     assert_eq!(err.number, 2628);
     assert_eq!(err.state, 1);
     assert!(err.message.contains("'b'"), "{}", err.message);
+}
+
+/// Trailing zero bytes past the column's length are cut in silence, the binary
+/// counterpart of the trailing spaces of a string: `0x01020000` into `varbinary(2)`
+/// writes `0x0102`, no error, because the two significant bytes alone already fit.
+#[test]
+fn trailing_zero_bytes_beyond_the_declared_length_do_not_raise_2628() {
+    let mut f = Fixture::new();
+    let table = f.create(
+        "insert_trunc_varbinary_zeros",
+        vec![column("b", varbinary(2, false), None)],
+    );
+
+    f.run_sql("INSERT INTO dbo.insert_trunc_varbinary_zeros VALUES (0x01020000);")
+        .expect("trailing zero bytes are cut in silence, like trailing spaces");
+
+    let b = col_binding(0, "b", varbinary(2, false));
+    assert_eq!(f.read(table, &[b]), vec![vec![Value::Bytes(vec![1, 2])]]);
 }
 
 #[test]
@@ -890,6 +962,25 @@ fn an_explicit_cast_still_truncates_without_error() {
             text: "ab".to_owned(),
         })]]
     );
+}
+
+/// A `CAST` that widens past the column, unlike the one just above: it still cuts
+/// silently to its own target, but the column is narrower than that target, so the
+/// assignment that follows still raises 2628 on the result.
+#[test]
+fn a_cast_wider_than_the_column_still_raises_2628_on_assignment() {
+    let mut f = Fixture::new();
+    f.create(
+        "insert_cast_then_narrow",
+        vec![column("c", varchar(2, false), None)],
+    );
+
+    let err = f
+        .run_sql("INSERT INTO dbo.insert_cast_then_narrow VALUES (CAST('abc' AS varchar(10)));")
+        .expect_err("three characters do not fit varchar(2), even read through a wider CAST");
+    assert_eq!(err.number, 2628);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 1);
 }
 
 #[test]
