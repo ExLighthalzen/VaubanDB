@@ -63,6 +63,22 @@ pub enum PhysicalStatement {
         /// holds none.
         subplans: Vec<SubPlan>,
     },
+    /// `SELECT @x = a, @y = b FROM t …`, the assignment of variables from the rows of a
+    /// plan.
+    ///
+    /// The statement produces no result set: the rows of `input` are walked and each one
+    /// overwrites the variables, so the last row walked leaves its values behind. The
+    /// select list of that statement is the `Project` the binder detached from the query
+    /// ([`BoundStatement::SelectAssign`](vauban_binder::BoundStatement::SelectAssign)),
+    /// which is why the expressions travel beside the plan rather than on top of it.
+    SelectAssign {
+        /// The rows to assign from, under a [`PhysicalPlan::SubqueryEval`] when an
+        /// assigned value holds a subquery.
+        input: PhysicalPlan,
+        /// One `@x = e` per entry, in written order: the name as the assignment wrote it,
+        /// `@` included, and the value as the binder converted it.
+        assignments: Vec<(String, BoundExpr)>,
+    },
     /// `DECLARE @a int, @b varchar(10) = 'x'`, in the order the declarations were written.
     Declare(Vec<PhysicalDeclaration>),
     /// `IF p stmt [ELSE stmt]`, both branches planned.

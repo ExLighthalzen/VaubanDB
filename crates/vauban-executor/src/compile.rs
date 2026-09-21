@@ -250,6 +250,22 @@ pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult
         }
         PhysicalStatement::Delete(delete) => compile_plan(&delete.input, ctx),
         PhysicalStatement::SetVariable { value, .. } => compile_expr(value, ctx),
+        // The assigned values are checked **before** the plan of the source, because the
+        // binder detached them from the `Project` they were written in: checking the plan
+        // first would put the `TOP` of the source above them, where [`compile_plan`] puts
+        // the select list below it. When the `TOP` sits above the list and both fault —
+        // `SELECT TOP (-1) @s = SUBSTRING('abc', 1, -1) FROM t` — this order answers the
+        // 536 of the length argument, as the same source read as a query does
+        // (`tests/control.rs`,
+        // `select_assign_answers_the_length_error_before_the_top_error`); the statement
+        // sends no column metadata either way, so the boundary this file draws is
+        // invisible to a client here.
+        PhysicalStatement::SelectAssign { input, assignments } => {
+            for (_, value) in assignments {
+                compile_expr(value, ctx)?;
+            }
+            compile_plan(input, ctx)
+        }
         PhysicalStatement::Declare(declarations) => {
             for declaration in declarations {
                 if let Some(value) = &declaration.value {
@@ -295,7 +311,7 @@ pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult
 ///
 /// Depth first and input first, so that the select list is checked before the `TOP` above
 /// it: `SELECT TOP (-1) SUBSTRING('abc', 1, -1);` answers **536** and not 127, the two
-/// checks being both compile-time ones (`compile::tests::compilation_comes_before_execution`).
+/// checks being both compile-time ones (`compile::tests::compile_time_checks_come_before_execution`).
 fn compile_plan(plan: &PhysicalPlan, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
     match plan {
         PhysicalPlan::OneRow => Ok(()),

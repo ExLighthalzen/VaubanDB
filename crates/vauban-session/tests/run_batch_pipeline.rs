@@ -1216,3 +1216,60 @@ fn nested_while_ends_with_rowcount_at_zero() {
         run("EXEC('DECLARE @i int = 0; WHILE @i < 3 SET @i = @i + 1; SELECT @@ROWCOUNT, @i;');");
     assert_eq!(rows(&events), vec![vec![Value::I32(0), Value::I32(3)]]);
 }
+
+#[test]
+fn select_assign_from_rows_sets_rowcount_to_the_rows_walked() {
+    let events = run(
+        "DECLARE @x int; SELECT @x = col FROM (VALUES (1), (2), (3)) AS t(col); \
+         SELECT @@ROWCOUNT, @x;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(3), Value::I32(3)]]);
+}
+
+#[test]
+fn select_assign_over_no_row_sets_rowcount_to_zero() {
+    // The variable keeps the value it was declared with, and the count of a source that
+    // produced nothing is 0, not the 1 an assignment without a `FROM` leaves.
+    let events = run(
+        "DECLARE @x int = 7; SELECT @x = col FROM (VALUES (1)) AS t(col) WHERE 1 = 0; \
+         SELECT @@ROWCOUNT, @x;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(0), Value::I32(7)]]);
+}
+
+#[test]
+fn print_after_a_select_assign_sets_rowcount_to_zero() {
+    // `PRINT` is a statement of its own and starts its own count, so what the assignment
+    // posted is gone by the time the read runs.
+    let events = run(
+        "DECLARE @x int; SELECT @x = col FROM (VALUES (1), (2)) AS t(col); PRINT 'x'; \
+         SELECT @@ROWCOUNT;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(0)]]);
+}
+
+#[test]
+fn select_assign_over_rows_accumulates_into_the_variable() {
+    let events = run("DECLARE @s varchar(20) = ''; \
+         SELECT @s = @s + CAST(col AS varchar(2)) FROM (VALUES (1), (2), (3)) AS t(col); \
+         SELECT @s;");
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::String(SqlString {
+            text: "123".to_owned()
+        })]]
+    );
+}
+
+#[test]
+fn select_assign_sends_no_result_set() {
+    // The assignment closes a statement that announced no columns: the only `Columns`
+    // event of the batch belongs to the `SELECT` that reads the variable back.
+    let events = run("DECLARE @x int; SELECT @x = col FROM (VALUES (1)) AS t(col); SELECT @x;");
+    let announced = events
+        .iter()
+        .filter(|event| matches!(event, Event::Columns(_)))
+        .count();
+    assert_eq!(announced, 1, "{events:#?}");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]]);
+}

@@ -127,6 +127,7 @@ fn dispatch<'a>(
         PhysicalStatement::Update(update) => dml::update_delete::execute_update(update, ctx),
         PhysicalStatement::Delete(delete) => dml::update_delete::execute_delete(delete, ctx),
         PhysicalStatement::SetVariable { .. }
+        | PhysicalStatement::SelectAssign { .. }
         | PhysicalStatement::Declare(_)
         | PhysicalStatement::If { .. }
         | PhysicalStatement::While { .. }

@@ -305,3 +305,76 @@ fn a_set_from_a_subquery_over_no_row_is_null() {
     );
     assert_eq!(rows(&events), vec![vec![Value::I32(5)]]);
 }
+
+/// `SELECT @x = v FROM t` assigns from a real table: the last row read leaves its value,
+/// and `@@ROWCOUNT` afterwards is the number of rows the source produced.
+#[test]
+fn a_select_assigns_from_the_rows_of_a_table() {
+    let mut session = session();
+    setup_plain_table(&mut session, "sv_assign");
+    run(
+        &mut session,
+        "INSERT INTO dbo.sv_assign (id, v) VALUES (1, 10), (2, 20), (3, 30);",
+    );
+
+    let events = run(
+        &mut session,
+        "DECLARE @x int; SELECT @x = v FROM dbo.sv_assign ORDER BY id; SELECT @x, @@ROWCOUNT;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(30), Value::I32(3)]]);
+}
+
+/// The same statement with `ORDER BY id DESC` leaves the other end of the table, so the
+/// value the variable keeps is the one the ordering puts last.
+#[test]
+fn a_select_assignment_follows_the_order_by() {
+    let mut session = session();
+    setup_plain_table(&mut session, "sv_assign_desc");
+    run(
+        &mut session,
+        "INSERT INTO dbo.sv_assign_desc (id, v) VALUES (1, 10), (2, 20), (3, 30);",
+    );
+
+    let events = run(
+        &mut session,
+        "DECLARE @x int; SELECT @x = v FROM dbo.sv_assign_desc ORDER BY id DESC; SELECT @x;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(10)]]);
+}
+
+/// Over a `WHERE` that keeps nothing the variable stays at the value it was declared
+/// with, and `@@ROWCOUNT` reads `0`.
+#[test]
+fn a_select_assignment_over_no_row_keeps_the_value() {
+    let mut session = session();
+    setup_plain_table(&mut session, "sv_assign_empty");
+    run(
+        &mut session,
+        "INSERT INTO dbo.sv_assign_empty (id, v) VALUES (1, 10);",
+    );
+
+    let events = run(
+        &mut session,
+        "DECLARE @x int = 7; SELECT @x = v FROM dbo.sv_assign_empty WHERE v = 0; \
+         SELECT @x, @@ROWCOUNT;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(7), Value::I32(0)]]);
+}
+
+/// Two targets in one list: each reads the row being walked, so both end on the last row.
+#[test]
+fn a_select_assigns_two_variables_from_the_same_row() {
+    let mut session = session();
+    setup_plain_table(&mut session, "sv_assign_two");
+    run(
+        &mut session,
+        "INSERT INTO dbo.sv_assign_two (id, v) VALUES (1, 10), (2, 20);",
+    );
+
+    let events = run(
+        &mut session,
+        "DECLARE @a int, @b int; SELECT @a = id, @b = v FROM dbo.sv_assign_two ORDER BY id; \
+         SELECT @a, @b;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(2), Value::I32(20)]]);
+}

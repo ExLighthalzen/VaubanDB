@@ -341,7 +341,7 @@ fn the_check_fires_where_execution_would_never_reach() {
 }
 
 #[test]
-fn compilation_comes_before_execution() {
+fn compile_time_checks_come_before_execution() {
     // A run-time error written first in the select list does not get its turn.
     assert_eq!(
         compile_error("SELECT 1 / 0, SUBSTRING('abc', 1, -1)").number,

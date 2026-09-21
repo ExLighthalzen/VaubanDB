@@ -363,6 +363,9 @@ fn plan_reads_user_table(plan: &PhysicalPlan) -> bool {
 fn statement_reads_user_table(bound: &PhysicalStatement) -> bool {
     match bound {
         PhysicalStatement::Query(plan) => plan_reads_user_table(plan),
+        // `SELECT @x = col FROM t` reads its source the way the same `FROM` read as a
+        // query does; the assigned values hang off that plan and add no source of rows.
+        PhysicalStatement::SelectAssign { input, .. } => plan_reads_user_table(input),
         PhysicalStatement::Insert(_)
         | PhysicalStatement::SelectInto(_)
         | PhysicalStatement::Update(_)

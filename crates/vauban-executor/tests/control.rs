@@ -3,7 +3,11 @@
 //!
 //! All `PhysicalStatement`s are built by hand; the binder and the parser are not involved.
 
-use vauban_binder::{BoundExpr, BoundExprKind, OutputColumn, OutputSchema, SessionOptions};
+use vauban_binder::{
+    BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding, OutputColumn, OutputSchema,
+    SessionOptions, SortKey,
+};
+use vauban_catalog::ColumnId;
 use vauban_executor::{CancelToken, CollectSink, ExecContext, ExecOutcome, ExecSession, execute};
 use vauban_planner::{PhysicalDeclaration, PhysicalPlan, PhysicalStatement};
 use vauban_sysfn::StaticContext;
@@ -203,19 +207,9 @@ fn set_conversion_error_has_the_original_number() {
     assert_eq!(err.number, 245);
 }
 
-/// `SELECT @x = col` over three rows: the last row wins.
-#[test]
-fn select_assign_takes_the_last_row() {
-    let mut session = new_session();
-    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
-        name: "@x".to_owned(),
-        ty: int_ty(),
-        value: None,
-        subplans: Vec::new(),
-    }]);
-    run(&mut session, &declare);
-
-    let plan = PhysicalPlan::Values {
+/// The three rows `1`, `2`, `3` read as one `int` column named `col`.
+fn three_rows() -> PhysicalPlan {
+    PhysicalPlan::Values {
         rows: vec![vec![int_lit(1)], vec![int_lit(2)], vec![int_lit(3)]],
         schema: OutputSchema {
             columns: vec![OutputColumn {
@@ -223,14 +217,200 @@ fn select_assign_takes_the_last_row() {
                 ty: int_ty(),
             }],
         },
-    };
-    let stmt = PhysicalStatement::Query(plan);
-    let eval = StaticContext::default();
-    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_session(&mut session);
-    let mut sink = CollectSink::new();
-    let outcome = execute(&stmt, &mut ctx, &mut sink).expect("the query executes");
+    }
+}
 
-    assert!(matches!(outcome, ExecOutcome::Rows(3)));
+/// A reference to the column of [`three_rows`], or to the `n`-th column of a wider plan.
+fn col_ref(index: usize, ty: TypeInfo) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            column: ColumnId(i32::try_from(index).expect("a small index") + 1),
+            index,
+            name: format!("c{index}"),
+            ty: ty.clone(),
+            depth: 0,
+        }),
+        ty,
+        line: 1,
+    }
+}
+
+/// `DECLARE @x int` (or another type), run against `session`.
+fn declare(session: &mut ExecSession, name: &str, ty: TypeInfo, value: Option<BoundExpr>) {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
+        name: name.to_owned(),
+        ty,
+        value,
+        subplans: Vec::new(),
+    }]);
+    run(session, &declare);
+}
+
+/// `SELECT @x = col FROM (three rows)`: the row walked last leaves its value behind, and
+/// the statement answers no result set.
+#[test]
+fn select_assign_keeps_the_last_row() {
+    let mut session = new_session();
+    declare(&mut session, "@x", int_ty(), None);
+
+    let stmt = PhysicalStatement::SelectAssign {
+        input: three_rows(),
+        assignments: vec![("@x".to_owned(), col_ref(0, int_ty()))],
+    };
+    let (outcome, sink) = run(&mut session, &stmt);
+
+    assert!(matches!(outcome, ExecOutcome::NoRows));
+    assert!(sink.schema.is_none(), "the assignment published no schema");
+    assert!(sink.rows.is_empty());
+    assert_eq!(session.variables.get("@x"), Some(&Value::I32(3)));
+}
+
+/// The same three rows under a `Sort` on `col DESC`: the winner follows the order the
+/// plan delivers, so `1` is the row walked last.
+#[test]
+fn select_assign_follows_the_order_by() {
+    let mut session = new_session();
+    declare(&mut session, "@x", int_ty(), None);
+
+    let sorted = PhysicalPlan::Sort {
+        input: Box::new(three_rows()),
+        keys: vec![SortKey {
+            expr: col_ref(0, int_ty()),
+            desc: true,
+            collation: None,
+        }],
+    };
+    let stmt = PhysicalStatement::SelectAssign {
+        input: sorted,
+        assignments: vec![("@x".to_owned(), col_ref(0, int_ty()))],
+    };
+    run(&mut session, &stmt);
+
+    assert_eq!(session.variables.get("@x"), Some(&Value::I32(1)));
+}
+
+/// `SELECT @s = @s + col FROM …`: the value read on each row is the one the row before
+/// it stored, so the three rows accumulate into `123`.
+#[test]
+fn select_assign_accumulates_over_the_rows() {
+    let mut session = new_session();
+    declare(&mut session, "@s", varchar_ty(20), Some(str_lit("")));
+
+    let rows = PhysicalPlan::Values {
+        rows: vec![vec![str_lit("1")], vec![str_lit("2")], vec![str_lit("3")]],
+        schema: OutputSchema {
+            columns: vec![OutputColumn {
+                name: "col".to_owned(),
+                ty: varchar_ty(2),
+            }],
+        },
+    };
+    let accumulate = BoundExpr {
+        kind: BoundExprKind::Arith {
+            op: vauban_types::BinaryOp::Add,
+            left: Box::new(BoundExpr {
+                kind: BoundExprKind::Variable {
+                    name: "@s".to_owned(),
+                },
+                ty: varchar_ty(20),
+                line: 1,
+            }),
+            right: Box::new(col_ref(0, varchar_ty(2))),
+        },
+        ty: varchar_ty(20),
+        line: 1,
+    };
+    let stmt = PhysicalStatement::SelectAssign {
+        input: rows,
+        assignments: vec![("@s".to_owned(), accumulate)],
+    };
+    run(&mut session, &stmt);
+
+    assert_eq!(
+        session.variables.get("@s"),
+        Some(&Value::String(SqlString {
+            text: "123".to_owned()
+        }))
+    );
+}
+
+/// A source that produces nothing leaves the variable at the value it held, where the
+/// subquery spelling `SET @x = (SELECT …)` over the same source stores `NULL`.
+#[test]
+fn select_assign_over_no_row_keeps_the_value() {
+    let mut session = new_session();
+    declare(&mut session, "@x", int_ty(), Some(int_lit(7)));
+
+    let empty = PhysicalPlan::Filter {
+        input: Box::new(three_rows()),
+        predicate: eq(int_lit(1), int_lit(0)),
+    };
+    let stmt = PhysicalStatement::SelectAssign {
+        input: empty,
+        assignments: vec![("@x".to_owned(), col_ref(0, int_ty()))],
+    };
+    let (outcome, _) = run(&mut session, &stmt);
+
+    assert!(matches!(outcome, ExecOutcome::NoRows));
+    assert_eq!(session.variables.get("@x"), Some(&Value::I32(7)));
+}
+
+/// Within one row the targets are stored left to right, so the second value reads the
+/// first target at the value of the row being walked, not of the row before it.
+#[test]
+fn select_assign_reads_a_target_assigned_before_it() {
+    let mut session = new_session();
+    declare(&mut session, "@a", int_ty(), None);
+    declare(&mut session, "@b", int_ty(), None);
+
+    let stmt = PhysicalStatement::SelectAssign {
+        input: three_rows(),
+        assignments: vec![
+            ("@a".to_owned(), col_ref(0, int_ty())),
+            ("@b".to_owned(), var_ref("@a")),
+        ],
+    };
+    run(&mut session, &stmt);
+
+    assert_eq!(session.variables.get("@a"), Some(&Value::I32(3)));
+    assert_eq!(session.variables.get("@b"), Some(&Value::I32(3)));
+}
+
+/// `@@ROWCOUNT` after the statement is the number of rows walked.
+#[test]
+fn select_assign_sets_rowcount_to_the_rows_walked() {
+    let mut session = new_session();
+    declare(&mut session, "@x", int_ty(), None);
+    session.rowcount = 99;
+
+    let stmt = PhysicalStatement::SelectAssign {
+        input: three_rows(),
+        assignments: vec![("@x".to_owned(), col_ref(0, int_ty()))],
+    };
+    run(&mut session, &stmt);
+
+    assert_eq!(session.rowcount, 3);
+}
+
+/// A source that produces nothing puts `@@ROWCOUNT` at `0`, over the count the previous
+/// statement left: the count is written whether or not a variable was assigned.
+#[test]
+fn select_assign_over_no_row_sets_rowcount_to_zero() {
+    let mut session = new_session();
+    declare(&mut session, "@x", int_ty(), Some(int_lit(7)));
+    session.rowcount = 99;
+
+    let empty = PhysicalPlan::Filter {
+        input: Box::new(three_rows()),
+        predicate: eq(int_lit(1), int_lit(0)),
+    };
+    let stmt = PhysicalStatement::SelectAssign {
+        input: empty,
+        assignments: vec![("@x".to_owned(), col_ref(0, int_ty()))],
+    };
+    run(&mut session, &stmt);
+
+    assert_eq!(session.rowcount, 0);
 }
 
 /// `IF 1 = 1` runs the `then` branch; `IF 1 = 0` runs the `else` branch.
@@ -431,4 +611,101 @@ fn rowcount_after_set() {
     };
     run(&mut session, &set);
     assert_eq!(session.rowcount, 1);
+}
+
+/// A call of a registered built-in, typed by `sysfn::check_call` as the binder types it.
+fn call(name: &str, args: Vec<BoundExpr>) -> BoundExpr {
+    vauban_sysfn::register_builtins();
+    let def = vauban_sysfn::lookup(name).unwrap_or_else(|| panic!("`{name}` is registered"));
+    let types: Vec<TypeInfo> = args.iter().map(|arg| arg.ty.clone()).collect();
+    let ty = vauban_sysfn::check_call(def, &types).expect("the call is well formed");
+    BoundExpr {
+        kind: BoundExprKind::Function { def, args },
+        ty,
+        line: 1,
+    }
+}
+
+/// `TOP (n)` over `input`, without `PERCENT` and without `WITH TIES`.
+fn top(input: PhysicalPlan, n: i64) -> PhysicalPlan {
+    PhysicalPlan::Top {
+        input: Box::new(input),
+        top: BoundTop {
+            expr: BoundExpr {
+                kind: BoundExprKind::Literal(Value::I64(n)),
+                ty: TypeInfo::new(SqlType::BigInt, false),
+                line: 1,
+            },
+            percent: false,
+            with_ties: false,
+        },
+    }
+}
+
+/// Runs `stmt` and answers the error it raised.
+fn run_err(session: &mut ExecSession, stmt: &PhysicalStatement) -> vauban_errors::SqlError {
+    let eval = StaticContext::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_session(session);
+    let mut sink = CollectSink::new();
+    execute(stmt, &mut ctx, &mut sink).expect_err("the statement fails")
+}
+
+/// `SELECT TOP (-1) @s = SUBSTRING('abc', 1, -1) FROM t` faults in two places at once: the
+/// row count is negative (127) and the length argument is negative (536). It answers
+/// **536**, the number the same source read as a query answers
+/// (`select_of_the_same_two_faults_answers_the_length_error`, just below), because the
+/// select list the binder detached is checked before the `TOP` that sits above the source.
+#[test]
+fn select_assign_answers_the_length_error_before_the_top_error() {
+    let mut session = new_session();
+    declare(&mut session, "@s", varchar_ty(10), None);
+
+    let stmt = PhysicalStatement::SelectAssign {
+        input: top(three_rows(), -1),
+        assignments: vec![(
+            "@s".to_owned(),
+            call("SUBSTRING", vec![str_lit("abc"), int_lit(1), int_lit(-1)]),
+        )],
+    };
+    assert_eq!(run_err(&mut session, &stmt).number, 536);
+}
+
+/// The query spelling of the same two faults, which is the shape the assignment above is
+/// aligned on: `SELECT TOP (-1) SUBSTRING('abc', 1, -1) FROM t` answers 536 as well.
+#[test]
+fn select_of_the_same_two_faults_answers_the_length_error() {
+    let mut session = new_session();
+    let projected = PhysicalPlan::Project {
+        input: Box::new(three_rows()),
+        exprs: vec![BoundProjection {
+            expr: call("SUBSTRING", vec![str_lit("abc"), int_lit(1), int_lit(-1)]),
+            name: String::new(),
+        }],
+        schema: OutputSchema {
+            columns: vec![OutputColumn {
+                name: String::new(),
+                ty: varchar_ty(3),
+            }],
+        },
+    };
+    let stmt = PhysicalStatement::Query(top(projected, -1));
+    assert_eq!(run_err(&mut session, &stmt).number, 536);
+}
+
+/// The counter-proof of the pair: with the length argument put right, the same assignment
+/// still answers the 127 of its `TOP`, so the 536 above is the length check running first
+/// rather than the row-count check being skipped.
+#[test]
+fn select_assign_over_a_negative_top_answers_127() {
+    let mut session = new_session();
+    declare(&mut session, "@s", varchar_ty(10), None);
+
+    let stmt = PhysicalStatement::SelectAssign {
+        input: top(three_rows(), -1),
+        assignments: vec![(
+            "@s".to_owned(),
+            call("SUBSTRING", vec![str_lit("abc"), int_lit(1), int_lit(1)]),
+        )],
+    };
+    assert_eq!(run_err(&mut session, &stmt).number, 127);
 }

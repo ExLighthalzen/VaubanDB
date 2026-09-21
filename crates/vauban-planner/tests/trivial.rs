@@ -710,3 +710,53 @@ fn the_declared_types_are_reachable_from_outside() {
     let point = KeyRangeExpr::Point(vec![literal(1)]);
     assert!(matches!(point, KeyRangeExpr::Point(ref keys) if keys.len() == 1));
 }
+
+/// `SELECT @x = id FROM t` plans into [`PhysicalStatement::SelectAssign`]: the source
+/// becomes an operator tree and the assignment list travels beside it, in written order.
+#[test]
+fn select_assign_from_rows_plans_its_input_and_assignments() {
+    let catalog = NoIndexes;
+    let bound = BoundStatement::SelectAssign {
+        input: Box::new(scan()),
+        assignments: vec![(
+            "@x".to_owned(),
+            BoundExpr {
+                kind: BoundExprKind::ColumnRef(id_binding()),
+                ty: int_type(),
+                line: 1,
+            },
+        )],
+    };
+    let planned = plan(bound, &context(&catalog)).expect("the assignment plans");
+    let PhysicalStatement::SelectAssign { input, assignments } = planned else {
+        panic!("expected PhysicalStatement::SelectAssign, got {planned:?}");
+    };
+    assert!(
+        matches!(input, PhysicalPlan::TableScan { .. }),
+        "expected the source to become a scan, got {input:?}"
+    );
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].0, "@x");
+}
+
+/// Two targets keep the order they were written in, which is the order the executor
+/// stores them in within one row.
+#[test]
+fn select_assign_keeps_the_order_of_its_targets() {
+    let catalog = NoIndexes;
+    let column = BoundExpr {
+        kind: BoundExprKind::ColumnRef(id_binding()),
+        ty: int_type(),
+        line: 1,
+    };
+    let bound = BoundStatement::SelectAssign {
+        input: Box::new(scan()),
+        assignments: vec![("@a".to_owned(), column.clone()), ("@b".to_owned(), column)],
+    };
+    let planned = plan(bound, &context(&catalog)).expect("the assignment plans");
+    let PhysicalStatement::SelectAssign { assignments, .. } = planned else {
+        panic!("expected PhysicalStatement::SelectAssign, got {planned:?}");
+    };
+    let names: Vec<&str> = assignments.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["@a", "@b"]);
+}

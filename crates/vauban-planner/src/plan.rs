@@ -42,10 +42,20 @@ pub fn plan(stmt: BoundStatement, ctx: &PlanContext<'_>) -> SqlResult<PhysicalSt
                 subplans,
             })
         }
-        BoundStatement::SelectAssign { .. } => Err(not_implemented(
-            "plan",
-            "a SELECT that assigns variables from a FROM",
-        )),
+        // The select list of the statement was detached by the binder, so the subqueries
+        // an assigned value holds get the treatment a `Project` expression gets in
+        // [`plan_node`]: one `SubqueryEval` layered over the rows they are read against
+        // (`tests/trivial.rs`, `select_assign_from_rows_plans_its_input_and_assignments`).
+        BoundStatement::SelectAssign { input, assignments } => {
+            let mut planned = plan_node(&input, ctx)?;
+            for (_, value) in &assignments {
+                planned = subquery::plan_expr_subqueries(value, planned, ctx)?;
+            }
+            Ok(PhysicalStatement::SelectAssign {
+                input: planned,
+                assignments,
+            })
+        }
         BoundStatement::Execute(execute) => Ok(PhysicalStatement::Execute(execute)),
         BoundStatement::Declare(declarations) => {
             let mut planned = Vec::with_capacity(declarations.len());

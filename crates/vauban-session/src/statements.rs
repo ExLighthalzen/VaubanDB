@@ -68,6 +68,12 @@ pub(crate) fn statement_clears_last_error(stmt: &PhysicalStatement) -> bool {
 /// loop on or moved by a `SET` inside the last iteration of the body
 /// (`tests/run_batch_pipeline.rs`, `while_ends_with_rowcount_at_zero`).
 ///
+/// A `SELECT` that assigns from a `FROM` posts the number of rows its source produced
+/// into `ExecSession::rowcount` and answers `NoRows`, so it needs no rule of its own here:
+/// reading `from_exec` gives that number, and `0` over a source that produced nothing
+/// (`tests/run_batch_pipeline.rs`, `select_assign_from_rows_sets_rowcount_to_the_rows_walked`
+/// and `select_assign_over_no_row_sets_rowcount_to_zero`).
+///
 /// Any other statement reads `from_exec` unchanged: `0` unless a nested `SET` changed it,
 /// the shape this already gives `IF` on its own (`ExecSession::rowcount` starts at `0` for
 /// the statement as a whole, so a false condition and a taken branch that assigns nothing
