@@ -148,7 +148,7 @@ use crate::set_options::{SetOutcome, apply_set_statement};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
 use crate::statements::{
-    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, statement_clears_last_error,
+    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, next_rowcount, statement_clears_last_error,
     statement_fragment, statement_line, statement_span, statement_text, use_name_line,
 };
 use crate::txn_session::{self, StatementTxn};
@@ -825,7 +825,9 @@ impl Session {
                     self.switch_database(database, line, sink)?;
                 }
                 sink.done(None, more)?;
-                self.state.rowcount = self.exec.rowcount;
+                // A top-level `DECLARE` or `WHILE` sets `@@ROWCOUNT` by its own rule, over
+                // what nested execution left in `self.exec.rowcount` (`next_rowcount`).
+                self.state.rowcount = next_rowcount(bound, self.state.rowcount, self.exec.rowcount);
                 apply_exec_session(
                     &mut self.state,
                     &self.exec,

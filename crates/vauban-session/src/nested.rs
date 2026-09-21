@@ -22,7 +22,7 @@ use crate::set_options::{SetOutcome, apply_set_statement, sync_exec_session};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
 use crate::statements::{
-    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, statement_clears_last_error,
+    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, next_rowcount, statement_clears_last_error,
     statement_fragment, statement_line, statement_span, statement_text, use_name_line,
 };
 use crate::txn_session::{self, StatementTxn};
@@ -560,7 +560,10 @@ impl Session {
                     self.switch_nested_database(database, line, nested_state, sink)?;
                 }
                 sink.done_in_proc(None, true)?;
-                nested_state.rowcount = self.exec().rowcount;
+                // Same rule as the top-level batch (`batch.rs`, `run_prepared`): `next_rowcount`
+                // decides `@@ROWCOUNT` for a `DECLARE` or a `WHILE`.
+                nested_state.rowcount =
+                    next_rowcount(bound, nested_state.rowcount, self.exec().rowcount);
                 apply_exec_session(
                     nested_state,
                     self.exec(),

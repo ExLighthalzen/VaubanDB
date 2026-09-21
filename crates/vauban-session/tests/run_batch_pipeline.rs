@@ -1039,3 +1039,66 @@ fn rowcount_still_tracks_select_after_variable_statements() {
         "{events:#?}"
     );
 }
+
+#[test]
+fn declare_with_an_initial_value_sets_rowcount_to_one() {
+    let events = run("DECLARE @x int = 1; SELECT @@ROWCOUNT;");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]]);
+}
+
+#[test]
+fn declare_with_two_initial_values_still_sets_rowcount_to_one() {
+    let events = run("DECLARE @a int = 1, @b int = 2; SELECT @@ROWCOUNT;");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]]);
+}
+
+#[test]
+fn declare_without_a_value_leaves_rowcount_alone() {
+    // A prior `INSERT` of two rows sets `@@ROWCOUNT` to 2; the bare `DECLARE` that follows
+    // does not touch it, unlike the initialized form above.
+    let events = run(
+        "CREATE TABLE dbo.sr1 (a int); INSERT INTO dbo.sr1 VALUES (1), (2); \
+         DECLARE @a int; SELECT @@ROWCOUNT;",
+    );
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(2)]),
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn if_with_a_false_condition_sets_rowcount_to_zero() {
+    // Same two-row `INSERT` first, so the reset a false `IF` leaves (0) is told apart from a
+    // value it merely left alone.
+    let events = run(
+        "CREATE TABLE dbo.sr2 (a int); INSERT INTO dbo.sr2 VALUES (1), (2); \
+         DECLARE @a int; IF 1 = 0 SET @a = 1; SELECT @@ROWCOUNT;",
+    );
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(0)]),
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn while_ends_with_rowcount_at_zero() {
+    let events = run("DECLARE @i int = 0; WHILE @i < 3 SET @i = @i + 1; SELECT @@ROWCOUNT, @i;");
+    assert_eq!(rows(&events), vec![vec![Value::I32(0), Value::I32(3)]]);
+}
+
+#[test]
+fn nested_declare_with_a_value_sets_rowcount_to_one() {
+    // `EXEC('…')` runs its text through the same nested pipeline as `sp_executesql` and a
+    // procedure call, with its own `@@ROWCOUNT`.
+    let events = run("EXEC('DECLARE @x int = 1; SELECT @@ROWCOUNT;');");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]]);
+}
+
+#[test]
+fn nested_while_ends_with_rowcount_at_zero() {
+    let events =
+        run("EXEC('DECLARE @i int = 0; WHILE @i < 3 SET @i = @i + 1; SELECT @@ROWCOUNT, @i;');");
+    assert_eq!(rows(&events), vec![vec![Value::I32(0), Value::I32(3)]]);
+}

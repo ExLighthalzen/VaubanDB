@@ -52,6 +52,44 @@ pub(crate) fn statement_clears_last_error(stmt: &PhysicalStatement) -> bool {
     }
 }
 
+/// `@@ROWCOUNT` after a top-level statement that answered `ExecOutcome::NoRows`, given
+/// what it held just before the statement ran (`previous`) and what nested execution left
+/// in `ExecSession::rowcount` (`from_exec`).
+///
+/// A `DECLARE` that gives at least one of its variables an initial value is an assignment,
+/// like `SET`: `DECLARE @a int = 1, @b int = 2; SELECT @@ROWCOUNT;` answers `1`, not `2`
+/// (`tests/run_batch_pipeline.rs`, `declare_with_an_initial_value_sets_rowcount_to_one`). A
+/// `DECLARE` with no initializer on any variable is not an assignment at all: it leaves
+/// `previous` untouched (`declare_without_a_value_leaves_rowcount_alone`), unlike every
+/// other statement here, which starts its own count at `0`.
+///
+/// A `WHILE` ends by evaluating its condition once more and finding it false, which is
+/// itself a no-op statement: `0`, over `from_exec`, be it still at the `0` it started the
+/// loop on or moved by a `SET` inside the last iteration of the body
+/// (`tests/run_batch_pipeline.rs`, `while_ends_with_rowcount_at_zero`).
+///
+/// Any other statement reads `from_exec` unchanged: `0` unless a nested `SET` changed it,
+/// the shape this already gives `IF` on its own (`ExecSession::rowcount` starts at `0` for
+/// the statement as a whole, so a false condition and a taken branch that assigns nothing
+/// both read back as `0`, and a taken branch that assigns behaves like the same code
+/// written outside the `IF`).
+pub(crate) fn next_rowcount(stmt: &PhysicalStatement, previous: i64, from_exec: i64) -> i64 {
+    match stmt {
+        PhysicalStatement::Declare(declarations) => {
+            if declarations
+                .iter()
+                .any(|declaration| declaration.value.is_some())
+            {
+                1
+            } else {
+                previous
+            }
+        }
+        PhysicalStatement::While { .. } => 0,
+        _ => from_exec,
+    }
+}
+
 /// The 1-based line the statement starts on, in the text that carries it.
 ///
 /// [`statement_span`] has one arm per variant of the parser, and the line of that span is
