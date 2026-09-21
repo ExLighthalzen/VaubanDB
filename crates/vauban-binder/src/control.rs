@@ -67,25 +67,25 @@ pub(crate) fn bind_block(
 
 /// Binds a `BREAK` into [`BoundStatement::Break`].
 ///
-/// Error 135 when outside a WHILE.
-pub(crate) fn bind_break(_ctx: &BindContext<'_>) -> SqlResult<BoundStatement> {
+/// Error 135 when outside a WHILE, carrying the line of the BREAK statement.
+pub(crate) fn bind_break(line: u32, _ctx: &BindContext<'_>) -> SqlResult<BoundStatement> {
     let inside_while = WHILE_DEPTH.with(|depth| depth.get() > 0);
     if inside_while {
         Ok(BoundStatement::Break)
     } else {
-        Err(SqlError::break_without_while())
+        Err(SqlError::break_without_while().with_line(line))
     }
 }
 
 /// Binds a `CONTINUE` into [`BoundStatement::Continue`].
 ///
-/// Error 136 when outside a WHILE.
-pub(crate) fn bind_continue(_ctx: &BindContext<'_>) -> SqlResult<BoundStatement> {
+/// Error 136 when outside a WHILE, carrying the line of the CONTINUE statement.
+pub(crate) fn bind_continue(line: u32, _ctx: &BindContext<'_>) -> SqlResult<BoundStatement> {
     let inside_while = WHILE_DEPTH.with(|depth| depth.get() > 0);
     if inside_while {
         Ok(BoundStatement::Continue)
     } else {
-        Err(SqlError::continue_without_while())
+        Err(SqlError::continue_without_while().with_line(line))
     }
 }
 

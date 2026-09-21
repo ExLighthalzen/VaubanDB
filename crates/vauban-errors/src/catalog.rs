@@ -679,6 +679,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "Column, parameter or variable #%d: unknown data type %.*ls.",
     },
     ErrorDef {
+        number: 2716,
+        severity: 16,
+        template: "Column, parameter or variable #%d: data type %.*ls does not accept a length.",
+    },
+    ErrorDef {
         number: 2717,
         severity: 15,
         template: "Size %d of the %S_MSG '%.*ls' is larger than the maximum (%d).",

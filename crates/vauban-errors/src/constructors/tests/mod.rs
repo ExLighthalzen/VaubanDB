@@ -67,6 +67,7 @@ fn all_constructors() -> Vec<SqlError> {
         SqlError::invalid_operand_type("uniqueidentifier", "add"),
         SqlError::non_boolean_expression("1"),
         SqlError::cannot_find_data_type(1, "foo"),
+        SqlError::type_does_not_allow_length(1, "sysname"),
         SqlError::must_declare_scalar_variable("@x"),
         SqlError::insufficient_result_space_money("smallmoney"),
         SqlError::insufficient_result_space_money("int"),
@@ -2532,6 +2533,35 @@ fn cannot_find_data_type_in_table_2715_state_6() {
     assert_eq!(declaration.state, 3);
     assert_eq!(declaration.message, column.message);
     assert_ne!(declaration.state, column.state);
+}
+
+/// Error 2716, a type recognised but given a length it does not accept
+/// (`DECLARE @v int(10);`, `DECLARE @v sysname(10);`): `sysname` carries its own state,
+/// the other types below carry the default.
+#[test]
+fn type_does_not_allow_length_2716_state_follows_the_type() {
+    let sysname = SqlError::type_does_not_allow_length(1, "sysname");
+    assert_eq!(sysname.number, 2716);
+    assert_eq!(sysname.severity, 16);
+    assert_eq!(sysname.state, 3);
+    assert_eq!(
+        sysname.message,
+        "Column, parameter or variable #1: data type sysname does not accept a length."
+    );
+    assert_eq!(sysname.line, 0);
+    assert_eq!(sysname.procedure, None);
+
+    // DECLARE @v int(10); and DECLARE @v date(3); and DECLARE @v bit(1);
+    for name in ["int", "date", "bit"] {
+        let err = SqlError::type_does_not_allow_length(1, name);
+        assert_eq!(err.state, 1, "{name}");
+    }
+
+    // DECLARE @a int, @b sysname(5); prints the rank of the column.
+    assert_eq!(
+        SqlError::type_does_not_allow_length(2, "sysname").message,
+        "Column, parameter or variable #2: data type sysname does not accept a length."
+    );
 }
 
 /// The DDL constructors carry their own states, not the catalogue default.

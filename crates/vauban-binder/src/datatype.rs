@@ -78,8 +78,11 @@ const SYSNAME_LEN: u16 = 128;
 ///   deliberate difference from SQL Server.
 /// - A parameter out of bounds (`varchar(9000)`, `decimal(39,2)`, `time(8)`,
 ///   `char(max)`…) yields **2715 as a placeholder**: see
-///   [`out_of_range`] for the numbers SQL Server really uses and why they are not
+///   [`value_out_of_bounds`] for the numbers SQL Server really uses and why they are not
 ///   produced yet.
+/// - A type that takes no parameter, given one anyway (`int(10)`,
+///   `sysname(10)`), yields **2716**, built by [`out_of_range`]: the type is
+///   recognised, it simply does not accept a length.
 ///
 /// In a `CAST`, an unknown type is error **243**, not 2715: `SELECT CAST(1 AS foo)`
 /// answers 243, severity 16, state 1, while `DECLARE @v foo` answers 2715. Which of
@@ -181,10 +184,8 @@ fn numeric(precision: u8, scale: u8) -> SqlType {
 }
 
 /// A type that takes no parameter: it resolves to `sql_type`, and any argument is
-/// refused.
-///
-/// `int(10)` does not reach the binder — SQL Server answers a syntax error and so
-/// does the parser — but the check costs nothing and keeps the function total.
+/// refused as 2716 — the type is recognised, unlike the 2715 [`unknown`] answers, and
+/// simply does not accept a length (`DECLARE @v int(10);`, `DECLARE @v sysname(10);`).
 fn plain(ty: &DataType, position: u32, sql_type: SqlType) -> SqlResult<SqlType> {
     if ty.args.is_empty() {
         Ok(sql_type)
@@ -206,12 +207,12 @@ fn sized(
         [] => DEFAULT_LEN,
         [TypeArg::Number(n)] => *n,
         [TypeArg::Max] if max_allowed == MaxLen::Allowed => return Ok(make(Len::Max)),
-        _ => return Err(out_of_range(ty, position)),
+        _ => return Err(value_out_of_bounds(ty, position)),
     };
     if !(1..=max_len).contains(&len) {
-        return Err(out_of_range(ty, position));
+        return Err(value_out_of_bounds(ty, position));
     }
-    let len = u16::try_from(len).map_err(|_| out_of_range(ty, position))?;
+    let len = u16::try_from(len).map_err(|_| value_out_of_bounds(ty, position))?;
     Ok(make(Len::Fixed(len)))
 }
 
@@ -222,13 +223,13 @@ fn exact_numeric(ty: &DataType, position: u32, make: fn(u8, u8) -> SqlType) -> S
         [] => (DEFAULT_PRECISION, 0),
         [TypeArg::Number(p)] => (*p, 0),
         [TypeArg::Number(p), TypeArg::Number(s)] => (*p, *s),
-        _ => return Err(out_of_range(ty, position)),
+        _ => return Err(value_out_of_bounds(ty, position)),
     };
     if !(1..=MAX_PRECISION).contains(&precision) || !(0..=precision).contains(&scale) {
-        return Err(out_of_range(ty, position));
+        return Err(value_out_of_bounds(ty, position));
     }
-    let precision = u8::try_from(precision).map_err(|_| out_of_range(ty, position))?;
-    let scale = u8::try_from(scale).map_err(|_| out_of_range(ty, position))?;
+    let precision = u8::try_from(precision).map_err(|_| value_out_of_bounds(ty, position))?;
+    let scale = u8::try_from(scale).map_err(|_| value_out_of_bounds(ty, position))?;
     Ok(make(precision, scale))
 }
 
@@ -242,12 +243,12 @@ fn float(ty: &DataType, position: u32) -> SqlResult<SqlType> {
     let bits = match ty.args.as_slice() {
         [] => return Ok(SqlType::Float),
         [TypeArg::Number(n)] => *n,
-        _ => return Err(out_of_range(ty, position)),
+        _ => return Err(value_out_of_bounds(ty, position)),
     };
     match bits {
         1..=MAX_REAL_BITS => Ok(SqlType::Real),
         b if (MAX_REAL_BITS + 1..=MAX_FLOAT_BITS).contains(&b) => Ok(SqlType::Float),
-        _ => Err(out_of_range(ty, position)),
+        _ => Err(value_out_of_bounds(ty, position)),
     }
 }
 
@@ -272,9 +273,9 @@ pub(crate) fn resolve_sysname_cast(ty: &DataType, position: u32) -> SqlResult<Sq
     let len = match ty.args.as_slice() {
         [] => SYSNAME_LEN,
         [TypeArg::Number(n)] if (1..=MAX_CHAR_LEN).contains(n) => {
-            u16::try_from(*n).map_err(|_| out_of_range(ty, position))?
+            u16::try_from(*n).map_err(|_| value_out_of_bounds(ty, position))?
         }
-        _ => return Err(out_of_range(ty, position)),
+        _ => return Err(value_out_of_bounds(ty, position)),
     };
     Ok(SqlType::NVarChar(Len::Fixed(len)))
 }
@@ -285,12 +286,12 @@ fn time_scale(ty: &DataType, position: u32, make: fn(u8) -> SqlType) -> SqlResul
     let scale = match ty.args.as_slice() {
         [] => DEFAULT_TIME_SCALE,
         [TypeArg::Number(s)] => *s,
-        _ => return Err(out_of_range(ty, position)),
+        _ => return Err(value_out_of_bounds(ty, position)),
     };
     if !(0..=MAX_TIME_SCALE).contains(&scale) {
-        return Err(out_of_range(ty, position));
+        return Err(value_out_of_bounds(ty, position));
     }
-    let scale = u8::try_from(scale).map_err(|_| out_of_range(ty, position))?;
+    let scale = u8::try_from(scale).map_err(|_| value_out_of_bounds(ty, position))?;
     Ok(make(scale))
 }
 
@@ -300,7 +301,8 @@ fn unknown(ty: &DataType, position: u32) -> SqlError {
     SqlError::cannot_find_data_type(position, &ty.name)
 }
 
-/// **Placeholder** error for a parameter out of bounds.
+/// **Placeholder** error for a parameter whose value is out of bounds, on a type that
+/// does accept one.
 ///
 /// SQL Server has one number per case, and the errors catalogue has them not
 /// yet. Until they are, an out-of-bounds parameter answers the same 2715
@@ -323,8 +325,20 @@ fn unknown(ty: &DataType, position: u32) -> SqlError {
 /// precision of 0 is invalid), and `float(54)` answers 2750/16/1 in a
 /// declaration. The numbers 131, 192, 1001, 1002, 2717 and 2750 need a catalogue
 /// entry and a constructor in `errors` first.
-fn out_of_range(ty: &DataType, position: u32) -> SqlError {
+fn value_out_of_bounds(ty: &DataType, position: u32) -> SqlError {
     unknown(ty, position)
+}
+
+/// Error 2716 for a type that [`plain`] resolves, given a length it does not accept
+/// (`DECLARE @v int(10);`, `DECLARE @v sysname(10);`): the type is recognised, unlike
+/// the 2715 [`unknown`] answers, and no value would make the length acceptable — the
+/// difference from [`value_out_of_bounds`], whose type takes a parameter and refuses
+/// this one's value instead.
+///
+/// The state follows the type name: `SqlError::type_does_not_allow_length`'s state
+/// table.
+fn out_of_range(ty: &DataType, position: u32) -> SqlError {
+    SqlError::type_does_not_allow_length(position, &ty.name)
 }
 
 #[cfg(test)]

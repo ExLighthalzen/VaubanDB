@@ -102,8 +102,8 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
             condition, body, ..
         } => bind_while(condition, body, ctx),
         Statement::Block { statements, .. } => bind_block(statements, ctx),
-        Statement::Break(_) => bind_break(ctx),
-        Statement::Continue(_) => bind_continue(ctx),
+        Statement::Break(span) => bind_break(span.line, ctx),
+        Statement::Continue(span) => bind_continue(span.line, ctx),
         Statement::Return { value, span } => bind_return(value.as_ref(), span.line, ctx),
         Statement::Print { expr, .. } => bind_print(expr, ctx),
         Statement::BeginTransaction { name, mark, .. } => {

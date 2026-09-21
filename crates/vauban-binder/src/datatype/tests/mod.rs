@@ -204,7 +204,26 @@ fn resolves_iso_synonyms() {
 #[test]
 fn sysname_with_a_length_is_refused_in_a_declaration() {
     let err = ty("sysname", &[TypeArg::Number(10)]).expect_err("no length in a declaration");
-    assert_eq!(err.number, 2715);
+    assert_eq!(err.number, 2716);
+    assert_eq!(err.severity, 16);
+    assert_eq!(err.state, 3);
+}
+
+/// A type that takes no parameter answers 2716, not the 2715 of an unknown name: the
+/// type is recognised, it simply refuses a length. `sysname` sends state 3, the other
+/// types below send state 1.
+#[test]
+fn a_type_with_no_parameter_given_one_is_2716() {
+    let sysname = ty("sysname", &[TypeArg::Number(10)]).expect_err("sysname takes no length");
+    assert_eq!(sysname.number, 2716);
+    assert_eq!(sysname.state, 3);
+
+    for name in ["int", "date", "bit"] {
+        let err = ty(name, &[TypeArg::Number(10)]).expect_err(name);
+        assert_eq!(err.number, 2716, "{name}");
+        assert_eq!(err.severity, 16, "{name}");
+        assert_eq!(err.state, 1, "{name}");
+    }
 }
 
 #[test]
@@ -295,7 +314,7 @@ fn position_is_the_rank_in_the_statement() {
 
 #[test]
 fn out_of_bounds_parameters_are_refused() {
-    // The number is the 2715 placeholder of `out_of_range`, whose rustdoc
+    // The number is the 2715 placeholder of `value_out_of_bounds`, whose rustdoc
     // lists what SQL Server really answers:
     // 131 for the two lengths, 2717 for `decimal(39,2)`, 192 for
     // `decimal(5,6)`, 1002 for `time(8)` and a syntax error 156 for

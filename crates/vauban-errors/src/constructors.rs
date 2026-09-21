@@ -417,6 +417,29 @@ const CANNOT_FIND_DATA_TYPE_2715_COLUMN_LIST_STATE: u8 = 6;
 /// (`DECLARE @x foo;`, `CREATE PROCEDURE p (@a foo) AS SELECT 1;`): severity 16, state 3.
 const CANNOT_FIND_DATA_TYPE_2715_DECLARATION_STATE: u8 = 3;
 
+/// The state error 2716 sends for a name without a row of its own.
+const DEFAULT_LENGTH_NOT_ALLOWED_STATE: u8 = 1;
+
+/// The states of error 2716 that are not [`DEFAULT_LENGTH_NOT_ALLOWED_STATE`], keyed by
+/// the type name, case-insensitively.
+///
+/// The state follows the type, the same in a `DECLARE`, a `CREATE TABLE` column and a
+/// procedure parameter: `sysname` sends 3 in the three of them
+/// (`DECLARE @v sysname(10);`, `CREATE TABLE t (a sysname(10));`,
+/// `CREATE PROCEDURE p (@a sysname(10)) AS SELECT 1;`), while `int`, `date`, `bit`,
+/// `tinyint`, `real`, `smalldatetime` and `uniqueidentifier` send
+/// [`DEFAULT_LENGTH_NOT_ALLOWED_STATE`] in a `DECLARE`.
+const LENGTH_NOT_ALLOWED_2716_STATES: &[(&str, u8)] = &[("sysname", 3)];
+
+/// The state of error 2716 for `name`, [`DEFAULT_LENGTH_NOT_ALLOWED_STATE`] when the
+/// name has no row.
+fn length_not_allowed_state(name: &str) -> u8 {
+    LENGTH_NOT_ALLOWED_2716_STATES
+        .iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(name))
+        .map_or(DEFAULT_LENGTH_NOT_ALLOWED_STATE, |(_, state)| *state)
+}
+
 /// The state of `key` in `table`, [`UNKNOWN_DDL_STATE`] for a filling without a row.
 fn ddl_state(table: &[(&str, u8)], key: &str) -> u8 {
     table
@@ -1546,6 +1569,26 @@ impl SqlError {
         from_catalog(
             2715,
             CANNOT_FIND_DATA_TYPE_2715_COLUMN_LIST_STATE,
+            &[Arg::Int(i64::from(position)), Arg::Str(name)],
+        )
+    }
+
+    /// Error 2716, severity 16 (`DECLARE @v sysname(10);`, state 3): a type with no
+    /// length parameter was given one. `position` is the 1-based rank, `name` the type
+    /// as written.
+    ///
+    /// The state follows the type, not the statement it is written in
+    /// ([`LENGTH_NOT_ALLOWED_2716_STATES`]): `sysname` sends 3 in a `DECLARE`, a
+    /// `CREATE TABLE` column and a procedure parameter alike, the other types here
+    /// sending [`DEFAULT_LENGTH_NOT_ALLOWED_STATE`].
+    ///
+    /// ```text
+    /// Column, parameter or variable #1: data type sysname does not accept a length.
+    /// ```
+    pub fn type_does_not_allow_length(position: u32, name: &str) -> Self {
+        from_catalog(
+            2716,
+            length_not_allowed_state(name),
             &[Arg::Int(i64::from(position)), Arg::Str(name)],
         )
     }

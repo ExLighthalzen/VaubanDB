@@ -145,6 +145,20 @@ fn continue_outside_while_is_136() {
     assert_eq!(error.number, 136);
 }
 
+/// 135 carries the line of the BREAK statement, not line 1 of the batch.
+#[test]
+fn break_outside_while_carries_the_line_of_the_statement() {
+    let error = err("SELECT 1;\nBREAK;");
+    assert_eq!(error.line, 2);
+}
+
+/// 136 carries the line of the CONTINUE statement, not line 1 of the batch.
+#[test]
+fn continue_outside_while_carries_the_line_of_the_statement() {
+    let error = err("SELECT 1;\nSELECT 2;\nCONTINUE;");
+    assert_eq!(error.line, 3);
+}
+
 // ---------------------------------------------------------------------------
 // BEGIN … END
 // ---------------------------------------------------------------------------
