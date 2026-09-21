@@ -228,10 +228,16 @@ fn return_with_value_outside_procedure_is_178() {
 // GOTO
 // ---------------------------------------------------------------------------
 
-/// `GOTO label` is rejected by the parser in V1 as a syntax error (156), before reaching
-/// the binder.
+/// `GOTO label` parses; the binder does not bind it yet and reports the generic internal
+/// error, naming the statement.
 #[test]
-fn goto_is_refused_as_v2() {
+fn goto_is_unsupported_by_the_binder() {
     let error = err("GOTO foo;");
-    assert_eq!(error.number, 156);
+    assert_eq!(error.number, 50000, "{}", error.message);
+    assert_eq!(error.severity, 16);
+    assert_eq!(error.state, 1);
+    assert_eq!(
+        error.message,
+        "Internal error: internal bug: GOTO is not implemented yet"
+    );
 }

@@ -80,7 +80,7 @@ fn routes_to_a_table_statement(text: &str, expected: &str) {
 /// Asserts that `text` was routed to a rule of `flow` that is written and parses it,
 /// and that the statement it yields is the `expected` variant.
 ///
-/// The eleven flow-of-control rows do not reach a stub either, so the proof of their
+/// The flow-of-control rows do not reach a stub either, so the proof of their
 /// routing is the variant they produce, as it is for the table statements.
 fn routes_to_a_flow_statement(text: &str, expected: &str) {
     match try_dispatch(text, true) {
@@ -103,6 +103,8 @@ fn routes_to_a_flow_statement(text: &str, expected: &str) {
                 Statement::Continue(_) => "CONTINUE",
                 Statement::Waitfor(_) => "WAITFOR",
                 Statement::Throw { .. } => "THROW",
+                Statement::Goto { .. } => "GOTO",
+                Statement::Label { .. } => "LABEL",
                 other => unreachable!("{text} is a flow statement, got {other:?}"),
             };
             assert_eq!(found, expected, "{text} was routed to {found}");
@@ -160,14 +162,15 @@ fn dispatch_routes_every_statement() {
     }
 }
 
-/// The eleven rows the routing table sends to `flow`.
+/// The rows the routing table sends to `flow`, plus the label row, a name followed by
+/// `:`, which the routing table checks ahead of the implicit `EXEC`.
 ///
-/// `BEGIN TRY` and `GOTO` are routed too, but their rule refuses them on purpose
-/// (V2 and V1 respectively), so they are checked by `dispatch_refuses_what_v1_has_not`
-/// rather than by the variant they would have yielded.
+/// `BEGIN TRY` is routed too, but its rule refuses it on purpose (V2), so it is checked
+/// by `dispatch_refuses_what_v1_has_not` rather than by the variant it would have
+/// yielded.
 #[test]
 fn dispatch_routes_the_flow_statements() {
-    let cases: [(&str, &str); 17] = [
+    let cases: [(&str, &str); 19] = [
         ("DECLARE @x int", "DECLARE"),
         ("SET @x = 1", "SET"),
         ("SET NOCOUNT ON", "SET OPTION"),
@@ -185,6 +188,8 @@ fn dispatch_routes_the_flow_statements() {
         ("BREAK", "BREAK"),
         ("CONTINUE", "CONTINUE"),
         ("WAITFOR DELAY '00:00:01'", "WAITFOR"),
+        ("GOTO skipit", "GOTO"),
+        ("skipit:", "LABEL"),
     ];
     for (text, expected) in cases {
         routes_to_a_flow_statement(text, expected);
@@ -194,17 +199,13 @@ fn dispatch_routes_the_flow_statements() {
     routes_to_a_flow_statement("THROW 50000, 'x', 1", "THROW");
 }
 
-/// The two constructs the routing table sends to a rule that refuses them: `GOTO` and
-/// `BEGIN TRY`, both out of the V1 subset (see `flow.rs`). A syntax error is what
-/// proves nothing else claimed them.
+/// The construct the routing table sends to a rule that refuses it: `BEGIN TRY`, out of
+/// the V1 subset (see `flow.rs`). A syntax error is what proves nothing else claimed it.
 #[test]
 fn dispatch_refuses_what_v1_has_not() {
-    // SQL Server: `GOTO l` => 133 (VaubanDB still 156);
-    // `BEGIN TRY SELECT 1 END TRY` => 102 near TRY.
-    for (text, expected) in [("GOTO l", 156), ("BEGIN TRY SELECT 1 END TRY", 102)] {
-        let (number, message) = dispatch(text, true);
-        assert_eq!(number, expected, "{text}: {number} {message}");
-    }
+    // SQL Server: `BEGIN TRY SELECT 1 END TRY` => 102 near TRY.
+    let (number, message) = dispatch("BEGIN TRY SELECT 1 END TRY", true);
+    assert_eq!(number, 102, "{number} {message}");
 }
 
 /// The three statements the routing table sends to `ddl_table`: they parse, so what
@@ -417,5 +418,30 @@ fn dispatch_consumes_nothing_before_routing() {
             assert_eq!(create.span.len as usize, text.len());
         }
         other => unreachable!("{text} is a CREATE INDEX, got {other:?}"),
+    }
+}
+
+/// `GOTO <label>` and `<label>:` each span the whole statement, exactly like every
+/// other rule that reads its own head token back.
+#[test]
+fn goto_and_label_span_the_whole_statement() {
+    let text = "GOTO skipit";
+    match routes_to_a_statement(text) {
+        Statement::Goto { label, span } => {
+            assert_eq!(label.value, "skipit");
+            assert_eq!(span.offset, 0);
+            assert_eq!(span.len as usize, text.len());
+        }
+        other => unreachable!("{text} is a GOTO, got {other:?}"),
+    }
+
+    let text = "skipit:";
+    match routes_to_a_statement(text) {
+        Statement::Label { name, span } => {
+            assert_eq!(name.value, "skipit");
+            assert_eq!(span.offset, 0);
+            assert_eq!(span.len as usize, text.len());
+        }
+        other => unreachable!("{text} is a LABEL, got {other:?}"),
     }
 }

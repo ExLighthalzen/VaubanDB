@@ -1275,6 +1275,23 @@ fn display_flow_and_txn() {
         span: Span::EMPTY,
     };
     assert_eq!(execute_text.to_string(), "EXECUTE ('SELECT 1')");
+
+    assert_eq!(
+        Statement::Goto {
+            label: ident("skipit"),
+            span: Span::EMPTY,
+        }
+        .to_string(),
+        "GOTO skipit"
+    );
+    assert_eq!(
+        Statement::Label {
+            name: ident("skipit"),
+            span: Span::EMPTY,
+        }
+        .to_string(),
+        "skipit:"
+    );
 }
 
 #[test]

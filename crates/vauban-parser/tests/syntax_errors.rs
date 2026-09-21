@@ -54,6 +54,25 @@ fn error_156_on_reserved_keyword() {
     assert_eq!(error.message, "Syntax error near the keyword 'FROM'.");
 }
 
+/// `GOTO` reads a single name and nothing else: with no name, a variable or a number in
+/// its place, the error falls on that following token, exactly as an ordinary missing or
+/// misplaced identifier does anywhere else in the grammar.
+#[test]
+fn error_102_on_a_goto_with_no_name() {
+    for (text, named) in [("GOTO;", ";"), ("GOTO @v;", "@v"), ("GOTO 1;", "1")] {
+        let error = err(text);
+        assert_eq!(error.number, 102, "{text}");
+        assert_eq!(error.severity, 15, "{text}");
+        assert_eq!(error.state, 1, "{text}");
+        assert_eq!(error.line, 1, "{text}");
+        assert_eq!(
+            error.message,
+            format!("Syntax error near '{named}'."),
+            "{text}"
+        );
+    }
+}
+
 /// 156 is for the **reserved** words and for them only.
 ///
 /// `GROUP` is in the reserved table and `OFFSET` is not (`OFFSETS` is), so a misplaced

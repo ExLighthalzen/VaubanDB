@@ -76,12 +76,38 @@ fn parse_statement_inner(p: &mut Parser, first_in_batch: bool) -> SqlResult<Stat
             | Keyword::Throw,
         ) => flow::parse_simple(p),
         _ if p.at_punct(Punct::LeftParen) => query::parse_select_statement(p),
+        // A name immediately followed by `:` is a label, regardless of its position in
+        // the batch: this is checked ahead of the implicit `EXEC` below, which a bare
+        // name with no `:` falls through to instead. A reserved word does not reach
+        // here: `at_name` refuses it, so `order:` is claimed by no rule and reports the
+        // same syntax error `ORDER` alone gets anywhere a statement is expected
+        // (`tests/flow.rs`).
+        _ if at_label(p) => flow::parse_label(p),
         // The implicit `EXEC`: a batch whose **first** statement is a bare name
         // calls the procedure of that name (`dbo.p 1` is `EXECUTE dbo.p 1`). Anywhere else
         // a bare name is claimed by no rule and falls through to the syntax error below.
         _ if first_in_batch && query::at_name(p, 0) => flow::parse_implicit_execute(p),
         _ => Err(p.error_here()),
     }
+}
+
+/// Whether the cursor sits on the head of a label: a name (`query::at_name`), then a
+/// `:` with **no gap** -- no space, comment or newline -- between the two. SQL Server
+/// reports the name alone, and no gap at all, when a space or a newline sits before the
+/// `:` (`tests/flow.rs`): the name is then left unclaimed by any rule, exactly as an
+/// ordinary bare name is anywhere else a statement is expected.
+///
+/// A delimited or quoted name reaches here too, and is refused further in by
+/// `flow::parse_label_name` (`tests/flow.rs`): this decides the *shape* of a label, not
+/// whether the name itself is legal.
+fn at_label(p: &Parser) -> bool {
+    if !query::at_name(p, 0) {
+        return false;
+    }
+    let name = p.peek_at(0);
+    let colon = p.peek_at(1);
+    matches!(colon.kind, TokenKind::Punct(Punct::Colon))
+        && name.span.offset.saturating_add(name.span.len) == colon.span.offset
 }
 
 /// The keyword `n` tokens ahead, or `None` when that token is not a keyword.

@@ -245,7 +245,7 @@ pub enum Statement {
     },
     /// (V2) `RAISERROR (…)`.
     RaiseError(Box<RaiseErrorStatement>),
-    /// `GOTO label`, refused by a syntax error in V1.
+    /// `GOTO label`. The jump itself belongs to the session, not to this crate.
     Goto {
         /// The target label.
         label: Ident,

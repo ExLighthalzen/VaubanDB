@@ -699,21 +699,73 @@ fn syntax_errors_case_still_passes() {
     assert_error_on_reserved(&p_err("SELECT FROM t;"), "FROM");
 }
 
-/// `GOTO` and `BEGIN TRY … END CATCH` are out of the V1 subset and are refused, although
-/// SQL Server accepts both (`GOTO fin` answers 133, a semantic error about the undeclared
-/// label, and the `TRY`/`CATCH` batch runs). A deliberate deviation.
+/// `BEGIN TRY … END CATCH` is out of the V1 subset and is refused, although SQL Server
+/// accepts it and runs the `TRY`/`CATCH` batch. A deliberate deviation.
 #[test]
-fn goto_and_try_catch_are_refused() {
-    // `GOTO fin` gives 133 on SQL Server; VaubanDB remains 156 with
-    // `Syntax error near the keyword 'GOTO'.`.
-    assert_error_on_reserved(&p_err("GOTO fin"), "GOTO");
-
+fn try_catch_is_refused() {
     // `TRY` is **not** reserved, so this one is a 102, and its
     // message is exact. The error deliberately names `TRY` rather than the `BEGIN` it
     // follows: `TRY` is the word that is out of the subset.
     let error = p_err("BEGIN TRY SELECT 1 END TRY BEGIN CATCH SELECT 2 END CATCH");
     assert_eq!(error.number, 102, "{}", error.message);
     assert_eq!(error.message, "Syntax error near 'TRY'.");
+}
+
+/// `GOTO <label>` reads a single name and nothing else: the jump itself and the 133 of
+/// a label that does not exist belong to the session, not to this crate.
+#[test]
+fn goto_reads_a_label() {
+    match one("GOTO skipit") {
+        Statement::Goto { label, .. } => assert_eq!(label.value, "skipit"),
+        other => unreachable!("it is a GOTO, got {other:?}"),
+    }
+    assert_eq!(rt("GOTO skipit"), "GOTO skipit");
+}
+
+/// `<label>:` reads a single name followed by `:`; the table of labels a `GOTO` jumps
+/// through belongs to the session, not to this crate.
+#[test]
+fn label_reads_a_name_before_a_colon() {
+    match one("skipit:") {
+        Statement::Label { name, .. } => assert_eq!(name.value, "skipit"),
+        other => unreachable!("it is a LABEL, got {other:?}"),
+    }
+    assert_eq!(rt("skipit:"), "skipit:");
+}
+
+/// A batch that carries both forms goes round the `parse` -> `Display` -> `parse` loop:
+/// the tree the printed text parses back to is equal to the first one, `GOTO` and the
+/// label included.
+#[test]
+fn goto_and_label_survive_the_loop() {
+    rt("GOTO skipit; PRINT 2; skipit: PRINT 3;");
+}
+
+/// `GOTO` reads a single name and nothing else; missing entirely, or a variable or a
+/// number in its place, the error falls on that token, exactly as an ordinary missing or
+/// misplaced identifier does anywhere else in this crate.
+#[test]
+fn goto_without_a_name_is_a_syntax_error() {
+    // SQL Server: `GOTO;` => 102 near ';', `GOTO @v;` => 102 near '@v', `GOTO 1;` => 102
+    // near '1'.
+    for (text, named) in [("GOTO;", ";"), ("GOTO @v;", "@v"), ("GOTO 1;", "1")] {
+        let error = p_err(text);
+        assert_eq!(error.number, 102, "{text}: {}", error.message);
+        assert_eq!(
+            error.message,
+            format!("Syntax error near '{named}'."),
+            "{text}"
+        );
+    }
+}
+
+/// A reserved word before a `:` is not read as a label: `at_name` already refuses a
+/// reserved word, so the dispatch falls through to the same syntax error the word gets
+/// anywhere else a statement is expected, the `:` claimed by no rule at all.
+#[test]
+fn a_reserved_word_before_a_colon_is_not_a_label() {
+    // SQL Server: `ORDER: PRINT 1;` => 156 near the keyword 'ORDER'.
+    assert_error_on_reserved(&p_err("ORDER: PRINT 1;"), "ORDER");
 }
 
 /// The cursor statements are V2 and are refused by the dispatch, on their head word.

@@ -184,3 +184,27 @@ fn semicolon_alone_after_else_is_refused() {
 fn condition_with_nothing_after_it_is_refused() {
     assert_eq!(p_err("IF 1 = 1;").number, 102);
 }
+
+/// A delimited or quoted name is refused as a `GOTO` target and as a label declaration,
+/// citing the name without its delimiters, exactly as an ordinary delimited token is
+/// printed anywhere else in this crate.
+#[test]
+fn a_delimited_name_is_not_a_label_nor_a_goto_target() {
+    for text in ["GOTO [l]", "GOTO \"l\"", "[l]: PRINT 1;", "\"l\": PRINT 1;"] {
+        let error = p_err(text);
+        assert_eq!(error.number, 102, "{text}: {}", error.message);
+        assert_eq!(error.message, "Syntax error near 'l'.", "{text}");
+    }
+}
+
+/// The `:` of a label must sit right against the name: a space or a newline between the
+/// two leaves the name unclaimed by any rule, exactly as an ordinary bare name is
+/// anywhere else a statement is expected.
+#[test]
+fn a_gap_before_the_colon_is_not_a_label() {
+    for text in ["PRINT 1; l : PRINT 2;", "PRINT 1; l\n: PRINT 2;"] {
+        let error = p_err(text);
+        assert_eq!(error.number, 102, "{text}: {}", error.message);
+        assert_eq!(error.message, "Syntax error near 'l'.", "{text}");
+    }
+}

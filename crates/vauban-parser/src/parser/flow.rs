@@ -9,13 +9,16 @@
 //! backtracking at all: a [`TokenKind::Variable`] opens an assignment, anything else opens
 //! an option, because no session option starts with `@`.
 //!
-//! # What is refused on purpose
+//! # What is accepted and what is refused on purpose
 //!
-//! `GOTO` and `BEGIN TRY … END TRY BEGIN CATCH … END CATCH` are **accepted** by SQL Server
-//! and refused here by a syntax error: the V1 subset has neither, and the AST variants
-//! [`Statement::Goto`] and [`Statement::TryCatch`] stay unproduced: a deliberate
-//! difference from SQL Server. The cursor reports the error on the word that is
-//! out of the subset -- `GOTO`, and the `TRY` of a `BEGIN TRY` rather than its `BEGIN`.
+//! `GOTO <label>` and `<label>:` are produced as [`Statement::Goto`] and
+//! [`Statement::Label`]; the jump itself, the table of labels and the semantic error of a
+//! label that does not exist belong to the session that runs the batch, not to this
+//! crate: the two variants carry a name and a span. `BEGIN TRY … END TRY BEGIN CATCH …
+//! END CATCH` is **accepted** by SQL Server and refused here by a syntax error: this V1
+//! subset does not read it, and the AST variant [`Statement::TryCatch`] stays unproduced:
+//! a deliberate difference from SQL Server. The cursor reports the error on the `TRY` of
+//! a `BEGIN TRY` rather than its `BEGIN`, the word that is out of the subset.
 //!
 //! The cursor statements `OPEN`, `FETCH`, `CLOSE` and `DEALLOCATE`, `RAISERROR` and the
 //! permission statements are V2 and V4: no rule claims them and the dispatch reports a
@@ -55,7 +58,7 @@
 //!
 //! - `BEGIN TRAN @n`, `COMMIT TRAN @n`: [`Statement::BeginTransaction`] names a
 //!   transaction with an `Ident` and has nowhere to put a variable.
-//! - `GOTO` and `BEGIN TRY … END CATCH`, refused on purpose (above).
+//! - `BEGIN TRY … END CATCH`, refused on purpose (above).
 //!
 //! And one the server refuses and this file accepts: `SET STATISTICS IO` without a value
 //! is `102 near 'IO'` on the server, where an option name is validated. Nothing is
@@ -78,7 +81,7 @@
 
 use vauban_errors::SqlResult;
 
-use crate::ast::expr::Expr;
+use crate::ast::expr::{Expr, Ident};
 use crate::ast::stmt::{
     AssignOp, AssignTarget, DeclareItem, DeclareStatement, ExecuteArg, ExecuteStatement,
     ExecuteTarget, SetOptionStatement, SetOptionValue, SetStatement, SetValue, Statement,
@@ -759,8 +762,11 @@ fn at_named_variable(p: &Parser) -> bool {
 ///
 /// # Errors
 ///
-/// The syntax error that stopped the parse, and always one for `GOTO`, which is out of
-/// the V1 subset.
+/// The syntax error that stopped the parse. `GOTO` with nothing after it, a variable or a
+/// number instead of a name reports on that following token, exactly as an ordinary
+/// missing or misplaced identifier does elsewhere in this crate: `GOTO;`, `GOTO @v;` and
+/// `GOTO 1;` report on `;`, `@v` and `1` in turn. A delimited or quoted name is refused
+/// the same way, by [`parse_label_name`].
 pub(crate) fn parse_simple(p: &mut Parser) -> SqlResult<Statement> {
     let start = p.mark();
     match p.peek().kind {
@@ -781,8 +787,58 @@ pub(crate) fn parse_simple(p: &mut Parser) -> SqlResult<Statement> {
         }
         TokenKind::Keyword(Keyword::Waitfor) => parse_waitfor(p, start),
         TokenKind::Keyword(Keyword::Throw) => parse_throw(p, start),
-        // `GOTO` is a reserved word SQL Server accepts and V1 does not: the refusal is
-        // reported on it, a deliberate difference.
+        TokenKind::Keyword(Keyword::Goto) => {
+            p.advance();
+            let label = parse_label_name(p)?;
+            Ok(Statement::Goto {
+                label,
+                span: p.span_from(start),
+            })
+        }
+        _ => Err(p.error_here()),
+    }
+}
+
+/// Parses `label:`, the target of a `GOTO`, starting on the label name.
+///
+/// The head token is still unconsumed: `parse_statement` decides on it without eating
+/// it, and this function reads it back itself, because it needs it for the statement
+/// span. The caller (`stmt::at_label`) only reaches here on a name immediately followed
+/// by a `:`, so a reserved word or a name with a gap before the `:` does not get this
+/// far and reports the same syntax error a bare, unclaimed name gets anywhere else a
+/// statement is expected (`tests/flow.rs`).
+///
+/// # Errors
+///
+/// The syntax error that stopped the parse. A delimited or quoted name is refused by
+/// [`parse_label_name`], the same as a `GOTO` target.
+pub(crate) fn parse_label(p: &mut Parser) -> SqlResult<Statement> {
+    let start = p.mark();
+    let name = parse_label_name(p)?;
+    p.expect_punct(Punct::Colon)?;
+    Ok(Statement::Label {
+        name,
+        span: p.span_from(start),
+    })
+}
+
+/// Reads the name of a `GOTO` target or of a label declaration: a **regular**
+/// identifier, or a non-reserved keyword read as one; a delimited or quoted name is
+/// refused (`tests/flow.rs`).
+///
+/// SQL Server refuses `GOTO [l]`, `GOTO "l"`, `[l]:` and `"l":`, citing the name alone,
+/// without its delimiters (`tests/flow.rs`): a label is not a table or a column, and
+/// this is the one place in the grammar a name may not be bracketed or quoted. The
+/// cursor is left where it was, so the refusal prints the same value a delimited token
+/// prints anywhere else in this crate.
+///
+/// # Errors
+///
+/// The syntax error of the token the cursor sits on, which stays where it is.
+fn parse_label_name(p: &mut Parser) -> SqlResult<Ident> {
+    match &p.peek().kind {
+        TokenKind::Ident { quoted: false, .. } => p.parse_ident(),
+        TokenKind::Keyword(k) if !k.is_reserved() => p.parse_ident(),
         _ => Err(p.error_here()),
     }
 }
