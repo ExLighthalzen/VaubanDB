@@ -88,7 +88,7 @@ pub mod testing;
 pub use context::{NoIndexes, PlanCatalog, PlanContext, StorageIndexes};
 pub use explain::explain;
 pub use physical::{
-    KeyRangeExpr, PhysicalDelete, PhysicalInsert, PhysicalJoinKind, PhysicalPlan,
-    PhysicalSelectInto, PhysicalStatement, PhysicalUpdate, SubPlan,
+    KeyRangeExpr, PhysicalDeclaration, PhysicalDelete, PhysicalInsert, PhysicalJoinKind,
+    PhysicalPlan, PhysicalSelectInto, PhysicalStatement, PhysicalUpdate, SubPlan,
 };
 pub use plan::plan;

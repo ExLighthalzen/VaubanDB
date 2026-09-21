@@ -99,6 +99,24 @@ pub(crate) fn plan_expr_subqueries(
     })
 }
 
+/// Plans the subqueries of an expression evaluated outside any plan: the value of a
+/// `SET`, the initial value of a `DECLARE`.
+///
+/// Such an expression is read over no row, so nothing is decorrelated here and no
+/// [`SubqueryEval`](PhysicalPlan::SubqueryEval) is built: the statement carries the list
+/// itself, in the depth-first order the module header describes for that node. An
+/// expression that holds no subquery answers an empty list (`tests/subquery.rs`,
+/// `a_set_without_a_subquery_carries_no_subplan`).
+pub(crate) fn plan_statement_subplans(
+    expr: &BoundExpr,
+    ctx: &PlanContext<'_>,
+) -> SqlResult<Vec<SubPlan>> {
+    if !holds_subquery(expr) {
+        return Ok(Vec::new());
+    }
+    collect_subplans(expr, ctx)
+}
+
 /// Tries to turn an uncorrelated `EXISTS`, `NOT EXISTS` or `IN (SELECT …)` predicate, or
 /// one such conjunct of an `AND`, into a [`NestedLoopJoin`](PhysicalPlan::NestedLoopJoin).
 ///

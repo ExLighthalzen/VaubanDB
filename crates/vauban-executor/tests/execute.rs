@@ -136,6 +136,7 @@ fn variable_assignment_updates_the_declared_spelling() {
     let set = PhysicalStatement::SetVariable {
         name: "@NOM".to_owned(),
         value: int_lit(2),
+        subplans: Vec::new(),
     };
     let eval = StaticContext::default();
     let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_session(&mut session);

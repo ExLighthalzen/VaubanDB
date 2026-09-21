@@ -257,3 +257,51 @@ fn scope_identity_is_numeric_38_0() {
         )
     );
 }
+
+/// A subquery written where a value is expected — the initializer of a `DECLARE`, then
+/// the value of a `SET` — is planned and read like the one of a select list.
+#[test]
+fn a_declare_and_a_set_read_their_value_from_a_subquery() {
+    let mut session = session();
+    setup_plain_table(&mut session, "sv_sub");
+    run(
+        &mut session,
+        "INSERT INTO dbo.sv_sub (id, v) VALUES (1, 10), (2, 20);",
+    );
+
+    let events = run(
+        &mut session,
+        "DECLARE @x int = (SELECT MAX(v) FROM dbo.sv_sub); SELECT @x;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(20)]]);
+
+    let events = run(
+        &mut session,
+        "DECLARE @y int; SET @y = (SELECT MIN(v) FROM dbo.sv_sub); SELECT @y;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(10)]]);
+}
+
+/// A subquery over no row assigns `NULL`, and one over a table filled since answers the
+/// value it holds then.
+#[test]
+fn a_set_from_a_subquery_over_no_row_is_null() {
+    let mut session = session();
+    setup_plain_table(&mut session, "sv_sub_empty");
+
+    let events = run(
+        &mut session,
+        "DECLARE @x int; SET @x = (SELECT MAX(v) FROM dbo.sv_sub_empty); SELECT @x;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::Null]]);
+
+    run(
+        &mut session,
+        "INSERT INTO dbo.sv_sub_empty (id, v) VALUES (1, 5);",
+    );
+    let events = run(
+        &mut session,
+        "DECLARE @y int; SET @y = (SELECT MAX(v) FROM dbo.sv_sub_empty); SELECT @y;",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(5)]]);
+}

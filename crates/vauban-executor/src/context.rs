@@ -660,6 +660,22 @@ impl<'a> ExecContext<'a> {
         self.subquery_frames.pop();
     }
 
+    /// Installs the plans an expression evaluated outside a plan carries — the value of a
+    /// `SET`, the initial value of a `DECLARE` — where
+    /// [`eval_expr`](crate::expr::eval_expr) looks for the plans of a subquery, and
+    /// answers where the correlation stacks stood, for [`ExecContext::unwind_to`] to take
+    /// them back once the expression is evaluated (`tests/subquery.rs`,
+    /// `a_set_from_a_subquery_of_one_row_takes_its_value`).
+    ///
+    /// A frame is opened for one evaluation and dropped with it, cache included: the
+    /// second turn of a `WHILE` runs its subquery again rather than reading what the
+    /// first stored (`tests/subquery.rs`, `a_set_run_twice_evaluates_its_subquery_twice`).
+    pub(crate) fn open_statement_subplans(&mut self, subplans: &[SubPlan]) -> CorrelationMark {
+        let mark = self.correlation_mark();
+        self.open_subquery_eval(subplans);
+        mark
+    }
+
     /// Resets the slot counter for a new row of the innermost
     /// [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval).
     pub(crate) fn begin_subquery_row(&mut self) {

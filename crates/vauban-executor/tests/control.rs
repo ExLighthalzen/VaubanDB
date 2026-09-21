@@ -3,11 +3,9 @@
 //!
 //! All `PhysicalStatement`s are built by hand; the binder and the parser are not involved.
 
-use vauban_binder::{
-    BoundDeclaration, BoundExpr, BoundExprKind, OutputColumn, OutputSchema, SessionOptions,
-};
+use vauban_binder::{BoundExpr, BoundExprKind, OutputColumn, OutputSchema, SessionOptions};
 use vauban_executor::{CancelToken, CollectSink, ExecContext, ExecOutcome, ExecSession, execute};
-use vauban_planner::{PhysicalPlan, PhysicalStatement};
+use vauban_planner::{PhysicalDeclaration, PhysicalPlan, PhysicalStatement};
 use vauban_sysfn::StaticContext;
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
@@ -124,10 +122,11 @@ fn new_session() -> ExecSession {
 #[test]
 fn declare_then_set_then_read() {
     let mut session = new_session();
-    let declare = PhysicalStatement::Declare(vec![BoundDeclaration {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
         name: "@i".to_owned(),
         ty: int_ty(),
         value: None,
+        subplans: Vec::new(),
     }]);
     let (outcome, _) = run(&mut session, &declare);
     assert!(matches!(outcome, ExecOutcome::NoRows));
@@ -135,6 +134,7 @@ fn declare_then_set_then_read() {
     let set = PhysicalStatement::SetVariable {
         name: "@i".to_owned(),
         value: int_lit(3),
+        subplans: Vec::new(),
     };
     let (outcome, _) = run(&mut session, &set);
     assert!(matches!(outcome, ExecOutcome::NoRows));
@@ -146,10 +146,11 @@ fn declare_then_set_then_read() {
 #[test]
 fn declare_gives_null() {
     let mut session = new_session();
-    let declare = PhysicalStatement::Declare(vec![BoundDeclaration {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
         name: "@i".to_owned(),
         ty: int_ty(),
         value: None,
+        subplans: Vec::new(),
     }]);
     let (outcome, _) = run(&mut session, &declare);
     assert!(matches!(outcome, ExecOutcome::NoRows));
@@ -160,16 +161,18 @@ fn declare_gives_null() {
 #[test]
 fn set_converts_to_the_declared_type() {
     let mut session = new_session();
-    let declare = PhysicalStatement::Declare(vec![BoundDeclaration {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
         name: "@i".to_owned(),
         ty: int_ty(),
         value: None,
+        subplans: Vec::new(),
     }]);
     run(&mut session, &declare);
 
     let set = PhysicalStatement::SetVariable {
         name: "@i".to_owned(),
         value: str_lit("3"),
+        subplans: Vec::new(),
     };
     let (outcome, _) = run(&mut session, &set);
     assert!(matches!(outcome, ExecOutcome::NoRows));
@@ -180,16 +183,18 @@ fn set_converts_to_the_declared_type() {
 #[test]
 fn set_conversion_error_has_the_original_number() {
     let mut session = new_session();
-    let declare = PhysicalStatement::Declare(vec![BoundDeclaration {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
         name: "@i".to_owned(),
         ty: int_ty(),
         value: None,
+        subplans: Vec::new(),
     }]);
     run(&mut session, &declare);
 
     let set = PhysicalStatement::SetVariable {
         name: "@i".to_owned(),
         value: str_lit("x"),
+        subplans: Vec::new(),
     };
     let eval = StaticContext::default();
     let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_session(&mut session);
@@ -202,10 +207,11 @@ fn set_conversion_error_has_the_original_number() {
 #[test]
 fn select_assign_takes_the_last_row() {
     let mut session = new_session();
-    let declare = PhysicalStatement::Declare(vec![BoundDeclaration {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
         name: "@x".to_owned(),
         ty: int_ty(),
         value: None,
+        subplans: Vec::new(),
     }]);
     run(&mut session, &declare);
 
@@ -234,10 +240,12 @@ fn if_takes_the_true_branch() {
     let then_stmt = PhysicalStatement::SetVariable {
         name: "@x".to_owned(),
         value: int_lit(1),
+        subplans: Vec::new(),
     };
     let else_stmt = PhysicalStatement::SetVariable {
         name: "@x".to_owned(),
         value: int_lit(2),
+        subplans: Vec::new(),
     };
     let if_stmt = PhysicalStatement::If {
         condition: eq(int_lit(1), int_lit(1)),
@@ -245,10 +253,11 @@ fn if_takes_the_true_branch() {
         else_: Some(Box::new(else_stmt)),
     };
 
-    let declare = PhysicalStatement::Declare(vec![BoundDeclaration {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
         name: "@x".to_owned(),
         ty: int_ty(),
         value: None,
+        subplans: Vec::new(),
     }]);
     run(&mut session, &declare);
 
@@ -263,10 +272,12 @@ fn if_takes_else_on_unknown() {
     let then_stmt = PhysicalStatement::SetVariable {
         name: "@x".to_owned(),
         value: int_lit(1),
+        subplans: Vec::new(),
     };
     let else_stmt = PhysicalStatement::SetVariable {
         name: "@x".to_owned(),
         value: int_lit(2),
+        subplans: Vec::new(),
     };
     let null_cond = lit(Value::Null, bit_ty());
     let if_stmt = PhysicalStatement::If {
@@ -275,10 +286,11 @@ fn if_takes_else_on_unknown() {
         else_: Some(Box::new(else_stmt)),
     };
 
-    let declare = PhysicalStatement::Declare(vec![BoundDeclaration {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
         name: "@x".to_owned(),
         ty: int_ty(),
         value: None,
+        subplans: Vec::new(),
     }]);
     run(&mut session, &declare);
 
@@ -290,21 +302,24 @@ fn if_takes_else_on_unknown() {
 #[test]
 fn while_loops_and_break_exits() {
     let mut session = new_session();
-    let declare = PhysicalStatement::Declare(vec![BoundDeclaration {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
         name: "@i".to_owned(),
         ty: int_ty(),
         value: None,
+        subplans: Vec::new(),
     }]);
     run(&mut session, &declare);
     let init = PhysicalStatement::SetVariable {
         name: "@i".to_owned(),
         value: int_lit(0),
+        subplans: Vec::new(),
     };
     run(&mut session, &init);
 
     let inc = PhysicalStatement::SetVariable {
         name: "@i".to_owned(),
         value: add(var_ref("@i"), int_lit(1)),
+        subplans: Vec::new(),
     };
     let break_if_three = PhysicalStatement::If {
         condition: eq(var_ref("@i"), int_lit(3)),
@@ -354,10 +369,11 @@ fn infinite_loop_is_cancellable() {
 #[test]
 fn block_stops_at_the_first_return() {
     let mut session = new_session();
-    let declare = PhysicalStatement::Declare(vec![BoundDeclaration {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
         name: "@x".to_owned(),
         ty: int_ty(),
         value: None,
+        subplans: Vec::new(),
     }]);
     run(&mut session, &declare);
 
@@ -365,11 +381,13 @@ fn block_stops_at_the_first_return() {
         PhysicalStatement::SetVariable {
             name: "@x".to_owned(),
             value: int_lit(1),
+            subplans: Vec::new(),
         },
         PhysicalStatement::Return(None),
         PhysicalStatement::SetVariable {
             name: "@x".to_owned(),
             value: int_lit(2),
+            subplans: Vec::new(),
         },
     ]);
 
@@ -398,16 +416,18 @@ fn print_emits_info_number_zero() {
 #[test]
 fn rowcount_after_set() {
     let mut session = new_session();
-    let declare = PhysicalStatement::Declare(vec![BoundDeclaration {
+    let declare = PhysicalStatement::Declare(vec![PhysicalDeclaration {
         name: "@i".to_owned(),
         ty: int_ty(),
         value: None,
+        subplans: Vec::new(),
     }]);
     run(&mut session, &declare);
 
     let set = PhysicalStatement::SetVariable {
         name: "@i".to_owned(),
         value: int_lit(1),
+        subplans: Vec::new(),
     };
     run(&mut session, &set);
     assert_eq!(session.rowcount, 1);

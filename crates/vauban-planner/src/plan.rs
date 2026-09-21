@@ -16,7 +16,7 @@ use vauban_binder::{BoundStatement, LogicalPlan};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 
 use crate::context::PlanContext;
-use crate::physical::{PhysicalPlan, PhysicalStatement};
+use crate::physical::{PhysicalDeclaration, PhysicalPlan, PhysicalStatement};
 use crate::{aggregate, dml, setop, sort, subquery};
 
 /// Turns a bound statement into the physical statement the `executor` runs.
@@ -35,14 +35,34 @@ pub fn plan(stmt: BoundStatement, ctx: &PlanContext<'_>) -> SqlResult<PhysicalSt
         BoundStatement::Update(update) => dml::plan_update(&update, ctx),
         BoundStatement::Delete(delete) => dml::plan_delete(&delete, ctx),
         BoundStatement::SetVariable { name, value } => {
-            Ok(PhysicalStatement::SetVariable { name, value })
+            let subplans = subquery::plan_statement_subplans(&value, ctx)?;
+            Ok(PhysicalStatement::SetVariable {
+                name,
+                value,
+                subplans,
+            })
         }
         BoundStatement::SelectAssign { .. } => Err(not_implemented(
             "plan",
             "a SELECT that assigns variables from a FROM",
         )),
         BoundStatement::Execute(execute) => Ok(PhysicalStatement::Execute(execute)),
-        BoundStatement::Declare(declarations) => Ok(PhysicalStatement::Declare(declarations)),
+        BoundStatement::Declare(declarations) => {
+            let mut planned = Vec::with_capacity(declarations.len());
+            for declaration in declarations {
+                let subplans = match &declaration.value {
+                    Some(value) => subquery::plan_statement_subplans(value, ctx)?,
+                    None => Vec::new(),
+                };
+                planned.push(PhysicalDeclaration {
+                    name: declaration.name,
+                    ty: declaration.ty,
+                    value: declaration.value,
+                    subplans,
+                });
+            }
+            Ok(PhysicalStatement::Declare(planned))
+        }
         BoundStatement::If {
             condition,
             then_,

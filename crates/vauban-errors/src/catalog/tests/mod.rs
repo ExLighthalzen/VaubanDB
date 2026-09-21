@@ -395,3 +395,11 @@ fn batch_scope_of_deferred_bind_errors_stays_batch() {
         assert_eq!(def.batch_scope(), BatchErrorScope::Batch, "error {number}");
     }
 }
+
+/// A subquery read where one value is expected and answering several rows stops its own
+/// statement: the statement written after it in the batch still runs.
+#[test]
+fn batch_scope_of_a_subquery_of_several_values_is_statement() {
+    let def = message_template(512).expect("error 512 is in the catalog");
+    assert_eq!(def.batch_scope(), BatchErrorScope::Statement);
+}

@@ -57,9 +57,12 @@ impl ErrorDef {
     /// through a column list without `IDENTITY_INSERT` (544), and a `DROP TABLE` or
     /// `DROP INDEX` naming an object that does not exist (3701, table or index alike) —
     /// `tests::batch_scope_of_constraint_and_truncation_errors_is_statement` runs each with
-    /// a successful statement on both sides. Error 536 is statement-scoped when it reaches
-    /// execution; a foldable length is caught at compilation and stops the batch on its
-    /// own. Batch-scoped numbers include 127, 234, 235, 241, 245, 281, 289, 292, 295, 1014,
+    /// a successful statement on both sides. So is a subquery answering more than one value
+    /// where one is expected (512), written as the value of a `SET` or as the initializer of
+    /// a `DECLARE` (`tests::batch_scope_of_a_subquery_of_several_values_is_statement`).
+    /// Error 536 is statement-scoped when it reaches execution; a foldable length is caught
+    /// at compilation and stops the batch on its own.
+    /// Batch-scoped numbers include 127, 234, 235, 241, 245, 281, 289, 292, 295, 1014,
     /// 8114, 8169 and 8170, and, on the same shape, an object `CREATE TABLE` finds already
     /// there (2714), a name `ALTER TABLE`/`CREATE INDEX` does not find (4902, 1088) and a
     /// `DROP CONSTRAINT` naming one absent (3728) —
@@ -67,10 +70,9 @@ impl ErrorDef {
     /// and internal errors default to the safer batch scope.
     pub const fn batch_scope(&self) -> BatchErrorScope {
         match self.number {
-            220 | 232 | 237 | 242 | 244 | 248 | 506 | 515 | 517 | 535 | 536 | 537 | 544 | 547
-            | 2601 | 2627 | 2628 | 3623 | 3701 | 8115 | 8134 | 8152 | 9806 | 9807 | 9809 | 9810 => {
-                BatchErrorScope::Statement
-            }
+            220 | 232 | 237 | 242 | 244 | 248 | 506 | 512 | 515 | 517 | 535 | 536 | 537 | 544
+            | 547 | 2601 | 2627 | 2628 | 3623 | 3701 | 8115 | 8134 | 8152 | 9806 | 9807 | 9809
+            | 9810 => BatchErrorScope::Statement,
             _ => BatchErrorScope::Batch,
         }
     }

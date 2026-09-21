@@ -14,13 +14,13 @@
 
 use std::ops::Bound;
 
-use vauban_binder::BoundDeclaration;
 use vauban_binder::{
     AggregateCall, BoundExecute, BoundExpr, BoundProjection, BoundTop, ColumnBinding, DdlStatement,
     JoinKind, LockHints, OutputSchema, SortKey, TxnStatement,
 };
 use vauban_catalog::{TableDef, TableId};
 use vauban_storage::{Direction, IndexId};
+use vauban_types::TypeInfo;
 
 /// A statement, planned: what the `executor` runs.
 ///
@@ -28,9 +28,11 @@ use vauban_storage::{Direction, IndexId};
 /// Deliberately **not** `#[non_exhaustive]`: adding a variant must break the compilation
 /// of the consumers rather than pass unnoticed.
 ///
-/// The variants that carry no relational plan — DDL, `USE`, `DECLARE`, the transaction
-/// statements — hold the payload the binder built, unchanged: planning has nothing to
-/// choose for them, and `plan.rs` moves them across.
+/// The variants that carry no relational plan — DDL, `USE`, the transaction statements —
+/// hold the payload the binder built, unchanged: planning has nothing to choose for them,
+/// and `plan.rs` moves them across. A `DECLARE` and a `SET` carry, beside that payload,
+/// the plan of each subquery their expression holds ([`SubPlan`]), since an expression
+/// evaluated outside a plan has no operator to hang one on.
 #[derive(Debug, Clone)]
 pub enum PhysicalStatement {
     /// A `SELECT` and its physical plan.
@@ -56,9 +58,13 @@ pub enum PhysicalStatement {
         name: String,
         /// The value, as the binder converted it.
         value: BoundExpr,
+        /// One plan per subquery `value` holds, in the order
+        /// [`SubqueryEval`](PhysicalPlan::SubqueryEval) lists them; empty when the value
+        /// holds none.
+        subplans: Vec<SubPlan>,
     },
     /// `DECLARE @a int, @b varchar(10) = 'x'`, in the order the declarations were written.
-    Declare(Vec<BoundDeclaration>),
+    Declare(Vec<PhysicalDeclaration>),
     /// `IF p stmt [ELSE stmt]`, both branches planned.
     If {
         /// The condition, which satisfies
@@ -288,6 +294,26 @@ pub enum PhysicalPlan {
         /// One column per column of the operands.
         schema: OutputSchema,
     },
+}
+
+/// One variable of a [`PhysicalStatement::Declare`], with the plans of the subqueries its
+/// initial value holds.
+///
+/// The three fields the binder wrote are carried across unchanged; `subplans` is what
+/// planning adds.
+#[derive(Debug, Clone)]
+pub struct PhysicalDeclaration {
+    /// The name, `@` included, as written.
+    pub name: String,
+    /// The declared type, nullability and collation included.
+    pub ty: TypeInfo,
+    /// The initial value, already converted to `ty`; `None` for a `DECLARE` written
+    /// without `=`, which is the `NULL` a variable starts at.
+    pub value: Option<BoundExpr>,
+    /// One plan per subquery `value` holds, in the order
+    /// [`SubqueryEval`](PhysicalPlan::SubqueryEval) lists them; empty for a value that
+    /// holds none, and for a declaration written without `=`.
+    pub subplans: Vec<SubPlan>,
 }
 
 /// One subquery of a [`PhysicalPlan::SubqueryEval`]. Not produced yet.

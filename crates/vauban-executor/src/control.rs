@@ -18,10 +18,15 @@
 //! `types::convert` returns, unchanged. `SET` puts `@@ROWCOUNT` at 1, as SQL Server does.
 //! Reading a name no `DECLARE` entered is a bug of the binder and answers the internal
 //! error.
+//!
+//! A value written as a subquery — `SET @x = (SELECT MAX(col) FROM t)`, and the same in
+//! the initializer of a `DECLARE` — is read outside a plan, so the plan of that subquery
+//! travels on the statement rather than under an operator; [`eval_statement_expr`]
+//! installs it for the time of the evaluation.
 
 use vauban_binder::BoundExpr;
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
-use vauban_planner::PhysicalStatement;
+use vauban_planner::{PhysicalStatement, SubPlan};
 use vauban_types::{SqlType, TypeInfo, Value, convert, default_display};
 
 use crate::context::{ExecContext, RowSink};
@@ -44,20 +49,33 @@ pub(crate) fn execute(
     match stmt {
         PhysicalStatement::Declare(declarations) => {
             for declaration in declarations {
-                let value = match &declaration.value {
-                    Some(expr) => eval_expr(expr, None, ctx)?,
-                    None => Value::Null,
-                };
+                // The name is entered before its initial value is read, so a statement
+                // that runs after a failed initializer reads the variable at `NULL`
+                // rather than a name nothing declared (`tests/subquery.rs`,
+                // `a_declare_whose_subquery_returns_two_rows_answers_512`).
                 let session = ctx.session()?;
-                session.variables.insert(declaration.name.clone(), value);
+                session
+                    .variables
+                    .insert(declaration.name.clone(), Value::Null);
                 session
                     .variable_types
                     .insert(declaration.name.clone(), declaration.ty.clone());
+                let Some(expr) = &declaration.value else {
+                    continue;
+                };
+                let value = eval_statement_expr(expr, &declaration.subplans, ctx)?;
+                ctx.session()?
+                    .variables
+                    .insert(declaration.name.clone(), value);
             }
             Ok(ExecOutcome::NoRows)
         }
-        PhysicalStatement::SetVariable { name, value } => {
-            set_variable(name, value, ctx)?;
+        PhysicalStatement::SetVariable {
+            name,
+            value,
+            subplans,
+        } => {
+            set_variable(name, value, subplans, ctx)?;
             ctx.session()?.rowcount = 1;
             Ok(ExecOutcome::NoRows)
         }
@@ -172,8 +190,19 @@ fn run_nested(
 
 /// `SET @x = e`: evaluates `e` and stores it under `name`, converted to the declared type
 /// when the binder did not already convert it.
-fn set_variable(name: &str, value: &BoundExpr, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
-    let evaluated = eval_expr(value, None, ctx)?;
+///
+/// `subplans` are the plans of the subqueries `e` holds, which the planner attached to the
+/// statement ([`PhysicalStatement::SetVariable`]). A value the evaluation refuses — 512
+/// for a subquery of two rows — stores nothing: the variable keeps what it held, `NULL` in
+/// `tests/subquery.rs`, `a_set_whose_subquery_returns_two_rows_answers_512`, which starts
+/// from an unset variable.
+fn set_variable(
+    name: &str,
+    value: &BoundExpr,
+    subplans: &[SubPlan],
+    ctx: &mut ExecContext<'_>,
+) -> SqlResult<()> {
+    let evaluated = eval_statement_expr(value, subplans, ctx)?;
     let declared = ctx.session()?.variable_type(name);
     let stored = match declared {
         Some(declared) => {
@@ -183,6 +212,30 @@ fn set_variable(name: &str, value: &BoundExpr, ctx: &mut ExecContext<'_>) -> Sql
     };
     ctx.session()?.store_variable_value(name, stored);
     Ok(())
+}
+
+/// Evaluates an expression a statement holds outside any plan — the value of a `SET`, the
+/// initial value of a `DECLARE` — with the plans of its subqueries installed while it is
+/// read, and taken back after, the error path included.
+///
+/// A subquery answers `NULL` over an empty source, its single column over one row, and
+/// 512 beyond, as it does in a select list (`tests/subquery.rs`,
+/// `a_set_from_an_empty_subquery_is_null`,
+/// `a_set_from_a_subquery_of_one_row_takes_its_value`,
+/// `a_set_whose_subquery_returns_two_rows_answers_512`). An expression with no subquery
+/// carries no plan and is read as it was before.
+fn eval_statement_expr(
+    expr: &BoundExpr,
+    subplans: &[SubPlan],
+    ctx: &mut ExecContext<'_>,
+) -> SqlResult<Value> {
+    if subplans.is_empty() {
+        return eval_expr(expr, None, ctx);
+    }
+    let mark = ctx.open_statement_subplans(subplans);
+    let value = eval_expr(expr, None, ctx);
+    ctx.unwind_to(mark);
+    value
 }
 
 /// The integer a `RETURN e` returns: `e` converted to `int`, `NULL` counting as 0.

@@ -9,8 +9,12 @@ use vauban_binder::{
     OutputSchema, SessionOptions,
 };
 use vauban_catalog::ColumnId;
-use vauban_executor::{ExecContext, ExecOutcome, Row, execute_collect};
-use vauban_planner::{PhysicalJoinKind, PhysicalPlan, PhysicalStatement, SubPlan};
+use vauban_executor::{
+    CollectSink, ExecContext, ExecOutcome, ExecSession, Row, execute, execute_collect,
+};
+use vauban_planner::{
+    PhysicalDeclaration, PhysicalJoinKind, PhysicalPlan, PhysicalStatement, SubPlan,
+};
 use vauban_storage::{MemoryStorage, Row as StorageRow, Snapshot, Storage, TableId, TableShape};
 use vauban_sysfn::StaticContext;
 use vauban_txn::{IsolationLevel, TransactionManager};
@@ -915,4 +919,137 @@ fn derived_table_under_a_join_column_read_from_an_enclosing_scalar() {
             &[3, 2, 2]
         ])
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Subqueries written outside a plan: the value of a `SET`, the initializer of a `DECLARE`
+// ---------------------------------------------------------------------------------------
+
+/// `SET @x = (SELECT v FROM (VALUES …) AS t(v))`, the plan of the subquery carried by the
+/// statement as the planner attaches it.
+fn set_from_subquery(rows: &[i32]) -> PhysicalStatement {
+    let inner = values_int(rows);
+    PhysicalStatement::SetVariable {
+        name: "@x".to_owned(),
+        value: scalar(inner.clone()),
+        subplans: vec![subplan(inner, false)],
+    }
+}
+
+/// `DECLARE @x int = (SELECT v FROM (VALUES …) AS t(v))`, the same attachment.
+fn declare_from_subquery(rows: &[i32]) -> PhysicalStatement {
+    let inner = values_int(rows);
+    PhysicalStatement::Declare(vec![PhysicalDeclaration {
+        name: "@x".to_owned(),
+        ty: int_ty(true),
+        value: Some(scalar(inner.clone())),
+        subplans: vec![subplan(inner, false)],
+    }])
+}
+
+/// A session where `@x` is an `int` holding `NULL`, as a `DECLARE` leaves it.
+fn session_with_x() -> ExecSession {
+    let mut session = ExecSession::default();
+    session.variables.insert("@x".to_owned(), Value::Null);
+    session.variable_types.insert("@x".to_owned(), int_ty(true));
+    session
+}
+
+fn run_statement(
+    session: &mut ExecSession,
+    stmt: &PhysicalStatement,
+) -> vauban_errors::SqlResult<ExecOutcome> {
+    let eval = StaticContext::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_session(session);
+    let mut sink = CollectSink::new();
+    execute(stmt, &mut ctx, &mut sink)
+}
+
+/// A subquery over no row assigns `NULL`.
+#[test]
+fn a_set_from_an_empty_subquery_is_null() {
+    let mut session = session_with_x();
+    run_statement(&mut session, &set_from_subquery(&[])).expect("the SET runs");
+    assert_eq!(session.variables.get("@x"), Some(&Value::Null));
+}
+
+/// A subquery over one row assigns the value of its single column.
+#[test]
+fn a_set_from_a_subquery_of_one_row_takes_its_value() {
+    let mut session = session_with_x();
+    run_statement(&mut session, &set_from_subquery(&[42])).expect("the SET runs");
+    assert_eq!(session.variables.get("@x"), Some(&Value::I32(42)));
+}
+
+/// A subquery over two rows answers 512 on the line of the expression, and the variable
+/// keeps the value it had.
+#[test]
+fn a_set_whose_subquery_returns_two_rows_answers_512() {
+    let mut session = session_with_x();
+    let err = run_statement(&mut session, &set_from_subquery(&[1, 2])).expect_err("512");
+    assert_eq!(
+        (err.number, err.severity, err.state, err.line),
+        (512, 16, 1, 7)
+    );
+    assert_eq!(session.variables.get("@x"), Some(&Value::Null));
+}
+
+/// The initializer of a `DECLARE` reads its subquery the same way.
+#[test]
+fn a_declare_from_a_subquery_of_one_row_takes_its_value() {
+    let mut session = ExecSession::default();
+    run_statement(&mut session, &declare_from_subquery(&[7])).expect("the DECLARE runs");
+    assert_eq!(session.variables.get("@x"), Some(&Value::I32(7)));
+}
+
+/// The initializer of a `DECLARE` over two rows answers 512 as the value of a `SET` does,
+/// and the variable it declares is entered at `NULL`, for the statements that follow.
+#[test]
+fn a_declare_whose_subquery_returns_two_rows_answers_512() {
+    let mut session = ExecSession::default();
+    let err = run_statement(&mut session, &declare_from_subquery(&[1, 2])).expect_err("512");
+    assert_eq!(
+        (err.number, err.severity, err.state, err.line),
+        (512, 16, 1, 7)
+    );
+    assert_eq!(session.variables.get("@x"), Some(&Value::Null));
+}
+
+/// The plans are installed for one evaluation and dropped with it: running the same `SET`
+/// twice opens its subquery plan twice, instead of reading what the first run cached.
+#[test]
+fn a_set_run_twice_evaluates_its_subquery_twice() {
+    let mut session = session_with_x();
+    let eval = StaticContext::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_session(&mut session);
+    let opens = Rc::new(Cell::new(0));
+    ctx.set_subquery_open_count(Rc::clone(&opens));
+    let mut sink = CollectSink::new();
+    let stmt = set_from_subquery(&[9]);
+    execute(&stmt, &mut ctx, &mut sink).expect("the first SET runs");
+    execute(&stmt, &mut ctx, &mut sink).expect("the second SET runs");
+    assert_eq!(opens.get(), 2);
+}
+
+/// `SET @x = EXISTS (…)` and `SET @x = 2 IN (SELECT …)`: the other two kinds of expression
+/// that hold a plan travel on the statement the same way as a scalar subquery.
+#[test]
+fn a_set_reads_an_exists_and_an_in_subquery_in_the_same_position() {
+    let mut session = session_with_x();
+    let rows = values_int(&[1, 2]);
+    let exists_value = PhysicalStatement::SetVariable {
+        name: "@x".to_owned(),
+        value: exists(rows.clone()),
+        subplans: vec![subplan(rows.clone(), false)],
+    };
+    run_statement(&mut session, &exists_value).expect("the EXISTS runs");
+    assert_eq!(session.variables.get("@x"), Some(&Value::I32(1)));
+
+    let in_value = PhysicalStatement::SetVariable {
+        name: "@x".to_owned(),
+        value: in_subquery(lit(2), rows.clone(), false),
+        subplans: vec![subplan(rows, false)],
+    };
+    run_statement(&mut session, &in_value).expect("the IN runs");
+    assert_eq!(session.variables.get("@x"), Some(&Value::I32(1)));
 }

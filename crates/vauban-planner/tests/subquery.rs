@@ -9,8 +9,8 @@ use vauban_planner::{
 };
 
 use vauban_binder::{
-    AggregateCall, BoundExpr, BoundExprKind, BoundProjection, BoundStatement, BoundTop,
-    ColumnBinding, CompareOp, JoinKind, LockHints, LogicalOp, LogicalPlan, OutputColumn,
+    AggregateCall, BoundDeclaration, BoundExpr, BoundExprKind, BoundProjection, BoundStatement,
+    BoundTop, ColumnBinding, CompareOp, JoinKind, LockHints, LogicalOp, LogicalPlan, OutputColumn,
     OutputSchema, SortKey,
 };
 use vauban_catalog::ColumnId;
@@ -888,4 +888,92 @@ fn contains_index_seek(plan: &PhysicalPlan) -> bool {
         }
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Subqueries written outside a plan: the value of a `SET`, the initializer of a `DECLARE`
+// ---------------------------------------------------------------------------------------
+
+fn planned_statement(logical: BoundStatement) -> PhysicalStatement {
+    let catalog = FakeCatalog::new();
+    let ctx = PlanContext { catalog: &catalog };
+    match plan(logical, &ctx) {
+        Ok(physical) => physical,
+        Err(err) => panic!("planning failed: {}", err.message),
+    }
+}
+
+fn set_variable(value: BoundExpr) -> BoundStatement {
+    BoundStatement::SetVariable {
+        name: "@x".to_owned(),
+        value,
+    }
+}
+
+fn set_subplans(stmt: &PhysicalStatement) -> &[SubPlan] {
+    match stmt {
+        PhysicalStatement::SetVariable { subplans, .. } => subplans,
+        other => panic!("expected a SET, got {other:?}"),
+    }
+}
+
+/// `SET @x = (SELECT k FROM a)`: the plan of the subquery travels on the statement, since
+/// there is no operator under the value to hang it on.
+#[test]
+fn a_set_carries_the_plan_of_its_subquery() {
+    let planned = planned_statement(set_variable(scalar(project_scan(scan_a()))));
+    let subplans = set_subplans(&planned);
+    assert_eq!(subplans.len(), 1);
+    assert!(contains_table(&subplans[0].plan, TABLE_A));
+    assert!(!subplans[0].correlated);
+}
+
+/// `SET @x = (SELECT … FROM a) + (SELECT … FROM b)`: one plan per subquery, in the order
+/// the expression is walked, left operand first.
+#[test]
+fn a_set_carries_one_subplan_per_subquery_of_its_value() {
+    let left = scalar(project_scan(scan_a()));
+    let right = scalar(project_scan(scan_b()));
+    let planned = planned_statement(set_variable(logical(LogicalOp::And, left, right)));
+    let subplans = set_subplans(&planned);
+    assert_eq!(subplans.len(), 2);
+    assert!(
+        contains_table(&subplans[0].plan, TABLE_A),
+        "the left subquery must be first in the walk"
+    );
+    assert!(
+        contains_table(&subplans[1].plan, TABLE_B),
+        "the right subquery must be second; swapping them fails this test"
+    );
+}
+
+/// `SET @x = 1`: no subquery, no plan attached.
+#[test]
+fn a_set_without_a_subquery_carries_no_subplan() {
+    let planned = planned_statement(set_variable(literal(1)));
+    assert!(set_subplans(&planned).is_empty());
+}
+
+/// `DECLARE @a int = (SELECT k FROM a), @b int`: the plan goes on the declaration that
+/// holds the subquery, and the one written without `=` carries none.
+#[test]
+fn a_declare_carries_the_subplans_of_each_initial_value() {
+    let planned = planned_statement(BoundStatement::Declare(vec![
+        BoundDeclaration {
+            name: "@a".to_owned(),
+            ty: int_type(),
+            value: Some(scalar(project_scan(scan_a()))),
+        },
+        BoundDeclaration {
+            name: "@b".to_owned(),
+            ty: int_type(),
+            value: None,
+        },
+    ]));
+    let PhysicalStatement::Declare(declarations) = &planned else {
+        panic!("expected a DECLARE, got {planned:?}");
+    };
+    assert_eq!(declarations[0].subplans.len(), 1);
+    assert!(contains_table(&declarations[0].subplans[0].plan, TABLE_A));
+    assert!(declarations[1].subplans.is_empty());
 }
