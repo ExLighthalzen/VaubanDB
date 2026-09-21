@@ -367,3 +367,31 @@ fn message_template_unknown_returns_none() {
     assert!(message_template(999_999).is_none());
     assert!(message_template(0).is_none());
 }
+
+/// With a successful statement on each side, these eight numbers let the surrounding
+/// statements run: a following statement in the same batch still runs, and so does the
+/// caller of an `EXEC('…')`/`sp_executesql` whose nested text raised one of them.
+#[test]
+fn batch_scope_of_constraint_and_truncation_errors_is_statement() {
+    for number in [515, 544, 547, 2601, 2627, 2628, 3701, 8152] {
+        let def =
+            message_template(number).unwrap_or_else(|| panic!("error {number} is in the catalog"));
+        assert_eq!(
+            def.batch_scope(),
+            BatchErrorScope::Statement,
+            "error {number}"
+        );
+    }
+}
+
+/// The counterpart of the test above: these four numbers are raised the same way, while a
+/// statement of a batch runs, and still stop the statement after them, unlike the eight
+/// numbers checked there.
+#[test]
+fn batch_scope_of_deferred_bind_errors_stays_batch() {
+    for number in [1088, 2714, 3728, 4902] {
+        let def =
+            message_template(number).unwrap_or_else(|| panic!("error {number} is in the catalog"));
+        assert_eq!(def.batch_scope(), BatchErrorScope::Batch, "error {number}");
+    }
+}

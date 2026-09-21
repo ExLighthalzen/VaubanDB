@@ -673,6 +673,28 @@ fn a_2627_in_an_exec_lets_the_caller_continue() {
     assert!(has_int_row(&events.0, 3), "{:?}", events.0);
 }
 
+/// `515` is statement-scoped: the nested text goes on to its own next statement too, next
+/// to the caller. `@@ERROR` right after the call is `0`, cleared by that statement, not
+/// the `NOT NULL` violation in the middle of the text (complements
+/// `a_515_in_an_exec_lets_the_caller_continue`, which checks the caller alone).
+#[test]
+fn a_515_in_an_exec_lets_the_nested_texts_own_next_statement_run_too() {
+    let mut session = session();
+    run_batch(
+        &mut session,
+        "CREATE TABLE dbo.nested_notnull_own (a int NOT NULL);",
+    );
+    let events = run_batch(
+        &mut session,
+        "EXEC('SELECT 1; INSERT dbo.nested_notnull_own (a) VALUES (NULL); SELECT 2;'); \
+         SELECT @@ERROR;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![515]);
+    assert!(has_int_row(&events.0, 1), "{:?}", events.0);
+    assert!(has_int_row(&events.0, 2), "{:?}", events.0);
+    assert_eq!(last_row(&events.0), &[Value::I32(0)], "{:?}", events.0);
+}
+
 /// One of a family of checked exceptions: a conversion error raised while a nested statement
 /// runs ends the caller's batch too, unlike the numbers checked above, even without
 /// `XACT_ABORT`.

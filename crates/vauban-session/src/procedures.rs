@@ -335,13 +335,6 @@ fn batch_continues(session: &Session, more: bool, failed: bool, error_number: u3
 /// other numbers of this list).
 const NESTED_TEXT_COMPILATION_ERRORS: [u32; 7] = [102, 137, 206, 207, 208, 2812, 4104];
 
-/// A `NOT NULL`, a `FOREIGN KEY`, a `UNIQUE` violation and a `DROP` of a name that does not
-/// exist let the caller continue on the shapes checked
-/// (`tests/nested.rs`, `nested_batch_scope_family_decides_caller_continuation`), matching the
-/// scope every other number here reads from `vauban_errors::SqlError::batch_scope`, which
-/// still answers `Batch` for these four: an open gap of that catalogue, not closed here.
-const NESTED_STATEMENT_ERRORS_LEFT_OUT_OF_THE_CATALOGUE: [u32; 4] = [515, 547, 2627, 3701];
-
 /// Whether the batch that issued `EXEC('…')` or `sp_executesql` runs its next statement once
 /// the nested text this call ran is done.
 ///
@@ -351,9 +344,9 @@ const NESTED_STATEMENT_ERRORS_LEFT_OUT_OF_THE_CATALOGUE: [u32; 4] = [515, 547, 2
 /// raised while a statement of the nested text *runs* stops the caller exactly when its
 /// catalogued scope (`vauban_errors::SqlError::batch_scope`) already stops the batch that
 /// raised it — `BatchErrorScope::Batch` — and lets the caller go on when it is
-/// `BatchErrorScope::Statement`, with the same answer restated for
-/// `NESTED_STATEMENT_ERRORS_LEFT_OUT_OF_THE_CATALOGUE` (`tests/nested.rs`,
-/// `nested_batch_scope_family_decides_caller_continuation`).
+/// `BatchErrorScope::Statement` (`tests/nested.rs`,
+/// `nested_batch_scope_family_decides_caller_continuation`,
+/// `a_515_in_an_exec_lets_the_caller_continue` and its siblings for 547, 2627 and 3701).
 pub(crate) fn continues_after_nested(more: bool, xact_abort: bool, error_number: u32) -> bool {
     if error_number == 0 {
         return more;
@@ -361,9 +354,7 @@ pub(crate) fn continues_after_nested(more: bool, xact_abort: bool, error_number:
     if xact_abort {
         return false;
     }
-    if NESTED_TEXT_COMPILATION_ERRORS.contains(&error_number)
-        || NESTED_STATEMENT_ERRORS_LEFT_OUT_OF_THE_CATALOGUE.contains(&error_number)
-    {
+    if NESTED_TEXT_COMPILATION_ERRORS.contains(&error_number) {
         return more;
     }
     more && SqlError::new(error_number, 16, 1, "x").batch_scope() == BatchErrorScope::Statement

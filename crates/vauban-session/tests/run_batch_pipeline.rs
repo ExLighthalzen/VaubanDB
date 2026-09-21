@@ -346,6 +346,35 @@ fn a_batch_scoped_runtime_error_stops_the_batch() {
 }
 
 #[test]
+fn a_not_null_violation_lets_the_batch_continue() {
+    // 515 is statement-scoped, like 8134 above: a `NOT NULL` violation stops the statement
+    // that raised it, not the batch, as on SQL Server.
+    let mut session = session();
+    let (_, setup) = run_on(&mut session, "CREATE TABLE dbo.t515 (a int NOT NULL)");
+    setup.expect("the setup statement succeeds");
+    let (events, result) = run_on(
+        &mut session,
+        "SELECT 1; INSERT dbo.t515 (a) VALUES (NULL); SELECT 2",
+    );
+    result.expect("a batch reports its errors through the sink, not through its result");
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(1)], vec![Value::I32(2)]],
+        "{events:#?}"
+    );
+    assert_eq!(only_error(&events).number, 515);
+    let error = events
+        .iter()
+        .position(|event| matches!(event, Event::Error(_)))
+        .expect("the statement raises its error");
+    assert_eq!(
+        events.get(error + 1),
+        Some(&Event::Done(None, true)),
+        "ERROR is closed by a DONE carrying MORE: {events:#?}"
+    );
+}
+
+#[test]
 fn xact_abort_stops_a_statement_scoped_runtime_error() {
     let events = run("SET XACT_ABORT ON; SELECT 1; SELECT 1 / 0; SELECT 2");
     assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
@@ -650,15 +679,21 @@ fn an_alter_table_on_a_table_still_missing_is_4902_at_run_time() {
 }
 
 #[test]
-fn a_drop_index_on_a_table_still_missing_stays_3701_at_run_time() {
+fn a_drop_index_on_a_table_still_missing_is_3701_and_the_batch_continues() {
     // Counter-proof: `DROP INDEX` carries no `ObjectId` and needs no catalogue
     // (`ddl_index.rs`), so this number does not join the deferred set above; it already
-    // answers at run time, unaffected by it.
+    // answers at run time, unaffected by it. 3701 is statement-scoped, so `SELECT 2` runs.
     let events = run("SELECT 1; DROP INDEX ix ON dbo.s3f; SELECT 2;");
     let err = only_error(&events);
     assert_eq!(err.number, 3701, "{err:?}");
-    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
-    assert_eq!(result_sets(&events), 1, "{events:#?}");
+    assert_eq!(err.severity, 11, "{err:?}");
+    assert_eq!(err.state, 6, "{err:?}");
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(1)], vec![Value::I32(2)]],
+        "{events:#?}"
+    );
+    assert_eq!(result_sets(&events), 2, "{events:#?}");
 }
 
 #[test]
