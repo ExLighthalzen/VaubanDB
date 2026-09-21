@@ -1,19 +1,20 @@
 //! `sys.dm_exec_sessions`, `sys.dm_exec_connections`, `sys.dm_exec_requests`,
-//! `sys.configurations` and `sys.dm_os_sys_info`.
+//! `sys.configurations`, `sys.dm_os_sys_info` and `sys.dm_os_host_info`.
 //!
 //! # The shape of the views
 //!
 //! The column list of each view — names, order, types — is the one SQL Server 2022 publishes:
 //! `sys.dm_exec_sessions` 52 columns, `sys.dm_exec_connections` 22, `sys.dm_exec_requests` 63,
-//! `sys.configurations` 9 and `sys.dm_os_sys_info` 37. The unit test
-//! `the_columns_of_the_five_views_are_the_published_ones` freezes the five vectors of names
+//! `sys.configurations` 9, `sys.dm_os_sys_info` 37 and `sys.dm_os_host_info` 7. The unit test
+//! `the_columns_of_the_six_views_are_the_published_ones` freezes the six vectors of names
 //! and compares them with the text this file builds.
 //!
 //! # Where the rows come from
 //!
 //! Session facts come from [`SESSIONS_TABLE`] and connection facts from [`CONNECTIONS_TABLE`]
-//! of `bootstrap.rs`. Configuration options come from [`CONFIGURATIONS_TABLE`] and host facts
-//! from [`OS_SYS_INFO_TABLE`], two internal tables this file owns.
+//! of `bootstrap.rs`. Configuration options come from [`CONFIGURATIONS_TABLE`], host resource
+//! facts from [`OS_SYS_INFO_TABLE`] and host identity facts from [`HOST_INFO_TABLE`], three
+//! internal tables this file owns.
 //!
 //! # Columns without stored facts
 //!
@@ -24,6 +25,13 @@
 //! varbinary(64))`. On a fresh session that includes `connect_time` (`NULL`),
 //! `blocking_session_id` (`0`), `most_recent_sql_handle` (`0x`), and `cpu_time` / `reads` /
 //! `writes` (`0`).
+//!
+//! # `sys.dm_os_host_info`
+//!
+//! One row, the identity of the host the instance runs on: an operating system family and
+//! distribution rather than a product name, the same choice [`os_info_row`] already makes for
+//! `container_type_desc`. `host_sku` is `NULL`: SQL Server publishes a Windows edition number
+//! there, a fact a Linux host does not carry.
 
 use vauban_storage::Row;
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
@@ -37,6 +45,9 @@ pub(crate) const CONFIGURATIONS_TABLE: &str = "vauban_sys_configurations";
 
 /// Internal table of the operating-system facts, read by `sys.dm_os_sys_info`.
 pub(crate) const OS_SYS_INFO_TABLE: &str = "vauban_sys_os_info";
+
+/// Internal table of the host identity, read by `sys.dm_os_host_info`.
+pub(crate) const HOST_INFO_TABLE: &str = "vauban_sys_host_info";
 
 const VIEW_SCHEMA: &str = "sys";
 const SYSNAME: SqlType = SqlType::NVarChar(Len::Fixed(128));
@@ -400,6 +411,16 @@ const PUBLISHED_OS_SYS_INFO_COLUMNS: [&str; 37] = [
     "container_type_desc",
 ];
 
+const PUBLISHED_HOST_INFO_COLUMNS: [&str; 7] = [
+    "host_platform",
+    "host_distribution",
+    "host_release",
+    "host_service_pack_level",
+    "host_sku",
+    "os_language_version",
+    "host_architecture",
+];
+
 pub(crate) mod configurations_columns {
     pub(crate) const CONFIGURATION_ID: usize = 0;
     pub(crate) const NAME: usize = 1;
@@ -500,6 +521,27 @@ const OS_INFO_VIEW: [(&str, &str); 37] = [
     ("container_type_desc", "container_type_desc"),
 ];
 
+pub(crate) mod host_info_columns {
+    pub(crate) const HOST_PLATFORM: usize = 0;
+    pub(crate) const HOST_DISTRIBUTION: usize = 1;
+    pub(crate) const HOST_RELEASE: usize = 2;
+    pub(crate) const HOST_SERVICE_PACK_LEVEL: usize = 3;
+    pub(crate) const HOST_SKU: usize = 4;
+    pub(crate) const OS_LANGUAGE_VERSION: usize = 5;
+    pub(crate) const HOST_ARCHITECTURE: usize = 6;
+    pub(crate) const WIDTH: usize = 7;
+}
+
+const HOST_INFO_VIEW: [(&str, &str); 7] = [
+    ("host_platform", "host_platform"),
+    ("host_distribution", "host_distribution"),
+    ("host_release", "host_release"),
+    ("host_service_pack_level", "host_service_pack_level"),
+    ("host_sku", "host_sku"),
+    ("os_language_version", "os_language_version"),
+    ("host_architecture", "host_architecture"),
+];
+
 pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
     vec![
         InternalTableDef {
@@ -522,6 +564,13 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
             rows: vec![os_info_row()],
             views: views_of("dm_os_sys_info", &os_info_definition()),
         },
+        InternalTableDef {
+            name: HOST_INFO_TABLE.to_owned(),
+            columns: host_info_table_columns(),
+            clustered_key: None,
+            rows: vec![host_info_row()],
+            views: views_of("dm_os_host_info", &host_info_definition()),
+        },
     ]
 }
 
@@ -543,6 +592,10 @@ fn configurations_definition() -> String {
 
 fn os_info_definition() -> String {
     definition(&OS_INFO_VIEW, OS_SYS_INFO_TABLE, None)
+}
+
+fn host_info_definition() -> String {
+    definition(&HOST_INFO_VIEW, HOST_INFO_TABLE, None)
 }
 
 fn views_of(name: &str, definition: &str) -> Vec<SystemViewDef> {
@@ -673,6 +726,30 @@ fn os_info_table_columns() -> Vec<InternalColumnDef> {
         column(
             "container_type_desc",
             SqlType::NVarChar(Len::Fixed(60)),
+            false,
+        ),
+    ]
+}
+
+fn host_info_table_columns() -> Vec<InternalColumnDef> {
+    vec![
+        column("host_platform", SqlType::NVarChar(Len::Fixed(256)), false),
+        column(
+            "host_distribution",
+            SqlType::NVarChar(Len::Fixed(256)),
+            false,
+        ),
+        column("host_release", SqlType::NVarChar(Len::Fixed(256)), false),
+        column(
+            "host_service_pack_level",
+            SqlType::NVarChar(Len::Fixed(256)),
+            false,
+        ),
+        column("host_sku", SqlType::Int, true),
+        column("os_language_version", SqlType::Int, false),
+        column(
+            "host_architecture",
+            SqlType::NVarChar(Len::Fixed(256)),
             false,
         ),
     ]
@@ -1820,6 +1897,18 @@ fn os_info_row() -> Row {
     ])
 }
 
+fn host_info_row() -> Row {
+    Row(vec![
+        text("Linux"),
+        text("Ubuntu"),
+        text("22.04"),
+        text(""),
+        Value::Null,
+        Value::I32(0),
+        text("X64"),
+    ])
+}
+
 fn text(value: &str) -> Value {
     Value::String(SqlString {
         text: value.to_owned(),
@@ -1881,7 +1970,7 @@ mod tests {
     }
 
     #[test]
-    fn the_columns_of_the_five_views_are_the_published_ones() {
+    fn the_columns_of_the_six_views_are_the_published_ones() {
         assert_eq!(
             column_names(&definition_of("dm_exec_sessions")),
             PUBLISHED_SESSIONS_COLUMNS.map(String::from)
@@ -1902,6 +1991,10 @@ mod tests {
             column_names(&definition_of("dm_os_sys_info")),
             PUBLISHED_OS_SYS_INFO_COLUMNS.map(String::from)
         );
+        assert_eq!(
+            column_names(&definition_of("dm_os_host_info")),
+            PUBLISHED_HOST_INFO_COLUMNS.map(String::from)
+        );
     }
 
     #[test]
@@ -1912,6 +2005,7 @@ mod tests {
             "dm_exec_requests",
             "configurations",
             "dm_os_sys_info",
+            "dm_os_host_info",
         ] {
             let definition = definition_of(name);
             assert!(
@@ -1933,6 +2027,7 @@ mod tests {
             "dm_exec_requests",
             "configurations",
             "dm_os_sys_info",
+            "dm_os_host_info",
         ] {
             let views: Vec<_> = internal_tables()
                 .into_iter()

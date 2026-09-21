@@ -1,5 +1,6 @@
 //! Bootstrap leaves the internal tables of `views/dm_exec.rs` in `storage`: the
-//! configuration options and the single row of `sys.dm_os_sys_info`.
+//! configuration options and the single row of `sys.dm_os_sys_info` and of
+//! `sys.dm_os_host_info`.
 
 use std::sync::Arc;
 
@@ -109,11 +110,25 @@ fn os_info_shape() -> Vec<TypeInfo> {
     ]
 }
 
+fn host_info_shape() -> Vec<TypeInfo> {
+    vec![
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(256)), false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(256)), false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(256)), false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(256)), false),
+        TypeInfo::new(SqlType::Int, true),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(256)), false),
+    ]
+}
+
 #[test]
 fn bootstrap_creates_configuration_and_os_info_tables() {
     let (_, storage, txn) = instance();
     let configurations = table_shaped(&storage, &configurations_shape());
     let os_info = table_shaped(&storage, &os_info_shape());
+    let host_info = table_shaped(&storage, &host_info_shape());
     assert_eq!(rows(&storage, &txn, configurations).len(), 97);
     assert_eq!(rows(&storage, &txn, os_info).len(), 1);
+    assert_eq!(rows(&storage, &txn, host_info).len(), 1);
 }

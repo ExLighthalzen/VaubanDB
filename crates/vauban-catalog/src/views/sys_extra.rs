@@ -1,17 +1,17 @@
 //! `sys.all_objects`, `sys.all_columns`, `sys.views`, `sys.partitions`,
-//! `sys.allocation_units`, `sys.database_files`, `sys.master_files` and
-//! `sys.extended_properties`.
+//! `sys.allocation_units`, `sys.database_files`, `sys.master_files`,
+//! `sys.extended_properties`, `sys.data_spaces` and `sys.filegroups`.
 //!
 //! # The shape of the views
 //!
-//! The column list of each of the eight views — names, order, types — is the one SQL Server
+//! The column list of each of the ten views — names, order, types — is the one SQL Server
 //! 2022 publishes: `sys.all_objects` 12 columns, `sys.all_columns` 40, `sys.views` 23,
 //! `sys.partitions` 11, `sys.allocation_units` 8, `sys.database_files` 30,
-//! `sys.master_files` 32 and `sys.extended_properties` 6. The unit test
-//! `the_columns_of_the_eight_views_are_the_published_ones` freezes the eight vectors of
-//! names and compares them with the text this file builds.
+//! `sys.master_files` 32, `sys.extended_properties` 6, `sys.data_spaces` 6 and
+//! `sys.filegroups` 10. The unit test `the_columns_of_the_ten_views_are_the_published_ones`
+//! freezes the ten vectors of names and compares them with the text this file builds.
 //!
-//! # Six internal tables for eight views
+//! # Seven internal tables for ten views
 //!
 //! A view is a `SELECT` over one denormalised internal table, without a join (unit test
 //! `no_definition_holds_a_join`).
@@ -24,6 +24,7 @@
 //! | [`ALLOCATION_UNITS_TABLE`] | `sys.allocation_units` |
 //! | [`FILES_TABLE`] | `sys.database_files`, `sys.master_files` |
 //! | [`EXTENDED_PROPERTIES_TABLE`] | `sys.extended_properties` |
+//! | [`DATA_SPACES_TABLE`] | `sys.data_spaces`, `sys.filegroups` |
 //!
 //! [`ALL_OBJECTS_TABLE`] and [`ALL_COLUMNS_TABLE`] are the two tables of `views/sys_tables.rs`
 //! again, column for column, with one change: their `database_id` is nullable, a `NULL`
@@ -51,7 +52,13 @@
 //!   already there under another identifier, `storage` reuses that one and these rows name
 //!   another database (integration test
 //!   `the_file_rows_name_the_databases_of_the_databases_table` reads the two tables together).
-//! - the three other tables hold no row at the bootstrap. The rows of a user object are built
+//! - [`DATA_SPACES_TABLE`] carries, from the bootstrap, one row, `PRIMARY`, `data_space_id` 1,
+//!   `is_default` 1, `is_system` 0 ([`data_space_rows`]): the filegroup every table of a
+//!   database that creates no filegroup of its own sits on, read in every database through the
+//!   same `NULL` `database_id` as [`ALL_OBJECTS_TABLE`]. `sys.indexes.data_space_id` already
+//!   publishes 1 for a clustered index or a heap (`views/sys_indexes.rs`), so the row this table
+//!   carries is the one a join on `data_space_id` finds.
+//! - the two other tables hold no row at the bootstrap. The rows of a user object are built
 //!   from the `*Meta` of the catalogue by [`user_object_rows`], [`user_column_rows`],
 //!   [`partition_rows`] and [`allocation_unit_rows`], as `views/sys_tables.rs` does, and
 //!   `sys_rows.rs` writes them into `storage` at each DDL.
@@ -84,6 +91,15 @@
 //!   database; and the `physical_name`, [`DATA_DIRECTORY`] and the two extensions of
 //!   VaubanDB's own file format. The `FILENAME` clause of a `CREATE DATABASE` is ignored.
 //!   The three are frozen by the unit test `the_file_rows_are_those_of_a_new_database`.
+//! - `sys.filegroups` reads the same `data_space_id`, `name`, `type`, `type_desc`,
+//!   `is_default` and `is_system` as `sys.data_spaces`, plus four columns of its own written as
+//!   T-SQL literals: `filegroup_guid` and `log_filegroup_id` `NULL`, `is_read_only` and
+//!   `is_autogrow_all_files` `0`, the values SQL Server publishes for the row this file
+//!   carries. `is_default` is not nullable on `sys.data_spaces` and nullable on
+//!   `sys.filegroups` there, an explicit conversion always being nullable
+//!   (`crates/vauban-binder/src/call.rs`, `bind_cast`); the two views read the same column of
+//!   [`DATA_SPACES_TABLE`] bare, so they publish the same nullability. Deliberate difference
+//!   for now.
 //!
 //! # What these views do not publish
 //!
@@ -130,13 +146,16 @@ pub(crate) const FILES_TABLE: &str = "vauban_sys_files";
 /// Internal table of the extended properties, read by `sys.extended_properties`.
 pub(crate) const EXTENDED_PROPERTIES_TABLE: &str = "vauban_sys_extended_properties";
 
-/// The schema the eight views of this file live in.
+/// Internal table of the data spaces, read by `sys.data_spaces` and `sys.filegroups`.
+pub(crate) const DATA_SPACES_TABLE: &str = "vauban_sys_data_spaces";
+
+/// The schema the ten views of this file live in.
 const VIEW_SCHEMA: &str = "sys";
 
 /// The type of a `sysname` column, `nvarchar(128)`.
 const SYSNAME: SqlType = SqlType::NVarChar(Len::Fixed(128));
 
-/// The column names of the eight views that are T-SQL reserved words and are therefore
+/// The column names of the ten views that are T-SQL reserved words and are therefore
 /// written as delimited identifiers in the text of a view: `rows`, a column of
 /// `sys.partitions`, and `precision`, a column of `sys.all_columns` (unit test
 /// `a_reserved_column_name_is_delimited`).
@@ -293,6 +312,28 @@ pub(crate) mod extended_properties_columns {
     pub(crate) const NAME: usize = 5;
     /// `value sql_variant` on SQL Server; see the module documentation.
     pub(crate) const VALUE: usize = 6;
+    /// Width of a row of the table.
+    pub(crate) const WIDTH: usize = 7;
+}
+
+/// Where each column of [`DATA_SPACES_TABLE`] sits in a [`Row`]. Same rule as
+/// [`objects_columns`].
+pub(crate) mod data_spaces_columns {
+    /// `database_id int NULL`: `NULL` for the row shared by the four system databases, as
+    /// [`ALL_OBJECTS_TABLE`] carries it.
+    pub(crate) const DATABASE_ID: usize = 0;
+    /// `data_space_id int`.
+    pub(crate) const DATA_SPACE_ID: usize = 1;
+    /// `name sysname`.
+    pub(crate) const NAME: usize = 2;
+    /// `type char(2)`.
+    pub(crate) const TYPE: usize = 3;
+    /// `type_desc nvarchar(60)`.
+    pub(crate) const TYPE_DESC: usize = 4;
+    /// `is_default bit`.
+    pub(crate) const IS_DEFAULT: usize = 5;
+    /// `is_system bit`.
+    pub(crate) const IS_SYSTEM: usize = 6;
     /// Width of a row of the table.
     pub(crate) const WIDTH: usize = 7;
 }
@@ -557,8 +598,35 @@ const EXTENDED_PROPERTIES_VIEW: [(&str, &str); 6] = [
     ("value", "value"),
 ];
 
-/// The filter of a view read over [`ALL_OBJECTS_TABLE`] or [`ALL_COLUMNS_TABLE`]: the objects
-/// of the current database, and those whose `database_id` is `NULL`.
+/// The select list of `sys.data_spaces`: the six items, each reading [`DATA_SPACES_TABLE`]
+/// bare.
+const DATA_SPACES_VIEW: [(&str, &str); 6] = [
+    ("name", "name"),
+    ("data_space_id", "data_space_id"),
+    ("type", "type"),
+    ("type_desc", "type_desc"),
+    ("is_default", "is_default"),
+    ("is_system", "is_system"),
+];
+
+/// The select list of `sys.filegroups`: the six items of [`DATA_SPACES_VIEW`] and four more,
+/// written as T-SQL literals (module documentation).
+const FILEGROUPS_VIEW: [(&str, &str); 10] = [
+    ("name", "name"),
+    ("data_space_id", "data_space_id"),
+    ("type", "type"),
+    ("type_desc", "type_desc"),
+    ("is_default", "is_default"),
+    ("is_system", "is_system"),
+    ("filegroup_guid", "CAST(NULL AS uniqueidentifier)"),
+    ("log_filegroup_id", "CAST(NULL AS int)"),
+    ("is_read_only", "CAST(0 AS bit)"),
+    ("is_autogrow_all_files", "CAST(0 AS bit)"),
+];
+
+/// The filter of a view read over [`ALL_OBJECTS_TABLE`], [`ALL_COLUMNS_TABLE`] or
+/// [`DATA_SPACES_TABLE`]: the objects of the current database, and those whose `database_id`
+/// is `NULL`.
 const ANY_DATABASE_FILTER: &str = "database_id = DB_ID()\n    OR database_id IS NULL";
 
 /// The internal tables this file describes, in the order of the table of the module
@@ -620,11 +688,22 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
             rows: Vec::new(),
             views: views_of("extended_properties", &extended_properties_definition()),
         },
+        InternalTableDef {
+            name: DATA_SPACES_TABLE.to_owned(),
+            columns: data_spaces_table_columns(),
+            clustered_key: None,
+            rows: data_space_rows(),
+            views: [
+                views_of("data_spaces", &data_spaces_definition()),
+                views_of("filegroups", &filegroups_definition()),
+            ]
+            .concat(),
+        },
     ]
 }
 
 /// The views this file installs, which [`installed_system_views`] needs before
-/// [`internal_tables`] can build its rows: the eight of the table of the module documentation.
+/// [`internal_tables`] can build its rows: the ten of the table of the module documentation.
 ///
 /// Written apart from [`internal_tables`] so that the rows of [`ALL_OBJECTS_TABLE`] can name
 /// the views of this file without that function calling itself.
@@ -638,6 +717,8 @@ fn own_views() -> Vec<SystemViewDef> {
         views_of("database_files", &database_files_definition()),
         views_of("master_files", &master_files_definition()),
         views_of("extended_properties", &extended_properties_definition()),
+        views_of("data_spaces", &data_spaces_definition()),
+        views_of("filegroups", &filegroups_definition()),
     ]
     .concat()
 }
@@ -1073,9 +1154,54 @@ fn extended_properties_table_columns() -> Vec<InternalColumnDef> {
     ]
 }
 
+/// The text of `sys.data_spaces`.
+fn data_spaces_definition() -> String {
+    definition(
+        &DATA_SPACES_VIEW,
+        DATA_SPACES_TABLE,
+        Some(ANY_DATABASE_FILTER),
+    )
+}
+
+/// The text of `sys.filegroups`: the same table as `sys.data_spaces` (module documentation).
+fn filegroups_definition() -> String {
+    definition(
+        &FILEGROUPS_VIEW,
+        DATA_SPACES_TABLE,
+        Some(ANY_DATABASE_FILTER),
+    )
+}
+
+/// The columns of [`DATA_SPACES_TABLE`], in the order of [`data_spaces_columns`].
+fn data_spaces_table_columns() -> Vec<InternalColumnDef> {
+    vec![
+        column("database_id", SqlType::Int, true),
+        column("data_space_id", SqlType::Int, false),
+        column("name", SYSNAME, false),
+        column("type", SqlType::Char(Len::Fixed(2)), false),
+        column("type_desc", SqlType::NVarChar(Len::Fixed(60)), true),
+        column("is_default", SqlType::Bit, false),
+        column("is_system", SqlType::Bit, true),
+    ]
+}
+
+/// The row of [`DATA_SPACES_TABLE`] the bootstrap writes: the filegroup a table sits on
+/// absent a `CREATE FILEGROUP` (module documentation).
+fn data_space_rows() -> Vec<Row> {
+    vec![Row(vec![
+        Value::Null,
+        Value::I32(1),
+        text("PRIMARY"),
+        text("FG"),
+        text("ROWS_FILEGROUP"),
+        Value::Bit(true),
+        Value::Bit(false),
+    ])]
+}
+
 /// The same view installed in the four system databases, `sys.<name>` in each of them.
 ///
-/// The eight views filter on the current database or on nothing, so the four definitions share
+/// The ten views filter on the current database or on nothing, so the four definitions share
 /// their text (unit test `the_views_are_installed_in_the_four_system_databases`). A database
 /// created by `CREATE DATABASE` receives no copies yet, as for the other files of `views/`.
 fn views_of(name: &str, definition: &str) -> Vec<SystemViewDef> {
@@ -1349,6 +1475,28 @@ mod tests {
         "backup_lsn",
         "credential_id",
     ];
+    /// The ordered column names of `sys.data_spaces`.
+    const PUBLISHED_DATA_SPACES_COLUMNS: [&str; 6] = [
+        "name",
+        "data_space_id",
+        "type",
+        "type_desc",
+        "is_default",
+        "is_system",
+    ];
+    /// The ordered column names of `sys.filegroups`.
+    const PUBLISHED_FILEGROUPS_COLUMNS: [&str; 10] = [
+        "name",
+        "data_space_id",
+        "type",
+        "type_desc",
+        "is_default",
+        "is_system",
+        "filegroup_guid",
+        "log_filegroup_id",
+        "is_read_only",
+        "is_autogrow_all_files",
+    ];
     /// The row `sys.views` publishes for a user view (`CREATE VIEW dbo.views_target …`).
     ///
     /// Frozen here so that a change of the text of a view has to face the row again.
@@ -1378,7 +1526,7 @@ mod tests {
         ("is_dropped_ledger_view", Some("0")),
     ];
 
-    /// The eight views of this file, as `(name, definition, published column names)`.
+    /// The ten views of this file, as `(name, definition, published column names)`.
     fn views_and_published_columns() -> Vec<(&'static str, String, Vec<&'static str>)> {
         vec![
             (
@@ -1420,6 +1568,16 @@ mod tests {
                 "extended_properties",
                 extended_properties_definition(),
                 PUBLISHED_EXTENDED_PROPERTIES_COLUMNS.to_vec(),
+            ),
+            (
+                "data_spaces",
+                data_spaces_definition(),
+                PUBLISHED_DATA_SPACES_COLUMNS.to_vec(),
+            ),
+            (
+                "filegroups",
+                filegroups_definition(),
+                PUBLISHED_FILEGROUPS_COLUMNS.to_vec(),
             ),
         ]
     }
@@ -1516,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn the_columns_of_the_eight_views_are_the_published_ones() {
+    fn the_columns_of_the_ten_views_are_the_published_ones() {
         for (name, definition, published) in views_and_published_columns() {
             assert_eq!(
                 published_columns(&definition),
@@ -1566,12 +1724,12 @@ mod tests {
                 }
             }
         }
-        // The eight views of the file, four copies each.
+        // The ten views of the file, four copies each.
         let installed: usize = internal_tables()
             .iter()
             .map(|table| table.views.len())
             .sum();
-        assert_eq!(installed, 8 * SYSTEM_DATABASES.len());
+        assert_eq!(installed, 10 * SYSTEM_DATABASES.len());
     }
 
     #[test]
@@ -1667,11 +1825,14 @@ mod tests {
             "database_files",
             "master_files",
             "extended_properties",
+            "data_spaces",
+            "filegroups",
             "dm_exec_sessions",
             "dm_exec_connections",
             "dm_exec_requests",
             "configurations",
             "dm_os_sys_info",
+            "dm_os_host_info",
         ] {
             assert!(names.contains(&expected.to_owned()), "{names:?}");
         }
@@ -1911,7 +2072,7 @@ mod tests {
     }
 
     #[test]
-    fn the_described_tables_are_six_and_named_apart() {
+    fn the_described_tables_are_seven_and_named_apart() {
         let names: Vec<String> = internal_tables()
             .into_iter()
             .map(|table| table.name)
@@ -1925,6 +2086,7 @@ mod tests {
                 ALLOCATION_UNITS_TABLE,
                 FILES_TABLE,
                 EXTENDED_PROPERTIES_TABLE,
+                DATA_SPACES_TABLE,
             ]
         );
         // A name another file of `views/` describes is not in this list.
@@ -1945,11 +2107,13 @@ mod tests {
     }
 
     #[test]
-    fn the_objects_and_the_files_tables_are_the_two_the_bootstrap_fills() {
+    fn the_three_tables_the_bootstrap_fills() {
         // The four others hold the rows of a user object, written into `storage` at each
         // DDL (module documentation), or stay empty (`EXTENDED_PROPERTIES_TABLE`).
         for table in internal_tables() {
-            let filled = table.name == ALL_OBJECTS_TABLE || table.name == FILES_TABLE;
+            let filled = table.name == ALL_OBJECTS_TABLE
+                || table.name == FILES_TABLE
+                || table.name == DATA_SPACES_TABLE;
             assert_eq!(!table.rows.is_empty(), filled, "{}", table.name);
             for row in &table.rows {
                 assert_eq!(row.0.len(), table.columns.len(), "{}", table.name);

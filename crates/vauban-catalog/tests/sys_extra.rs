@@ -180,6 +180,19 @@ fn files_shape() -> Vec<TypeInfo> {
     ]
 }
 
+/// The shape of the table `sys.data_spaces` and `sys.filegroups` read: 7 columns.
+fn data_spaces_shape() -> Vec<TypeInfo> {
+    vec![
+        TypeInfo::new(SqlType::Int, true),
+        TypeInfo::new(SqlType::Int, false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), false),
+        TypeInfo::new(SqlType::Char(Len::Fixed(2)), false),
+        TypeInfo::new(SqlType::NVarChar(Len::Fixed(60)), true),
+        TypeInfo::new(SqlType::Bit, false),
+        TypeInfo::new(SqlType::Bit, true),
+    ]
+}
+
 /// The texts a row carries.
 fn texts(row: &[Value]) -> Vec<String> {
     row.iter()
@@ -191,13 +204,12 @@ fn texts(row: &[Value]) -> Vec<String> {
 }
 
 #[test]
-fn the_bootstrap_creates_the_five_internal_tables_of_this_file() {
+fn the_bootstrap_creates_the_six_internal_tables_of_this_file() {
     let (catalog, storage, txn) = instance();
     // The copy of the objects table carries the system views and the table of the files the two
     // files of each of the four system databases; the three others hold the rows of a user
-    // object, written at each DDL (unit test
-    // `the_objects_and_the_files_tables_are_the_two_the_bootstrap_fills`). The bootstrap also
-    // seeds `master.dbo` with the five tables of `MASTER_DBO_SHIPPED_TABLES`, whose rows enter
+    // object, written at each DDL (unit test `the_three_tables_the_bootstrap_fills`). The
+    // bootstrap also seeds `master.dbo` with the five tables of `MASTER_DBO_SHIPPED_TABLES`, whose rows enter
     // `all_columns` and `partitions` through `create_table` like any other table's: filtered out
     // below by their `object_id`. `allocation_units` carries no `object_id` of its own (it is
     // keyed on a derived `allocation_unit_id` instead), so its five rows — one heap per shipped
@@ -223,6 +235,9 @@ fn the_bootstrap_creates_the_five_internal_tables_of_this_file() {
         table_shaped(&storage, &allocation_units_shape()),
     );
     assert_eq!(allocation_units.len(), MASTER_DBO_SHIPPED_TABLES.len());
+    let data_spaces = rows(&storage, &txn, table_shaped(&storage, &data_spaces_shape()));
+    assert_eq!(data_spaces.len(), 1);
+    assert!(texts(&data_spaces[0]).contains(&"PRIMARY".to_owned()));
 }
 
 #[test]
@@ -298,6 +313,8 @@ fn the_objects_copy_carries_the_system_views_of_the_catalogue() {
         "database_files",
         "master_files",
         "extended_properties",
+        "data_spaces",
+        "filegroups",
     ] {
         assert!(names.contains(&view.to_owned()), "{names:?}");
     }

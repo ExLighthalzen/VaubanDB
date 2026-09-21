@@ -14,8 +14,8 @@
 //! | `sys_indexes.rs` | `sys.indexes`, `sys.index_columns`, `sys.key_constraints`, `sys.identity_columns` |
 //! | `info_schema.rs` | `INFORMATION_SCHEMA.TABLES`, `COLUMNS`, `SCHEMATA` |
 //! | `sys_constraints.rs` | `sys.foreign_keys`, `sys.foreign_key_columns`, `sys.check_constraints`, `sys.default_constraints` |
-//! | `sys_extra.rs` | `sys.all_objects`, `sys.views`, `sys.partitions`, `sys.allocation_units`, the file views, `sys.extended_properties` |
-//! | `dm_exec.rs` | `sys.dm_exec_sessions`, `sys.dm_exec_connections`, `sys.dm_exec_requests`, `sys.configurations`, `sys.dm_os_sys_info` |
+//! | `sys_extra.rs` | `sys.all_objects`, `sys.views`, `sys.partitions`, `sys.allocation_units`, the file views, `sys.extended_properties`, `sys.data_spaces`, `sys.filegroups` |
+//! | `dm_exec.rs` | `sys.dm_exec_sessions`, `sys.dm_exec_connections`, `sys.dm_exec_requests`, `sys.configurations`, `sys.dm_os_sys_info`, `sys.dm_os_host_info` |
 //! | `sys_routines.rs` | `sys.procedures`, `sql_modules`, `sys.parameters` |
 //! | `sys_object_kinds.rs` | `sys.triggers`, `sys.synonyms`, `sys.sequences`, `sys.table_types` |
 //! | `info_schema_constraints.rs` | `INFORMATION_SCHEMA.TABLE_CONSTRAINTS`, `KEY_COLUMN_USAGE`, `REFERENTIAL_CONSTRAINTS`, `VIEWS` |

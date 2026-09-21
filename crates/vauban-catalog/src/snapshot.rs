@@ -615,7 +615,7 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
 /// other than
 /// `sys_extra.rs`, in the order `views::internal_tables()` lists them, then the two views of
 /// the tables of the bootstrap (`views::sys_core::bootstrap_views`, which `bootstrap.rs` reads
-/// too), then the eight of `sys_extra.rs`, then the five of `dm_exec.rs`, then the four of
+/// too), then the ten of `sys_extra.rs`, then the six of `dm_exec.rs`, then the four of
 /// `sys_object_kinds.rs`, then the four of `info_schema_constraints.rs`, then the four of
 /// `sys_principals.rs`. A file that describes no view adds nothing here, so the vector grows
 /// with the files of `views/` — and so do the identifiers of the views that follow the new
