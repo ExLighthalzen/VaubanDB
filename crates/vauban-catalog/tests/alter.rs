@@ -315,6 +315,131 @@ fn add_not_null_without_default_follows_the_measure() {
 }
 
 #[test]
+fn add_two_columns_appends_both_in_written_order() {
+    let (catalog, storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &two_int_columns("t2col"))
+        .expect("create_table");
+    insert_rows(&storage, &handle, meta.storage_id, &[(1, 2)]);
+    let altered = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::AddColumns {
+                columns: vec![
+                    (Box::new(column("c", SqlType::Int, true)), None),
+                    (Box::new(column("d", SqlType::Int, true)), None),
+                ],
+            },
+        )
+        .expect("ALTER TABLE t2col ADD c int, d int;");
+    assert_eq!(altered.columns.len(), 4, "both columns are appended");
+    assert_eq!(altered.columns[2].name, "c");
+    assert_eq!(altered.columns[3].name, "d");
+    assert_ne!(
+        altered.columns[2].id, altered.columns[3].id,
+        "each added column gets its own id"
+    );
+    let rows = scan_values(&storage, &handle, &txn, altered.storage_id, 4);
+    assert_eq!(
+        rows[0],
+        vec![Value::I32(1), Value::I32(2), Value::Null, Value::Null]
+    );
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
+fn add_two_columns_one_needing_a_default_is_4901_and_neither_is_added() {
+    let (catalog, storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(
+            &handle,
+            &table("t2fail", vec![column("a", SqlType::Int, false)]),
+        )
+        .expect("create_table");
+    storage
+        .insert(handle.id, meta.storage_id, &Row(vec![Value::I32(1)]))
+        .expect("insert");
+    let err = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::AddColumns {
+                columns: vec![
+                    (Box::new(column("b", SqlType::Int, true)), None),
+                    (Box::new(column("c", SqlType::Int, false)), None),
+                ],
+            },
+        )
+        .expect_err("ALTER TABLE t2fail ADD b int NULL, c int NOT NULL;");
+    assert_eq!(err.number, 4901);
+    let snapshot = catalog.snapshot(&handle);
+    let unchanged = snapshot.table(meta.id).expect("table still there");
+    assert_eq!(unchanged.columns.len(), 1, "neither b nor c was added");
+    txn.rollback(handle).expect("rollback");
+}
+
+#[test]
+fn add_nullable_column_with_default_leaves_existing_rows_null() {
+    let (catalog, storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &two_int_columns("nullable_default"))
+        .expect("create_table");
+    insert_rows(&storage, &handle, meta.storage_id, &[(1, 2)]);
+    let mut with_default = column("c", SqlType::Int, true);
+    with_default.default = Some(Expr::Literal(Literal::Integer("7".to_owned()), Span::EMPTY));
+    let altered = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::AddColumn {
+                column: Box::new(with_default),
+                default_name: None,
+            },
+        )
+        .expect("ALTER TABLE nullable_default ADD c int NULL DEFAULT (7);");
+    let rows = scan_values(&storage, &handle, &txn, altered.storage_id, 3);
+    assert_eq!(
+        rows[0][2],
+        Value::Null,
+        "a nullable column keeps DEFAULT for future inserts, not for a row that predates it"
+    );
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
+fn add_not_null_column_with_default_still_fills_existing_rows() {
+    let (catalog, storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &two_int_columns("not_null_default"))
+        .expect("create_table");
+    insert_rows(&storage, &handle, meta.storage_id, &[(1, 2)]);
+    let mut with_default = column("c", SqlType::Int, false);
+    with_default.default = Some(Expr::Literal(Literal::Integer("7".to_owned()), Span::EMPTY));
+    let altered = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::AddColumn {
+                column: Box::new(with_default),
+                default_name: None,
+            },
+        )
+        .expect("ALTER TABLE not_null_default ADD c int NOT NULL DEFAULT (7);");
+    let rows = scan_values(&storage, &handle, &txn, altered.storage_id, 3);
+    assert_eq!(
+        rows[0][2],
+        Value::I32(7),
+        "a NOT NULL column has no row left NULL to leave alone, so it keeps filling"
+    );
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
 fn drop_column_used_by_an_index_is_refused() {
     let (catalog, _storage, txn) = instance();
     let handle = begin(&txn);

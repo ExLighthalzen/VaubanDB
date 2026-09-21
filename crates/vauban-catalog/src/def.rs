@@ -132,6 +132,14 @@ pub enum AlterTable {
         /// `apply_table_constraints`).
         default_name: Option<String>,
     },
+    /// `ADD a …, b …, …`: several columns added by the same statement, each with the same
+    /// fields as [`AlterTable::AddColumn`] (a column and the name written on its `DEFAULT`,
+    /// if any). The binder sends this variant from two columns up and keeps `AddColumn` for
+    /// one, so a caller building a single-column `ADD` by hand keeps its shape.
+    AddColumns {
+        /// Columns to append, in the order they were written.
+        columns: Vec<(Box<ColumnDef>, Option<String>)>,
+    },
     /// `DROP COLUMN`.
     DropColumn {
         /// Name of the column to remove.

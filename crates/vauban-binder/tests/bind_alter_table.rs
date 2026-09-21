@@ -133,6 +133,11 @@ fn err(text: &str, catalog: &Tables) -> SqlError {
     bind(&batch.statements[0], &ctx(text, catalog)).expect_err("error")
 }
 
+/// The error a `text` that never reaches the binder fails on, still at the parser.
+fn parse_err(text: &str) -> SqlError {
+    parse_batch(text, &ParseOptions::default()).expect_err("parse should fail")
+}
+
 fn alter(text: &str, catalog: &Tables) -> AlterTable {
     register_builtins();
     let batch = parse_batch(text, &ParseOptions::default()).expect("parse");
@@ -183,6 +188,50 @@ fn add_unknown_type_is_2715() {
     let error = err("ALTER TABLE dbo.t ADD c nosuch NULL;", &catalog());
     assert_eq!((error.number, error.severity, error.state), (2715, 16, 6));
     assert!(error.message.contains("#3"));
+}
+
+#[test]
+fn add_two_columns_binds_both_in_order() {
+    let action = alter(
+        "ALTER TABLE dbo.t ADD c int NULL, d nvarchar(5) NOT NULL;",
+        &catalog(),
+    );
+    let AlterTable::AddColumns { columns } = action else {
+        panic!("expected AddColumns");
+    };
+    assert_eq!(columns.len(), 2);
+    assert_eq!(columns[0].0.name, "c");
+    assert_eq!(columns[0].0.ty.ty, SqlType::Int);
+    assert!(columns[0].0.ty.nullable);
+    assert_eq!(columns[1].0.name, "d");
+    assert!(!columns[1].0.ty.nullable);
+}
+
+#[test]
+fn add_two_columns_duplicate_against_the_table_beats_an_earlier_unknown_type() {
+    // `a` already exists on `t`: every name is checked against the table before any of them
+    // is resolved into a type, so the duplicate on the second column wins over the unknown
+    // type of the first (this test mirrors `bind_add_columns` in
+    // `crates/vauban-binder/src/alter.rs`).
+    let error = err(
+        "ALTER TABLE dbo.t ADD c nosuch NULL, a int NULL;",
+        &catalog(),
+    );
+    assert_eq!((error.number, error.severity, error.state), (2705, 16, 4));
+}
+
+#[test]
+fn add_two_columns_duplicate_within_the_list_is_state_3() {
+    let error = err("ALTER TABLE dbo.t ADD e int NULL, e int NULL;", &catalog());
+    assert_eq!((error.number, error.severity, error.state), (2705, 16, 3));
+}
+
+#[test]
+fn add_column_with_values_is_a_syntax_error() {
+    // `WITH VALUES` is not part of the grammar this binder accepts: the parser stops on it
+    // with a plain syntax error rather than accepting it silently or panicking.
+    let error = parse_err("ALTER TABLE dbo.t ADD c int NULL DEFAULT (7) WITH VALUES;");
+    assert_eq!(error.number, 156);
 }
 
 #[test]

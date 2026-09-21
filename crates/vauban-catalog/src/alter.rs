@@ -235,6 +235,70 @@ fn table_meta_for_alter(catalog: &Catalog, table: ObjectId) -> SqlResult<TableMe
     })
 }
 
+/// Appends one column of an `ADD` (single or listed) to `columns`, in place.
+///
+/// Refuses a name `old` already carries, and a `NOT NULL` column without a default, an
+/// identity or a computed expression when `empty` is `false` (4901). Registers a literal
+/// `DEFAULT` into `add` under `default_name` so the constraint keeps the name the client
+/// wrote (`crates/vauban-binder/tests/bind_alter_table.rs`,
+/// `add_column_with_a_named_default_keeps_its_name`).
+fn plan_add_column(
+    columns: &mut Vec<ColumnMeta>,
+    add: &mut Vec<ConstraintDef>,
+    watermark: &mut i32,
+    old: &TableMeta,
+    empty: bool,
+    column: &ColumnDef,
+    default_name: &Option<String>,
+) -> SqlResult<()> {
+    refuse_duplicate_column(old, &column.name)?;
+    if !column.ty.nullable
+        && column.default.is_none()
+        && column.identity.is_none()
+        && column.computed.is_none()
+        && !empty
+    {
+        return Err(SqlError::cannot_add_column_to_non_empty_table(
+            &column.name,
+            &old.name,
+        ));
+    }
+    let ordinal = u16::try_from(columns.len()).map_err(|_| {
+        InternalError::Bug(format!(
+            "Catalog::alter_table: table {} has more columns than a u16 ordinal holds",
+            old.name
+        ))
+    })?;
+    *watermark += 1;
+    columns.push(ColumnMeta {
+        id: ColumnId(*watermark),
+        name: column.name.clone(),
+        ty: column.ty.clone(),
+        ordinal,
+        // Kept here (not only on the `ConstraintDef::Default` pushed below) because
+        // `copy_visible_rows`, above in `copy_table`, backfills the existing rows from
+        // `plan.columns` before `apply_table_constraints` runs
+        // (`crates/vauban-executor/tests/ddl_alter.rs`,
+        // `add_column_with_default_fills_existing_rows`).
+        default: column.default.clone(),
+        identity: column.identity,
+        computed: column.computed.clone(),
+    });
+    if let Some(expr) = &column.default {
+        // Registered under `default_name` (or generated when `None`) so the object and the
+        // row of `sys.default_constraints` carry the name the client wrote, instead of
+        // falling to the bare, always-generated-name path of `apply_table_constraints`
+        // (`crates/vauban-binder/tests/bind_alter_table.rs`,
+        // `add_column_with_a_named_default_keeps_its_name`).
+        add.push(ConstraintDef::Default {
+            name: default_name.clone(),
+            column: column.name.clone(),
+            expr: expr.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn plan_change(
     catalog: &Catalog,
     txn: &TxnHandle,
@@ -251,52 +315,37 @@ fn plan_change(
             column,
             default_name,
         } => {
-            refuse_duplicate_column(old, &column.name)?;
-            if !column.ty.nullable
-                && column.default.is_none()
-                && column.identity.is_none()
-                && column.computed.is_none()
-                && !table_is_empty(catalog, txn, old)?
-            {
-                return Err(SqlError::cannot_add_column_to_non_empty_table(
-                    &column.name,
-                    &old.name,
-                ));
-            }
+            let empty = table_is_empty(catalog, txn, old)?;
             let mut columns = old.columns.clone();
-            let ordinal = u16::try_from(columns.len()).map_err(|_| {
-                InternalError::Bug(format!(
-                    "Catalog::alter_table: table {} has more columns than a u16 ordinal holds",
-                    old.name
-                ))
-            })?;
-            let next = column_id_watermark + 1;
-            column_id_watermark = next;
-            columns.push(ColumnMeta {
-                id: ColumnId(next),
-                name: column.name.clone(),
-                ty: column.ty.clone(),
-                ordinal,
-                // Kept here (not only on the `ConstraintDef::Default` pushed below) because
-                // `copy_visible_rows`, above in `copy_table`, backfills the existing rows from
-                // `plan.columns` before `apply_table_constraints` runs
-                // (`crates/vauban-executor/tests/ddl_alter.rs`,
-                // `add_column_with_default_fills_existing_rows`).
-                default: column.default.clone(),
-                identity: column.identity,
-                computed: column.computed.clone(),
-            });
-            if let Some(expr) = &column.default {
-                // Registered under `default_name` (or generated when `None`) so the object
-                // and the row of `sys.default_constraints` carry the name the client wrote,
-                // instead of falling to the bare, always-generated-name path of
-                // `apply_table_constraints` (`tests/alter.rs`,
-                // `add_column_with_a_named_default_keeps_its_name`).
-                add.push(ConstraintDef::Default {
-                    name: default_name.clone(),
-                    column: column.name.clone(),
-                    expr: expr.clone(),
-                });
+            plan_add_column(
+                &mut columns,
+                &mut add,
+                &mut column_id_watermark,
+                old,
+                empty,
+                column,
+                default_name,
+            )?;
+            columns
+        }
+        AlterTable::AddColumns { columns: added } => {
+            // Each column is appended in the order it was written, watermark and
+            // ordinal advancing one at a time, so a later one that fails 4901 (below)
+            // leaves none of them behind
+            // (`add_two_columns_one_needing_a_default_is_4901_and_neither_is_added` in
+            // `tests/alter.rs`).
+            let empty = table_is_empty(catalog, txn, old)?;
+            let mut columns = old.columns.clone();
+            for (column, default_name) in added {
+                plan_add_column(
+                    &mut columns,
+                    &mut add,
+                    &mut column_id_watermark,
+                    old,
+                    empty,
+                    column,
+                    default_name,
+                )?;
             }
             columns
         }
@@ -493,7 +542,16 @@ fn copy_visible_rows(
         }
         let filled: BTreeSet<usize> = map.iter().map(|(_, to)| *to).collect();
         for (position, column) in new_columns.iter().enumerate() {
+            // A nullable column backfills to `NULL` (the initial value of `copied` above):
+            // `DEFAULT` only fills a row an `INSERT` leaves the column out of, not a row that
+            // predates the column, unless the statement carries `WITH VALUES` (not part of
+            // this grammar yet) (`tests/alter.rs`,
+            // `add_nullable_column_with_default_leaves_existing_rows_null`). A `NOT NULL`
+            // column has no such row to leave `NULL`, so it keeps filling from the default
+            // (`crates/vauban-executor/tests/ddl_alter.rs`,
+            // `add_column_with_default_fills_existing_rows`).
             if !filled.contains(&position)
+                && !column.ty.nullable
                 && let Some(value) = default_for_new_column(column)?
             {
                 copied[position] = value;

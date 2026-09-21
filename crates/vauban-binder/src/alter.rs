@@ -103,40 +103,66 @@ pub(crate) fn bind_alter_table(
     }))
 }
 
+/// Binds `ADD a …, b …, …`, one call for the whole list: [`AlterTable::AddColumn`] for one
+/// column, [`AlterTable::AddColumns`] from two up.
+///
+/// Every name is checked twice before any of them is resolved into a [`ColumnDef`] (a
+/// resolution that can itself fail, on an unknown data type for instance): first against the
+/// columns the table already has (2705, state 4, the qualified table name), then against an
+/// earlier name of the same list (2705, state 3, the bare table name). A name that clears the
+/// table wins over a duplicate written earlier in the list, and a duplicate against the table
+/// wins over a bad type written earlier in the list, in list order otherwise
+/// (`add_two_columns_duplicate_against_the_table_beats_an_earlier_unknown_type` in
+/// `tests/bind_alter_table.rs`).
 fn bind_add_columns(
     columns: &[AstColumnDef],
     table: &QualifiedName,
     resolved: &ResolvedTable,
     span: &Span,
 ) -> SqlResult<AlterTable> {
-    let column = columns
-        .first()
-        .ok_or_else(|| SqlError::from(InternalError::Bug("bind_alter_table: empty ADD".into())))?;
-    if columns
-        .iter()
-        .skip(1)
-        .any(|earlier| earlier.name.value.eq_ignore_ascii_case(&column.name.value))
-    {
-        return Err(
-            SqlError::duplicate_column_name(&column.name.value, &table.name).with_line(span.line),
-        );
+    if columns.is_empty() {
+        return Err(SqlError::from(InternalError::Bug(
+            "bind_alter_table: empty ADD".into(),
+        )));
     }
-    let position = u32::try_from(resolved.columns.len() + 1).unwrap_or(u32::MAX);
-    if resolved
-        .columns
-        .iter()
-        .any(|existing| existing.name.eq_ignore_ascii_case(&column.name.value))
-    {
-        let printed = format!("{}.{}", table.schema, table.name);
-        let mut err = SqlError::duplicate_column_name(&column.name.value, &printed);
-        err.state = DUPLICATE_COLUMN_2705_ALTER_TABLE_STATE;
-        return Err(err.with_line(span.line));
+    for column in columns {
+        if resolved
+            .columns
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(&column.name.value))
+        {
+            let printed = format!("{}.{}", table.schema, table.name);
+            let mut err = SqlError::duplicate_column_name(&column.name.value, &printed);
+            err.state = DUPLICATE_COLUMN_2705_ALTER_TABLE_STATE;
+            return Err(err.with_line(span.line));
+        }
     }
-    let (def, default_name) = column_def(column, position, span)?;
-    Ok(AlterTable::AddColumn {
-        column: Box::new(def),
-        default_name,
-    })
+    for (position, column) in columns.iter().enumerate() {
+        if columns[..position]
+            .iter()
+            .any(|earlier| earlier.name.value.eq_ignore_ascii_case(&column.name.value))
+        {
+            return Err(
+                SqlError::duplicate_column_name(&column.name.value, &table.name)
+                    .with_line(span.line),
+            );
+        }
+    }
+    let base = u32::try_from(resolved.columns.len() + 1).unwrap_or(u32::MAX);
+    let mut added = Vec::with_capacity(columns.len());
+    for (offset, column) in columns.iter().enumerate() {
+        let position = base.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+        let (def, default_name) = column_def(column, position, span)?;
+        added.push((Box::new(def), default_name));
+    }
+    if added.len() == 1 {
+        let (column, default_name) = added.remove(0);
+        return Ok(AlterTable::AddColumn {
+            column,
+            default_name,
+        });
+    }
+    Ok(AlterTable::AddColumns { columns: added })
 }
 
 fn bind_drop_column(
