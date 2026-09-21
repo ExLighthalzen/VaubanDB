@@ -376,10 +376,25 @@ fn parse_option_word(p: &mut Parser) -> SqlResult<String> {
 /// it, and this function reads it back itself, because it needs it for the statement
 /// span.
 ///
+/// A run of one or more `;` right after the `THEN` branch is consumed only when `ELSE`
+/// follows the last of them, so a script that ends every statement with `;` still parses
+/// (`tests::semicolon_before_else_after_a_plain_statement`,
+/// `tests::semicolon_before_else_after_a_block`): `IF 1 = 1 SELECT 1; ELSE
+/// SELECT 2;` takes the branch the condition selects, and so does the block form `IF
+/// 1 = 1 BEGIN SELECT 1 END; ELSE SELECT 2;`. A doubled `;`, or a comment between two of
+/// them, changes nothing (`tests::a_run_of_semicolons_before_else_is_consumed_as_one`,
+/// `tests::a_comment_between_two_semicolons_before_else_changes_nothing`): the loop that
+/// looks ahead for the run does not stop at the first `;`, and a comment produces no
+/// token for it to see. Without a following `ELSE`, the run is left alone
+/// (`tests::semicolon_without_else_is_left_to_the_caller`): `IF 1 = 0 SET
+/// @r = 1; SELECT @r;` still hands it to the caller as the ordinary separator between
+/// two statements, and the `IF` node's span stops at the end of its branch, not at the
+/// `;`.
+///
 /// The `ELSE` binds to the **nearest** `IF`, and the recursion is what does it: the inner
-/// `IF` of `IF a IF b x ELSE y` is parsed as the `then_branch` of the outer one and reads
-/// the `ELSE` before the outer one ever looks for it. On the server, `IF 1 = 1 IF
-/// 2 = 3 PRINT 'x' ELSE PRINT 'y'` prints `y`.
+/// `IF` of `IF a IF b x; ELSE y` is parsed as the `then_branch` of the outer one and reads
+/// the `;` and the `ELSE` before the outer one ever looks for either. On the server, `IF
+/// 1 = 1 IF 2 = 3 PRINT 'x' ELSE PRINT 'y'` prints `y`.
 ///
 /// # Errors
 ///
@@ -389,6 +404,23 @@ pub(crate) fn parse_if(p: &mut Parser) -> SqlResult<Statement> {
     p.expect_keyword(Keyword::If)?;
     let condition = parse_expr(p)?;
     let then_branch = Box::new(stmt::parse_statement(p, false)?);
+    let mut semicolons = 0usize;
+    while matches!(
+        p.peek_at(semicolons).kind,
+        TokenKind::Punct(Punct::Semicolon)
+    ) {
+        semicolons += 1;
+    }
+    if semicolons > 0
+        && matches!(
+            p.peek_at(semicolons).kind,
+            TokenKind::Keyword(Keyword::Else)
+        )
+    {
+        for _ in 0..semicolons {
+            p.advance();
+        }
+    }
     let else_branch = if p.eat_keyword(Keyword::Else) {
         Some(Box::new(stmt::parse_statement(p, false)?))
     } else {
@@ -914,3 +946,6 @@ fn eat_string_literal(p: &mut Parser) -> Option<String> {
     p.advance();
     Some(value)
 }
+
+#[cfg(test)]
+mod tests;
