@@ -463,3 +463,160 @@ fn two_columns_in_in_is_116() {
     let error = error_of("SELECT 1 WHERE c IN (SELECT k, c FROM a)");
     assert_eq!(error.number, 116, "{}", error.message);
 }
+
+// ---------------------------------------------------------------------------------------
+// Table value constructor as a derived table
+// ---------------------------------------------------------------------------------------
+
+/// The `Values` node a constructor binds to, read through the `Subquery` that carries the
+/// alias, and the schema of that `Subquery`.
+fn values_of(
+    text: &str,
+) -> (
+    Vec<Vec<vauban_binder::BoundExpr>>,
+    vauban_binder::OutputSchema,
+) {
+    let plan = bind_with(text).expect("binds");
+    let mut node = &plan;
+    loop {
+        match node {
+            LogicalPlan::Subquery { input, schema, .. } => {
+                let LogicalPlan::Values { rows, .. } = input.as_ref() else {
+                    panic!("the Subquery does not hold a Values: {input:?}");
+                };
+                return (rows.clone(), schema.clone());
+            }
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Aggregate { input, .. } => node = input.as_ref(),
+            other => panic!("no Subquery over a Values in {other:?}"),
+        }
+    }
+}
+
+/// `FROM (VALUES (1), (2)) v(c)` binds to two rows of one column named by the list, under
+/// the alias the rest of the query reads `v.c` through.
+#[test]
+fn a_values_constructor_binds_to_rows_under_its_alias() {
+    let (rows, schema) = values_of("SELECT v.c FROM (VALUES (1), (2)) v(c)");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].len(), 1);
+    assert_eq!(schema.columns.len(), 1);
+    assert_eq!(schema.columns[0].name, "c");
+    assert_eq!(schema.columns[0].ty.ty, SqlType::Int);
+    assert!(!schema.columns[0].ty.nullable);
+
+    // The alias is what the outer query resolves through: `a.c` names no source here.
+    let error = error_of("SELECT a.c FROM (VALUES (1)) v(c)");
+    assert_eq!(error.number, 4104, "{}", error.message);
+}
+
+/// A constructor stands where a derived table stands: under an aggregate, in a join, in a
+/// scalar subquery.
+#[test]
+fn a_values_constructor_stands_where_a_derived_table_stands() {
+    bind_with("SELECT SUM(c) FROM (VALUES (1), (2), (3)) v(c)").expect("binds under an aggregate");
+    bind_with("SELECT t.c FROM (VALUES (1)) t(c) JOIN a ON a.k = t.c").expect("binds in a join");
+    bind_with("SELECT (SELECT MAX(c) FROM (VALUES (1), (2)) v(c)) AS m")
+        .expect("binds in a scalar subquery");
+}
+
+/// Each column takes the common type of the expressions written at its position, and is
+/// nullable when the position holds an untyped `NULL` or a nullable value.
+#[test]
+fn a_values_column_takes_the_common_type_of_its_position() {
+    let (_, plain) = values_of("SELECT c FROM (VALUES (1), (2)) v(c)");
+    assert_eq!(plain.columns[0].ty.ty, SqlType::Int);
+    assert!(!plain.columns[0].ty.nullable);
+
+    let (_, mixed) = values_of("SELECT c FROM (VALUES (1), (2.5)) v(c)");
+    assert!(
+        matches!(mixed.columns[0].ty.ty, SqlType::Numeric { .. }),
+        "{:?}",
+        mixed.columns[0].ty.ty
+    );
+
+    let (_, text) = values_of("SELECT c FROM (VALUES ('a'), (N'b')) v(c)");
+    assert!(
+        matches!(text.columns[0].ty.ty, SqlType::NVarChar(_)),
+        "{:?}",
+        text.columns[0].ty.ty
+    );
+
+    let (_, with_null) = values_of("SELECT c FROM (VALUES (NULL), (1)) v(c)");
+    assert_eq!(with_null.columns[0].ty.ty, SqlType::Int);
+    assert!(with_null.columns[0].ty.nullable);
+
+    let (_, only_nulls) = values_of("SELECT c FROM (VALUES (NULL), (NULL)) v(c)");
+    assert_eq!(only_nulls.columns[0].ty.ty, SqlType::Int);
+    assert!(only_nulls.columns[0].ty.nullable);
+}
+
+/// A position holding two types takes the type the pair takes under a set operation:
+/// each of the three mixtures below binds to the type of the `UNION ALL` written beside
+/// it, precision and scale included.
+#[test]
+fn a_values_column_takes_the_type_its_pair_takes_under_a_set_operation() {
+    for (constructor, set_operation) in [
+        (
+            "SELECT c FROM (VALUES (1), (2.5)) v(c)",
+            "SELECT 1 AS c UNION ALL SELECT 2.5",
+        ),
+        (
+            "SELECT c FROM (VALUES ('a'), (N'b')) v(c)",
+            "SELECT 'a' AS c UNION ALL SELECT N'b'",
+        ),
+        (
+            "SELECT c FROM (VALUES (NULL), (1)) v(c)",
+            "SELECT NULL AS c UNION ALL SELECT 1",
+        ),
+    ] {
+        let (_, schema) = values_of(constructor);
+        let other = bind_with(set_operation).expect("the set operation binds");
+        let expected = &other.schema().columns[0].ty;
+        assert_eq!(
+            schema.columns[0].ty.ty, expected.ty,
+            "{constructor} against {set_operation}"
+        );
+        assert_eq!(
+            schema.columns[0].ty.nullable, expected.nullable,
+            "{constructor} against {set_operation}"
+        );
+    }
+}
+
+/// Two values of one position with no common type answer 206 at binding.
+#[test]
+fn a_values_position_without_a_common_type_is_206() {
+    let error = error_of("SELECT c FROM (VALUES (1), (CAST('2020-01-01' AS date))) v(c)");
+    assert_eq!(error.number, 206, "{}", error.message);
+}
+
+/// An alias with no column list is 8155: a constructor leaves its columns unnamed.
+#[test]
+fn a_values_alias_without_a_column_list_is_8155() {
+    let error = error_of("SELECT * FROM (VALUES (1), (2)) v");
+    assert_eq!(error.number, 8155, "{}", error.message);
+    assert!(error.message.contains("'v'"), "{}", error.message);
+}
+
+/// A column list shorter than the rows is 8158, longer is 8159, as after a subquery.
+#[test]
+fn a_values_column_list_of_the_wrong_length_is_8158_or_8159() {
+    let shorter = error_of("SELECT * FROM (VALUES (1, 2)) v(c)");
+    assert_eq!(shorter.number, 8158, "{}", shorter.message);
+    let longer = error_of("SELECT * FROM (VALUES (1)) v(c, d)");
+    assert_eq!(longer.number, 8159, "{}", longer.message);
+}
+
+/// Rows of differing widths are 10709, and that check comes before the column list is
+/// looked at: the list matches the first row in the second text below.
+#[test]
+fn values_rows_of_differing_widths_are_10709_before_the_column_list() {
+    let plain = error_of("SELECT * FROM (VALUES (1), (2, 3)) v(c)");
+    assert_eq!(plain.number, 10709, "{}", plain.message);
+    let matching_list = error_of("SELECT * FROM (VALUES (1), (2, 3)) v(c, d)");
+    assert_eq!(matching_list.number, 10709, "{}", matching_list.message);
+}

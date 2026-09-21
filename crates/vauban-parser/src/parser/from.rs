@@ -33,14 +33,28 @@
 //! A `(` that opens a table reference -- not glued to a name, where the arguments of a
 //! function or a hint list read differently, see below -- is either the start of a
 //! **derived table** or a **grouped join tree**, told apart by the token right after it:
-//! `SELECT` or `WITH` opens a query, anything else -- a name, `@variable`, another `(` --
-//! opens a join tree. A join tree in parentheses must actually **join** something: SQL
-//! Server refuses a lone table or derived table wrapped for no reason, `FROM (dbo.t)`
+//! `SELECT`, `WITH` and `VALUES` open a derived table, anything else -- a name,
+//! `@variable`, another `(` -- opens a join tree. A join tree in parentheses must actually
+//! **join** something: SQL Server refuses a lone table or derived table wrapped for no
+//! reason, `FROM (dbo.t)`
 //! answering "Syntax error near ')'" exactly like `FROM (dbo.t, dbo.u)` answers one near
 //! ','. Once accepted, the parentheses are not kept in the tree: the shape of what they
 //! held -- a [`TableRef::Join`] or [`TableRef::Apply`] -- already says how it associates,
 //! `a LEFT JOIN (b INNER JOIN c ON …) ON …` handing back a [`TableRef::Join`] whose right
 //! side is itself one (see the `Display` parentheses this needs, above).
+//!
+//! # `(VALUES …)` in the source position
+//!
+//! A `(` the word `VALUES` follows opens a **table value constructor** read as a derived
+//! table: `FROM (VALUES (1), (2)) AS v (c)` is two rows of one column. The alias is
+//! required, as after a subquery, and the column list with it, since a row constructor
+//! leaves its columns unnamed. Both omissions are the binder's to report, on what
+//! [`TableRef::Values`] carries.
+//!
+//! The rows read like those of an `INSERT … VALUES` but for one word: `DEFAULT` is a
+//! value there and not here, SQL Server answering 156 to `SELECT * FROM (VALUES
+//! (DEFAULT)) v(c);`. That is why [`parse_row_value`] reads the item rather than the
+//! expression list.
 //!
 //! A `(` immediately followed by another `(` is genuinely ambiguous -- `((SELECT 1) UNION
 //! (SELECT 2)) AS d` and `((SELECT 1) AS x JOIN t ON …)` share the same two opening
@@ -278,8 +292,9 @@ fn parse_table_primary(p: &mut Parser) -> SqlResult<TableRef> {
 /// Reads a table reference that opens with `(`, the cursor on it: a derived table or a
 /// grouped join tree, see the module header.
 ///
-/// The two are told apart by the token right after the `(`: `SELECT` or `WITH` opens a
-/// query, so anything else sends the parse to [`parse_parenthesised_join_tree`]. Another
+/// The two are told apart by the token right after the `(`: `SELECT`, `WITH` and
+/// `VALUES` open a derived table, so anything else sends the parse to
+/// [`parse_parenthesised_join_tree`]. Another
 /// `(` right there is the one shape that reads either way -- `((SELECT 1) UNION
 /// (SELECT 2)) AS d` and `((SELECT 1) AS x JOIN t ON …)` open alike -- so the join tree is
 /// tried first and the derived table picked up on its failure. `tests/select.rs` covers
@@ -291,7 +306,9 @@ fn parse_table_primary(p: &mut Parser) -> SqlResult<TableRef> {
 fn parse_parenthesised_source(p: &mut Parser) -> SqlResult<TableRef> {
     if matches!(
         p.peek_at(1).kind,
-        TokenKind::Keyword(Keyword::Select) | TokenKind::Keyword(Keyword::With)
+        TokenKind::Keyword(Keyword::Select)
+            | TokenKind::Keyword(Keyword::With)
+            | TokenKind::Keyword(Keyword::Values)
     ) {
         return parse_derived_table(p);
     }
@@ -334,7 +351,43 @@ fn parse_parenthesised_join_tree(p: &mut Parser) -> SqlResult<TableRef> {
     })
 }
 
-/// Reads a derived table `(SELECT …) AS d (c1, c2)`, the cursor on its `(`.
+/// Reads a derived table `(SELECT …) AS d (c1, c2)` or a table value constructor
+/// `(VALUES (…), (…)) AS d (c1)`, the cursor on its `(`.
+///
+/// The word after the `(` picks the shape, and the alias then reads the same way for
+/// both ([`parse_derived_alias`]).
+///
+/// # Errors
+///
+/// The syntax error that stopped the parse of the subquery or of the rows, of the alias
+/// or of its column list.
+fn parse_derived_table(p: &mut Parser) -> SqlResult<TableRef> {
+    let start = p.mark();
+    p.expect_punct(Punct::LeftParen)?;
+    if p.at_keyword(Keyword::Values) {
+        let rows = parse_values_rows(p)?;
+        p.expect_punct(Punct::RightParen)?;
+        let (alias, columns) = parse_derived_alias(p)?;
+        return Ok(TableRef::Values {
+            rows,
+            alias,
+            columns,
+            span: p.span_from(start),
+        });
+    }
+    let query = parse_subquery(p)?;
+    p.expect_punct(Punct::RightParen)?;
+    let (alias, columns) = parse_derived_alias(p)?;
+    Ok(TableRef::Derived {
+        query,
+        alias,
+        columns,
+        span: p.span_from(start),
+    })
+}
+
+/// Reads the alias of a derived table and the column list it may carry, the cursor just
+/// past the closing `)`.
 ///
 /// The alias is **required**: SQL Server answers "Syntax error near ')'" to a derived
 /// table without one. The error is reported on the token that follows the closing
@@ -342,13 +395,9 @@ fn parse_parenthesised_join_tree(p: &mut Parser) -> SqlResult<TableRef> {
 ///
 /// # Errors
 ///
-/// The syntax error that stopped the parse of the subquery, of the alias or of its
-/// column list.
-fn parse_derived_table(p: &mut Parser) -> SqlResult<TableRef> {
-    let start = p.mark();
-    p.expect_punct(Punct::LeftParen)?;
-    let query = parse_subquery(p)?;
-    p.expect_punct(Punct::RightParen)?;
+/// The syntax error of a missing alias, or the one that stopped the parse of the column
+/// list.
+fn parse_derived_alias(p: &mut Parser) -> SqlResult<(Option<Ident>, Vec<Ident>)> {
     let alias = parse_table_alias(p)?;
     if alias.is_none() {
         return Err(p.error_here());
@@ -358,12 +407,56 @@ fn parse_derived_table(p: &mut Parser) -> SqlResult<TableRef> {
     } else {
         Vec::new()
     };
-    Ok(TableRef::Derived {
-        query,
-        alias,
-        columns,
-        span: p.span_from(start),
-    })
+    Ok((alias, columns))
+}
+
+/// Reads `VALUES (…), (…)`, the cursor on the `VALUES` keyword.
+///
+/// How many rows are written is not a grammar rule here: the reader takes as many as
+/// there are.
+///
+/// # Errors
+///
+/// The syntax error that stopped the parse of one of the rows.
+fn parse_values_rows(p: &mut Parser) -> SqlResult<Vec<Vec<Expr>>> {
+    p.expect_keyword(Keyword::Values)?;
+    let mut rows = vec![parse_values_row(p)?];
+    while p.eat_punct(Punct::Comma) {
+        rows.push(parse_values_row(p)?);
+    }
+    Ok(rows)
+}
+
+/// Reads one parenthesised row of a table value constructor.
+///
+/// # Errors
+///
+/// The syntax error that stopped the parse of the row, a missing `)` included.
+fn parse_values_row(p: &mut Parser) -> SqlResult<Vec<Expr>> {
+    p.expect_punct(Punct::LeftParen)?;
+    let mut values = vec![parse_row_value(p)?];
+    while p.eat_punct(Punct::Comma) {
+        values.push(parse_row_value(p)?);
+    }
+    p.expect_punct(Punct::RightParen)?;
+    Ok(values)
+}
+
+/// Reads one value of a row of a table value constructor.
+///
+/// An expression, `DEFAULT` excepted: the word takes its value from a column of an
+/// `INSERT` target, and a constructor in a `FROM` stands outside such a target. SQL Server
+/// refuses the word where it stands, so the token is reported rather than read
+/// (`tests::values_default_is_a_syntax_error`).
+///
+/// # Errors
+///
+/// The syntax error of a `DEFAULT`, or the one that stopped the parse of the expression.
+fn parse_row_value(p: &mut Parser) -> SqlResult<Expr> {
+    if p.at_keyword(Keyword::Default) {
+        return Err(p.error_here());
+    }
+    parse_expr(p)
 }
 
 /// Reads the alias of a table reference, with or without `AS`, when there is one.
@@ -511,3 +604,6 @@ fn at_hint_word(p: &Parser, n: usize) -> bool {
 fn at_hint_arg(p: &Parser, n: usize) -> bool {
     at_hint_word(p, n) || matches!(p.peek_at(n).kind, TokenKind::Integer)
 }
+
+#[cfg(test)]
+mod tests;

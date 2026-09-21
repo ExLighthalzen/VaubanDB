@@ -129,7 +129,7 @@ pub(crate) fn bind_from(
         )),
         // Routed to `subquery.rs` by `query.rs` before reaching this function; the arm is
         // kept so that the `match` on `TableRef` stays exhaustive.
-        TableRef::Derived { .. } => Err(not_yet(
+        TableRef::Derived { .. } | TableRef::Values { .. } => Err(not_yet(
             "bind_from: a derived table in FROM is not implemented yet",
         )),
         TableRef::Variable { .. } => Err(not_yet(

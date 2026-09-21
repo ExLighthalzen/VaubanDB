@@ -211,6 +211,7 @@ fn bind_target(
         TableRef::Join { .. }
         | TableRef::Apply { .. }
         | TableRef::Derived { .. }
+        | TableRef::Values { .. }
         | TableRef::Pivot(_)
         | TableRef::Unpivot(_) => {
             return Err(bug(
@@ -897,6 +898,7 @@ fn target_name(reference: &TableRef) -> SqlResult<&ObjectName> {
         TableRef::Join { .. }
         | TableRef::Apply { .. }
         | TableRef::Derived { .. }
+        | TableRef::Values { .. }
         | TableRef::Pivot(_)
         | TableRef::Unpivot(_) => Err(bug(
             "joined_target: the parser does not build this reference as the target of an \

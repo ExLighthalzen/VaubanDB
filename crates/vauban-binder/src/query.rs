@@ -173,7 +173,7 @@ fn bind_query_spec(
 
     let (mut plan, joined) = match spec.from.as_slice() {
         [] => (LogicalPlan::OneRow, None),
-        [TableRef::Derived { .. }] => (
+        [TableRef::Derived { .. } | TableRef::Values { .. }] => (
             subquery::bind_derived(&spec.from[0], line_of(&stmt.span), ctx)?,
             None,
         ),
@@ -202,7 +202,11 @@ fn bind_query_spec(
         }
         // A derived table: the alias and the schema of the `Subquery` node are the
         // columns the outer query sees.
-        (None, LogicalPlan::Subquery { alias, schema, .. }, Some(TableRef::Derived { .. })) => {
+        (
+            None,
+            LogicalPlan::Subquery { alias, schema, .. },
+            Some(TableRef::Derived { .. } | TableRef::Values { .. }),
+        ) => {
             let columns: Vec<_> = schema
                 .columns
                 .iter()
@@ -744,7 +748,10 @@ fn check_table_arguments(
         }
         TableRef::Pivot(pivot) => check_table_arguments(&pivot.source, statement_line, ctx),
         TableRef::Unpivot(unpivot) => check_table_arguments(&unpivot.source, statement_line, ctx),
-        TableRef::Table { .. } | TableRef::Derived { .. } | TableRef::Variable { .. } => Ok(()),
+        TableRef::Table { .. }
+        | TableRef::Derived { .. }
+        | TableRef::Values { .. }
+        | TableRef::Variable { .. } => Ok(()),
     }
 }
 

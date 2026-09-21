@@ -259,6 +259,29 @@ impl fmt::Display for TableRef {
                 }
                 Ok(())
             }
+            Self::Values {
+                rows,
+                alias,
+                columns,
+                ..
+            } => {
+                f.write_str("(VALUES ")?;
+                for (index, row) in rows.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    parenthesised_list(f, row)?;
+                }
+                f.write_str(")")?;
+                if let Some(alias) = alias {
+                    write!(f, " AS {alias}")?;
+                }
+                if !columns.is_empty() {
+                    f.write_str(" ")?;
+                    parenthesised_list(f, columns)?;
+                }
+                Ok(())
+            }
             Self::Join {
                 left,
                 right,

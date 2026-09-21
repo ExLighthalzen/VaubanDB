@@ -26,16 +26,19 @@
 //!   `bind_select` raises.
 
 use vauban_errors::{SqlError, SqlResult};
-use vauban_parser::{Expr, SelectStatement, TableRef};
+use vauban_parser::{Expr, Ident, SelectStatement, Span, TableRef};
+use vauban_types::{SqlType, TypeInfo};
 
 use crate::bound::{BoundExpr, BoundExprKind, LogicalPlan, OutputColumn, OutputSchema};
 use crate::context::BindContext;
 use crate::errors::line_of;
-use crate::expr::{Scope, bind_expr};
+use crate::expr::{Scope, bind_expr, convert_to};
+use crate::insert::{common_value_type, is_untyped_null};
 use crate::query::bind_select_with_parent;
 
-/// Binds a derived table of a `FROM`, `(SELECT …) AS d [(c1, c2)]`, into a
-/// [`LogicalPlan::Subquery`].
+/// Binds a derived table of a `FROM` into a [`LogicalPlan::Subquery`]: the subquery
+/// `(SELECT …) AS d [(c1, c2)]`, or the table value constructor `(VALUES (…), (…)) AS d
+/// (c1, c2)` that [`bind_values_derived`] reads.
 ///
 /// The inner query is bound through [`bind_select`] with no parent scope, since a derived
 /// table cannot reference columns of the enclosing query (SQL Server refuses `SELECT 1 FROM
@@ -59,16 +62,24 @@ pub(crate) fn bind_derived(
     _statement_line: u32,
     ctx: &BindContext<'_>,
 ) -> SqlResult<LogicalPlan> {
-    let TableRef::Derived {
-        query,
-        alias,
-        columns,
-        span,
-    } = reference
-    else {
-        return Err(crate::query::bug(
-            "bind_derived: expected TableRef::Derived",
-        ));
+    let (query, alias, columns, span) = match reference {
+        TableRef::Derived {
+            query,
+            alias,
+            columns,
+            span,
+        } => (query, alias, columns, span),
+        TableRef::Values {
+            rows,
+            alias,
+            columns,
+            span,
+        } => return bind_values_derived(rows, alias.as_ref(), columns, span, ctx),
+        _ => {
+            return Err(crate::query::bug(
+                "bind_derived: expected TableRef::Derived or TableRef::Values",
+            ));
+        }
     };
     let inner = bind_select_with_parent(query, ctx, &Scope::empty())?;
     let inner_schema = inner.schema().clone();
@@ -109,6 +120,110 @@ pub(crate) fn bind_derived(
 
     Ok(LogicalPlan::Subquery {
         input: Box::new(inner),
+        alias,
+        schema,
+    })
+}
+
+/// Binds a table value constructor written where a derived table stands,
+/// `(VALUES (…), (…)) AS v (c1, c2)`, into a [`LogicalPlan::Values`] under the
+/// [`LogicalPlan::Subquery`] that carries the alias.
+///
+/// # The type of a column
+///
+/// A constructor has this in common with a set operation and not with an `INSERT`: there
+/// is no target column to take a type from. So each column takes the common type of the
+/// expressions written at its position ([`common_value_type`]), and each value is put
+/// under a `Convert` towards it. A position holding the untyped `NULL` literal and
+/// nothing else takes `int`. The column is nullable when the position holds one such
+/// literal or one nullable value, which
+/// `tests/bind_subquery.rs` asserts against the type the pair takes under a set
+/// operation (`a_values_column_takes_the_type_its_pair_takes_under_a_set_operation`).
+///
+/// # The order of the checks
+///
+/// Rows of differing widths are refused before the column list is looked at, so that
+/// `(VALUES (1), (2, 3)) v (c, d)` answers 10709 rather than an arity error, and the
+/// column list is looked at before the expressions are bound.
+///
+/// # Errors
+///
+/// - **10709** when the rows are not of one width;
+/// - **8155** when the alias carries a column list of length zero, a constructor leaving
+///   its columns unnamed;
+/// - **8158** when the rows are wider than the column list, **8159** when they are
+///   narrower;
+/// - **206** when two values of one position have no type in common;
+/// - the errors of the expressions.
+fn bind_values_derived(
+    rows: &[Vec<Expr>],
+    alias: Option<&Ident>,
+    columns: &[Ident],
+    span: &Span,
+    ctx: &BindContext<'_>,
+) -> SqlResult<LogicalPlan> {
+    let line = line_of(span);
+    let alias = alias.map(|a| a.value.clone()).unwrap_or_default();
+    let width = rows.first().map_or(0, Vec::len);
+    if rows.iter().any(|row| row.len() != width) {
+        return Err(SqlError::table_value_constructor_rows_differ().with_line(line));
+    }
+    if columns.is_empty() {
+        return Err(SqlError::no_column_name_in_derived_table(1, &alias).with_line(line));
+    }
+    if columns.len() < width {
+        return Err(SqlError::derived_table_more_columns_than_column_list(&alias).with_line(line));
+    }
+    if columns.len() > width {
+        return Err(SqlError::derived_table_fewer_columns_than_column_list(&alias).with_line(line));
+    }
+
+    let mut bound_rows: Vec<Vec<BoundExpr>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut bound_row = Vec::with_capacity(width);
+        for expr in row {
+            bound_row.push(bind_expr(expr, ctx, &Scope::empty())?);
+        }
+        bound_rows.push(bound_row);
+    }
+
+    let mut output_columns = Vec::with_capacity(width);
+    for (position, ident) in columns.iter().enumerate() {
+        let nullable = bound_rows
+            .iter()
+            .any(|row| is_untyped_null(&row[position]) || row[position].ty.nullable);
+        let ty = match common_value_type(&bound_rows, position, line)? {
+            Some(common) => TypeInfo {
+                ty: common.ty,
+                nullable,
+                collation: common.collation,
+            },
+            None => TypeInfo::new(SqlType::Int, nullable),
+        };
+        output_columns.push(OutputColumn {
+            name: ident.value.clone(),
+            ty,
+        });
+    }
+    let schema = OutputSchema {
+        columns: output_columns,
+    };
+
+    let converted: Vec<Vec<BoundExpr>> = bound_rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .zip(&schema.columns)
+                .map(|(value, column)| convert_to(value, &column.ty))
+                .collect()
+        })
+        .collect();
+
+    Ok(LogicalPlan::Subquery {
+        input: Box::new(LogicalPlan::Values {
+            rows: converted,
+            schema: schema.clone(),
+        }),
         alias,
         schema,
     })

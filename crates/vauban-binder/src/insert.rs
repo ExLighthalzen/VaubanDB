@@ -303,6 +303,7 @@ impl Target {
                 ));
             }
             TableRef::Derived { .. }
+            | TableRef::Values { .. }
             | TableRef::Join { .. }
             | TableRef::Apply { .. }
             | TableRef::Pivot(_)
@@ -602,21 +603,7 @@ fn convert_rows(
     line: u32,
 ) -> SqlResult<Vec<Vec<BoundExpr>>> {
     for (position, column) in columns.iter().enumerate() {
-        let mut common: Option<TypeInfo> = None;
-        for row in &rows {
-            let value = &row[position];
-            if is_untyped_null(value) {
-                continue;
-            }
-            common = Some(match common {
-                None => value.ty.clone(),
-                Some(so_far) => {
-                    check_pair(&so_far, &value.ty, line)?;
-                    implicit_result_type(&so_far, &value.ty).unwrap_or(so_far)
-                }
-            });
-        }
-        if let Some(common) = common {
+        if let Some(common) = common_value_type(&rows, position, line)? {
             check_pair(&common, &column.ty, line)?;
         }
     }
@@ -629,6 +616,42 @@ fn convert_rows(
                 .collect()
         })
         .collect())
+}
+
+/// The type the expressions written at `position` in each row of a `VALUES` row
+/// constructor share, `None` when the position holds the untyped `NULL` literal and
+/// nothing else.
+///
+/// The rule folds [`implicit_result_type`] over the rows, the untyped `NULL` literal
+/// taking no part in the fold, which is the rule a set operation applies to a pair of
+/// columns. A row shorter than `position` is skipped, so that a caller which has yet to
+/// refuse rows of differing widths does not index out of bounds.
+///
+/// # Errors
+///
+/// 206 on `line` when two values of the position have no type in common.
+pub(crate) fn common_value_type(
+    rows: &[Vec<BoundExpr>],
+    position: usize,
+    line: u32,
+) -> SqlResult<Option<TypeInfo>> {
+    let mut common: Option<TypeInfo> = None;
+    for row in rows {
+        let Some(value) = row.get(position) else {
+            continue;
+        };
+        if is_untyped_null(value) {
+            continue;
+        }
+        common = Some(match common {
+            None => value.ty.clone(),
+            Some(so_far) => {
+                check_pair(&so_far, &value.ty, line)?;
+                implicit_result_type(&so_far, &value.ty).unwrap_or(so_far)
+            }
+        });
+    }
+    Ok(common)
 }
 
 /// `value` under the `Convert` node towards `target`. The node is nullable when the value
@@ -678,6 +701,6 @@ fn is_null(expr: &Expr) -> bool {
 }
 
 /// Whether the bound expression is the `NULL` literal, which has no type of its own.
-fn is_untyped_null(expr: &BoundExpr) -> bool {
+pub(crate) fn is_untyped_null(expr: &BoundExpr) -> bool {
     matches!(expr.kind, BoundExprKind::Literal(Value::Null))
 }

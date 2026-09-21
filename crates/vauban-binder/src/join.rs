@@ -162,7 +162,7 @@ fn bind_reference(
                 ctx,
             )
         }
-        TableRef::Derived { alias, .. } => {
+        TableRef::Derived { alias, .. } | TableRef::Values { alias, .. } => {
             let plan = subquery::bind_derived(reference, statement_line, ctx)?;
             let source = derived_source(&plan, ctx)?;
             let written = Written {

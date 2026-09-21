@@ -197,6 +197,29 @@ pub enum TableRef {
         /// Position of the whole reference.
         span: Span,
     },
+    /// A table value constructor written where a derived table stands:
+    /// `(VALUES (1), (2)) AS v (c)`.
+    ///
+    /// A variant of its own rather than a second shape of [`TableRef::Derived`], so that
+    /// a consumer reaches the rows without unwrapping a query that is not there. The
+    /// alias and its column list are read by the rule of [`TableRef::Derived`], and the
+    /// errors that check them name a derived table: `(VALUES (1)) v (c, d)` answers 8159,
+    /// as `(SELECT 1) v (c, d)` does.
+    ///
+    /// `DEFAULT` is a value of an `INSERT … VALUES` and not of this one: it is refused
+    /// where it stands, error 156.
+    Values {
+        /// The rows, one inner vector per row, in written order.
+        rows: Vec<Vec<Expr>>,
+        /// The alias, which T-SQL requires here.
+        alias: Option<Ident>,
+        /// The column list of the alias. A row constructor leaves its columns unnamed,
+        /// and an unnamed column of a derived table is error 8155, so the binder asks
+        /// for this list where it accepts an empty one after a subquery.
+        columns: Vec<Ident>,
+        /// Position of the whole reference.
+        span: Span,
+    },
     /// A join between two references.
     Join {
         /// Left side.

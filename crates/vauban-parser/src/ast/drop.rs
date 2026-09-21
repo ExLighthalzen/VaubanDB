@@ -325,6 +325,7 @@ fn for_each_table_ref_child(node: &mut TableRef, visit: &mut impl FnMut(&mut Tab
         // parser never fills: neither is a direct child.
         TableRef::Table { .. }
         | TableRef::Derived { .. }
+        | TableRef::Values { .. }
         | TableRef::Variable { .. }
         | TableRef::Function { .. }
         | TableRef::Pivot(_)
