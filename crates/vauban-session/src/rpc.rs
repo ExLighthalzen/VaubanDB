@@ -9,7 +9,7 @@ use vauban_types::{Len, SqlType, TypeInfo, Value};
 
 use crate::batch::Session;
 use crate::prepared::execute_prepared_action;
-use crate::procedures::{ProcFinish, execute_proc_action};
+use crate::procedures::{ProcFinish, execute_proc_action, resolve_call_database};
 use crate::sink::ResultSink;
 
 /// One argument of a system procedure call, as the session received it.
@@ -144,8 +144,23 @@ impl Session {
     /// answered with error 2812 then a DONEPROC carrying `DoneStatus::ERROR`. A `ProcID` is named
     /// after the special procedure it stands for ([MS-TDS] 2.2.6.6, e.g. 10 →
     /// `sp_executesql`).
+    ///
+    /// A name qualified by a database runs the procedure body on that database
+    /// (`compat/tests/catalog_procs.rs`, `a_three_part_rpc_name_reads_the_named_database`),
+    /// and the qualifier is read before the procedure name is resolved.
     pub fn run_rpc(&mut self, rpc: &Rpc, sink: &mut dyn ResultSink) -> SqlResult<()> {
         let name = rpc_procedure_name(rpc);
+        let qualifier = split_procedure_name(&name);
+        if let Some(server) = &qualifier.server
+            && !server.eq_ignore_ascii_case(&self.state().server_name)
+        {
+            let err = SqlError::linked_server_not_found(server);
+            return fail_rpc_error(self, &err, sink);
+        }
+        let database = match resolve_call_database(self, qualifier.database.as_deref()) {
+            Ok(database) => database,
+            Err(err) => return fail_rpc_error(self, &err, sink),
+        };
         let stored = rpc_params_storage(&rpc.params);
         let params: Vec<ProcArg<'_>> = stored
             .iter()
@@ -173,7 +188,7 @@ impl Session {
                     | ProcAction::Unprepare { .. } => {
                         execute_prepared_action(self, action, finish, &rpc.params, sink)?
                     }
-                    _ => execute_proc_action(self, action, finish, sink)?,
+                    _ => execute_proc_action(self, action, database.as_deref(), finish, sink)?,
                 };
                 if outcome.failed {
                     self.state_mut().last_error = outcome.error_number;
@@ -184,6 +199,47 @@ impl Session {
                 Ok(())
             }
         }
+    }
+}
+
+/// The parts written left of a procedure name in an RPC name.
+struct QualifiedProcedureName {
+    /// Server part, the leftmost of four, `None` when the name has fewer parts.
+    server: Option<String>,
+    /// Database part, `None` when the name has fewer than three parts.
+    database: Option<String>,
+}
+
+/// Reads the qualification of an RPC procedure name.
+///
+/// The wire carries the name the client wrote, in one to four parts separated by dots, a
+/// part optionally bracketed: `sp_tables`, `sys.sp_tables`, `d.sys.sp_tables`,
+/// `srv.d.sys.sp_tables`. The object part is the rightmost, the schema the one before it,
+/// then the database, then the server (`compat/tests/catalog_procs.rs`,
+/// `a_three_part_rpc_name_reads_the_named_database`,
+/// `a_bracketed_three_part_rpc_name_reads_the_named_database` and
+/// `a_four_part_rpc_name_on_an_unknown_server_fails_before_the_body_runs`). A name of more
+/// than four parts keeps its four rightmost parts.
+fn split_procedure_name(name: &str) -> QualifiedProcedureName {
+    let parts: Vec<&str> = name.split('.').collect();
+    let unbracket = |part: &str| {
+        let trimmed = part.trim();
+        trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(trimmed)
+            .to_owned()
+    };
+    let from_end = |offset: usize| {
+        parts
+            .len()
+            .checked_sub(offset)
+            .map(|index| unbracket(parts[index]))
+            .filter(|part| !part.is_empty())
+    };
+    QualifiedProcedureName {
+        server: from_end(4),
+        database: from_end(3),
     }
 }
 

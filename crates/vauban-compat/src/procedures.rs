@@ -104,6 +104,13 @@ const CURSOR_PROCS: &[&str] = &[
 ];
 
 /// Normalises a procedure name: strips brackets, keeps the last name part, lowercases.
+///
+/// The parts this drops name a schema, a database and a server, and the resolution of a
+/// procedure ignores them: `sp_tables`, `sys.sp_tables` and `d.sys.sp_tables` reach the same
+/// entry (`tests/catalog_procs.rs`, `sys_prefix_normalises_for_sp_tables`,
+/// `a_three_part_exec_of_sp_tables_reads_the_named_database`). What the database part
+/// designates is decided by the caller, which runs the body it receives on that database
+/// (`tests/catalog_procs.rs`, `a_three_part_rpc_name_reads_the_named_database`).
 pub fn normalize_procedure_name(name: &str) -> String {
     let stripped = name.replace(['[', ']'], "");
     stripped

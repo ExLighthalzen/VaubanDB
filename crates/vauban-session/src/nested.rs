@@ -17,6 +17,7 @@ use crate::batch::{DEFERRED_UNTIL_EXECUTION, Session};
 use crate::eval_context::{SessionEvalContext, apply_exec_session};
 use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
+use crate::procedures::resolve_call_database;
 use crate::rpc::{ProcAction, ProcArg, ProcParam, StaticResultColumn};
 use crate::set_options::{SetOutcome, apply_set_statement, sync_exec_session};
 use crate::sink::{ResultSink, RowSinkAdapter};
@@ -128,6 +129,25 @@ impl Session {
         params: &[NestedParam],
         sink: &mut dyn ResultSink,
     ) -> SqlResult<NestedOutcome> {
+        self.run_nested_in_database(text, params, None, sink)
+    }
+
+    /// [`run_nested`](Self::run_nested) with `database` as the current database of the text.
+    ///
+    /// The name is placed on the clone of the session state this call already runs on, so
+    /// `DB_NAME()`, `DB_ID()` and the objects the text resolves are those of `database`
+    /// while it runs, and the caller keeps the database it had when the call returns. No
+    /// 5701 message accompanies the change, where a `USE` sends one
+    /// (`compat/tests/catalog_procs.rs`,
+    /// `a_qualified_call_leaves_the_caller_database_and_sends_no_context_change`). `None`
+    /// runs the text on the caller's database.
+    pub(crate) fn run_nested_in_database(
+        &mut self,
+        text: &str,
+        params: &[NestedParam],
+        database: Option<&str>,
+        sink: &mut dyn ResultSink,
+    ) -> SqlResult<NestedOutcome> {
         let trancount_before = self.state().trancount;
         let saved_exec = std::mem::take(self.exec_mut());
         {
@@ -138,6 +158,9 @@ impl Session {
         }
 
         let mut nested_state = self.state().clone();
+        if let Some(database) = database {
+            nested_state.database = database.to_owned();
+        }
         let mut outcome = NestedOutcome {
             outputs: Vec::new(),
             return_status: 0,
@@ -602,11 +625,13 @@ impl Session {
             ))),
             Ok(ExecOutcome::CallProcedure {
                 name,
+                database,
                 args,
                 return_into,
                 line: exec_line,
             }) => self.run_nested_procedure(
                 &name,
+                database.as_deref(),
                 &args,
                 return_into.as_deref(),
                 exec_line,
@@ -734,6 +759,7 @@ impl Session {
     fn run_nested_procedure(
         &mut self,
         name: &str,
+        qualifier: Option<&str>,
         exec_args: &[EvaluatedExecArg],
         return_into: Option<&str>,
         line: u32,
@@ -742,6 +768,18 @@ impl Session {
         sink: &mut dyn ResultSink,
         outcome: &mut NestedOutcome,
     ) -> SqlResult<Flow> {
+        let database = match resolve_call_database(self, qualifier) {
+            Ok(database) => database,
+            Err(err) => {
+                return self.finish_nested_procedure_error(
+                    at_procedure_line(err, line),
+                    more,
+                    nested_state,
+                    sink,
+                    outcome,
+                );
+            }
+        };
         let proc_args = exec_args_to_proc_args(exec_args);
         let resolver_args: Vec<ProcArg<'_>> = proc_args
             .iter()
@@ -771,6 +809,7 @@ impl Session {
             ),
             Some(Ok(action)) => self.execute_nested_proc_action(
                 action,
+                database.as_deref(),
                 exec_args,
                 return_into,
                 more,
@@ -800,6 +839,7 @@ impl Session {
     fn execute_nested_proc_action(
         &mut self,
         action: ProcAction,
+        database: Option<&str>,
         exec_args: &[EvaluatedExecArg],
         return_into: Option<&str>,
         more: bool,
@@ -812,7 +852,12 @@ impl Session {
                 let nested_params = proc_params_to_nested(&params);
                 let mut wrapper =
                     NestedProcedureSink::new(sink, more, nested_state.options.xact_abort);
-                let inner = self.run_nested(&statement, &nested_params, &mut wrapper)?;
+                let inner = self.run_nested_in_database(
+                    &statement,
+                    &nested_params,
+                    database,
+                    &mut wrapper,
+                )?;
                 self.finish_nested_procedure_flow(
                     inner,
                     &wrapper,
@@ -827,7 +872,8 @@ impl Session {
                 let nested_params = proc_params_to_nested(&params);
                 let mut wrapper =
                     NestedProcedureSink::new(sink, more, nested_state.options.xact_abort);
-                let inner = self.run_nested(&sql, &nested_params, &mut wrapper)?;
+                let inner =
+                    self.run_nested_in_database(&sql, &nested_params, database, &mut wrapper)?;
                 self.finish_nested_procedure_flow(
                     inner,
                     &wrapper,

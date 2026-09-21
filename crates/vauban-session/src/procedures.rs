@@ -4,6 +4,7 @@ use crate::rpc::{DescribeKind, ProcAction, ProcArg, ProcParam, StaticResultColum
 use vauban_errors::{BatchErrorScope, SqlError, SqlResult};
 use vauban_executor::EvaluatedExecArg;
 use vauban_tds::{ColumnFlags, ColumnMeta, RpcParam};
+use vauban_txn::IsolationLevel;
 use vauban_types::{Len, SqlType, TypeInfo, Value};
 
 use crate::batch::{Flow, Session};
@@ -25,6 +26,48 @@ pub(crate) enum ProcFinish<'a> {
     },
 }
 
+/// The database a call qualified by a name runs its body on, `None` when the call qualified
+/// nothing.
+///
+/// The name is answered with the spelling the catalogue holds. A name the catalogue holds no
+/// database for answers 911 before the body runs, so the call produces no result set
+/// (`compat/tests/catalog_procs.rs`,
+/// `a_call_qualified_by_a_missing_database_fails_before_the_body_runs`).
+pub(crate) fn resolve_call_database(
+    session: &Session,
+    database: Option<&str>,
+) -> SqlResult<Option<String>> {
+    let Some(database) = database else {
+        return Ok(None);
+    };
+    match catalogued_database_name(session, database)? {
+        Some(found) => Ok(Some(found)),
+        None => Err(SqlError {
+            state: QUALIFIED_CALL_MISSING_DATABASE_STATE,
+            ..SqlError::database_not_found(database)
+        }),
+    }
+}
+
+/// State of the 911 an `EXEC` qualified by an unknown database answers, where
+/// [`SqlError::database_not_found`] builds state 1 (`compat/tests/catalog_procs.rs`,
+/// `a_call_qualified_by_a_missing_database_fails_before_the_body_runs`).
+const QUALIFIED_CALL_MISSING_DATABASE_STATE: u8 = 4;
+
+/// The name the catalogue holds for `database`, `None` when the lookup finds nothing.
+fn catalogued_database_name(session: &Session, database: &str) -> SqlResult<Option<String>> {
+    let engine = session.engine();
+    if let Some(session_txn) = &session.state().txn {
+        let snapshot = engine.catalog.snapshot(&session_txn.handle);
+        return Ok(snapshot.database(database).map(|found| found.name.clone()));
+    }
+    let binding = engine.txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = engine.catalog.snapshot(&binding);
+    let found = snapshot.database(database).map(|found| found.name.clone());
+    engine.txn.commit(binding)?;
+    Ok(found)
+}
+
 /// What a batch `EXEC` leaves in session state after the call.
 pub(crate) struct BatchProcOutcome {
     /// Final values of nested `OUTPUT` parameters.
@@ -42,18 +85,22 @@ pub(crate) struct BatchProcOutcome {
 }
 
 /// Runs `action` for an RPC or a batch `EXEC`.
+///
+/// `database` is the database the body runs on, `None` for the caller's own. It reaches the
+/// two actions that run T-SQL; a static result set and a description are built without one.
 pub(crate) fn execute_proc_action(
     session: &mut Session,
     action: ProcAction,
+    database: Option<&str>,
     finish: ProcFinish<'_>,
     sink: &mut dyn ResultSink,
 ) -> SqlResult<BatchProcOutcome> {
     match action {
         ProcAction::ExecuteSql { statement, params } => {
-            execute_nested_sql(session, &statement, &params, finish, sink)
+            execute_nested_sql(session, &statement, &params, database, finish, sink)
         }
         ProcAction::Template { sql, params } => {
-            execute_nested_sql(session, &sql, &params, finish, sink)
+            execute_nested_sql(session, &sql, &params, database, finish, sink)
         }
         ProcAction::Static { columns, rows } => execute_static(&columns, &rows, finish, sink),
         ProcAction::Describe {
@@ -84,15 +131,27 @@ pub(crate) fn execute_proc_action(
 }
 
 /// Resolves and runs a batch `EXEC` of a stored procedure.
+///
+/// `database` is the qualifier the call wrote, resolved before the procedure name is: a call
+/// qualified by a database the catalogue does not hold fails whether or not the procedure
+/// exists (`compat/tests/catalog_procs.rs`,
+/// `a_call_qualified_by_a_missing_database_fails_before_the_body_runs`).
+// The name parts, the database and the sinks travel together on the one call site.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_batch_procedure(
     session: &mut Session,
     name: &str,
+    qualifier: Option<&str>,
     exec_args: &[EvaluatedExecArg],
     return_into: Option<&str>,
     line: u32,
     more: bool,
     sink: &mut dyn ResultSink,
 ) -> SqlResult<(Flow, BatchProcOutcome)> {
+    let database = match resolve_call_database(session, qualifier) {
+        Ok(database) => database,
+        Err(err) => return finish_batch_exec_error(session, at_line(err, line), more, sink),
+    };
     let stored = exec_args_to_proc_args(exec_args);
     let proc_args: Vec<ProcArg<'_>> = stored
         .iter()
@@ -115,7 +174,13 @@ pub(crate) fn run_batch_procedure(
         }
         Some(Err(err)) => finish_batch_exec_error(session, at_line(err, line), more, sink),
         Some(Ok(action)) => {
-            let outcome = execute_proc_action(session, action, ProcFinish::Batch { more }, sink)?;
+            let outcome = execute_proc_action(
+                session,
+                action,
+                database.as_deref(),
+                ProcFinish::Batch { more },
+                sink,
+            )?;
             apply_batch_outputs(session, exec_args, return_into, &outcome);
             Ok((flow_from_outcome(&outcome), outcome))
         }
@@ -160,6 +225,7 @@ fn execute_nested_sql(
     session: &mut Session,
     statement: &str,
     params: &[ProcParam],
+    database: Option<&str>,
     finish: ProcFinish<'_>,
     sink: &mut dyn ResultSink,
 ) -> SqlResult<BatchProcOutcome> {
@@ -172,7 +238,8 @@ fn execute_nested_sql(
             session.state().options.xact_abort,
         )),
     };
-    let nested = session.run_nested(statement, &nested_params, &mut body_sink)?;
+    let nested =
+        session.run_nested_in_database(statement, &nested_params, database, &mut body_sink)?;
     let last_error = body_sink.last_error();
     if let ProcFinish::Rpc { rpc_params } = finish {
         if !nested.failed {

@@ -65,6 +65,10 @@ pub enum ExecOutcome {
     CallProcedure {
         /// Normalised procedure name, or the value of a procedure variable, lower-cased.
         name: String,
+        /// Database part written left of the procedure name, absent when the statement did
+        /// not write one. The name keeps the spelling of the statement; the caller resolves
+        /// it (`tests/execute.rs`, `exec_of_a_three_part_name_carries_the_database`).
+        database: Option<String>,
         /// Arguments in written order.
         args: Vec<EvaluatedExecArg>,
         /// The `@rc =` variable receiving the return status, when the form was written.

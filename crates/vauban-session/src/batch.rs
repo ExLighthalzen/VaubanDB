@@ -718,6 +718,7 @@ impl Session {
             return match result {
                 Ok(ExecOutcome::CallProcedure {
                     name,
+                    database,
                     args,
                     return_into,
                     line: exec_line,
@@ -725,6 +726,7 @@ impl Session {
                     let (flow, outcome) = crate::procedures::run_batch_procedure(
                         self,
                         &name,
+                        database.as_deref(),
                         &args,
                         return_into.as_deref(),
                         exec_line,
@@ -876,6 +878,7 @@ impl Session {
             ))),
             Ok(ExecOutcome::CallProcedure {
                 name,
+                database,
                 args,
                 return_into,
                 line,
@@ -883,6 +886,7 @@ impl Session {
                 let (flow, outcome) = crate::procedures::run_batch_procedure(
                     self,
                     &name,
+                    database.as_deref(),
                     &args,
                     return_into.as_deref(),
                     line,

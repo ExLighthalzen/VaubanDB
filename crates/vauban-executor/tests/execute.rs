@@ -293,3 +293,104 @@ fn call_procedure_and_run_dynamic_emit_nothing_on_the_sink() {
         assert_eq!(sink.infos, 0, "no info for {stmt:?}");
     }
 }
+
+/// A procedure target written with the parts `server`, `database` and `schema` left of
+/// `name`, any of them absent when the argument is `None`.
+fn qualified_procedure_target(
+    server: Option<&str>,
+    database: Option<&str>,
+    schema: Option<&str>,
+    name: &str,
+) -> BoundExecTarget {
+    let part = |value: Option<&str>| {
+        value.map(|value| Ident {
+            value: value.to_owned(),
+            quoted: false,
+        })
+    };
+    BoundExecTarget::Procedure {
+        name: name.to_owned(),
+        raw: ObjectName {
+            server: part(server),
+            database: part(database),
+            schema: part(schema),
+            name: Ident {
+                value: name.to_owned(),
+                quoted: false,
+            },
+            span: Span::EMPTY,
+        },
+    }
+}
+
+#[test]
+fn exec_of_a_three_part_name_carries_the_database() {
+    let mut session = ExecSession::default();
+    let stmt = BoundExecute {
+        target: qualified_procedure_target(None, Some("d"), Some("sys"), "sp_tables"),
+        args: Vec::new(),
+        return_into: None,
+        line: 1,
+    };
+    let (outcome, _sink) = run(&mut session, &stmt);
+    let ExecOutcome::CallProcedure { name, database, .. } = outcome else {
+        panic!("expected CallProcedure, got {outcome:?}");
+    };
+    assert_eq!(name, "sp_tables");
+    assert_eq!(database.as_deref(), Some("d"));
+}
+
+#[test]
+fn exec_of_a_four_part_name_on_another_server_fails() {
+    let mut session = ExecSession::default();
+    let stmt = BoundExecute {
+        target: qualified_procedure_target(Some("srv"), Some("d"), Some("sys"), "sp_tables"),
+        args: Vec::new(),
+        return_into: None,
+        line: 3,
+    };
+    let eval = StaticContext::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_session(&mut session);
+    let mut sink = CountingSink {
+        rows: 0,
+        columns: 0,
+        infos: 0,
+    };
+    let err =
+        execute_bound(&stmt, &mut ctx, &mut sink).expect_err("another server reaches nothing");
+    assert_eq!((err.number, err.severity, err.state), (7202, 11, 2));
+    assert_eq!(err.line, 3);
+}
+
+#[test]
+fn exec_of_a_four_part_name_on_this_server_carries_the_database() {
+    let mut session = ExecSession::default();
+    let server = StaticContext::default().server_name.clone();
+    let stmt = BoundExecute {
+        target: qualified_procedure_target(Some(&server), Some("d"), Some("sys"), "sp_tables"),
+        args: Vec::new(),
+        return_into: None,
+        line: 1,
+    };
+    let (outcome, _sink) = run(&mut session, &stmt);
+    let ExecOutcome::CallProcedure { database, .. } = outcome else {
+        panic!("expected CallProcedure, got {outcome:?}");
+    };
+    assert_eq!(database.as_deref(), Some("d"));
+}
+
+#[test]
+fn exec_of_an_unqualified_name_carries_no_database() {
+    let mut session = ExecSession::default();
+    let stmt = BoundExecute {
+        target: procedure_target("sp_tables"),
+        args: Vec::new(),
+        return_into: None,
+        line: 1,
+    };
+    let (outcome, _sink) = run(&mut session, &stmt);
+    let ExecOutcome::CallProcedure { database, .. } = outcome else {
+        panic!("expected CallProcedure, got {outcome:?}");
+    };
+    assert_eq!(database, None);
+}

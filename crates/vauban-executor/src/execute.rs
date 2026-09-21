@@ -4,6 +4,13 @@
 //! binder bound and answers [`ExecOutcome::CallProcedure`] or [`ExecOutcome::RunDynamic`].
 //! The session resolves the procedure, runs the dynamic text, and writes any `OUTPUT`
 //! back into the caller's variables.
+//!
+//! The database written left of a procedure name travels unresolved: `EXEC d.sys.sp_tables`
+//! answers a `CallProcedure` whose `database` is `d`, and the session decides what that name
+//! designates (`tests/execute.rs`, `exec_of_a_three_part_name_carries_the_database`). The
+//! server written left of it is resolved here instead, against the name this instance
+//! answers to: another one reaches no procedure and answers 7202 (`tests/execute.rs`,
+//! `exec_of_a_four_part_name_on_another_server_fails`).
 
 use vauban_binder::{BoundExecArg, BoundExecTarget, BoundExecute, BoundExpr, BoundExprKind};
 use vauban_errors::{InternalError, SqlError, SqlResult};
@@ -25,16 +32,25 @@ pub(crate) fn execute(stmt: &BoundExecute, ctx: &mut ExecContext<'_>) -> SqlResu
                 line: stmt.line,
             })
         }
-        BoundExecTarget::Procedure { name, .. } => Ok(ExecOutcome::CallProcedure {
-            name: name.clone(),
-            args: eval_args(&stmt.args, stmt.line, ctx)?,
-            return_into: stmt.return_into.clone(),
-            line: stmt.line,
-        }),
+        BoundExecTarget::Procedure { name, raw } => {
+            if let Some(server) = &raw.server
+                && !server.value.eq_ignore_ascii_case(ctx.eval.server_name())
+            {
+                return Err(SqlError::linked_server_not_found(&server.value).with_line(stmt.line));
+            }
+            Ok(ExecOutcome::CallProcedure {
+                name: name.clone(),
+                database: raw.database.as_ref().map(|part| part.value.clone()),
+                args: eval_args(&stmt.args, stmt.line, ctx)?,
+                return_into: stmt.return_into.clone(),
+                line: stmt.line,
+            })
+        }
         BoundExecTarget::ProcedureVariable(expr) => {
             let name = procedure_name(expr, ctx)?;
             Ok(ExecOutcome::CallProcedure {
                 name,
+                database: None,
                 args: eval_args(&stmt.args, stmt.line, ctx)?,
                 return_into: stmt.return_into.clone(),
                 line: stmt.line,
