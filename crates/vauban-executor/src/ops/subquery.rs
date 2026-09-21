@@ -332,7 +332,10 @@ pub(crate) fn scan_column_bindings(plan: &PhysicalPlan) -> Vec<ColumnBinding> {
         } => aggregate_row_bindings(input, group_by, aggregates, schema),
         PhysicalPlan::Distinct(input) => scan_column_bindings(input),
         PhysicalPlan::NestedLoopJoin { outer, inner, .. } => join_row_bindings(outer, inner),
-        PhysicalPlan::HashJoin { build, probe, .. } => join_row_bindings(build, probe),
+        // `HashJoin::concat` lays out the probe row before the build row (`hash_join.rs`):
+        // the bindings describing a hash join's output follow that order, not the
+        // `(build, probe)` order the plan carries.
+        PhysicalPlan::HashJoin { build, probe, .. } => join_row_bindings(probe, build),
         PhysicalPlan::Union { inputs, .. }
         | PhysicalPlan::Except { inputs, .. }
         | PhysicalPlan::Intersect { inputs, .. } => {

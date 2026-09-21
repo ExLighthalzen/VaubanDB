@@ -200,8 +200,11 @@ pub fn eval_expr(
             // A column of an enclosing query is read from the outer-row stack before the
             // current row is looked at: the row of the subquery may carry a column of the
             // same identifier and name (`tests/subquery.rs`,
-            // `correlated_scalar_over_the_same_table_reads_the_enclosing_row`).
-            if binding.depth > 0 && binding.column != SLOT_COLUMN_ID {
+            // `correlated_scalar_over_the_same_table_reads_the_enclosing_row`). This holds
+            // for a derived table's own column too, which carries `SLOT_COLUMN_ID`: a
+            // depth of 1 or more still means the enclosing row, not the local one
+            // (`tests/subquery.rs`, `derived_table_column_read_from_an_enclosing_scalar`).
+            if binding.depth > 0 {
                 return ctx.read_outer_column(binding);
             }
             let row = if let Some(row) = row {

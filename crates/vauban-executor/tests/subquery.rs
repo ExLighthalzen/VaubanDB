@@ -816,3 +816,103 @@ fn derived_table_crossed_inside_a_correlated_scalar_reads_the_enclosing_row() {
         ]
     );
 }
+
+/// A hash join's row is laid out probe-then-build: a scalar subquery correlated to the
+/// build side reads the right value, not zero on every row.
+#[test]
+fn hash_join_row_read_by_a_correlated_scalar_on_the_build_side() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a, w.v, (SELECT COUNT(*) FROM t3 q WHERE q.v < w.v) AS n FROM t1 x JOIN t3 w ON x.a = w.k ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[1, 10, 0], &[2, 20, 1], &[3, 30, 2]]));
+}
+
+/// Same hash join, the correlated scalar reads the probe side instead.
+#[test]
+fn hash_join_row_read_by_a_correlated_scalar_on_the_probe_side() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a, w.v, (SELECT COUNT(*) FROM t3 q WHERE q.k > x.a) AS n FROM t1 x JOIN t3 w ON x.a = w.k ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[1, 10, 2], &[2, 20, 1], &[3, 30, 0]]));
+}
+
+/// A correlated `EXISTS` reads the build side of the enclosing hash join.
+#[test]
+fn hash_join_row_read_by_a_correlated_exists_on_the_build_side() {
+    let f = seeded();
+    let rows = f.run("SELECT x.a, w.v FROM t1 x JOIN t3 w ON x.a = w.k WHERE EXISTS (SELECT 1 FROM t3 q WHERE q.v = w.v AND q.k = 2) ORDER BY x.a;");
+    assert_eq!(rows, i32s(&[&[2, 20]]));
+}
+
+/// A hash join built and probed **inside** a correlated scalar subquery: its own row
+/// layout must not be swapped either.
+#[test]
+fn hash_join_inside_a_correlated_scalar_filters_on_its_build_side() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a, (SELECT COUNT(*) FROM t1 p JOIN t3 q ON p.a = q.k WHERE q.v > x.a * 10) AS n FROM t1 x ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1, 2], &[2, 1], &[3, 0]]));
+}
+
+/// Same inner hash join, the correlated scalar projects the build side instead of
+/// filtering on it.
+#[test]
+fn hash_join_inside_a_correlated_scalar_projects_its_build_side() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a, (SELECT MAX(q.v) FROM t1 p JOIN t3 q ON p.a = q.k WHERE p.a <= x.a) AS m FROM t1 x ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1, 10], &[2, 20], &[3, 30]]));
+}
+
+/// A derived table's own column, read by a scalar subquery that encloses it: the
+/// reference is at depth 1 but still carries `SLOT_COLUMN_ID`, and must be read from the
+/// enclosing row, not the local one.
+#[test]
+fn derived_table_column_read_from_an_enclosing_scalar() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT d.a, (SELECT COUNT(*) FROM t1 z WHERE z.a < d.a) AS m FROM (SELECT x.a FROM t1 x) d ORDER BY d.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1, 0], &[2, 1], &[3, 2]]));
+}
+
+/// Same derived table, read from an enclosing `EXISTS` instead of a scalar subquery.
+#[test]
+fn derived_table_column_read_from_an_enclosing_exists() {
+    let f = seeded();
+    let rows =
+        f.run("SELECT d.a FROM (SELECT x.a FROM t1 x) d WHERE EXISTS (SELECT 1 FROM t2 o WHERE o.a = d.a) ORDER BY d.a;");
+    assert_eq!(rows, i32s(&[&[1], &[2]]));
+}
+
+/// Two levels down: the innermost `EXISTS` reads the derived table's column two queries
+/// up.
+#[test]
+fn derived_table_column_read_two_levels_down() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT d.a FROM (SELECT x.a FROM t1 x) d WHERE EXISTS (SELECT 1 FROM t1 y WHERE y.a = d.a AND EXISTS (SELECT 1 FROM t1 z WHERE z.a > y.a AND z.a > d.a)) ORDER BY d.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1], &[2]]));
+}
+
+/// The derived table sits under a join: its `SLOT_COLUMN_ID` column keeps the position
+/// the join gave it, and a correlated scalar still reads the enclosing row through it.
+#[test]
+fn derived_table_under_a_join_column_read_from_an_enclosing_scalar() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT d.a, o.a, (SELECT COUNT(*) FROM t1 z WHERE z.a < d.a) AS m FROM (SELECT x.a FROM t1 x) d CROSS JOIN t2 o ORDER BY d.a, o.a;",
+    );
+    assert_eq!(
+        rows,
+        i32s(&[
+            &[1, 1, 0],
+            &[1, 2, 0],
+            &[2, 1, 1],
+            &[2, 2, 1],
+            &[3, 1, 2],
+            &[3, 2, 2]
+        ])
+    );
+}
