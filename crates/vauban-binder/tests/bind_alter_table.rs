@@ -404,6 +404,16 @@ fn alter_column_names_v2() {
 fn alter_unknown_table_is_4902() {
     let error = err("ALTER TABLE dbo.nosuch ADD c int NULL;", &catalog());
     assert_eq!((error.number, error.severity, error.state), (4902, 16, 1));
+    assert_eq!(
+        error.message,
+        "Object \"dbo.nosuch\" was not found: it does not exist or this login lacks permissions."
+    );
+    assert_eq!(error.line, 1);
+    // The session defers this number the same way it defers 208
+    // (`vauban-session`, `tests/run_batch_pipeline.rs`); the line asserted here is the
+    // statement's, not the first line of the text.
+    let multiline = err("\n\nALTER TABLE dbo.nosuch2 ADD c int NULL;", &catalog());
+    assert_eq!(multiline.line, 3);
 }
 
 #[test]

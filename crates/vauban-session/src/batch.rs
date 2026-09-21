@@ -44,22 +44,26 @@
 //! | `SELECT 1; SELECT CAST(300 AS tinyint); SELECT 2;` | one row, an empty result set, 220, **then `2`** |
 //! | `SELECT 1; SELECT CAST('abc' AS int); SELECT 2;` | one row, an empty result set, then 245, and **no** `2` |
 //! | `SELECT 1; SELECT * FROM dbo.t; CREATE TABLE dbo.t (a int); SELECT 2;` | one row, **no** result set, then 208, and **no** `2` |
+//! | `SELECT 1; CREATE INDEX ix ON dbo.nosuchtable (a); SELECT 2;` | one row, **no** result set, then 1088, and **no** `2` |
+//! | `SELECT 1; ALTER TABLE dbo.nosuchtable ADD b int; SELECT 2;` | one row, **no** result set, then 4902, and **no** `2` |
 //! | `CREATE TABLE dbo.t (a int); INSERT dbo.t VALUES (1); SELECT * FROM dbo.t;` | one row, no error |
 //!
-//! The three frontiers, and the one number that crosses them:
+//! The three frontiers, and the numbers that cross them:
 //!
 //! - a **syntax** error kills the batch, because `parse_batch` reads the whole text before
 //!   the first statement runs (`syntax_error_stops_the_batch`);
 //! - a **binding or compile-time** error kills the batch too: `prepare_batch` binds and checks
 //!   each statement before execution emits any row
 //!   (`a_compilation_error_silences_the_whole_batch`);
-//! - **208** is a binding error the batch does not stop on: a table the catalogue does not
-//!   hold may be created by a statement before the one that names it, in this batch or in
-//!   the nested batch of an `EXEC`. The statement is deferred and bound again when the
-//!   batch reaches it; a 208 that holds then is a run-time error of that statement, after
-//!   the results of the ones before it, and batch-scoped
+//! - **208, 1088 and 4902** are binding errors the batch does not stop on: a table the
+//!   catalogue does not hold may be created by a statement before the one that names it, in
+//!   this batch or in the nested batch of an `EXEC`. The statement is deferred and bound
+//!   again when the batch reaches it; whichever of the three still holds then is a run-time
+//!   error of that statement, after the results of the ones before it, and batch-scoped
 //!   (`a_select_before_the_create_is_208_at_run_time`,
-//!   `a_table_created_by_an_exec_is_read_by_the_rest_of_the_batch`). A deferred statement
+//!   `a_table_created_by_an_exec_is_read_by_the_rest_of_the_batch`,
+//!   `a_create_index_on_a_table_still_missing_is_1088_at_run_time`,
+//!   `an_alter_table_on_a_table_still_missing_is_4902_at_run_time`). A deferred statement
 //!   whose table exists by then is checked like the rest, so a 207 it raises is a run-time
 //!   error too (`a_deferred_statement_raises_207_when_it_runs`);
 //! - a **run-time** error stops its statement. Its catalogued [`BatchErrorScope`] then
@@ -78,7 +82,7 @@
 //! succeeded, `run_prepared` sends COLMETADATA and calls `executor::execute`. A compilation
 //! error reaches the client with **no** result set (`a_bind_error_sends_no_metadata_at_all`),
 //! a run-time error with a result set that carries the columns and no row. A deferred
-//! statement whose binding fails when it runs has no columns to send, so its 208 comes
+//! statement whose binding fails when it runs has no columns to send, so its error comes
 //! with no result set either, after the result sets of the statements before it.
 //!
 //! The boundary between the two families lives next to the code that implements it, in
@@ -166,6 +170,25 @@ use vauban_txn::IsolationLevel;
 /// Default schema of a login, `dbo` until `catalog` knows better.
 const DEFAULT_SCHEMA: &str = "dbo";
 
+/// Number of the error a `CREATE INDEX` answers when its table does not resolve
+/// (`errors`, `SqlError::cannot_find_object_to_index`). Deferred the same way as
+/// [`INVALID_OBJECT_NAME`].
+const CREATE_INDEX_MISSING_TABLE: u32 = 1088;
+
+/// Number of the error an `ALTER TABLE` answers when its table does not resolve
+/// (`errors`, `SqlError::cannot_find_object_to_alter_table`). Deferred the same way as
+/// [`INVALID_OBJECT_NAME`].
+const ALTER_TABLE_MISSING_TABLE: u32 = 4902;
+
+/// The numbers a batch defers instead of treating as a compilation error: a table the
+/// catalogue does not hold yet may be created by an earlier statement of the batch, in
+/// this batch or in the nested one of an `EXEC`. Shared with `nested.rs`.
+pub(crate) const DEFERRED_UNTIL_EXECUTION: [u32; 3] = [
+    INVALID_OBJECT_NAME,
+    CREATE_INDEX_MISSING_TABLE,
+    ALTER_TABLE_MISSING_TABLE,
+];
+
 /// The state and the execution of one connection after its login.
 pub struct Session {
     state: SessionState,
@@ -249,10 +272,11 @@ enum PreparedStatement {
     },
     /// A bound `EXECUTE`, evaluated at run time without going through the planner.
     Execute { stmt: BoundExecute, line: u32 },
-    /// A statement whose binding answered 208 while the batch was prepared: the table it
-    /// names may be created by a statement before it, in this batch or in a nested one, so
-    /// it is bound, planned and compile-checked again when the batch reaches it, against the
-    /// catalogue of that moment ([`Session::run_deferred`]).
+    /// A statement whose binding answered one of [`DEFERRED_UNTIL_EXECUTION`] while the
+    /// batch was prepared: the table it names may be created by a statement before it, in
+    /// this batch or in a nested one, so it is bound, planned and compile-checked again
+    /// when the batch reaches it, against the catalogue of that moment
+    /// ([`Session::run_deferred`]).
     Deferred {
         /// The fragment of the statement, padded with newlines up to its line of the batch,
         /// the text [`Session::bind_one`] reparses.
@@ -436,11 +460,13 @@ impl Session {
                 Ok(one) => one,
                 // A table the catalogue does not hold yet is not a compilation error: the
                 // statement is kept as text and bound when the batch reaches it.
-                Err(error) if error.number == INVALID_OBJECT_NAME => PreparedStatement::Deferred {
-                    padded,
-                    raw: statement_text(text, original),
-                    variables: batch_variables.clone(),
-                },
+                Err(error) if DEFERRED_UNTIL_EXECUTION.contains(&error.number) => {
+                    PreparedStatement::Deferred {
+                        padded,
+                        raw: statement_text(text, original),
+                        variables: batch_variables.clone(),
+                    }
+                }
                 Err(error) => return Err(error),
             };
             let counts = matches!(
@@ -556,9 +582,9 @@ impl Session {
     ///
     /// A binding that fails now is a run-time error of the statement: what came before it
     /// has produced its results, and the catalogued [`BatchErrorScope`] of the number
-    /// decides whether the batch goes on. 208 and 207 are batch-scoped, so `SELECT 1;
-    /// SELECT * FROM dbo.t; CREATE TABLE dbo.t (a int); SELECT 2;` answers the row of the
-    /// first `SELECT`, then 208 on the line of the second, and no `2`
+    /// decides whether the batch goes on. 208, 207, 1088 and 4902 are batch-scoped, so
+    /// `SELECT 1; SELECT * FROM dbo.t; CREATE TABLE dbo.t (a int); SELECT 2;` answers the
+    /// row of the first `SELECT`, then 208 on the line of the second, and no `2`
     /// (`tests/run_batch_pipeline.rs`, `a_select_before_the_create_is_208_at_run_time`).
     fn run_deferred(
         &mut self,

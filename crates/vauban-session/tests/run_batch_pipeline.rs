@@ -583,6 +583,85 @@ fn a_table_created_by_an_exec_is_read_by_the_rest_of_the_batch() {
 }
 
 #[test]
+fn a_table_created_earlier_in_the_batch_lets_a_create_index_bind() {
+    // The `CREATE INDEX` names a table the catalogue does not hold when the batch is
+    // bound: deferred like a `SELECT` on the same table, it resolves once the `CREATE
+    // TABLE` before it has run. No error, and both statements complete.
+    let events = run("CREATE TABLE dbo.s3b (a int); CREATE INDEX ix ON dbo.s3b (a);");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(result_sets(&events), 0, "{events:#?}");
+    assert_eq!(
+        dones(&events),
+        vec![(None, true), (None, false)],
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn a_table_created_by_an_exec_lets_an_alter_table_bind() {
+    // The `CREATE TABLE` runs in the nested batch of the `EXEC`; the `ALTER TABLE` of the
+    // calling batch is deferred and sees it once the `EXEC` has run.
+    let events = run("EXEC('CREATE TABLE dbo.s3c (a int)'); ALTER TABLE dbo.s3c ADD b int;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(result_sets(&events), 0, "{events:#?}");
+}
+
+#[test]
+fn a_create_index_on_a_table_still_missing_is_1088_at_run_time() {
+    // No `CREATE TABLE` anywhere: the deferred statement is bound again against the same
+    // catalogue and still fails. 1088 is batch-scoped, like 208, so the `SELECT 1` before
+    // it has sent its row and the `SELECT 2` after it does not run.
+    let events = run("SELECT 1; CREATE INDEX ix ON dbo.s3d (a); SELECT 2;");
+    let err = only_error(&events);
+    assert_eq!(err.number, 1088, "{err:?}");
+    assert_eq!(err.severity, 16, "{err:?}");
+    assert_eq!(err.state, 12, "{err:?}");
+    assert_eq!(err.line, 1, "{err:?}");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+    assert_eq!(result_sets(&events), 1, "{events:#?}");
+    assert_eq!(
+        dones(&events),
+        vec![(Some(1), true), (None, false)],
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn an_alter_table_on_a_table_still_missing_is_4902_at_run_time() {
+    // Same shape as the `CREATE INDEX` case above, for `ALTER TABLE`: 4902 is batch-scoped
+    // too, so the `SELECT 2` after it does not run. An `ALTER TABLE` anywhere in the batch
+    // narrows how many statements are bound at once (`bind_limit_for`), which is why the
+    // `more` bit of the `SELECT 1` DONE is not asserted here the way it is above.
+    let events = run("SELECT 1; ALTER TABLE dbo.s3e ADD b int; SELECT 2;");
+    let err = only_error(&events);
+    assert_eq!(err.number, 4902, "{err:?}");
+    assert_eq!(err.severity, 16, "{err:?}");
+    assert_eq!(err.state, 1, "{err:?}");
+    assert_eq!(err.line, 1, "{err:?}");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+    assert_eq!(result_sets(&events), 1, "{events:#?}");
+    assert_eq!(events.last(), Some(&Event::Done(None, false)));
+}
+
+#[test]
+fn a_drop_index_on_a_table_still_missing_stays_3701_at_run_time() {
+    // Counter-proof: `DROP INDEX` carries no `ObjectId` and needs no catalogue
+    // (`ddl_index.rs`), so this number does not join the deferred set above; it already
+    // answers at run time, unaffected by it.
+    let events = run("SELECT 1; DROP INDEX ix ON dbo.s3f; SELECT 2;");
+    let err = only_error(&events);
+    assert_eq!(err.number, 3701, "{err:?}");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+    assert_eq!(result_sets(&events), 1, "{events:#?}");
+}
+
+#[test]
 fn a_select_before_the_create_is_208_at_run_time() {
     // The counter-proof of the deferral: the same statement written **before** the
     // `CREATE TABLE` answers 208 when the batch reaches it, on the line the statement

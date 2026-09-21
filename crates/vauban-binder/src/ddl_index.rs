@@ -32,9 +32,11 @@
 //!
 //! One deviation is forced: [`IndexDef::table`] is an [`ObjectId`], so a `CREATE INDEX`
 //! cannot be bound at all without resolving its table. A name
-//! [`CatalogView`](crate::CatalogView) does not resolve is therefore refused here, at
-//! compilation, by the internal 50000 that names 1088 — a provisional refusal, like the
-//! ones `ddl.rs` raises. `DROP INDEX` carries a
+//! [`CatalogView`](crate::CatalogView) does not resolve is refused here by
+//! [`SqlError::cannot_find_object_to_index`](vauban_errors::SqlError::cannot_find_object_to_index),
+//! 1088 state 12, on the line of the statement — a binding error like any other, which the
+//! session defers the same way it defers 208, so a table created earlier in the batch or by
+//! a nested `EXEC` still lets the statement bind once it exists. `DROP INDEX` carries a
 //! [`QualifiedName`](vauban_catalog::QualifiedName) and needs no catalogue, so it keeps SQL
 //! Server's own phase.
 //!
@@ -63,8 +65,9 @@
 //!
 //! # Numbers this file has no template for
 //!
-//! 1088, 1909, 1939, 8110 and 8112 have no constructor in `vauban-errors`, so each refusal
-//! is the internal 50000 that names the number, as `ddl.rs` does for 8111.
+//! 1909, 1939, 8110 and 8112 have no constructor in `vauban-errors`, so each refusal is the
+//! internal 50000 that names the number, as `ddl.rs` does for 8111. 1088 does
+//! ([`SqlError::cannot_find_object_to_index`](vauban_errors::SqlError::cannot_find_object_to_index)).
 
 use vauban_catalog::{ConstraintDef, IndexDef, ObjectId, SortedColumn};
 use vauban_errors::{InternalError, SqlError, SqlResult};
@@ -99,8 +102,9 @@ use crate::ddl::{table_name, written};
 ///   served by SQL Server (`sys.index_columns.is_included_column` = 1 on the included
 ///   column, `sys.indexes.filter_definition` = `([a]>(1))` on the filtered index), so the
 ///   refusal is ours, not a syntax error.
-/// - the internal 50000 naming 1088 when the table does not resolve, and naming 1939 for
-///   an index on a view.
+/// - 1088 when the table does not resolve
+///   ([`SqlError::cannot_find_object_to_index`](vauban_errors::SqlError::cannot_find_object_to_index)),
+///   and the internal 50000 naming 1939 for an index on a view.
 pub(crate) fn bind_create_index(
     stmt: &CreateIndexStatement,
     ctx: &BindContext<'_>,
@@ -140,8 +144,9 @@ pub(crate) fn bind_create_index(
 ///
 /// # Errors
 ///
-/// The internal 50000 naming 1088 when the name resolves to nothing, and naming 1939 when
-/// it resolves to a view: an index on a view is 1939 on SQL Server (the view is not schema
+/// 1088 state 12, on the line of the statement, when the name resolves to nothing
+/// ([`SqlError::cannot_find_object_to_index`]); the internal 50000 naming 1939 when it
+/// resolves to a view: an index on a view is 1939 on SQL Server (the view is not schema
 /// bound), and `SCHEMABINDING` itself is not implemented.
 ///
 /// A batch bound without a catalogue cannot answer either way, and refusing is what is
@@ -156,11 +161,9 @@ fn index_target(stmt: &CreateIndexStatement, ctx: &BindContext<'_>) -> SqlResult
     };
     let Some(resolved) = catalog.resolve_table(&stmt.table, ctx.database, ctx.default_schema)
     else {
-        return Err(bug(format!(
-            "bind: CREATE INDEX cannot find the object \"{}\"; SQL Server answers 1088 state \
-             12 while it runs, which is not implemented yet",
-            written(&stmt.table)
-        )));
+        return Err(
+            SqlError::cannot_find_object_to_index(&written(&stmt.table)).with_line(stmt.span.line)
+        );
     };
     if resolved.kind == ResolvedTableKind::View {
         return Err(bug(format!(

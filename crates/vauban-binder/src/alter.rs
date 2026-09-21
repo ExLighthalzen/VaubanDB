@@ -34,6 +34,11 @@ const DUPLICATE_COLUMN_2705_ALTER_TABLE_STATE: u8 = 4;
 const CONSTRAINT_EXISTS_2714_STATE: u8 = 5;
 
 /// Binds an `ALTER TABLE` into [`BoundStatement::Ddl`].
+///
+/// A name [`CatalogView`] does not resolve answers 4902, state 1, on the line of the
+/// statement ([`SqlError::cannot_find_object_to_alter_table`]) — a binding error the
+/// session defers the same way it defers 208, so a table created earlier in the batch or
+/// by a nested `EXEC` still lets the statement bind once it exists.
 pub(crate) fn bind_alter_table(
     stmt: &AlterTableStatement,
     ctx: &BindContext<'_>,

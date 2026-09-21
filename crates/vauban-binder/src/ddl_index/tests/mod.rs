@@ -131,20 +131,23 @@ fn create_index_on_known_table_binds() {
 /// The table of a `CREATE INDEX` that the catalogue does not resolve.
 ///
 /// SQL Server answers **1088** state 12, and answers it while the statement runs (one
-/// result set already sent, module header). 1088 has no constructor in
-/// `vauban-errors`, so the refusal is the internal 50000 naming it.
+/// result set already sent, module header). The session defers this number the same way
+/// it defers 208 (`vauban-session`, `tests/run_batch_pipeline.rs`); what this binder-level
+/// test pins is the error the binding itself produces.
 #[test]
 fn create_index_unknown_table_is_1088() {
     let error = err("CREATE INDEX ix ON dbo.nosuchtable (a);");
-    assert_eq!(error.number, 50000);
-    assert!(
-        error.message.ends_with(
-            "bind: CREATE INDEX cannot find the object \"dbo.nosuchtable\"; SQL Server \
-             answers 1088 state 12 while it runs, which is not implemented yet"
-        ),
-        "{}",
-        error.message
+    assert_eq!((error.number, error.severity, error.state), (1088, 16, 12));
+    assert_eq!(
+        error.message,
+        "Object \"dbo.nosuchtable\" was not found: it does not exist or is not accessible."
     );
+    assert_eq!(error.line, 1);
+    // A four-line statement still answers the line it starts on, not the line the table
+    // name sits on.
+    let multiline = err("SELECT 1;\nCREATE INDEX\nix\nON dbo.nosuchtable2\n(a);");
+    assert_eq!(multiline.number, 1088);
+    assert_eq!(multiline.line, 2);
     // The counter-proof: the same catalogue, the same statement, a name it resolves.
     assert!(bind_one("CREATE INDEX ix ON dbo.t1 (a);").is_ok());
     // And a name it resolves to a view is refused by another sentence, 1939's.

@@ -13,7 +13,7 @@ use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
 use vauban_txn::IsolationLevel;
 use vauban_types::{Len, SqlType, TypeInfo, Value};
 
-use crate::batch::Session;
+use crate::batch::{DEFERRED_UNTIL_EXECUTION, Session};
 use crate::eval_context::{SessionEvalContext, apply_exec_session};
 use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
@@ -22,8 +22,8 @@ use crate::set_options::{SetOutcome, apply_set_statement, sync_exec_session};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
 use crate::statements::{
-    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, next_rowcount, statement_clears_last_error,
-    statement_fragment, statement_line, statement_span, statement_text, use_name_line,
+    INTERNAL_ERROR, at_statement, next_rowcount, statement_clears_last_error, statement_fragment,
+    statement_line, statement_span, statement_text, use_name_line,
 };
 use crate::txn_session::{self, StatementTxn};
 
@@ -99,10 +99,10 @@ enum PreparedStatement {
         database: String,
         line: u32,
     },
-    /// A statement whose binding answered 208 while the text was prepared, bound again
-    /// when the text reaches it (`batch.rs`, `PreparedStatement::Deferred`, for the
-    /// rule; here it is what makes `EXEC('CREATE TABLE dbo.t (n int); INSERT dbo.t VALUES
-    /// (1); SELECT n FROM dbo.t;')` answer a row).
+    /// A statement whose binding answered one of `DEFERRED_UNTIL_EXECUTION` while the text
+    /// was prepared, bound again when the text reaches it (`batch.rs`,
+    /// `PreparedStatement::Deferred`, for the rule; here it is what makes `EXEC('CREATE
+    /// TABLE dbo.t (n int); INSERT dbo.t VALUES (1); SELECT n FROM dbo.t;')` answer a row).
     Deferred {
         padded: String,
         raw: String,
@@ -306,11 +306,13 @@ impl Session {
             let padded = format!("{}{}", "\n".repeat(line.saturating_sub(1) as usize), source);
             let one = match self.bind_one_nested(&padded, raw, snapshot, state, batch_variables) {
                 Ok(one) => one,
-                Err(error) if error.number == INVALID_OBJECT_NAME => PreparedStatement::Deferred {
-                    padded,
-                    raw: statement_text(text, original),
-                    variables: batch_variables.clone(),
-                },
+                Err(error) if DEFERRED_UNTIL_EXECUTION.contains(&error.number) => {
+                    PreparedStatement::Deferred {
+                        padded,
+                        raw: statement_text(text, original),
+                        variables: batch_variables.clone(),
+                    }
+                }
                 Err(error) => return Err(error),
             };
             let counts = matches!(
