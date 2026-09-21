@@ -9,6 +9,7 @@
 mod catalog_keys;
 mod catalog_procs;
 mod database_properties;
+mod describe_procs;
 mod help_procs;
 mod procedures;
 mod server_functions;
@@ -25,6 +26,7 @@ use vauban_errors::SqlResult;
 use vauban_sysfn::{Arity, EvalArgs, EvalContext, FunctionDef, FunctionKind};
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
+pub use describe_procs::{DescribeKind, describe_columns};
 pub use procedures::{ProcAction, ProcParam, normalize_procedure_name, resolve_system_procedure};
 pub use sp_datatype_info::{ResultColumn, ResultSetData, sp_datatype_info_100};
 pub use special_procs::ProcArg;
@@ -70,11 +72,8 @@ pub fn call_system_procedure(
     })
 }
 
-fn resolve_for_session(
-    name: &str,
-    params: &[vauban_session::ProcArg<'_>],
-) -> Option<SqlResult<vauban_session::ProcAction>> {
-    let compat_args: Vec<special_procs::ProcArg<'_>> = params
+fn compat_args<'a>(params: &[vauban_session::ProcArg<'a>]) -> Vec<special_procs::ProcArg<'a>> {
+    params
         .iter()
         .map(|arg| special_procs::ProcArg {
             name: arg.name,
@@ -83,8 +82,17 @@ fn resolve_for_session(
             output: arg.output,
             default: arg.default,
         })
-        .collect();
-    resolve_system_procedure(name, &compat_args).map(|result| result.map(convert_proc_action))
+        .collect()
+}
+
+fn resolve_for_session(
+    name: &str,
+    params: &[vauban_session::ProcArg<'_>],
+) -> Option<SqlResult<vauban_session::ProcAction>> {
+    match resolve_system_procedure(name, &compat_args(params))? {
+        Err(err) => Some(Err(err)),
+        Ok(action) => Some(Ok(convert_proc_action(action))),
+    }
 }
 
 fn convert_proc_action(action: ProcAction) -> vauban_session::ProcAction {
@@ -124,6 +132,26 @@ fn convert_proc_action(action: ProcAction) -> vauban_session::ProcAction {
             rows,
         },
         ProcAction::Refuse(err) => vauban_session::ProcAction::Refuse(err),
+        ProcAction::Describe {
+            statement,
+            kind,
+            columns,
+        } => vauban_session::ProcAction::Describe {
+            statement,
+            kind: match kind {
+                DescribeKind::FirstResultSet => vauban_session::DescribeKind::FirstResultSet,
+                DescribeKind::UndeclaredParameters => {
+                    vauban_session::DescribeKind::UndeclaredParameters
+                }
+            },
+            columns: columns
+                .into_iter()
+                .map(|column| vauban_session::StaticResultColumn {
+                    name: column.name,
+                    ty: column.ty,
+                })
+                .collect(),
+        },
     }
 }
 

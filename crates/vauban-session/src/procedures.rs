@@ -1,6 +1,6 @@
 //! Execute a resolved system-procedure [`ProcAction`] through the session.
 
-use crate::rpc::{ProcAction, ProcArg, ProcParam, StaticResultColumn};
+use crate::rpc::{DescribeKind, ProcAction, ProcArg, ProcParam, StaticResultColumn};
 use vauban_errors::{BatchErrorScope, SqlError, SqlResult};
 use vauban_executor::EvaluatedExecArg;
 use vauban_tds::{ColumnFlags, ColumnMeta, RpcParam};
@@ -56,6 +56,11 @@ pub(crate) fn execute_proc_action(
             execute_nested_sql(session, &sql, &params, finish, sink)
         }
         ProcAction::Static { columns, rows } => execute_static(&columns, &rows, finish, sink),
+        ProcAction::Describe {
+            statement,
+            kind,
+            columns,
+        } => execute_describe(session, &statement, kind, &columns, finish, sink),
         ProcAction::Refuse(err) => fail_proc(session, err, finish, sink),
         ProcAction::Prepare { .. } => fail_proc(
             session,
@@ -199,6 +204,24 @@ fn execute_nested_sql(
         error_number: last_error,
         continues,
     })
+}
+
+/// Describes a batch without running it, and answers one row per described item.
+///
+/// A batch the binder refuses answers that binding error instead of a result set
+/// (`tests/describe.rs`, `describe_of_an_unknown_table_fails`).
+fn execute_describe(
+    session: &mut Session,
+    statement: &str,
+    kind: DescribeKind,
+    columns: &[StaticResultColumn],
+    finish: ProcFinish<'_>,
+    sink: &mut dyn ResultSink,
+) -> SqlResult<BatchProcOutcome> {
+    match crate::prepared::describe_batch(session, statement, kind) {
+        Ok(rows) => execute_static(columns, &rows, finish, sink),
+        Err(err) => fail_proc(session, err, finish, sink),
+    }
 }
 
 fn execute_static(

@@ -3,20 +3,20 @@
 
 use std::collections::HashMap;
 
-use vauban_binder::{BatchVariables, BindContext, BoundStatement};
+use vauban_binder::{BatchVariables, BindContext, BoundExprKind, BoundStatement};
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{DataType, ParameterDeclaration, Statement, TypeArg, parse_batch};
-use vauban_planner::{PlanContext, StorageIndexes};
+use vauban_planner::{PhysicalPlan, PhysicalStatement, PlanContext, StorageIndexes};
 use vauban_tds::RpcParam;
 use vauban_txn::IsolationLevel;
-use vauban_types::{Len, SqlType, TypeInfo, Value};
+use vauban_types::{Collation, Len, SqlString, SqlType, TypeInfo, Value};
 
 use crate::batch::Session;
 use crate::eval_context::SessionEvalContext;
 use crate::nested::NestedParam;
 use crate::procedures::{BatchProcOutcome, ProcFinish};
-use crate::rpc::{ProcAction, ProcParam};
+use crate::rpc::{DescribeKind, ProcAction, ProcParam};
 use crate::sink::ResultSink;
 use crate::state::SessionState;
 use crate::statements::{statement_fragment, statement_line};
@@ -359,9 +359,11 @@ fn validate_prepared_text(
         &mut batch_variables,
     );
     session.engine().txn.commit(binding)?;
-    result
+    result.map(|_| ())
 }
 
+/// Binds the statements of `text` in order and answers the columns of the first one that
+/// produces a result set, `None` for a batch without a result set.
 fn bind_prepared_statements(
     session: &Session,
     text: &str,
@@ -369,7 +371,8 @@ fn bind_prepared_statements(
     snapshot: &CatalogSnapshot,
     state: &SessionState,
     batch_variables: &mut BatchVariables,
-) -> SqlResult<()> {
+) -> SqlResult<Option<Vec<DescribedColumn>>> {
+    let mut first: Option<Vec<DescribedColumn>> = None;
     for (index, original) in statements.iter().enumerate() {
         if matches!(original, Statement::SetOption(_)) {
             continue;
@@ -403,9 +406,426 @@ fn bind_prepared_statements(
         let eval = SessionEvalContext::new(state, Some(snapshot));
         let mut exec = vauban_executor::ExecContext::scalar(&eval, state.options.to_binder());
         vauban_executor::compile(&physical, &mut exec)?;
-        let _ = physical;
+        if first.is_none()
+            && let PhysicalStatement::Query(plan) = &physical
+        {
+            first = Some(described_columns(plan));
+        }
     }
-    Ok(())
+    Ok(first)
+}
+
+/// One column of the result set a described batch would produce.
+struct DescribedColumn {
+    /// Name sent to the client, empty for an expression the batch does not name.
+    name: String,
+    /// Type, nullability and collation sent to the client.
+    ty: TypeInfo,
+    /// Where the value of the column comes from.
+    origin: ColumnOrigin,
+}
+
+/// Where the value of a described column comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnOrigin {
+    /// A reference to a column the query reads from storage.
+    StoredColumn,
+    /// A value the query computes from the row it reads, such as a literal or an arithmetic
+    /// expression.
+    ComputedValue,
+    /// A value an operator builds from several rows or from several inputs, such as an
+    /// aggregate or a branch of a set operation.
+    OperatorOutput,
+}
+
+/// Name of the collation the character columns report.
+const DEFAULT_COLLATION_NAME: &str = "SQL_Latin1_General_CP1_CI_AS";
+
+/// Describes the batch `text` without running its statements, and answers one row per
+/// described item, in the order of the columns the caller was given.
+///
+/// A batch that binds and produces no result set answers no row, and so does an empty
+/// batch (`tests/describe.rs`, `describing_an_empty_batch_has_no_row`). A batch the binder
+/// refuses fails with the binding error.
+pub(crate) fn describe_batch(
+    session: &Session,
+    text: &str,
+    kind: DescribeKind,
+) -> SqlResult<Vec<Vec<Value>>> {
+    let state = session.state().clone();
+    let batch = parse_batch(text, &state.options.parse_options())?;
+    if batch.statements.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut batch_variables = BatchVariables::new();
+    let binding = session.engine().txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = session.engine().catalog.snapshot(&binding);
+    let described = bind_prepared_statements(
+        session,
+        text,
+        &batch.statements,
+        &snapshot,
+        &state,
+        &mut batch_variables,
+    );
+    session.engine().txn.commit(binding)?;
+    let described = described?;
+    match kind {
+        DescribeKind::FirstResultSet => Ok(described
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(index, column)| first_result_set_row(index, column))
+            .collect()),
+        // A parameter the batch does not declare stops the binding above, so a batch that
+        // reaches this point declares what it uses.
+        DescribeKind::UndeclaredParameters => Ok(Vec::new()),
+    }
+}
+
+/// The columns a plan produces, each with the origin of its value.
+fn described_columns(plan: &PhysicalPlan) -> Vec<DescribedColumn> {
+    plan.schema()
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| DescribedColumn {
+            name: column.name.clone(),
+            ty: column.ty.clone(),
+            origin: column_origin(plan, index),
+        })
+        .collect()
+}
+
+/// Where the column at `index` of `plan` takes its value.
+///
+/// A projection answers on the expression it evaluates and follows a column reference into
+/// its input; a scan answers on the column it reads; a grouping follows its key and answers
+/// on itself for an aggregate; a join follows the operand whose columns hold the index; the
+/// operators that keep the shape of their input answer on that input. The shapes pinned by
+/// `tests/describe.rs` are a column read from a table, a literal, an arithmetic expression,
+/// an aggregate with and without a grouping key, a branch of a `UNION ALL`, and a column
+/// read through a join on either operand (`a_column_read_through_a_join_is_updateable`).
+fn column_origin(plan: &PhysicalPlan, index: usize) -> ColumnOrigin {
+    match plan {
+        PhysicalPlan::Project { input, exprs, .. } => {
+            match exprs.get(index).map(|projection| &projection.expr.kind) {
+                Some(BoundExprKind::ColumnRef(binding)) => column_origin(input, binding.index),
+                Some(_) => ColumnOrigin::ComputedValue,
+                None => ColumnOrigin::OperatorOutput,
+            }
+        }
+        PhysicalPlan::TableScan { .. } | PhysicalPlan::IndexSeek { .. } => {
+            ColumnOrigin::StoredColumn
+        }
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Top { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::TopN { input, .. } => column_origin(input, index),
+        PhysicalPlan::Distinct(input) => column_origin(input, index),
+        // The columns of a grouping are its keys, then its aggregates.
+        PhysicalPlan::HashAggregate {
+            input, group_by, ..
+        }
+        | PhysicalPlan::StreamAggregate {
+            input, group_by, ..
+        } => match group_by.get(index).map(|key| &key.kind) {
+            Some(BoundExprKind::ColumnRef(binding)) => column_origin(input, binding.index),
+            Some(_) => ColumnOrigin::ComputedValue,
+            None => ColumnOrigin::OperatorOutput,
+        },
+        PhysicalPlan::NestedLoopJoin { outer, inner, .. } => {
+            join_column_origin(outer, inner, index)
+        }
+        // The hash table may be built from either operand: the operand whose column names
+        // open the join's schema is the left one. Two operands with the same names are the
+        // same shape read twice, and the build side stands for the left one.
+        PhysicalPlan::HashJoin {
+            build,
+            probe,
+            schema,
+            ..
+        } => {
+            let build_columns = &build.schema().columns;
+            let build_is_left = schema.columns.len() >= build_columns.len()
+                && schema.columns[..build_columns.len()]
+                    .iter()
+                    .zip(build_columns)
+                    .all(|(joined, built)| joined.name == built.name);
+            if build_is_left {
+                join_column_origin(build, probe, index)
+            } else {
+                join_column_origin(probe, build, index)
+            }
+        }
+        _ => ColumnOrigin::OperatorOutput,
+    }
+}
+
+/// Where the column at `index` of a join takes its value: the columns of `left` come first,
+/// then those of `right`.
+fn join_column_origin(left: &PhysicalPlan, right: &PhysicalPlan, index: usize) -> ColumnOrigin {
+    let left_width = left.schema().columns.len();
+    if index < left_width {
+        column_origin(left, index)
+    } else {
+        column_origin(right, index - left_width)
+    }
+}
+
+/// The row that describes one column of a first result set.
+fn first_result_set_row(index: usize, column: &DescribedColumn) -> Vec<Value> {
+    let shape = TypeShape::of(&column.ty);
+    let ordinal = i32::try_from(index + 1).unwrap_or(i32::MAX);
+    vec![
+        Value::Bit(false),
+        Value::I32(ordinal),
+        text_or_null(&column.name),
+        Value::Bit(column.ty.nullable),
+        Value::I32(shape.system_type_id),
+        Value::String(SqlString {
+            text: column.ty.ty.declaration(),
+        }),
+        Value::I16(shape.max_length),
+        Value::I8(shape.precision),
+        Value::I8(shape.scale),
+        shape.collation_name,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Bit(false),
+        Value::Bit(false),
+        Value::Bit(false),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Bit(false),
+        Value::Null,
+        Value::Bit(column.origin == ColumnOrigin::StoredColumn),
+        Value::Bit(column.origin == ColumnOrigin::ComputedValue),
+        Value::Bit(false),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::I32(shape.tds_type_id),
+        Value::I32(shape.tds_length),
+        shape.tds_collation_id,
+        shape.tds_collation_sort_id,
+    ]
+}
+
+fn text_or_null(name: &str) -> Value {
+    if name.is_empty() {
+        Value::Null
+    } else {
+        Value::String(SqlString {
+            text: name.to_owned(),
+        })
+    }
+}
+
+/// What a described column reports about its type.
+struct TypeShape {
+    /// Identifier of the type, as the catalogue numbers it.
+    system_type_id: i32,
+    /// Storage width in bytes, `-1` for a `max` type.
+    max_length: i16,
+    /// Decimal precision, `0` for the types without one.
+    precision: u8,
+    /// Decimal scale, `0` for the types without one.
+    scale: u8,
+    /// Collation name, `NULL` outside the character types.
+    collation_name: Value,
+    /// Identifier of the TDS token that carries the type on the wire.
+    tds_type_id: i32,
+    /// Width the TDS token declares.
+    tds_length: i32,
+    /// Collation as the wire packs its locale and flags, `NULL` outside character types.
+    tds_collation_id: Value,
+    /// Sort identifier of the collation, `NULL` outside the character types.
+    tds_collation_sort_id: Value,
+}
+
+impl TypeShape {
+    fn of(ty: &TypeInfo) -> Self {
+        let (system_type_id, nullable_tds_id) = type_ids(&ty.ty);
+        let (max_length, precision, scale) = size_of(&ty.ty);
+        let string = ty.ty.is_string();
+        let collation = ty.collation.unwrap_or(Collation::DEFAULT);
+        TypeShape {
+            system_type_id,
+            max_length,
+            precision,
+            scale,
+            collation_name: if string {
+                Value::String(SqlString {
+                    text: DEFAULT_COLLATION_NAME.to_owned(),
+                })
+            } else {
+                Value::Null
+            },
+            tds_type_id: if ty.nullable {
+                nullable_tds_id
+            } else {
+                non_nullable_tds_id(&ty.ty, system_type_id)
+            },
+            tds_length: tds_length(&ty.ty, max_length),
+            tds_collation_id: if string {
+                Value::I32(packed_collation(&collation))
+            } else {
+                Value::Null
+            },
+            tds_collation_sort_id: if string {
+                Value::I8(collation.sort_id)
+            } else {
+                Value::Null
+            },
+        }
+    }
+}
+
+/// The locale, the comparison flags and the version of a collation packed into one number,
+/// the first four of the five bytes the wire carries ([MS-TDS] 2.2.5.1.2).
+fn packed_collation(collation: &Collation) -> i32 {
+    let packed = (collation.lcid & 0x000F_FFFF)
+        | (u32::from(collation.flags) << 20)
+        | (u32::from(collation.version & 0x0F) << 28);
+    packed.cast_signed()
+}
+
+/// The catalogue identifier of a type, and the identifier of the TDS token that carries it
+/// when it may be `NULL`.
+fn type_ids(ty: &SqlType) -> (i32, i32) {
+    match ty {
+        SqlType::Bit => (104, 104),
+        SqlType::TinyInt => (48, 38),
+        SqlType::SmallInt => (52, 38),
+        SqlType::Int => (56, 38),
+        SqlType::BigInt => (127, 38),
+        SqlType::Decimal { .. } => (106, 106),
+        SqlType::Numeric { .. } => (108, 108),
+        SqlType::Float => (62, 109),
+        SqlType::Real => (59, 109),
+        SqlType::Money => (60, 110),
+        SqlType::SmallMoney => (122, 110),
+        SqlType::Char(_) => (175, 175),
+        SqlType::VarChar(_) => (167, 167),
+        SqlType::NChar(_) => (239, 239),
+        SqlType::NVarChar(_) => (231, 231),
+        SqlType::Binary(_) => (173, 173),
+        SqlType::VarBinary(_) => (165, 165),
+        SqlType::Date => (40, 40),
+        SqlType::Time(_) => (41, 41),
+        SqlType::DateTime => (61, 111),
+        SqlType::SmallDateTime => (58, 111),
+        SqlType::DateTime2(_) => (42, 42),
+        SqlType::DateTimeOffset(_) => (43, 43),
+        SqlType::UniqueIdentifier => (36, 36),
+    }
+}
+
+/// The identifier of the TDS token that carries a type that cannot be `NULL`.
+///
+/// The token of a value that cannot be `NULL` carries the catalogue identifier of its
+/// type, `bit` excepted, which has a token of its own. The families whose nullable token
+/// differs from that one are pinned by `tests/describe.rs`,
+/// `the_wire_token_of_a_column_follows_its_nullability`: `bit`, the integers, `float`,
+/// `money` and `datetime`; the character, binary and `date` families keep a single token.
+fn non_nullable_tds_id(ty: &SqlType, system_type_id: i32) -> i32 {
+    match ty {
+        SqlType::Bit => 50,
+        _ => system_type_id,
+    }
+}
+
+/// Storage width in bytes, decimal precision and decimal scale of a type.
+fn size_of(ty: &SqlType) -> (i16, u8, u8) {
+    match ty {
+        SqlType::Bit => (1, 1, 0),
+        SqlType::TinyInt => (1, 3, 0),
+        SqlType::SmallInt => (2, 5, 0),
+        SqlType::Int => (4, 10, 0),
+        SqlType::BigInt => (8, 19, 0),
+        SqlType::Decimal { precision, scale } | SqlType::Numeric { precision, scale } => {
+            (decimal_bytes(*precision), *precision, *scale)
+        }
+        SqlType::Float => (8, 53, 0),
+        SqlType::Real => (4, 24, 0),
+        SqlType::Money => (8, 19, 4),
+        SqlType::SmallMoney => (4, 10, 4),
+        SqlType::Char(len)
+        | SqlType::VarChar(len)
+        | SqlType::Binary(len)
+        | SqlType::VarBinary(len) => (byte_len(len, 1), 0, 0),
+        SqlType::NChar(len) | SqlType::NVarChar(len) => (byte_len(len, 2), 0, 0),
+        SqlType::Date => (3, 10, 0),
+        SqlType::Time(scale) => (
+            temporal_bytes(*scale),
+            8 + u8::from(*scale > 0) + *scale,
+            *scale,
+        ),
+        SqlType::DateTime => (8, 23, 3),
+        SqlType::SmallDateTime => (4, 16, 0),
+        SqlType::DateTime2(scale) => (
+            temporal_bytes(*scale) + 3,
+            19 + u8::from(*scale > 0) + *scale,
+            *scale,
+        ),
+        SqlType::DateTimeOffset(scale) => (
+            temporal_bytes(*scale) + 5,
+            26 + u8::from(*scale > 0) + *scale,
+            *scale,
+        ),
+        SqlType::UniqueIdentifier => (16, 0, 0),
+    }
+}
+
+/// Storage width of an exact numeric, which grows in four steps with its precision.
+fn decimal_bytes(precision: u8) -> i16 {
+    match precision {
+        0..=9 => 5,
+        10..=19 => 9,
+        20..=28 => 13,
+        _ => 17,
+    }
+}
+
+/// Storage width of the time part of a temporal type, which grows with its scale.
+fn temporal_bytes(scale: u8) -> i16 {
+    match scale {
+        0..=2 => 3,
+        3..=4 => 4,
+        _ => 5,
+    }
+}
+
+/// Storage width of a sized type, `-1` for `max`.
+fn byte_len(len: &Len, per_character: i16) -> i16 {
+    match len {
+        Len::Fixed(n) => i16::try_from(*n)
+            .unwrap_or(i16::MAX)
+            .saturating_mul(per_character),
+        Len::Max => -1,
+    }
+}
+
+/// The width the TDS token declares, which spells `max` as the largest short width.
+fn tds_length(ty: &SqlType, max_length: i16) -> i32 {
+    if ty.is_exact_numeric() {
+        return 17;
+    }
+    if max_length < 0 {
+        return 65_535;
+    }
+    i32::from(max_length)
 }
 
 /// Resolves each declaration of `@params`, in order, or refuses the first one it cannot name

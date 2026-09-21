@@ -4,6 +4,7 @@ use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::ParameterDeclaration;
 use vauban_types::{TypeInfo, Value};
 
+use crate::describe_procs::DescribeKind;
 use crate::sp_datatype_info::{ResultColumn, sp_datatype_info_100_static};
 use crate::special_procs;
 
@@ -62,6 +63,15 @@ pub enum ProcAction {
         /// Named arguments of the catalog call.
         params: Vec<ProcParam>,
     },
+    /// Describe a T-SQL batch without running it.
+    Describe {
+        /// The batch to describe.
+        statement: String,
+        /// Which description the caller asked for.
+        kind: DescribeKind,
+        /// Result metadata of the description.
+        columns: Vec<ResultColumn>,
+    },
     /// Static result set, such as `sp_datatype_info_100`.
     Static {
         /// Result metadata.
@@ -118,7 +128,8 @@ pub fn resolve_system_procedure(name: &str, args: &[ProcArg<'_>]) -> Option<SqlR
         "sp_execute" => Some(special_procs::resolve_sp_execute(args)),
         "sp_unprepare" => Some(special_procs::resolve_sp_unprepare(args)),
         "sp_datatype_info_100" => Some(resolve_sp_datatype_info_100(args)),
-        name => resolve_catalog_procedure(name, args),
+        name => crate::describe_procs::resolve(name, args)
+            .or_else(|| resolve_catalog_procedure(name, args)),
     }
 }
 

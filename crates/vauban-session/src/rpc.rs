@@ -49,6 +49,15 @@ pub struct StaticResultColumn {
     pub ty: TypeInfo,
 }
 
+/// Which of the two descriptions a [`ProcAction::Describe`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescribeKind {
+    /// Columns of the first result set of the batch.
+    FirstResultSet,
+    /// Parameters the batch uses without declaring them.
+    UndeclaredParameters,
+}
+
 /// What the session should do after a system procedure has been resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProcAction {
@@ -95,6 +104,19 @@ pub enum ProcAction {
         columns: Vec<StaticResultColumn>,
         /// Result rows.
         rows: Vec<Vec<Value>>,
+    },
+    /// A call that asks for the shape of a T-SQL batch instead of running it.
+    ///
+    /// The batch is described by the same parse and bind the session runs before it prepares
+    /// a statement; the caller receives the fixed result set named by `columns`, one row per
+    /// described item.
+    Describe {
+        /// The batch to describe.
+        statement: String,
+        /// Which description the caller asked for.
+        kind: DescribeKind,
+        /// Result metadata of the description.
+        columns: Vec<StaticResultColumn>,
     },
     /// Known procedure deliberately refused (for example cursor RPCs).
     Refuse(SqlError),

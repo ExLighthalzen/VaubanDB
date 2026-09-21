@@ -812,6 +812,18 @@ impl Session {
             ProcAction::Static { columns, rows } => {
                 self.run_nested_static(&columns, &rows, more, nested_state, sink, outcome)
             }
+            ProcAction::Describe {
+                statement,
+                kind,
+                columns,
+            } => match crate::prepared::describe_batch(self, &statement, kind) {
+                Ok(rows) => {
+                    self.run_nested_static(&columns, &rows, more, nested_state, sink, outcome)
+                }
+                Err(err) => {
+                    self.finish_nested_procedure_error(err, more, nested_state, sink, outcome)
+                }
+            },
             ProcAction::Refuse(err) => {
                 self.finish_nested_procedure_error(err, more, nested_state, sink, outcome)
             }
