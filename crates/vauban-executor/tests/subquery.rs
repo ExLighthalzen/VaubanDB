@@ -921,6 +921,17 @@ fn derived_table_under_a_join_column_read_from_an_enclosing_scalar() {
     );
 }
 
+/// A derived table whose own projection reorders its source's columns, joined on its
+/// second column: the join key must read the position the derived table gives it, not
+/// the position its source has underneath.
+#[test]
+fn hash_join_key_on_a_derived_table_that_reorders_its_source() {
+    let f = seeded();
+    let rows =
+        f.run("SELECT d.k, d.dv FROM (SELECT q.v AS dv, q.k FROM t3 q) d JOIN t1 w ON d.k = w.a ORDER BY d.k;");
+    assert_eq!(rows, i32s(&[&[1, 10], &[2, 20], &[3, 30]]));
+}
+
 // ---------------------------------------------------------------------------------------
 // Subqueries written outside a plan: the value of a `SET`, the initializer of a `DECLARE`
 // ---------------------------------------------------------------------------------------
