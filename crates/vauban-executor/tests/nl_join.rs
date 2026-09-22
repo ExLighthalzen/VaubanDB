@@ -987,3 +987,162 @@ fn self_left_join_pads_the_second_alias() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// A derived table as the inner of a nested-loop join
+//
+// The axis is the layout the inner plan is described by while the join drives it: a
+// derived table that reorders its source names its own columns, and a predicate inside
+// the inner plan reads them at the positions the derived table gives them, not at the
+// positions its source has underneath. The outer side is a plain scan here; the derived
+// table on the outer side, the two join operators against each other and the choice of
+// plan are left out, the last one being the planner's.
+// ---------------------------------------------------------------------------------------
+
+/// Two tables of two `int` columns: `small` holds `(1, 10)`, `(2, 20)` and `(3, 30)`,
+/// `other` holds `(1, 100)`, `(3, 300)` and `(4, 400)`.
+struct DerivedInnerFixture {
+    storage: Arc<dyn Storage>,
+    txn: TransactionManager,
+    small: TableId,
+    other: TableId,
+}
+
+impl DerivedInnerFixture {
+    fn new() -> Self {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let db = storage
+            .create_database("mydb")
+            .expect("the database is new");
+        let shape = TableShape {
+            columns: vec![int_ty(), int_ty()],
+            clustered_key: None,
+        };
+        let small = storage.create_table(db, &shape).expect("small");
+        let other = storage.create_table(db, &shape).expect("other");
+        let txn = TransactionManager::new(Arc::clone(&storage));
+        let insert = |table: TableId, rows: &[(i32, i32)]| {
+            for (a, b) in rows {
+                let h = txn.begin(IsolationLevel::ReadCommitted);
+                storage
+                    .insert(
+                        h.id,
+                        table,
+                        &StorageRow(vec![Value::I32(*a), Value::I32(*b)]),
+                    )
+                    .expect("insert");
+                txn.commit(h).expect("commit");
+            }
+        };
+        insert(small, &[(1, 10), (2, 20), (3, 30)]);
+        insert(other, &[(1, 100), (3, 300), (4, 400)]);
+        Self {
+            storage,
+            txn,
+            small,
+            other,
+        }
+    }
+
+    fn column(id: i32, index: usize, name: &str) -> ColumnBinding {
+        ColumnBinding {
+            column: ColumnId(id),
+            index,
+            name: name.to_owned(),
+            ty: int_ty(),
+            depth: 0,
+        }
+    }
+
+    fn column_ref(id: i32, index: usize, name: &str) -> BoundExpr {
+        BoundExpr {
+            kind: BoundExprKind::ColumnRef(Self::column(id, index, name)),
+            ty: int_ty(),
+            line: 1,
+        }
+    }
+
+    /// `small` scanned as `(k, v)`, column ids 1 and 2.
+    fn small_scan(&self) -> PhysicalPlan {
+        PhysicalPlan::TableScan {
+            table: self.small,
+            columns: vec![Self::column(1, 0, "k"), Self::column(2, 1, "v")],
+            alias: "q".to_owned(),
+            schema: schema_of(&["k", "v"]),
+            hints: LockHints::default(),
+        }
+    }
+
+    /// `other` scanned as `(ok, ow)`, column ids 11 and 12, which `small_scan` leaves
+    /// unused: a reference to one of them is read from the outer row.
+    fn other_scan(&self) -> PhysicalPlan {
+        PhysicalPlan::TableScan {
+            table: self.other,
+            columns: vec![Self::column(11, 0, "ok"), Self::column(12, 1, "ow")],
+            alias: "o".to_owned(),
+            schema: schema_of(&["ok", "ow"]),
+            hints: LockHints::default(),
+        }
+    }
+
+    /// `(SELECT q.v, q.k FROM small q) d`: the projection swaps the two columns and keeps
+    /// their names, so `d.k` sits at index 1 where the source keeps `k` at index 0.
+    fn derived_swapping_small(&self) -> PhysicalPlan {
+        PhysicalPlan::Project {
+            input: Box::new(self.small_scan()),
+            exprs: vec![
+                vauban_binder::BoundProjection {
+                    expr: Self::column_ref(2, 1, "v"),
+                    name: "v".to_owned(),
+                },
+                vauban_binder::BoundProjection {
+                    expr: Self::column_ref(1, 0, "k"),
+                    name: "k".to_owned(),
+                },
+            ],
+            schema: schema_of(&["v", "k"]),
+        }
+    }
+
+    fn run(&self, plan: PhysicalPlan) -> Vec<Row> {
+        let eval = StaticContext::default();
+        let snap = self
+            .txn
+            .statement_snapshot(&self.txn.begin(IsolationLevel::ReadCommitted));
+        let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_engine(
+            self.storage.as_ref(),
+            &self.txn,
+            &snap,
+        );
+        let (_, set) =
+            execute_collect(&PhysicalStatement::Query(plan), &mut ctx).expect("the plan runs");
+        set.rows
+    }
+}
+
+/// The join drives a derived table that swaps its source's columns, and the predicate
+/// inside it compares the derived table's own `k` with the outer row's `ok`: the pairs
+/// kept are those whose keys are equal.
+#[test]
+fn nested_loop_join_over_a_derived_table_that_reorders_its_source() {
+    let f = DerivedInnerFixture::new();
+    let inner = PhysicalPlan::Filter {
+        input: Box::new(f.derived_swapping_small()),
+        predicate: eq(
+            DerivedInnerFixture::column_ref(1, 1, "k"),
+            DerivedInnerFixture::column_ref(11, 0, "ok"),
+        ),
+    };
+    let plan = PhysicalPlan::NestedLoopJoin {
+        outer: Box::new(f.other_scan()),
+        inner: Box::new(inner),
+        kind: PhysicalJoinKind::Cross,
+        on: None,
+        schema: schema_of(&["ok", "ow", "v", "k"]),
+    };
+    assert_eq!(
+        f.run(plan),
+        vec![ints(&[1, 100, 10, 1]), ints(&[3, 300, 30, 3])],
+        "the derived table's `k` is read at index 1, where its own projection puts it"
+    );
+}

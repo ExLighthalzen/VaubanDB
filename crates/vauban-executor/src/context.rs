@@ -788,38 +788,25 @@ impl<'a> ExecContext<'a> {
         self.subquery_locals.last().map(|frame| &frame.columns)
     }
 
+    /// The value of `binding` in `row`, at the index the binder wrote on the reference.
+    ///
+    /// An expression is evaluated over the row of the plan level it belongs to, which is
+    /// not always the row the enclosing correlated plan hands back: a predicate written
+    /// between two derived tables reads the inner projection's row. The binder numbered
+    /// the reference against that level, and an operator describes its own output — a
+    /// `Project` by its schema
+    /// ([`scan_column_bindings`](crate::ops::subquery::scan_column_bindings)) — so the
+    /// index the reference carries is its position in the row at hand.
+    ///
+    /// Reconciling the reference against the innermost locals frame answers for the
+    /// level that frame describes instead. The two numberings then meet one position
+    /// apart: the frame numbers its own output `ColumnId(position + 1)`, while a derived
+    /// table's own column is `ColumnId(position)` from 0
+    /// (`crates/vauban-binder/src/join.rs::derived_source`), so a nested derived table
+    /// whose projection has the width of the frame is read one column to the left
+    /// (`tests/subquery.rs`,
+    /// `correlated_exists_over_a_derived_table_nested_under_a_projection_of_the_same_width`).
     pub(crate) fn read_local_column(&self, row: &Row, binding: &ColumnBinding) -> SqlResult<Value> {
-        if let Some(bindings) = self.subquery_locals.last().map(|frame| &frame.bindings) {
-            if let Some(found) = bindings.iter().find(|item| {
-                item.column == binding.column
-                    && item.name == binding.name
-                    && item.index == binding.index
-            }) && found.index < row.len()
-            {
-                return row.get(found.index).cloned().ok_or_else(|| {
-                    bug(&format!(
-                        "read_local_column: column `{}` is at index {} of a row of {} value(s)",
-                        found.name,
-                        found.index,
-                        row.len()
-                    ))
-                });
-            }
-            if let Some(found) = bindings
-                .iter()
-                .find(|item| item.column == binding.column && item.name == binding.name)
-                && found.index < row.len()
-            {
-                return row.get(found.index).cloned().ok_or_else(|| {
-                    bug(&format!(
-                        "read_local_column: column `{}` is at index {} of a row of {} value(s)",
-                        found.name,
-                        found.index,
-                        row.len()
-                    ))
-                });
-            }
-        }
         if binding.index < row.len() {
             return row.get(binding.index).cloned().ok_or_else(|| {
                 bug(&format!(

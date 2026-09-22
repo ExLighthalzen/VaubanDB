@@ -305,13 +305,28 @@ pub(crate) fn eval_subquery_expr(
 }
 
 /// Scan bindings describing how each position of a plan's row is laid out.
+///
+/// A `Project` is described by its own `schema` rather than by its input. A `Project`
+/// that expands a catalogue view numbers its output by position in that schema
+/// (`crates/vauban-binder/src/view.rs::source_columns`), and a `Project` that expands a
+/// derived table numbers its own output by position too, under a `column` scheme of its
+/// own (`crates/vauban-binder/src/join.rs::derived_source`, `query.rs`): either way, an
+/// identity that a later reference is bound against, not the identity its input exposes.
+/// Delegating to the input describes a column of the input's own row shape instead,
+/// which parts ways with the `Project`'s output once it reorders, drops or adds columns
+/// of its own. On a derived table that reorders its source, that shows up in a join key
+/// (`tests/subquery.rs`, `hash_join_key_on_a_derived_table_that_reorders_its_source`),
+/// under a correlated filter (`tests/subquery.rs`,
+/// `correlated_exists_over_a_derived_table_that_reorders_its_source`) and under a
+/// nested-loop join (`tests/nl_join.rs`,
+/// `nested_loop_join_over_a_derived_table_that_reorders_its_source`).
 pub(crate) fn scan_column_bindings(plan: &PhysicalPlan) -> Vec<ColumnBinding> {
     match plan {
         PhysicalPlan::TableScan { columns, .. } | PhysicalPlan::IndexSeek { columns, .. } => {
             columns.clone()
         }
+        PhysicalPlan::Project { schema, .. } => source_columns(schema),
         PhysicalPlan::Filter { input, .. }
-        | PhysicalPlan::Project { input, .. }
         | PhysicalPlan::Top { input, .. }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::TopN { input, .. }
@@ -345,6 +360,9 @@ pub(crate) fn scan_column_bindings(plan: &PhysicalPlan) -> Vec<ColumnBinding> {
     }
 }
 
+/// The column identifiers a row produced anywhere in `plan` carries,
+/// [`scan_column_bindings`]'s counterpart for the `HashSet` that scopes an evaluation to
+/// the current row.
 pub(crate) fn local_column_ids(plan: &PhysicalPlan) -> HashSet<ColumnId> {
     let mut ids = HashSet::new();
     collect_local_column_ids(plan, &mut ids);
@@ -363,6 +381,16 @@ fn collect_local_column_ids(plan: &PhysicalPlan, ids: &mut HashSet<ColumnId>) {
                 ids.insert(binding.column);
             }
         }
+        // A `Project` carries the identifiers of its own output columns on top of those
+        // of its input: a predicate under the projection is evaluated on the input row,
+        // one above it on the projected row.
+        PhysicalPlan::Project { input, schema, .. } => {
+            collect_local_column_ids(input, ids);
+            for binding in source_columns(schema) {
+                ids.insert(binding.column);
+            }
+            ids.insert(SLOT_COLUMN_ID);
+        }
         PhysicalPlan::NestedLoopJoin { outer, inner, .. } => {
             collect_local_column_ids(outer, ids);
             collect_local_column_ids(inner, ids);
@@ -372,7 +400,6 @@ fn collect_local_column_ids(plan: &PhysicalPlan, ids: &mut HashSet<ColumnId>) {
             collect_local_column_ids(probe, ids);
         }
         PhysicalPlan::Filter { input, .. }
-        | PhysicalPlan::Project { input, .. }
         | PhysicalPlan::Top { input, .. }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::TopN { input, .. }
@@ -392,6 +419,32 @@ fn collect_local_column_ids(plan: &PhysicalPlan, ids: &mut HashSet<ColumnId>) {
         }
         PhysicalPlan::OneRow | PhysicalPlan::Values { .. } => {}
     }
+}
+
+/// One [`ColumnBinding`] per column of `schema`, numbered by position: the scheme
+/// `crates/vauban-binder/src/view.rs::source_columns` uses for a column that has no
+/// identifier of its own in the catalogue. A reference to a catalogue view's own column,
+/// bound that same way, resolves to the same `column` and `index` here. A derived table's
+/// own column is numbered differently by the binder
+/// (`crates/vauban-binder/src/join.rs::derived_source`, `query.rs`: `ColumnId(i)` from 0,
+/// not from 1 here) — only `index` then agrees, and `index` is what the executor reads
+/// off the row (`ExecContext::read_local_column`). The `column` of a binding serves to
+/// find a column of an enclosing row, not to place one in the row at hand
+/// (`tests/subquery.rs`, `hash_join_key_on_a_derived_table_that_reorders_its_source` and
+/// `correlated_exists_over_a_derived_table_that_reorders_its_source`).
+fn source_columns(schema: &OutputSchema) -> Vec<ColumnBinding> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(position, column)| ColumnBinding {
+            column: ColumnId(i32::try_from(position.saturating_add(1)).unwrap_or(i32::MAX)),
+            index: position,
+            name: column.name.clone(),
+            ty: column.ty.clone(),
+            depth: 0,
+        })
+        .collect()
 }
 
 fn join_row_bindings(left: &PhysicalPlan, right: &PhysicalPlan) -> Vec<ColumnBinding> {

@@ -5,18 +5,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use vauban_binder::{
-    AggregateCall, BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LogicalOp, OutputSchema,
-};
+use vauban_binder::{BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LogicalOp, OutputSchema};
 use vauban_catalog::ColumnId;
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{PhysicalJoinKind, PhysicalPlan};
 use vauban_types::Value;
 
-use crate::context::{ExecContext, SLOT_COLUMN_ID, SubqueryLocalsSource};
+use crate::context::{ExecContext, SubqueryLocalsSource};
 use crate::expr::eval_expr;
 use crate::operator::{Operator, bucket_hash, build_operator, keys_equal};
 use crate::ops::not_implemented;
+use crate::ops::subquery::{local_column_ids, scan_column_bindings};
 use crate::row::Row;
 
 /// The hash join operator, built from a [`PhysicalPlan::HashJoin`].
@@ -596,10 +595,10 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
     }
     let residual = merge_residual(residual.clone(), extra_residual, template);
 
-    let build_locals = own_local_column_ids(build);
-    let build_bindings = own_scan_column_bindings(build);
-    let probe_locals = own_local_column_ids(probe);
-    let probe_bindings = own_scan_column_bindings(probe);
+    let build_locals = local_column_ids(build);
+    let build_bindings = scan_column_bindings(build);
+    let probe_locals = local_column_ids(probe);
+    let probe_bindings = scan_column_bindings(probe);
 
     Ok(Box::new(HashJoin {
         build: build_operator(build)?,
@@ -623,164 +622,4 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         probe_matched: false,
         exhausted: false,
     }))
-}
-
-/// The columns of `plan`'s own row, positioned as the operator that runs `plan` actually
-/// produces them.
-///
-/// A `Project` gets its own entry here instead of delegating to its input, unlike
-/// `crate::ops::subquery::scan_column_bindings`: a `Project` that expands a catalogue view
-/// numbers its output by position in its own schema
-/// (`crates/vauban-binder/src/view.rs::source_columns`), and a `Project` that expands a
-/// derived table numbers its own output by position too, under a `column` scheme of its
-/// own (`crates/vauban-binder/src/join.rs::derived_source`, `query.rs`) — either way, an
-/// identity that a later reference — a join key here — is bound against, not the identity
-/// its input exposes. Delegating to the input reads a column of the input's own row shape
-/// instead, which does not generally agree with the `Project`'s output once it reorders,
-/// drops or adds columns of its own (a catalogue view over a narrower backing row, for
-/// one; a derived table that reorders its source, for another — `tests/subquery.rs`,
-/// `hash_join_key_on_a_derived_table_that_reorders_its_source`).
-fn own_scan_column_bindings(plan: &PhysicalPlan) -> Vec<ColumnBinding> {
-    match plan {
-        PhysicalPlan::TableScan { columns, .. } | PhysicalPlan::IndexSeek { columns, .. } => {
-            columns.clone()
-        }
-        PhysicalPlan::Project { schema, .. } => own_source_columns(schema),
-        PhysicalPlan::Filter { input, .. }
-        | PhysicalPlan::Top { input, .. }
-        | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::TopN { input, .. }
-        | PhysicalPlan::SubqueryEval { input, .. } => own_scan_column_bindings(input),
-        PhysicalPlan::HashAggregate {
-            input,
-            group_by,
-            aggregates,
-            schema,
-            ..
-        }
-        | PhysicalPlan::StreamAggregate {
-            input,
-            group_by,
-            aggregates,
-            schema,
-            ..
-        } => own_aggregate_row_bindings(input, group_by, aggregates, schema),
-        PhysicalPlan::Distinct(input) => own_scan_column_bindings(input),
-        PhysicalPlan::NestedLoopJoin { outer, inner, .. } => own_join_row_bindings(outer, inner),
-        // `HashJoin::concat` lays out the probe row before the build row: the bindings
-        // describing a hash join's output follow that order, not the `(build, probe)`
-        // order the plan carries.
-        PhysicalPlan::HashJoin { build, probe, .. } => own_join_row_bindings(probe, build),
-        PhysicalPlan::Union { inputs, .. }
-        | PhysicalPlan::Except { inputs, .. }
-        | PhysicalPlan::Intersect { inputs, .. } => inputs
-            .first()
-            .map_or_else(Vec::new, own_scan_column_bindings),
-        PhysicalPlan::OneRow | PhysicalPlan::Values { .. } => Vec::new(),
-    }
-}
-
-/// The column identifiers `plan`'s own row carries, `own_scan_column_bindings`'s
-/// counterpart for the `HashSet` a hash join scopes a key evaluation to.
-fn own_local_column_ids(plan: &PhysicalPlan) -> HashSet<ColumnId> {
-    let mut ids = HashSet::new();
-    own_collect_local_column_ids(plan, &mut ids);
-    ids
-}
-
-fn own_collect_local_column_ids(plan: &PhysicalPlan, ids: &mut HashSet<ColumnId>) {
-    match plan {
-        PhysicalPlan::TableScan { columns, .. } | PhysicalPlan::IndexSeek { columns, .. } => {
-            for binding in columns {
-                ids.insert(binding.column);
-            }
-        }
-        PhysicalPlan::Project { schema, .. } => {
-            for binding in own_source_columns(schema) {
-                ids.insert(binding.column);
-            }
-        }
-        PhysicalPlan::NestedLoopJoin { outer, inner, .. } => {
-            own_collect_local_column_ids(outer, ids);
-            own_collect_local_column_ids(inner, ids);
-        }
-        PhysicalPlan::HashJoin { build, probe, .. } => {
-            own_collect_local_column_ids(build, ids);
-            own_collect_local_column_ids(probe, ids);
-        }
-        PhysicalPlan::Filter { input, .. }
-        | PhysicalPlan::Top { input, .. }
-        | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::TopN { input, .. }
-        | PhysicalPlan::SubqueryEval { input, .. }
-        | PhysicalPlan::HashAggregate { input, .. }
-        | PhysicalPlan::StreamAggregate { input, .. } => {
-            own_collect_local_column_ids(input, ids);
-            ids.insert(SLOT_COLUMN_ID);
-        }
-        PhysicalPlan::Distinct(input) => own_collect_local_column_ids(input, ids),
-        PhysicalPlan::Union { inputs, .. }
-        | PhysicalPlan::Except { inputs, .. }
-        | PhysicalPlan::Intersect { inputs, .. } => {
-            for input in inputs {
-                own_collect_local_column_ids(input, ids);
-            }
-        }
-        PhysicalPlan::OneRow | PhysicalPlan::Values { .. } => {}
-    }
-}
-
-/// One `ColumnBinding` per column of `schema`, numbered by position: the scheme
-/// `crates/vauban-binder/src/view.rs::source_columns` uses for a column that has no
-/// identifier of its own in the catalogue. A reference to a catalogue view's own column,
-/// bound that same way, resolves to the same `column` and `index` here. A derived table's
-/// own column is numbered differently by the binder
-/// (`crates/vauban-binder/src/join.rs::derived_source`, `query.rs`: `ColumnId(i)` from 0,
-/// not from 1 here) — only `index` then agrees, which is what `read_local_column`'s
-/// fallback to `binding.index` relies on (`tests/subquery.rs`,
-/// `hash_join_key_on_a_derived_table_that_reorders_its_source`).
-fn own_source_columns(schema: &OutputSchema) -> Vec<ColumnBinding> {
-    schema
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(position, column)| ColumnBinding {
-            column: ColumnId(i32::try_from(position.saturating_add(1)).unwrap_or(i32::MAX)),
-            index: position,
-            name: column.name.clone(),
-            ty: column.ty.clone(),
-            depth: 0,
-        })
-        .collect()
-}
-
-fn own_join_row_bindings(left: &PhysicalPlan, right: &PhysicalPlan) -> Vec<ColumnBinding> {
-    let mut bindings = own_scan_column_bindings(left);
-    let left_width = bindings.len();
-    for mut binding in own_scan_column_bindings(right) {
-        binding.index += left_width;
-        bindings.push(binding);
-    }
-    bindings
-}
-
-fn own_aggregate_row_bindings(
-    input: &PhysicalPlan,
-    group_by: &[BoundExpr],
-    aggregates: &[AggregateCall],
-    schema: &OutputSchema,
-) -> Vec<ColumnBinding> {
-    let _ = (group_by, aggregates);
-    let mut bindings = own_scan_column_bindings(input);
-    let group_len = schema.columns.len().saturating_sub(aggregates.len());
-    for index in group_len..schema.columns.len() {
-        bindings.push(ColumnBinding {
-            column: SLOT_COLUMN_ID,
-            index,
-            name: schema.columns[index].name.clone(),
-            ty: schema.columns[index].ty.clone(),
-            depth: 0,
-        });
-    }
-    bindings
 }

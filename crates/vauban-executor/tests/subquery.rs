@@ -933,6 +933,209 @@ fn hash_join_key_on_a_derived_table_that_reorders_its_source() {
 }
 
 // ---------------------------------------------------------------------------------------
+// A derived table under a correlated filter
+//
+// The axes crossed below are the shape of the filter (`EXISTS`, `NOT EXISTS`, a
+// correlated scalar), the shape of the derived table (reordering, narrowing, widening,
+// two levels) and what stands between the filter and the derived table (nothing, a join).
+// Four of these shapes are witnesses rather than axes, each for a stated reason: a derived
+// table that keeps its source's order, one that renames as it reorders, one narrower than
+// its source, and `IN (SELECT …)` over an *uncorrelated* derived table. The shape of the
+// enclosing projection is an axis of its own below: a derived table nested under a
+// projection of the same width, of a different width, and renamed. `UNION` inside a
+// correlated subquery is left out altogether: `ops/setop.rs` empties the correlation
+// stacks, which is a defect of its own. The choice of join shape is left out too: which
+// of the two join operators a plan gets is the planner's, not read here.
+// ---------------------------------------------------------------------------------------
+
+/// `EXISTS` over a derived table that swaps its source's two columns, correlated on the
+/// column the swap moved: the filter reads the position the derived table gives it.
+#[test]
+fn correlated_exists_over_a_derived_table_that_reorders_its_source() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE EXISTS (SELECT 1 FROM (SELECT q.v, q.k FROM t3 q) d WHERE d.k = x.a AND d.v > 10) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[2], &[3]]));
+}
+
+/// The negated form answers the complement of the rows the positive form keeps.
+#[test]
+fn correlated_not_exists_over_a_derived_table_that_reorders_its_source() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE NOT EXISTS (SELECT 1 FROM (SELECT q.v, q.k FROM t3 q) d WHERE d.k = x.a AND d.v > 10) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1]]));
+}
+
+/// Witness, not an axis: a derived table that renames as it reorders is read right under
+/// either layout, the new name matching no column of the source.
+#[test]
+fn correlated_scalar_over_a_derived_table_that_renames_as_it_reorders_is_a_witness() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a, (SELECT COUNT(*) FROM (SELECT q.v AS dv, q.k AS dk FROM t3 q) d WHERE d.dk = x.a) AS n FROM t1 x ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1, 1], &[2, 1], &[3, 1]]));
+}
+
+/// Witness, not an axis: a derived table narrower than its source keeps the order of the
+/// columns it does keep, and its only column carries `SLOT_COLUMN_ID`, which
+/// `expr.rs` reads by index without reconciling names.
+#[test]
+fn correlated_exists_over_a_derived_table_narrower_than_its_source_is_a_witness() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE EXISTS (SELECT 1 FROM (SELECT q.v FROM t3 q) d WHERE d.v = x.a * 10) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1], &[2], &[3]]));
+}
+
+/// A derived table wider than its source: a computed column pushes `k` one position to
+/// the right of where the source keeps it.
+#[test]
+fn correlated_exists_over_a_derived_table_wider_than_its_source() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE EXISTS (SELECT 1 FROM (SELECT q.v + 1 AS w, q.k, q.v FROM t3 q) d WHERE d.k = x.a AND d.w > 11) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[2], &[3]]));
+}
+
+/// A join stands between the correlated filter and the derived table that reorders.
+#[test]
+fn correlated_scalar_over_a_join_holding_a_derived_table_that_reorders() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a, (SELECT COUNT(*) FROM (SELECT q.v, q.k FROM t3 q) d JOIN t2 o ON d.k = o.a WHERE d.k = x.a) AS n FROM t1 x ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1, 1], &[2, 1], &[3, 0]]));
+}
+
+/// Two levels of derived table, each reordering, under a correlated scalar subquery.
+#[test]
+fn correlated_scalar_over_two_levels_of_derived_table_that_reorder() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a, (SELECT COUNT(*) FROM (SELECT y.k, y.v FROM (SELECT q.v, q.k FROM t3 q) y) d JOIN t2 o ON d.k = o.a WHERE o.a = x.a) AS n FROM t1 x ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1, 1], &[2, 1], &[3, 0]]));
+}
+
+/// Witness, not an axis: a derived table that keeps its source's order answers the same
+/// rows under either layout.
+#[test]
+fn correlated_exists_over_a_derived_table_that_keeps_its_order_is_a_witness() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE EXISTS (SELECT 1 FROM (SELECT q.k, q.v FROM t3 q) d WHERE d.k = x.a AND d.v > 10) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[2], &[3]]));
+}
+
+/// `IN (SELECT …)` whose inner query is correlated as well, over a derived table that
+/// reorders: the subquery projects one column under a name the derived table also
+/// carries, and the predicate under that projection reads a wider row than the one the
+/// subquery hands back.
+#[test]
+fn correlated_in_over_a_derived_table_that_reorders_its_source() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE x.a IN (SELECT d.k FROM (SELECT q.v, q.k FROM t3 q) d WHERE d.k <= x.a AND d.v >= 20) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[2], &[3]]));
+}
+
+/// A derived table nested under a projection **of the same width**, the predicate
+/// written between the two: `d1.b` is a column of the inner projection, and the frame
+/// the correlated plan pushed describes the outer one. Both are two columns wide, and
+/// the two numberings meet one position apart, so the reference must be read where the
+/// inner projection puts it.
+#[test]
+fn correlated_exists_over_a_derived_table_nested_under_a_projection_of_the_same_width() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE EXISTS (SELECT d2.b, d2.a FROM (SELECT d1.b, d1.a FROM (SELECT q.v AS a, q.k AS b FROM t3 q) d1 WHERE d1.b > 2) d2 WHERE d2.b = x.a) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[3]]));
+}
+
+/// The negated form of the same shape answers the complement.
+#[test]
+fn correlated_not_exists_over_a_derived_table_nested_under_a_projection_of_the_same_width() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE NOT EXISTS (SELECT d2.b, d2.a FROM (SELECT d1.b, d1.a FROM (SELECT q.v AS a, q.k AS b FROM t3 q) d1 WHERE d1.b > 2) d2 WHERE d2.b = x.a) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1], &[2]]));
+}
+
+/// The same shape with the nested predicate on the column the inner projection puts at
+/// index 0.
+#[test]
+fn correlated_exists_whose_nested_predicate_reads_the_column_at_index_zero() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE EXISTS (SELECT d2.b, d2.a FROM (SELECT d1.b, d1.a FROM (SELECT q.v AS a, q.k AS b FROM t3 q) d1 WHERE d1.a > 15) d2 WHERE d2.b = x.a) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[2], &[3]]));
+}
+
+/// Three projections of the same width stacked, the predicate at the deepest.
+#[test]
+fn correlated_exists_over_three_derived_tables_of_the_same_width() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE EXISTS (SELECT d3.b, d3.a FROM (SELECT d2.b, d2.a FROM (SELECT d1.b, d1.a FROM (SELECT q.v AS a, q.k AS b FROM t3 q) d1 WHERE d1.b > 2) d2) d3 WHERE d3.b = x.a) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[3]]));
+}
+
+/// A join stands between the correlated filter and the nested derived table.
+#[test]
+fn correlated_exists_over_a_nested_derived_table_under_a_join() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE EXISTS (SELECT d2.b, d2.a FROM (SELECT d1.b, d1.a FROM (SELECT q.v AS a, q.k AS b FROM t3 q) d1 WHERE d1.b > 2) d2 JOIN t1 z ON z.a = d2.b WHERE d2.b = x.a) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[3]]));
+}
+
+/// Witness, not an axis: the outer projection renaming its columns takes the two
+/// numberings out of reach of one another.
+#[test]
+fn correlated_exists_over_a_nested_derived_table_that_renames_is_a_witness() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE EXISTS (SELECT d2.bb, d2.aa FROM (SELECT d1.b AS bb, d1.a AS aa FROM (SELECT q.v AS a, q.k AS b FROM t3 q) d1 WHERE d1.b > 2) d2 WHERE d2.bb = x.a) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[3]]));
+}
+
+/// Witness, not an axis: under a correlated scalar subquery the enclosing projection is
+/// one column wide, a width the nested projection does not share.
+#[test]
+fn correlated_scalar_over_a_derived_table_nested_under_a_projection_is_a_witness() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a, (SELECT COUNT(*) FROM (SELECT d1.b, d1.a FROM (SELECT q.v AS a, q.k AS b FROM t3 q) d1 WHERE d1.b > 2) d2 WHERE d2.b = x.a) AS n FROM t1 x ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1, 0], &[2, 0], &[3, 1]]));
+}
+
+/// Witness, not an axis: `IN (SELECT …)` over an uncorrelated derived table that
+/// reorders.
+#[test]
+fn in_subquery_over_an_uncorrelated_derived_table_that_reorders_is_a_witness() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a FROM t1 x WHERE x.a IN (SELECT d.k FROM (SELECT q.v, q.k FROM t3 q) d WHERE d.v > 10) ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[2], &[3]]));
+}
+
+// ---------------------------------------------------------------------------------------
 // Subqueries written outside a plan: the value of a `SET`, the initializer of a `DECLARE`
 // ---------------------------------------------------------------------------------------
 
