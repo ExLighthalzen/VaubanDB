@@ -16,7 +16,7 @@ use std::ops::Bound;
 
 use vauban_binder::{
     AggregateCall, BoundExecute, BoundExpr, BoundProjection, BoundTop, ColumnBinding, DdlStatement,
-    JoinKind, LockHints, OutputSchema, SortKey, TxnStatement,
+    DeferredStatement, JoinKind, LockHints, OutputSchema, SortKey, TxnStatement,
 };
 use vauban_catalog::{TableDef, TableId};
 use vauban_storage::{Direction, IndexId};
@@ -113,6 +113,10 @@ pub enum PhysicalStatement {
     Transaction(TxnStatement),
     /// `EXECUTE`, carried across from the bound statement.
     Execute(BoundExecute),
+    /// A statement of a branch or of a loop body left unbound, carried across from the
+    /// bound statement: there is nothing to plan until it is bound, which happens when the
+    /// control of flow reaches it.
+    Deferred(Box<DeferredStatement>),
 }
 
 /// A node of the physical plan: how the rows are produced.

@@ -3,12 +3,15 @@
 //!
 //! All `PhysicalStatement`s are built by hand; the binder and the parser are not involved.
 
+use std::sync::Arc;
+
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding, OutputColumn, OutputSchema,
-    SessionOptions, SortKey,
+    BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding, DeferredStatement,
+    OutputColumn, OutputSchema, SessionOptions, SortKey,
 };
 use vauban_catalog::ColumnId;
 use vauban_executor::{CancelToken, CollectSink, ExecContext, ExecOutcome, ExecSession, execute};
+use vauban_parser::{ParseOptions, parse_batch};
 use vauban_planner::{PhysicalDeclaration, PhysicalPlan, PhysicalStatement};
 use vauban_sysfn::StaticContext;
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
@@ -708,4 +711,114 @@ fn select_assign_over_a_negative_top_answers_127() {
         )],
     };
     assert_eq!(run_err(&mut session, &stmt).number, 127);
+}
+
+// ---------------------------------------------------------------------------------------
+// A statement the binder left unbound
+// ---------------------------------------------------------------------------------------
+
+/// A statement kept as it was parsed, the shape the binder leaves in a branch or in a loop
+/// body for a name the catalogue did not hold.
+fn deferred(text: &str) -> PhysicalStatement {
+    vauban_sysfn::register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+    PhysicalStatement::Deferred(Box::new(DeferredStatement {
+        text: Arc::from(text),
+        statement: Box::new(batch.statements[0].clone()),
+        database: "master".to_owned(),
+        default_schema: "dbo".to_owned(),
+        line: 1,
+    }))
+}
+
+/// An `IF` over `taken` whose branch holds `stmt`.
+fn if_over(taken: bool, stmt: PhysicalStatement) -> PhysicalStatement {
+    PhysicalStatement::If {
+        condition: eq(int_lit(1), int_lit(if taken { 1 } else { 0 })),
+        then_: Box::new(stmt),
+        else_: None,
+    }
+}
+
+/// A block reaching a statement left unbound binds it, plans it and runs it: the rows
+/// arrive as they would have from a statement bound with the block.
+#[test]
+fn a_deferred_statement_binds_when_the_block_reaches_it() {
+    let mut session = new_session();
+    let stmt = PhysicalStatement::Block(vec![deferred("SELECT 1;")]);
+    let (_, sink) = run(&mut session, &stmt);
+    assert_eq!(sink.rows, vec![vec![Value::I32(1)]], "{sink:?}");
+}
+
+/// A branch that is not taken never binds the statement it holds, and the same statement
+/// in the branch that **is** taken answers the error its binding raises.
+///
+/// The pair is what separates "not bound" from "bound and silent": `SELECT @nope` reads a
+/// variable no `DECLARE` entered, which is error 137 at binding time.
+#[test]
+fn a_branch_that_is_not_taken_never_binds_its_statement() {
+    let mut session = new_session();
+    let (outcome, sink) = run(&mut session, &if_over(false, deferred("SELECT @nope;")));
+    assert!(matches!(outcome, ExecOutcome::NoRows), "{outcome:?}");
+    assert!(sink.rows.is_empty(), "{sink:?}");
+
+    let mut session = new_session();
+    let error = run_err(&mut session, &if_over(true, deferred("SELECT @nope;")));
+    assert_eq!(error.number, 137, "{error:?}");
+}
+
+/// A statement left unbound in the body of a loop runs on every turn.
+#[test]
+fn a_deferred_statement_in_a_loop_runs_on_every_turn() {
+    let mut session = new_session();
+    declare(&mut session, "@i", int_ty(), Some(int_lit(0)));
+    let stmt = PhysicalStatement::While {
+        condition: lt(var_ref("@i"), int_lit(3)),
+        body: Box::new(PhysicalStatement::Block(vec![
+            PhysicalStatement::SetVariable {
+                name: "@i".to_owned(),
+                value: add(var_ref("@i"), int_lit(1)),
+                subplans: Vec::new(),
+            },
+            deferred("SELECT 1;"),
+        ])),
+    };
+    let (_, sink) = run(&mut session, &stmt);
+    assert_eq!(sink.rows.len(), 3, "{sink:?}");
+}
+
+/// A statement bound this late reads the variables the session holds when it is reached,
+/// so a `DECLARE` written before the block is in scope.
+#[test]
+fn a_deferred_statement_reads_a_variable_declared_before_it() {
+    let mut session = new_session();
+    declare(&mut session, "@v", int_ty(), Some(int_lit(7)));
+    let stmt = PhysicalStatement::Block(vec![deferred("SELECT @v;")]);
+    let (_, sink) = run(&mut session, &stmt);
+    assert_eq!(sink.rows, vec![vec![Value::I32(7)]], "{sink:?}");
+}
+
+/// The compile-time checks run on what the binding produced, for the shapes that reach no
+/// other caller: `PRINT` is run by this file and by nothing else, and its folded negative
+/// length answers **536**, the compile-time number, where the same value computed at run
+/// time answers 537 (`compile.rs`, module header).
+///
+/// 536 against 537 is what separates "checked before it runs" from "checked while it
+/// runs" here; the query below is the neighbouring shape, whose 127 the caller of a query
+/// would have raised anyway.
+#[test]
+fn a_deferred_statement_gets_the_compile_time_checks() {
+    let mut session = new_session();
+    let error = run_err(
+        &mut session,
+        &if_over(true, deferred("PRINT SUBSTRING('abc', 1, 0 - 1);")),
+    );
+    assert_eq!(error.number, 536, "{error:?}");
+
+    let mut session = new_session();
+    let error = run_err(
+        &mut session,
+        &if_over(true, deferred("SELECT TOP (0 - 1) 1;")),
+    );
+    assert_eq!(error.number, 127, "{error:?}");
 }

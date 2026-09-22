@@ -388,6 +388,10 @@ fn statement_reads_user_table(bound: &PhysicalStatement) -> bool {
         | PhysicalStatement::Print(_)
         | PhysicalStatement::Transaction(_)
         | PhysicalStatement::Execute(_) => false,
+        // A statement that is not bound yet gets its plan when the control of flow
+        // reaches it (`vauban_executor`, `control.rs`), and the tables it names are
+        // resolved there.
+        PhysicalStatement::Deferred(_) => false,
     }
 }
 

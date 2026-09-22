@@ -262,6 +262,33 @@ pub(crate) fn at_statement(err: SqlError, line: u32) -> SqlError {
     err.with_line(line)
 }
 
+/// The line the **first statement held** by `stmt` starts on, for the three statements
+/// that hold statements, and `None` for the others.
+///
+/// What it is read for: an error the executor lines at or after that line keeps that
+/// line, it was raised by a statement the `IF`, the `WHILE` or the `BEGIN … END` holds; an
+/// error of the **condition** arrives with no line of its own (the executor clears it,
+/// `crates/vauban-executor/src/control.rs`, `condition_error`), so [`at_statement`] puts
+/// the enclosing statement's line on it, a condition folded onto the line of its first
+/// held statement included. Both halves are fixed by `tests/run_batch_pipeline.rs`,
+/// `an_error_of_a_condition_carries_the_line_of_the_statement_that_holds_it` and
+/// `an_error_of_a_branch_keeps_the_line_the_executor_gave_it`.
+///
+/// The line kept is the line of the failing sub-expression, which parts company with the
+/// line the statement starts on as soon as the statement spans two: `IF 1 = 1` followed by
+/// a `SELECT` on one line and its `1 / 0` on the next answers the line of the `1 / 0`
+/// (`a_branch_statement_over_two_lines_answers_the_line_of_the_fault`).
+pub(crate) fn first_held_statement_line(stmt: &Statement) -> Option<u32> {
+    match stmt {
+        Statement::If { then_branch, .. } => Some(statement_span(then_branch).line),
+        Statement::While { body, .. } => Some(statement_span(body).line),
+        Statement::Block { statements, .. } => {
+            statements.first().map(|first| statement_span(first).line)
+        }
+        _ => None,
+    }
+}
+
 /// The text of `stmt` as the client wrote it, cut out of the batch by the span of the
 /// statement, or re-rendered from the AST when the variant carries no span this function
 /// knows.

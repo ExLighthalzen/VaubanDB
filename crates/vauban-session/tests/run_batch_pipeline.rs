@@ -841,6 +841,253 @@ fn a_deferred_statement_posts_its_row_count_and_reads_the_variables_before_it() 
 }
 
 // ---------------------------------------------------------------------------------------
+// A statement of a branch or of a loop body waits for the control of flow
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_branch_that_is_not_taken_does_not_look_for_its_table() {
+    // Nothing in this batch creates `dbo.never`, and nothing needs to: the branch is not
+    // taken, so the name is never resolved. Both `SELECT`s answer, in order, and no error
+    // reaches the sink.
+    let events = run("SELECT 1; IF 1 = 0 SELECT * FROM dbo.never; SELECT 2;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(1)], vec![Value::I32(2)]],
+        "{events:#?}"
+    );
+    assert_eq!(result_sets(&events), 2, "{events:#?}");
+}
+
+#[test]
+fn a_block_creates_the_table_it_then_writes_to() {
+    // The shape of a migration script: the `INSERT` of the block names a table the
+    // `CREATE TABLE` of the same block creates, and the `SELECT` after the `IF` reads it.
+    let events = run(
+        "IF OBJECT_ID('dbo.b1') IS NULL BEGIN CREATE TABLE dbo.b1 (a int); \
+         INSERT dbo.b1 VALUES (1); END; SELECT * FROM dbo.b1;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+}
+
+#[test]
+fn a_block_at_the_head_of_the_batch_creates_then_writes() {
+    // `BEGIN … END` written first, with no `IF` around it.
+    let events = run(
+        "BEGIN CREATE TABLE dbo.b3 (a int); INSERT dbo.b3 VALUES (7); END; SELECT a FROM dbo.b3;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(7)]], "{events:#?}");
+}
+
+#[test]
+fn a_while_body_writes_to_the_table_its_first_turn_created() {
+    // The loop creates the table on its first turn and writes on every turn, so the
+    // `INSERT` is bound again against the catalogue of each turn.
+    let events = run("DECLARE @i int = 0; WHILE @i < 2 BEGIN SET @i = @i + 1; \
+         IF @i = 1 CREATE TABLE dbo.b4 (a int); \
+         INSERT dbo.b4 VALUES (@i); END; SELECT a FROM dbo.b4 ORDER BY a;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(1)], vec![Value::I32(2)]],
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn a_nested_if_creates_the_table_the_batch_then_reads() {
+    let events = run(
+        "IF 1 = 1 BEGIN IF OBJECT_ID('dbo.b5') IS NULL BEGIN CREATE TABLE dbo.b5 (a int); \
+         INSERT dbo.b5 VALUES (3); END END; SELECT a FROM dbo.b5;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(3)]], "{events:#?}");
+}
+
+#[test]
+fn an_else_branch_is_looked_up_only_when_it_is_taken() {
+    // The `ELSE` names a table nothing creates. Not taken, the batch runs through; taken,
+    // 208 falls on the line of the statement the `ELSE` holds, not on the line of the
+    // `IF`, and the batch stops there (208 is batch-scoped).
+    let events = run("IF 1 = 1\n  SELECT 10;\nELSE\n  SELECT * FROM dbo.b6;\nSELECT 11;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(10)], vec![Value::I32(11)]],
+        "{events:#?}"
+    );
+
+    let events = run("IF 1 = 0\n  SELECT 10;\nELSE\n  SELECT * FROM dbo.b6;\nSELECT 11;");
+    let error = only_error(&events);
+    assert_eq!(error.number, 208, "{events:#?}");
+    assert_eq!(error.line, 4, "{events:#?}");
+    assert!(rows(&events).is_empty(), "{events:#?}");
+}
+
+#[test]
+fn a_branch_that_is_taken_over_a_table_nothing_creates_is_208_at_run_time() {
+    // The `SELECT 1` before it has produced its result set, so 208 fell while the batch
+    // ran; it carries the line of the statement the branch holds, and the `SELECT 2`
+    // after it does not run.
+    let events = run("SELECT 1;\nIF 1 = 1\n  SELECT * FROM dbo.b7;\nSELECT 2;");
+    let error = only_error(&events);
+    assert_eq!(error.number, 208, "{events:#?}");
+    assert_eq!(error.line, 3, "{events:#?}");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+}
+
+#[test]
+fn a_branch_that_fails_on_another_number_still_stops_the_batch_before_it_runs() {
+    // The counter-proof of the pair: the table is there and the column is not, so 207
+    // falls while the batch is compiled. The branch is not taken and the `SELECT 1`
+    // before it produces nothing, which is what separates a compilation error from the
+    // 208 above.
+    let mut session = session();
+    let (_, result) = run_on(&mut session, "CREATE TABLE dbo.b8 (a int);");
+    result.expect("the setup batch reports through the sink");
+    let (events, result) = run_on(
+        &mut session,
+        "SELECT 1;\nIF 1 = 0\n  SELECT nosuch FROM dbo.b8;\nSELECT 2;",
+    );
+    result.expect("the batch reports through the sink");
+    let error = only_error(&events);
+    assert_eq!(error.number, 207, "{events:#?}");
+    assert_eq!(error.line, 3, "{events:#?}");
+    assert_eq!(result_sets(&events), 0, "{events:#?}");
+}
+
+#[test]
+fn an_error_of_a_branch_keeps_the_line_the_executor_gave_it() {
+    // The `IF` starts on line 2 and holds a `SELECT` on line 3. The divide by zero is
+    // answered on line 3, the line of the statement the branch holds, and the batch goes
+    // on (8134 is statement-scoped).
+    let events = run("SELECT 1;\nIF 1 = 1\n  SELECT 1 / 0;\nSELECT 2;");
+    let error = only_error(&events);
+    assert_eq!(error.number, 8134, "{events:#?}");
+    assert_eq!(error.line, 3, "{events:#?}");
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(1)], vec![Value::I32(2)]],
+        "{events:#?}"
+    );
+
+    // The counter-proof: the same divide by zero written as a statement of its own, over
+    // two lines, is answered on the line the **statement** starts on. The two shapes hold
+    // the fault on the same line, so the line that changes is the rule.
+    let events = run("SELECT 1;\nSELECT\n  1 / 0;\nSELECT 2;");
+    let error = only_error(&events);
+    assert_eq!(error.number, 8134, "{events:#?}");
+    assert_eq!(error.line, 2, "{events:#?}");
+}
+
+#[test]
+fn an_error_of_a_condition_carries_the_line_of_the_statement_that_holds_it() {
+    // The condition is evaluated before the branch, and it belongs to the `IF`: the
+    // divide by zero of a condition written on line 3 is answered on line 2, where the
+    // `IF` starts, and the batch goes on. The three shapes below are the condition of an
+    // `IF`, the condition of a `WHILE` and a conversion that fails in a condition.
+    let events = run("SELECT 1;\nIF\n  1 / 0 = 1\n  SELECT 2;\nSELECT 3;");
+    let error = only_error(&events);
+    assert_eq!(error.number, 8134, "{events:#?}");
+    assert_eq!(error.line, 2, "{events:#?}");
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(1)], vec![Value::I32(3)]],
+        "{events:#?}"
+    );
+
+    let events = run("SELECT 1;\nWHILE\n  1 / 0 = 1\n  SELECT 2;\nSELECT 3;");
+    let error = only_error(&events);
+    assert_eq!(error.number, 8134, "{events:#?}");
+    assert_eq!(error.line, 2, "{events:#?}");
+
+    let events = run("SELECT 1;\nIF\n  CONVERT(int, 'abc') = 1\n  SELECT 2;");
+    let error = only_error(&events);
+    assert_eq!(error.number, 245, "{events:#?}");
+    assert_eq!(error.line, 2, "{events:#?}");
+
+    // A condition folded onto the line of the statement it holds is still the condition:
+    // the divide by zero written on line 3, next to the `SELECT 2`, is answered on line 2.
+    for batch in [
+        "SELECT 1;\nIF 1 = 1 AND\n  1 / 0 = 1 SELECT 2;\nSELECT 3;",
+        "SELECT 1;\nWHILE 1 = 1 AND\n  1 / 0 = 1 SELECT 2;\nSELECT 3;",
+        "SELECT 1;\nIF 1 = 1 AND\n  1 / 0 = 1 BEGIN SELECT 2; END\nSELECT 3;",
+    ] {
+        let events = run(batch);
+        let error = only_error(&events);
+        assert_eq!(error.number, 8134, "{batch}: {events:#?}");
+        assert_eq!(error.line, 2, "{batch}: {events:#?}");
+    }
+}
+
+#[test]
+fn a_branch_statement_over_two_lines_answers_the_line_of_the_fault() {
+    // What the rule above keeps is the line the executor put on the error, which is the
+    // line of the failing sub-expression: a branch statement starting on line 3 whose
+    // `1 / 0` is written on line 4 is answered on line 4. The line a statement of its own
+    // is answered on, line 2 in the counter-proof of
+    // `an_error_of_a_branch_keeps_the_line_the_executor_gave_it`, is the statement's.
+    let events = run("SELECT 1;\nIF 1 = 1\n  SELECT\n    1 / 0;\nSELECT 3;");
+    let error = only_error(&events);
+    assert_eq!(error.number, 8134, "{events:#?}");
+    assert_eq!(error.line, 4, "{events:#?}");
+}
+
+#[test]
+fn a_create_index_and_an_alter_table_in_a_block_wait_for_the_table() {
+    // 1088 and 4902 name a missing table the way 208 does, in a block as at the head of a
+    // batch: both statements of the block are bound after the `CREATE TABLE` before them
+    // has run.
+    let events = run(
+        "BEGIN CREATE TABLE dbo.b9 (a int); CREATE INDEX ix_b9 ON dbo.b9 (a); \
+         ALTER TABLE dbo.b9 ADD b int; END; INSERT dbo.b9 (a, b) VALUES (1, 2); \
+         SELECT a, b FROM dbo.b9;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(1), Value::I32(2)]],
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn a_statement_of_a_block_reads_a_variable_declared_before_the_block() {
+    let events = run(
+        "DECLARE @v int = 42; IF OBJECT_ID('dbo.b10') IS NULL BEGIN \
+         CREATE TABLE dbo.b10 (a int); INSERT dbo.b10 VALUES (@v); END; SELECT a FROM dbo.b10;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(42)]], "{events:#?}");
+}
+
+// ---------------------------------------------------------------------------------------
 // `SET` statements
 // ---------------------------------------------------------------------------------------
 

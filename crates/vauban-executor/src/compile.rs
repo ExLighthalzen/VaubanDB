@@ -239,6 +239,10 @@ pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult
         // transaction gate (`ddl.rs`). A `USE` is the same: `session` acts on it after
         // the statement runs.
         PhysicalStatement::Ddl(_) | PhysicalStatement::Use { .. } => Ok(()),
+        // Nothing to check either: the statement is not bound yet, so its expressions are
+        // not built. Whoever binds it runs these checks on what comes out (`control.rs`,
+        // `run_deferred`).
+        PhysicalStatement::Deferred(_) => Ok(()),
         PhysicalStatement::Insert(insert) => compile_plan(&insert.source, ctx),
         PhysicalStatement::SelectInto(select_into) => compile_plan(&select_into.source, ctx),
         PhysicalStatement::Update(update) => {

@@ -135,7 +135,8 @@ fn dispatch<'a>(
         | PhysicalStatement::Break
         | PhysicalStatement::Continue
         | PhysicalStatement::Return(_)
-        | PhysicalStatement::Print(_) => control::execute(stmt, ctx, sink),
+        | PhysicalStatement::Print(_)
+        | PhysicalStatement::Deferred(_) => control::execute(stmt, ctx, sink),
         PhysicalStatement::Transaction(txn) => txn_exec::execute(txn, ctx),
         PhysicalStatement::Execute(stmt) => crate::execute::execute(stmt, ctx),
     }

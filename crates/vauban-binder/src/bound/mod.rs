@@ -10,7 +10,10 @@
 //! (`f32`/`f64`). Tests compare the shape of a plan by pattern matching, not by `==`.
 //! The two small operator enums, [`CompareOp`] and [`LogicalOp`], do derive the full set.
 
+use std::sync::Arc;
+
 use vauban_catalog::{AlterTable, ColumnId, IndexDef, QualifiedName, TableDef, TableId};
+use vauban_parser::Statement;
 use vauban_sysfn::FunctionDef;
 use vauban_types::{BinaryOp, Collation, TypeInfo, Value};
 
@@ -119,6 +122,35 @@ pub enum BoundStatement {
     Execute(BoundExecute),
     /// `BEGIN`, `COMMIT`, `ROLLBACK` and `SAVE TRANSACTION`..
     Transaction(TxnStatement),
+    /// A statement of a branch or of a loop body that names a table the catalogue does not
+    /// hold: kept as it was parsed, to be bound when the control of flow reaches it.
+    ///
+    /// Produced by `control.rs` for a statement written inside `IF`, `WHILE` or
+    /// `BEGIN … END`, and by nothing else: a statement written at the head of a batch that
+    /// names a missing table is still a binding error, which the caller answers as it sees
+    /// fit (`tests/bind_control_flow.rs`,
+    /// `a_head_statement_over_a_missing_table_is_still_208`).
+    Deferred(Box<DeferredStatement>),
+}
+
+/// A statement kept as it was parsed, with what binding it takes besides the catalogue.
+///
+/// The fields are the parts of a [`BindContext`](crate::BindContext) that the text alone
+/// cannot give back: whoever binds it later supplies the catalogue of that moment and the
+/// variables in scope, and reads the rest here.
+#[derive(Debug, Clone)]
+pub struct DeferredStatement {
+    /// Text the spans of `statement` index into, so an error carries the line and the
+    /// `near '…'` it would have carried at the first attempt.
+    pub text: Arc<str>,
+    /// The statement, as the parser built it.
+    pub statement: Box<Statement>,
+    /// Current database when the enclosing statement was bound.
+    pub database: String,
+    /// Default schema when the enclosing statement was bound.
+    pub default_schema: String,
+    /// Line the first binding attempt reported, put on a later error whose own line is 0.
+    pub line: u32,
 }
 
 /// One `@x <type> [= e]` of a `DECLARE`, bound.

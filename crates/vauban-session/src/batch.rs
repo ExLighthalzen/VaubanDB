@@ -152,8 +152,9 @@ use crate::set_options::{SetOutcome, apply_set_statement};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
 use crate::statements::{
-    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, next_rowcount, statement_clears_last_error,
-    statement_fragment, statement_line, statement_span, statement_text, use_name_line,
+    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, first_held_statement_line, next_rowcount,
+    statement_clears_last_error, statement_fragment, statement_line, statement_span,
+    statement_text, use_name_line,
 };
 use crate::txn_session::{self, StatementTxn};
 use vauban_binder::{
@@ -258,6 +259,11 @@ enum PreparedStatement {
     Bound {
         statement: PhysicalStatement,
         line: u32,
+        /// Line the first statement held by an `IF`, a `WHILE` or a `BEGIN … END` starts
+        /// on, and `None` for the other statements
+        /// ([`first_held_statement_line`]). Read by [`Session::run_prepared`] to tell an
+        /// error raised by a held statement from one raised by the condition.
+        held_from: Option<u32>,
     },
     /// A `USE` whose target was **found** in the catalogue while the batch was bound: a
     /// name that is not there raises 911 at that moment and no statement of the batch
@@ -567,6 +573,7 @@ impl Session {
         Ok(PreparedStatement::Bound {
             statement: physical,
             line,
+            held_from: first_held_statement_line(statement),
         })
     }
 
@@ -779,13 +786,17 @@ impl Session {
 
         // A `USE` is a `Bound` statement with one thing more: the name its ENVCHANGE and its
         // INFO 5701 carry, resolved against the catalogue while the batch was bound.
-        let (bound, line, target) = match prepared {
-            PreparedStatement::Bound { statement, line } => (statement, *line, None),
+        let (bound, line, held_from, target) = match prepared {
+            PreparedStatement::Bound {
+                statement,
+                line,
+                held_from,
+            } => (statement, *line, *held_from, None),
             PreparedStatement::Use {
                 statement,
                 database,
                 line,
-            } => (statement, *line, Some(database.as_str())),
+            } => (statement, *line, None, Some(database.as_str())),
             PreparedStatement::Set { .. }
             | PreparedStatement::Fallback { .. }
             | PreparedStatement::Deferred { .. }
@@ -925,9 +936,17 @@ impl Session {
             // whether the rest of the batch runs. It is not handed to the fake engine
             // even when it is internal: a cancelled request raises one, and running it again
             // would ignore the ATTENTION. The line the executor put on it is the failing
-            // sub-expression's; SQL Server answers the statement's, and this layer knows it.
+            // sub-expression's; SQL Server answers the statement's, and this layer knows it
+            // — except past `held_from`, where the error was raised by a statement the
+            // `IF`, the `WHILE` or the `BEGIN … END` holds and the executor's line is the
+            // one to keep. An error of the condition reaches this layer with no line (the
+            // executor clears it), so it falls back to the line of the statement the batch
+            // is running ([`first_held_statement_line`]).
             Err(err) => {
-                let err = at_statement(err, line);
+                let err = match held_from {
+                    Some(first) if err.line >= first => err,
+                    _ => at_statement(err, line),
+                };
                 self.state.last_error = err.number;
                 sink.error(&err)?;
                 let continues = more

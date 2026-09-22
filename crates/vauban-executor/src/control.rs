@@ -10,6 +10,25 @@
 //! A `WHILE` reads the cancellation token once per iteration, so an infinite loop ends by
 //! [`ExecOutcome::Cancelled`] and not by waiting.
 //!
+//! # A statement left unbound
+//!
+//! [`PhysicalStatement::Deferred`] is a statement of a branch or of a loop body that the
+//! binder left as it was parsed because it named a table the catalogue did not hold.
+//! [`run_deferred`] binds it, plans it and checks it here, against the catalogue as it
+//! stands when the control of flow reaches it, then runs it like the statement it turned
+//! out to be. Three consequences, each with its test in `tests/control.rs`:
+//!
+//! * a branch that is not taken runs nothing, so what it holds stays unbound
+//!   (`a_branch_that_is_not_taken_never_binds_its_statement`);
+//! * a block that reaches such a statement binds it and hands over its rows
+//!   (`a_deferred_statement_binds_when_the_block_reaches_it`);
+//! * a loop reaches it once per turn
+//!   (`a_deferred_statement_in_a_loop_runs_on_every_turn`).
+//!
+//! A binding that still fails is a run-time error of that statement: it leaves this file
+//! with the number and the line the binder gave it, and the caller decides what the rest
+//! of the batch does.
+//!
 //! # Variables
 //!
 //! `DECLARE` enters the name with `NULL` and its declared type. `SET` evaluates its value
@@ -38,11 +57,16 @@
 //! included (`select_assign_sets_rowcount_to_the_rows_walked`,
 //! `select_assign_over_no_row_sets_rowcount_to_zero`).
 
-use vauban_binder::BoundExpr;
+use std::collections::HashMap;
+
+use vauban_binder::{BindContext, BoundExpr, CatalogView, DeferredStatement, VariableScope};
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
-use vauban_planner::{PhysicalPlan, PhysicalStatement, SubPlan};
+use vauban_planner::{
+    NoIndexes, PhysicalPlan, PhysicalStatement, PlanCatalog, PlanContext, StorageIndexes, SubPlan,
+};
 use vauban_types::{SqlType, TypeInfo, Value, convert, default_display};
 
+use crate::compile::compile;
 use crate::context::{CANCEL_CHECK_ROWS, ExecContext, RowSink};
 use crate::errors::at;
 use crate::expr::eval_expr;
@@ -104,7 +128,7 @@ pub(crate) fn execute<'a>(
             then_,
             else_,
         } => {
-            let value = eval_expr(condition, None, ctx)?;
+            let value = eval_expr(condition, None, ctx).map_err(condition_error)?;
             if matches!(value, Value::Bit(true)) {
                 run_nested(then_, ctx, sink)
             } else if let Some(else_) = else_ {
@@ -118,7 +142,7 @@ pub(crate) fn execute<'a>(
                 if ctx.cancelled() {
                     return Ok(ExecOutcome::Cancelled);
                 }
-                let value = eval_expr(condition, None, ctx)?;
+                let value = eval_expr(condition, None, ctx).map_err(condition_error)?;
                 if !matches!(value, Value::Bit(true)) {
                     break;
                 }
@@ -177,7 +201,77 @@ pub(crate) fn execute<'a>(
             })?;
             Ok(ExecOutcome::NoRows)
         }
+        PhysicalStatement::Deferred(deferred) => run_deferred(deferred, ctx, sink),
         _ => Err(bug("control::execute: not a control-of-flow statement")),
+    }
+}
+
+/// Binds, plans, checks and runs a statement the binder left unbound (module header).
+///
+/// The catalogue is the one `ctx` carries, so a `CREATE TABLE` that ran earlier in the
+/// same block is seen. The compile-time checks run here rather than in [`run_nested`],
+/// which sends a control-of-flow statement straight to [`execute`] without them
+/// (`tests/control.rs`, `a_deferred_statement_gets_the_compile_time_checks`).
+fn run_deferred<'a>(
+    deferred: &DeferredStatement,
+    ctx: &mut ExecContext<'a>,
+    sink: &mut dyn RowSink,
+) -> SqlResult<ExecOutcome> {
+    let statement = bind_and_plan(deferred, ctx)?;
+    compile(&statement, ctx)?;
+    run_nested(&statement, ctx, sink)
+}
+
+/// Binds `deferred` against the catalogue `ctx` carries and plans what comes out.
+///
+/// The variables are the ones the session holds at this moment, so a `DECLARE` written
+/// before the enclosing statement is in scope (`tests/control.rs`,
+/// `a_deferred_statement_reads_a_variable_declared_before_it`). The database, the default
+/// schema and the text the spans index into travel on the statement: they are what the
+/// first binding attempt used.
+fn bind_and_plan(
+    deferred: &DeferredStatement,
+    ctx: &mut ExecContext<'_>,
+) -> SqlResult<PhysicalStatement> {
+    let declared = DeclaredTypes(
+        ctx.session
+            .as_deref()
+            .map(|session| session.variable_types.clone())
+            .unwrap_or_default(),
+    );
+    let snapshot = match (ctx.catalog, ctx.handle) {
+        (Some(catalog), Some(handle)) => Some(catalog.snapshot(handle)),
+        _ => None,
+    };
+    let bind_ctx = BindContext {
+        text: &deferred.text,
+        catalog: snapshot
+            .as_ref()
+            .map(|snapshot| snapshot as &dyn CatalogView),
+        database: &deferred.database,
+        default_schema: &deferred.default_schema,
+        variables: &declared,
+        options: ctx.options,
+    };
+    let bound = vauban_binder::bind(&deferred.statement, &bind_ctx)?;
+    let indexes = ctx.storage.map(StorageIndexes);
+    let catalog: &dyn PlanCatalog = match &indexes {
+        Some(indexes) => indexes,
+        None => &NoIndexes,
+    };
+    vauban_planner::plan(bound, &PlanContext { catalog }).map_err(|error| at(error, deferred.line))
+}
+
+/// The variables in scope for a statement bound at run time: the declared types the
+/// session holds, looked up with `eq_ignore_ascii_case` as the session looks them up.
+struct DeclaredTypes(HashMap<String, TypeInfo>);
+
+impl VariableScope for DeclaredTypes {
+    fn type_of(&self, name: &str) -> Option<TypeInfo> {
+        self.0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, ty)| ty.clone())
     }
 }
 
@@ -202,7 +296,8 @@ fn run_nested<'a>(
         | PhysicalStatement::Break
         | PhysicalStatement::Continue
         | PhysicalStatement::Return(_)
-        | PhysicalStatement::Print(_) => execute(stmt, ctx, sink),
+        | PhysicalStatement::Print(_)
+        | PhysicalStatement::Deferred(_) => execute(stmt, ctx, sink),
         _ => crate::execute(stmt, ctx, sink),
     }
 }
@@ -339,6 +434,16 @@ fn return_code(value: &Value, ty: &TypeInfo, line: u32) -> SqlResult<i32> {
         Value::I32(n) => n,
         _ => 0,
     })
+}
+
+/// An error raised while the condition of an `IF` or a `WHILE` is evaluated belongs to
+/// that statement, not to the sub-expression that failed: its line is cleared here, and the
+/// layer that runs the batch puts the statement's own line on it, whether the condition sits
+/// on its own line or is folded onto the line of the first statement held
+/// (`crates/vauban-session/tests/run_batch_pipeline.rs`,
+/// `an_error_of_a_condition_carries_the_line_of_the_statement_that_holds_it`).
+fn condition_error(err: SqlError) -> SqlError {
+    err.with_line(0)
 }
 
 /// The internal error 50000 for a broken precondition.
