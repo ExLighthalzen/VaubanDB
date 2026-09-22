@@ -107,6 +107,18 @@ pub enum PhysicalStatement {
     Continue,
     /// `RETURN [e]`, the expression being `None` for a bare `RETURN`.
     Return(Option<BoundExpr>),
+    /// `GOTO label`, the name carried across from the bound statement: there is nothing to
+    /// plan, since where the jump lands is a position in a list of statements neither this
+    /// crate nor the executor holds.
+    Goto {
+        /// The label named, as the `GOTO` wrote it.
+        label: String,
+    },
+    /// `label:`, carried across from the bound statement. Runs nothing.
+    Label {
+        /// The name declared, as the label wrote it.
+        name: String,
+    },
     /// `PRINT e`.
     Print(BoundExpr),
     /// `BEGIN`, `COMMIT`, `ROLLBACK` and `SAVE TRANSACTION`.

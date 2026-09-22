@@ -69,6 +69,7 @@ fn all_constructors() -> Vec<SqlError> {
         SqlError::cannot_find_data_type(1, "foo"),
         SqlError::type_does_not_allow_length(1, "sysname"),
         SqlError::must_declare_scalar_variable("@x"),
+        SqlError::goto_label_not_declared("skipit"),
         SqlError::insufficient_result_space_money("smallmoney"),
         SqlError::insufficient_result_space_money("int"),
         SqlError::number_out_of_numeric_range("1234567890123456789012345678901234567.89"),
@@ -1466,6 +1467,22 @@ fn variable_already_declared_is_134() {
         err.message,
         "The variable '@X' is already declared; a batch or a procedure declares each name once."
     );
+}
+
+/// Error 133 for `GOTO skipit;` in a batch whose labels do not declare `skipit:`:
+/// severity 15, state 1, and the name the `GOTO` wrote in the text.
+#[test]
+fn goto_label_not_declared_is_133() {
+    let err = SqlError::goto_label_not_declared("skipit");
+    assert_eq!(err.number, 133);
+    assert_eq!(err.severity, 15);
+    assert_eq!(err.state, 1);
+    assert_eq!(
+        err.message,
+        "GOTO names the label 'skipit', which this batch does not declare."
+    );
+    assert_eq!(err.line, 0);
+    assert_eq!(err.procedure, None);
 }
 
 #[test]

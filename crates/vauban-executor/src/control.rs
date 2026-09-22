@@ -7,6 +7,15 @@
 //! answer what the statement they ran answered, and so pass a `RETURN` or a `BREAK` up the
 //! tree. `BREAK` and `CONTINUE` answer themselves, and their enclosing `WHILE` reads them.
 //!
+//! # A jump out of the tree
+//!
+//! A label runs nothing and answers `NoRows`; a `GOTO` answers
+//! [`ExecOutcome::Goto`] with the name it wrote. Where that name sits is a position in a
+//! list of statements this crate does not hold, so the outcome climbs instead of being
+//! acted upon: the `WHILE` that reads a `BREAK` passes a `Goto` up as it passes a
+//! `RETURN` up, and so does a `BEGIN … END` (`tests/control.rs`,
+//! `a_goto_in_a_block_stops_the_block`, `a_goto_in_a_while_body_leaves_the_loop`).
+//!
 //! A `WHILE` reads the cancellation token once per iteration, so an infinite loop ends by
 //! [`ExecOutcome::Cancelled`] and not by waiting.
 //!
@@ -149,7 +158,9 @@ pub(crate) fn execute<'a>(
                 match run_nested(body, ctx, sink)? {
                     ExecOutcome::Break => break,
                     ExecOutcome::Return(code) => return Ok(ExecOutcome::Return(code)),
-                    flow @ (ExecOutcome::CallProcedure { .. } | ExecOutcome::RunDynamic { .. }) => {
+                    flow @ (ExecOutcome::CallProcedure { .. }
+                    | ExecOutcome::RunDynamic { .. }
+                    | ExecOutcome::Goto(_)) => {
                         return Ok(flow);
                     }
                     ExecOutcome::Cancelled => return Ok(ExecOutcome::Cancelled),
@@ -166,6 +177,7 @@ pub(crate) fn execute<'a>(
                     flow @ (ExecOutcome::Continue
                     | ExecOutcome::Break
                     | ExecOutcome::Return(_)
+                    | ExecOutcome::Goto(_)
                     | ExecOutcome::CallProcedure { .. }
                     | ExecOutcome::RunDynamic { .. }
                     | ExecOutcome::Cancelled
@@ -176,6 +188,8 @@ pub(crate) fn execute<'a>(
         }
         PhysicalStatement::Break => Ok(ExecOutcome::Break),
         PhysicalStatement::Continue => Ok(ExecOutcome::Continue),
+        PhysicalStatement::Goto { label } => Ok(ExecOutcome::Goto(label.clone())),
+        PhysicalStatement::Label { .. } => Ok(ExecOutcome::NoRows),
         PhysicalStatement::Return(expr) => {
             let code = match expr {
                 None => 0,
@@ -295,6 +309,8 @@ fn run_nested<'a>(
         | PhysicalStatement::Block(_)
         | PhysicalStatement::Break
         | PhysicalStatement::Continue
+        | PhysicalStatement::Goto { .. }
+        | PhysicalStatement::Label { .. }
         | PhysicalStatement::Return(_)
         | PhysicalStatement::Print(_)
         | PhysicalStatement::Deferred(_) => execute(stmt, ctx, sink),

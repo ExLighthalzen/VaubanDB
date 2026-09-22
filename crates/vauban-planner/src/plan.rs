@@ -103,6 +103,8 @@ pub fn plan(stmt: BoundStatement, ctx: &PlanContext<'_>) -> SqlResult<PhysicalSt
         BoundStatement::Break => Ok(PhysicalStatement::Break),
         BoundStatement::Continue => Ok(PhysicalStatement::Continue),
         BoundStatement::Return(expr) => Ok(PhysicalStatement::Return(expr)),
+        BoundStatement::Goto { label } => Ok(PhysicalStatement::Goto { label }),
+        BoundStatement::Label { name } => Ok(PhysicalStatement::Label { name }),
         BoundStatement::Print(expr) => Ok(PhysicalStatement::Print(expr)),
         BoundStatement::Transaction(txn) => Ok(PhysicalStatement::Transaction(txn)),
         // Nothing to plan: the statement is not bound yet, and whoever runs it plans it

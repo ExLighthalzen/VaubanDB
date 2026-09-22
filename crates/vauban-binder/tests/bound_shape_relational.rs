@@ -285,12 +285,18 @@ fn every_statement_variant_exists() {
         BoundStatement::Continue,
         BoundStatement::Return(None),
         BoundStatement::Print(literal()),
+        BoundStatement::Goto {
+            label: "again".to_owned(),
+        },
+        BoundStatement::Label {
+            name: "again".to_owned(),
+        },
         BoundStatement::Transaction(TxnStatement::Begin {
             name: Some("t".to_owned()),
             mark: None,
         }),
     ];
-    assert_eq!(values.len(), 14, "one value per variant");
+    assert_eq!(values.len(), 16, "one value per variant");
     let mut matched = 0;
     for value in &values {
         matched += match value {
@@ -307,6 +313,8 @@ fn every_statement_variant_exists() {
             | BoundStatement::Continue
             | BoundStatement::Return(_)
             | BoundStatement::Print(_) => 1,
+            BoundStatement::Goto { label } => usize::from(label == "again"),
+            BoundStatement::Label { name } => usize::from(name == "again"),
             BoundStatement::Transaction(TxnStatement::Begin { name, .. }) => {
                 usize::from(name.as_deref() == Some("t"))
             }

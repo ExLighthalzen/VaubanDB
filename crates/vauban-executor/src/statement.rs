@@ -134,6 +134,8 @@ fn dispatch<'a>(
         | PhysicalStatement::Block(_)
         | PhysicalStatement::Break
         | PhysicalStatement::Continue
+        | PhysicalStatement::Goto { .. }
+        | PhysicalStatement::Label { .. }
         | PhysicalStatement::Return(_)
         | PhysicalStatement::Print(_)
         | PhysicalStatement::Deferred(_) => control::execute(stmt, ctx, sink),

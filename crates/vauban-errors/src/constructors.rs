@@ -1503,6 +1503,17 @@ impl SqlError {
         from_catalog(135, 1, &[])
     }
 
+    /// Error 133, severity 15, state 1 (`GOTO skipit;` in a batch whose labels do not
+    /// declare `skipit:`): a `GOTO` names a label the batch does not declare. `label` is
+    /// the name the `GOTO` wrote, as written.
+    ///
+    /// ```text
+    /// GOTO names the label 'skipit', which this batch does not declare.
+    /// ```
+    pub fn goto_label_not_declared(label: &str) -> Self {
+        from_catalog(133, 1, &[Arg::Str(label)])
+    }
+
     /// Error 136, severity 15, state 1 (`CONTINUE;` outside a `WHILE`): a CONTINUE
     /// statement written where no WHILE encloses it.
     ///

@@ -1,14 +1,19 @@
 //! Geometry of one statement inside the text that carries it: its span, the source
 //! fragment it owns, the line it starts on, the line the name of a `USE` starts on, and
-//! the line an error leaves with.
+//! the line an error leaves with. The labels of a text and the `GOTO` statements that
+//! name them are read here too: both are positions in the list of statements.
 //!
 //! The three texts a session binds — the batch it receives, the nested text of a
 //! procedure-style call, and the text of a prepared handle — read their statements the
 //! same way, so the answers live here once (`statements/tests/mod.rs`).
 
+use std::collections::HashMap;
+
 use vauban_errors::SqlError;
+use vauban_executor::ExecSession;
 use vauban_parser::Statement;
 use vauban_planner::PhysicalStatement;
+use vauban_types::Value;
 
 #[cfg(test)]
 mod tests;
@@ -43,11 +48,18 @@ pub(crate) const USE_KEYWORD_LEN: usize = "USE".len();
 /// Whether a successful statement resets `@@ERROR` to `0`. A bare `DECLARE` with no
 /// initializer on any item leaves the previous error in place
 /// (`tests/session_variables.rs`, `last_error_is_cleared_by_a_successful_statement`).
+///
+/// A `GOTO` and a label leave it in place too: `SELECT 1 / 0;` followed by a label and a
+/// `SELECT @@ERROR;` answers 8134, and so does the same with a `GOTO` between the two
+/// (`tests/run_batch_pipeline.rs`, `a_goto_and_a_label_leave_the_last_error_alone`). A
+/// `PRINT` in their place clears it, which is what tells the rule from "nothing clears it
+/// here" (`a_print_between_the_two_clears_it`, same file).
 pub(crate) fn statement_clears_last_error(stmt: &PhysicalStatement) -> bool {
     match stmt {
         PhysicalStatement::Declare(declarations) => declarations
             .iter()
             .all(|declaration| declaration.value.is_some()),
+        PhysicalStatement::Goto { .. } | PhysicalStatement::Label { .. } => false,
         _ => true,
     }
 }
@@ -74,6 +86,13 @@ pub(crate) fn statement_clears_last_error(stmt: &PhysicalStatement) -> bool {
 /// (`tests/run_batch_pipeline.rs`, `select_assign_from_rows_sets_rowcount_to_the_rows_walked`
 /// and `select_assign_over_no_row_sets_rowcount_to_zero`).
 ///
+/// A `GOTO` and a label count no row and leave `previous` where it was, as a bare
+/// `DECLARE` does: a `SELECT` of two rows followed by a label and a `SELECT @@ROWCOUNT;`
+/// answers `2`, and a `SELECT` of three rows read through a `GOTO` answers `3`
+/// (`tests/run_batch_pipeline.rs`, `a_goto_and_a_label_leave_the_row_count_alone`). A
+/// `PRINT` written in their place answers `0`, which separates this rule from "the count
+/// survives anything" (`a_print_between_the_two_puts_the_row_count_back_to_zero`).
+///
 /// Any other statement reads `from_exec` unchanged: `0` unless a nested `SET` changed it,
 /// the shape this already gives `IF` on its own (`ExecSession::rowcount` starts at `0` for
 /// the statement as a whole, so a false condition and a taken branch that assigns nothing
@@ -92,6 +111,7 @@ pub(crate) fn next_rowcount(stmt: &PhysicalStatement, previous: i64, from_exec: 
             }
         }
         PhysicalStatement::While { .. } => 0,
+        PhysicalStatement::Goto { .. } | PhysicalStatement::Label { .. } => previous,
         _ => from_exec,
     }
 }
@@ -287,6 +307,117 @@ pub(crate) fn first_held_statement_line(stmt: &Statement) -> Option<u32> {
         }
         _ => None,
     }
+}
+
+/// Enters the variables of `stmt` with no value when `stmt` is a `DECLARE`, leaving a name
+/// already entered as it stands; does nothing for any other statement.
+///
+/// What it is for: a variable of a text belongs to the whole text, not to the place its
+/// `DECLARE` is written, so a statement that reads it after a `GOTO` jumped over that
+/// `DECLARE` reads `NULL` and may be assigned to (`tests/run_batch_pipeline.rs`,
+/// `a_goto_over_a_declare_leaves_the_variable_at_null` and
+/// `a_variable_whose_declare_was_jumped_over_can_still_be_assigned`, and, in a batch bound
+/// one statement at a time because it holds an `ALTER TABLE`,
+/// `a_goto_over_a_declare_in_a_batch_with_an_alter_table_still_declares_it`). The jump
+/// enters the names it stepped over once they are bound; running the `DECLARE` itself is
+/// what gives them their initial value, which is why a name already entered keeps what it
+/// holds.
+pub(crate) fn declare_variables_of(stmt: &PhysicalStatement, exec: &mut ExecSession) {
+    let PhysicalStatement::Declare(declarations) = stmt else {
+        return;
+    };
+    for declaration in declarations {
+        exec.variables
+            .entry(declaration.name.clone())
+            .or_insert(Value::Null);
+        exec.variable_types
+            .entry(declaration.name.clone())
+            .or_insert_with(|| declaration.ty.clone());
+    }
+}
+
+/// The labels `statements` declares, from the name folded to lower case to the index of
+/// the `label:` statement itself.
+///
+/// The index is the label's own, not the one of the statement after it: a jump that lands
+/// on a label runs it, which does nothing, and the loop that runs the batch goes on with
+/// the next statement.
+///
+/// A label written **inside** an `IF`, a `WHILE` or a `BEGIN … END` is not in the table.
+/// The loop steps over the statements of this list and holds no position inside one of
+/// them, so a `GOTO` that names such a label is answered 133 (`tests/run_batch_pipeline.rs`,
+/// `a_goto_to_a_label_inside_a_block_is_133`).
+///
+/// A name declared twice keeps the first declaration (`tests/run_batch_pipeline.rs`,
+/// `a_label_declared_twice_keeps_the_first_declaration`).
+pub(crate) fn batch_labels(statements: &[Statement]) -> HashMap<String, usize> {
+    let mut labels = HashMap::new();
+    for (index, stmt) in statements.iter().enumerate() {
+        if let Statement::Label { name, .. } = stmt {
+            labels
+                .entry(name.value.to_ascii_lowercase())
+                .or_insert(index);
+        }
+    }
+    labels
+}
+
+/// The name written by the first `GOTO` of `statements` that names a label `labels` does
+/// not hold, in written order, `None` when each `GOTO` names a label of the table.
+///
+/// The `GOTO` written inside an `IF`, a `WHILE` or a `BEGIN … END` is looked at too: its
+/// jump leaves the statement that holds it, so it is checked against the same table
+/// (`tests/run_batch_pipeline.rs`, `a_goto_in_a_branch_that_is_not_taken_is_still_133`).
+pub(crate) fn first_undeclared_goto<'a>(
+    statements: &'a [Statement],
+    labels: &HashMap<String, usize>,
+) -> Option<&'a str> {
+    statements
+        .iter()
+        .find_map(|stmt| undeclared_goto(stmt, labels))
+}
+
+/// [`first_undeclared_goto`] for one statement and the statements it holds.
+fn undeclared_goto<'a>(stmt: &'a Statement, labels: &HashMap<String, usize>) -> Option<&'a str> {
+    match stmt {
+        Statement::Goto { label, .. } => (!labels.contains_key(&label.value.to_ascii_lowercase()))
+            .then_some(label.value.as_str()),
+        Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => undeclared_goto(then_branch, labels).or_else(|| {
+            else_branch
+                .as_deref()
+                .and_then(|branch| undeclared_goto(branch, labels))
+        }),
+        Statement::While { body, .. } => undeclared_goto(body, labels),
+        Statement::Block { statements, .. } => first_undeclared_goto(statements, labels),
+        // The other statements hold no statement, so they hold no `GOTO` either.
+        _ => None,
+    }
+}
+
+/// The 1-based number of the last line of `text`, which is the line 133 leaves on.
+///
+/// Neither the line of the `GOTO` nor the line of the last statement: a trailing blank
+/// line and a trailing comment both push the answer past the last statement, which is
+/// what tells the three readings apart.
+///
+/// | text | `GOTO` | last statement | answer |
+/// |---|:-:|:-:|:-:|
+/// | `GOTO nowhere;` / `SELECT 1;` | 1 | 2 | **2** |
+/// | `GOTO nowhere;` / `SELECT 1;` / `` / `-- a comment` | 1 | 2 | **4** |
+/// | `GOTO nowhere;` / `SELECT` / `  1;` | 1 | 2 | **3** |
+/// | `GOTO nowhere;` | 1 | 1 | **1** |
+///
+/// The four shapes are run end to end by `tests/run_batch_pipeline.rs`,
+/// `the_line_of_133_is_the_last_line_of_the_batch`; a text that ends with a newline ends
+/// on the line that newline closes, not on an empty line after it.
+pub(crate) fn last_line(text: &str) -> u32 {
+    let counted = text.strip_suffix('\n').unwrap_or(text);
+    let breaks = u32::try_from(counted.matches('\n').count()).unwrap_or(u32::MAX);
+    breaks.saturating_add(1)
 }
 
 /// The text of `stmt` as the client wrote it, cut out of the batch by the span of the

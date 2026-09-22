@@ -1520,3 +1520,362 @@ fn select_assign_sends_no_result_set() {
     assert_eq!(announced, 1, "{events:#?}");
     assert_eq!(rows(&events), vec![vec![Value::I32(1)]]);
 }
+
+// ---------------------------------------------------------------------------------------
+// GOTO: the jump, the labels of the batch, and 133
+// ---------------------------------------------------------------------------------------
+
+/// A `GOTO` written before its label runs the statement at the label next, so the
+/// statements between the two do not run: `@i` keeps the value it was declared with.
+#[test]
+fn a_goto_jumps_forward_over_the_statements_it_skips() {
+    let events = run("DECLARE @i int = 0; GOTO skipit; SET @i = 99; skipit: SELECT @i;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(0)]]);
+}
+
+/// A `GOTO` written after its label runs the batch from that label again, which is how a
+/// batch loops without a `WHILE`: three turns of the `SET` before the condition is false.
+#[test]
+fn a_goto_jumps_backward_and_the_batch_loops() {
+    let events =
+        run("DECLARE @i int = 0; again: SET @i = @i + 1; IF @i < 3 GOTO again; SELECT @i;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(3)]]);
+}
+
+/// A `GOTO` written inside a `BEGIN … END` jumps to a label of the batch: the rest of the
+/// block does not run, and neither do the statements between the block and the label.
+#[test]
+fn a_goto_written_in_a_block_jumps_to_a_label_of_the_batch() {
+    let events = run(
+        "DECLARE @i int = 0;\nBEGIN SET @i = 1; GOTO after; SET @i = 50; END\nSET @i = 99;\nafter: SELECT @i;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]]);
+}
+
+/// A `GOTO` written as the body of a `WHILE` leaves the loop and jumps: the label sits
+/// before the `WHILE`, so the batch runs the `SET` again and reaches the `WHILE` with a
+/// larger value each turn.
+#[test]
+fn a_goto_in_a_while_body_jumps_out_of_the_loop() {
+    let events = run(
+        "DECLARE @j int = 0; startover: SET @j = @j + 1; WHILE @j < 3 GOTO startover; SELECT @j;",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(3)]]);
+}
+
+/// A label the batch does not declare is 133, severity 15, state 1, and the batch
+/// produces nothing: the statement after the `GOTO` sends no result set, which is what
+/// separates a compilation error from a run-time one.
+#[test]
+fn a_goto_to_an_unknown_label_is_133_and_stops_the_batch() {
+    let events = run("GOTO nowhere;\nSELECT 1;");
+    let err = only_error(&events);
+    assert_eq!(err.number, 133);
+    assert_eq!(err.severity, 15);
+    assert_eq!(err.state, 1);
+    assert_eq!(
+        err.message,
+        "GOTO names the label 'nowhere', which this batch does not declare."
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Columns(_))),
+        "no statement of the batch ran: {events:#?}"
+    );
+    assert_eq!(events.last(), Some(&Event::Done(None, false)));
+}
+
+/// A `GOTO` written in a branch that is not taken is checked all the same: the label is
+/// read from the text of the batch, before its first statement runs.
+#[test]
+fn a_goto_in_a_branch_that_is_not_taken_is_still_133() {
+    let events = run("IF 1 = 0 GOTO nowhere;\nSELECT 1;");
+    let err = only_error(&events);
+    assert_eq!(err.number, 133);
+    assert!(rows(&events).is_empty(), "{events:#?}");
+}
+
+/// The line of 133 is the last line of the batch, not the line of the `GOTO` and not the
+/// line of the last statement: a trailing blank line and a trailing comment both push it
+/// past the last statement, and a last statement spread over two lines answers its second.
+#[test]
+fn the_line_of_133_is_the_last_line_of_the_batch() {
+    for (text, line) in [
+        ("GOTO nowhere;\nSELECT 1;", 2),
+        ("GOTO nowhere;\nSELECT 1;\n\n-- a comment", 4),
+        ("GOTO nowhere;\nSELECT\n  1;", 3),
+        ("GOTO nowhere;", 1),
+    ] {
+        let err = only_error(&run(text));
+        assert_eq!(err.number, 133, "{text:?}");
+        assert_eq!(err.line, line, "{text:?}");
+    }
+}
+
+/// A name declared by two labels keeps the first: the jump lands on it, so the statement
+/// of the second declaration runs after the one of the first. SQL Server refuses the
+/// batch instead, with a number this engine does not raise.
+#[test]
+fn a_label_declared_twice_keeps_the_first_declaration() {
+    let events =
+        run("DECLARE @i int = 0; GOTO l; l: SET @i = @i + 1; l: SET @i = @i + 10; SELECT @i;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(11)]]);
+}
+
+/// The DONE of a `GOTO` carries MORE even when the `GOTO` is the last statement of the
+/// text: the statement at its label runs after it, so it is not the DONE that closes the
+/// response.
+#[test]
+fn a_goto_written_last_still_leaves_more_on_its_done() {
+    let events = run("DECLARE @i int = 0; skip: SET @i = @i + 1; IF @i < 2 GOTO skip;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    let dones: Vec<&Event> = events
+        .iter()
+        .filter(|event| matches!(event, Event::Done(..)))
+        .collect();
+    assert_eq!(
+        dones.last(),
+        Some(&&Event::Done(None, false)),
+        "only the last DONE of the response closes it: {events:#?}"
+    );
+    assert_eq!(
+        dones
+            .iter()
+            .filter(|done| **done == &Event::Done(None, false))
+            .count(),
+        1,
+        "{events:#?}"
+    );
+}
+
+/// A batch that loops on a `GOTO` for ever answers the ATTENTION: the cancellation token
+/// is read between two statements, so the jump comes back to it on every turn.
+///
+/// The counter-proof is the first half: the same jump written so that it ends by itself
+/// runs to its `SELECT` and answers no error, on a session whose token is never raised.
+#[test]
+fn a_batch_that_loops_on_a_goto_answers_the_cancellation() {
+    let bounded =
+        run("DECLARE @i int = 0; again: SET @i = @i + 1; IF @i < 3 GOTO again; SELECT @i;");
+    assert_eq!(rows(&bounded), vec![vec![Value::I32(3)]]);
+
+    let mut session = session();
+    let cancel = session.cancel_handle();
+    let raiser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        cancel.cancel();
+    });
+    let started = Instant::now();
+    let (events, result) = run_on(&mut session, "forever: SELECT 1; GOTO forever;");
+    raiser.join().expect("the token was raised");
+    let err = result.expect_err("a cancelled batch returns the internal error");
+    assert_eq!(err.number, 50000, "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the loop ended on the token, not on a timeout"
+    );
+    assert!(
+        events.iter().any(|event| matches!(event, Event::Row(_))),
+        "the loop ran before the token was raised: {}",
+        events.len()
+    );
+}
+
+/// A dynamic text jumps inside itself: its labels are its own, read from the text the
+/// `EXEC` runs and not from the batch that issued it.
+#[test]
+fn a_goto_of_a_dynamic_text_jumps_inside_that_text() {
+    let events = run("EXEC ('DECLARE @i int = 0; GOTO skipit; SET @i = 99; skipit: SELECT @i;');");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(0)]]);
+}
+
+/// A label the dynamic text does not declare is 133 on the last line of **that** text,
+/// and the batch that issued the `EXEC` runs its next statement: no statement of the text
+/// ran, so nothing there asked the caller to stop.
+#[test]
+fn a_goto_to_an_unknown_label_of_a_dynamic_text_is_133() {
+    let events = run("EXEC ('GOTO nowhere;\nSELECT 1;');\nSELECT 2;");
+    let err = only_error(&events);
+    assert_eq!(err.number, 133);
+    assert_eq!(err.line, 2, "the last line of the dynamic text");
+    assert_eq!(rows(&events), vec![vec![Value::I32(2)]]);
+}
+
+/// A label written inside a `BEGIN … END` is not a label of the batch: the loop that runs
+/// the batch steps over the block as one statement and holds no position inside it, so a
+/// `GOTO` that names it answers 133. SQL Server runs the block from that label instead.
+#[test]
+fn a_goto_to_a_label_inside_a_block_is_133() {
+    let events = run("GOTO inside;\nBEGIN inside: SELECT 1; END");
+    let err = only_error(&events);
+    assert_eq!(err.number, 133);
+    assert!(rows(&events).is_empty(), "{events:#?}");
+}
+
+/// `@@ROWCOUNT` crosses a `GOTO` and a label: neither counts a row, so the count the
+/// statement before them posted is the one the statement after them reads.
+#[test]
+fn a_goto_and_a_label_leave_the_row_count_alone() {
+    let events = run("SELECT 1 UNION ALL SELECT 2;\nlbl: SELECT @@ROWCOUNT;");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(2)]),
+        "{events:#?}"
+    );
+
+    let events = run(
+        "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3;\nGOTO l;\nSELECT 9;\nl: SELECT @@ROWCOUNT;",
+    );
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(3)]),
+        "{events:#?}"
+    );
+
+    // A `DECLARE` with an initial value posts 1, and the jump carries it across.
+    let events = run("DECLARE @i int = 0; GOTO l; l: SELECT @@ROWCOUNT;");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+}
+
+/// The counter-proof of the rule above: a `PRINT` written where the label sits puts the
+/// count back to 0, so what crosses the jump is the pair of statements and not the batch.
+#[test]
+fn a_print_between_the_two_puts_the_row_count_back_to_zero() {
+    let events = run("SELECT 1 UNION ALL SELECT 2;\nPRINT 'x';\nSELECT @@ROWCOUNT;");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(0)]),
+        "{events:#?}"
+    );
+}
+
+/// `@@ERROR` crosses a `GOTO` and a label the same way: the number the failing statement
+/// left is the one the statement after the jump reads.
+#[test]
+fn a_goto_and_a_label_leave_the_last_error_alone() {
+    let events = run("SELECT 1 / 0;\nlbl: SELECT @@ERROR;");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(8134)]),
+        "{events:#?}"
+    );
+
+    let events = run("SELECT 1 / 0;\nGOTO l;\nSELECT 9;\nl: SELECT @@ERROR;");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(8134)]),
+        "{events:#?}"
+    );
+}
+
+/// The counter-proof: a `PRINT` in the place of the label clears `@@ERROR`.
+#[test]
+fn a_print_between_the_two_clears_it() {
+    let events = run("SELECT 1 / 0;\nPRINT 'x';\nSELECT @@ERROR;");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(0)]),
+        "{events:#?}"
+    );
+}
+
+/// A variable belongs to the whole batch: a `DECLARE` the jump stepped over leaves its
+/// name readable, at `NULL`, since the initial value is written by running the `DECLARE`.
+#[test]
+fn a_goto_over_a_declare_leaves_the_variable_at_null() {
+    let events = run("GOTO l;\nDECLARE @z int = 5;\nl: SELECT @z;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::Null]]);
+}
+
+/// A batch that holds an `ALTER TABLE` is bound one statement at a time, so the target of
+/// a jump forward may lie past what is bound when the jump runs: the `DECLARE` stepped over
+/// is entered once the statements up to the target are bound, in the batch and in the text
+/// of an `EXEC` alike, and the variable reads `NULL`.
+#[test]
+fn a_goto_over_a_declare_in_a_batch_with_an_alter_table_still_declares_it() {
+    for batch in [
+        "CREATE TABLE dbo.z1 (a int);\nGOTO l1;\nDECLARE @z int = 5;\nALTER TABLE dbo.z1 ADD b int;\nl1: SELECT @z;",
+        "CREATE TABLE dbo.z2 (a int);\nGOTO l1;\nALTER TABLE dbo.z2 ADD b int;\nDECLARE @z int = 5;\nl1: SELECT @z;",
+        "EXEC ('CREATE TABLE dbo.z3 (a int); GOTO l1; DECLARE @z int = 5; ALTER TABLE dbo.z3 ADD b int; l1: SELECT @z;');",
+    ] {
+        let events = run(batch);
+        assert!(
+            !events.iter().any(|event| matches!(event, Event::Error(_))),
+            "{batch}: {events:#?}"
+        );
+        assert_eq!(rows(&events), vec![vec![Value::Null]], "{batch}");
+    }
+}
+
+/// The same name takes an assignment afterwards, converted to the type its `DECLARE`
+/// wrote, which is the counter-proof that the jump entered the declaration and not just a
+/// value: a name the session does not hold is stored as it was evaluated.
+#[test]
+fn a_variable_whose_declare_was_jumped_over_can_still_be_assigned() {
+    let events = run("GOTO l;\nDECLARE @w int = 5;\nl: SET @w = 9; SELECT @w;");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(9)]]);
+}
+
+/// The three rules hold in the text of an `EXEC` too, which runs its own loop over its own
+/// statements: the count crosses the jump, the error crosses it, and the `DECLARE` stepped
+/// over leaves its name at `NULL`.
+#[test]
+fn a_dynamic_text_keeps_the_count_the_error_and_the_jumped_declare() {
+    let events =
+        run("EXEC ('SELECT 1 UNION ALL SELECT 2; GOTO l; SELECT 9; l: SELECT @@ROWCOUNT;');");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(2)]),
+        "{events:#?}"
+    );
+
+    let events = run("EXEC ('SELECT 1 / 0; GOTO l; l: SELECT @@ERROR;');");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(8134)]),
+        "{events:#?}"
+    );
+
+    let events = run("EXEC ('GOTO l; DECLARE @z int = 5; l: SELECT @z;');");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::Null]]);
+}

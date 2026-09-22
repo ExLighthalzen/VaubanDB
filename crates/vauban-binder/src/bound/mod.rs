@@ -116,6 +116,21 @@ pub enum BoundStatement {
     Continue,
     /// `RETURN [e]`, the expression being `None` for a bare `RETURN`..
     Return(Option<BoundExpr>),
+    /// `GOTO label`: the transfer of control to the label of that name..
+    ///
+    /// The binder resolves nothing here. Which statement the jump lands on is read from
+    /// the list of statements, which the layer that holds the batch owns, so the name
+    /// travels as it was written and is answered back by the execution
+    /// (`tests/bind_control_flow.rs`, `a_goto_binds_to_the_label_it_names`).
+    Goto {
+        /// The label named, as the `GOTO` wrote it.
+        label: String,
+    },
+    /// `label:`, the target of a `GOTO`. Runs nothing..
+    Label {
+        /// The name declared, as the label wrote it.
+        name: String,
+    },
     /// `PRINT e`..
     Print(BoundExpr),
     /// `EXECUTE`: a procedure call or a text, with its arguments.

@@ -23,8 +23,9 @@ use crate::set_options::{SetOutcome, apply_set_statement, sync_exec_session};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
 use crate::statements::{
-    INTERNAL_ERROR, at_statement, next_rowcount, statement_clears_last_error, statement_fragment,
-    statement_line, statement_span, statement_text, use_name_line,
+    INTERNAL_ERROR, at_statement, batch_labels, declare_variables_of, first_undeclared_goto,
+    last_line, next_rowcount, statement_clears_last_error, statement_fragment, statement_line,
+    statement_span, statement_text, use_name_line,
 };
 use crate::txn_session::{self, StatementTxn};
 
@@ -87,6 +88,8 @@ pub(crate) fn nested_done_proc_rowcount(
 enum Flow {
     Continue,
     Stop,
+    /// Go on at the label of this name, which a `GOTO` of this text just named.
+    Jump(String),
 }
 
 /// One statement after compilation-stage checks have succeeded for the nested text.
@@ -220,6 +223,15 @@ impl Session {
         if batch.statements.is_empty() {
             return Ok(());
         }
+        // The labels of a nested text are its own, and so is the 133 of a `GOTO` that
+        // names none of them: it is raised before the first statement of the text runs,
+        // and the caller reads it as the error of the call (`tests/run_batch_pipeline.rs`,
+        // `a_goto_to_an_unknown_label_of_a_dynamic_text_is_133`).
+        let labels = batch_labels(&batch.statements);
+        if let Some(label) = first_undeclared_goto(&batch.statements, &labels) {
+            let err = SqlError::goto_label_not_declared(label).with_line(last_line(text));
+            return self.fail_nested(&err, sink, outcome);
+        }
 
         let (mut prepared, mut bind_state, mut batch_variables) =
             match self.prepare_nested(text, &batch.statements, params, nested_state) {
@@ -233,9 +245,8 @@ impl Session {
             self.cancel_handle().check()?;
             let more = index + 1 < prepared.len();
             let current = &prepared[index];
-            if let Flow::Stop =
-                self.run_nested_prepared(current, more, nested_state, sink, outcome)?
-            {
+            let flow = self.run_nested_prepared(current, more, nested_state, sink, outcome)?;
+            if let Flow::Stop = flow {
                 break;
             }
             let tail_start = index + 1;
@@ -255,7 +266,46 @@ impl Session {
                 prepared.truncate(tail_start);
                 prepared.extend(tail);
             }
-            index += 1;
+            let was = index;
+            index = match flow {
+                // The jump of a nested text lands in that text: the labels of the caller
+                // are not in this table, and a name this table does not hold was answered
+                // 133 before the first statement ran.
+                Flow::Jump(label) => match labels.get(&label.to_ascii_lowercase()) {
+                    Some(target) => *target,
+                    None => {
+                        let err = SqlError::from(InternalError::Bug(format!(
+                            "run_nested_body: no label {label} to jump to"
+                        )));
+                        return self.fail_nested_statement(&err, sink, outcome);
+                    }
+                },
+                _ => index + 1,
+            };
+            while index >= prepared.len() && prepared.len() < batch.statements.len() {
+                let from = prepared.len();
+                let tail = self.reprepare_nested_tail(
+                    text,
+                    &batch.statements[from..],
+                    params,
+                    &mut bind_state,
+                    &mut batch_variables,
+                )?;
+                if tail.is_empty() {
+                    break;
+                }
+                prepared.extend(tail);
+            }
+            // As in the top-level batch: the `DECLARE` a jump stepped over still enters its
+            // names, with no value (`statements.rs`, `declare_variables_of`), once the
+            // statements up to the target are bound (`tests/run_batch_pipeline.rs`,
+            // `a_goto_over_a_declare_in_a_batch_with_an_alter_table_still_declares_it`).
+            let bound_up_to = index.min(prepared.len());
+            for stepped in prepared.get(was + 1..bound_up_to).unwrap_or_default() {
+                if let PreparedStatement::Bound { statement, .. } = stepped {
+                    declare_variables_of(statement, self.exec_mut());
+                }
+            }
         }
         Ok(())
     }
@@ -644,6 +694,21 @@ impl Session {
                 text,
                 line: exec_line,
             }) => self.run_nested_dynamic(&text, exec_line, more, nested_state, sink, outcome),
+            // As in the top-level batch (`batch.rs`, `run_prepared`): the name travels
+            // to the loop that holds the labels of this text.
+            Ok(ExecOutcome::Goto(label)) => {
+                sink.done_in_proc(None, true)?;
+                nested_state.rowcount =
+                    next_rowcount(bound, nested_state.rowcount, self.exec().rowcount);
+                apply_exec_session(
+                    nested_state,
+                    self.exec(),
+                    true,
+                    statement_clears_last_error(bound),
+                );
+                self.exec_mut().identity_updated = false;
+                Ok(Flow::Jump(label))
+            }
             Ok(flow @ (ExecOutcome::Break | ExecOutcome::Continue)) => {
                 let err = SqlError::from(InternalError::Bug(format!(
                     "run_nested_prepared: the executor answered {flow:?}, which this layer does \

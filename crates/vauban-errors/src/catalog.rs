@@ -169,6 +169,11 @@ const CATALOG: &[ErrorDef] = &[
         template: "Size %d of the %S_MSG '%.*ls' is larger than any data type allows (%d).",
     },
     ErrorDef {
+        number: 133,
+        severity: 15,
+        template: "GOTO names the label '%.*ls', which this batch does not declare.",
+    },
+    ErrorDef {
         number: 134,
         severity: 15,
         template: "The variable '%.*ls' is already declared; a batch or a procedure declares each name once.",

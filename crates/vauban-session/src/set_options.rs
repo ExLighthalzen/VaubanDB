@@ -384,6 +384,8 @@ fn statement_reads_user_table(bound: &PhysicalStatement) -> bool {
         | PhysicalStatement::Declare(_)
         | PhysicalStatement::Break
         | PhysicalStatement::Continue
+        | PhysicalStatement::Goto { .. }
+        | PhysicalStatement::Label { .. }
         | PhysicalStatement::Return(_)
         | PhysicalStatement::Print(_)
         | PhysicalStatement::Transaction(_)

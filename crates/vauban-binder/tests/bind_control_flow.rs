@@ -241,24 +241,6 @@ fn return_with_value_outside_procedure_is_178() {
 }
 
 // ---------------------------------------------------------------------------
-// GOTO
-// ---------------------------------------------------------------------------
-
-/// `GOTO label` parses; the binder does not bind it yet and reports the generic internal
-/// error, naming the statement.
-#[test]
-fn goto_is_unsupported_by_the_binder() {
-    let error = err("GOTO foo;");
-    assert_eq!(error.number, 50000, "{}", error.message);
-    assert_eq!(error.severity, 16);
-    assert_eq!(error.state, 1);
-    assert_eq!(
-        error.message,
-        "Internal error: internal bug: GOTO is not implemented yet"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // A statement of a branch or of a loop body over a table the catalogue lacks
 // ---------------------------------------------------------------------------
 
@@ -424,4 +406,60 @@ fn a_condition_of_a_nested_if_is_deferred_with_it() {
     };
     assert_eq!(statements.len(), 1, "{statements:?}");
     assert!(matches!(deferred(&statements[0]), Statement::If { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// GOTO and its labels
+// ---------------------------------------------------------------------------
+
+/// `GOTO again;` binds to [`BoundStatement::Goto`] carrying the name as it was written:
+/// the binder resolves nothing, since where the jump lands is a position in a list of
+/// statements it never sees.
+#[test]
+fn a_goto_binds_to_the_label_it_names() {
+    let stmt = bind_one("GOTO again;");
+    let BoundStatement::Goto { label } = &stmt else {
+        panic!("expected Goto, got {stmt:?}");
+    };
+    assert_eq!(label, "again");
+}
+
+/// `again: SELECT 1;` is two statements: the label, which carries the name it declares,
+/// then the `SELECT`.
+#[test]
+fn a_label_binds_to_the_name_it_declares() {
+    register_builtins();
+    let text = "again: SELECT 1;";
+    let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+    let ctx = BindContext::scalar(text, SessionOptions::default());
+    let bound: Vec<BoundStatement> = batch
+        .statements
+        .iter()
+        .map(|statement| bind(statement, &ctx).expect("both statements bind"))
+        .collect();
+    assert_eq!(bound.len(), 2, "{bound:?}");
+    let BoundStatement::Label { name } = &bound[0] else {
+        panic!("expected Label, got {:?}", bound[0]);
+    };
+    assert_eq!(name, "again");
+    assert!(
+        matches!(&bound[1], BoundStatement::Query(_)),
+        "the statement after the label is the query, got {:?}",
+        bound[1]
+    );
+}
+
+/// A `GOTO` written in a branch binds with the statement that holds it: the name travels
+/// inside the `IF` rather than stopping the binding of the batch.
+#[test]
+fn a_goto_in_a_branch_binds_with_the_branch() {
+    let stmt = bind_one("IF 1 = 1 GOTO again;");
+    let BoundStatement::If { then_, else_, .. } = &stmt else {
+        panic!("expected If, got {stmt:?}");
+    };
+    assert!(else_.is_none(), "no ELSE was written");
+    assert!(
+        matches!(then_.as_ref(), BoundStatement::Goto { label } if label == "again"),
+        "then_ is the Goto, got {then_:?}"
+    );
 }

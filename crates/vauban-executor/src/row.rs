@@ -40,7 +40,7 @@ pub struct RowSet {
 ///
 /// A `SELECT` produces `Rows`, with the number of rows the sink received. `NoRows` is
 /// the answer of the statements without a result set (`USE`, DDL). The outcomes of the
-/// control flow (`Return`, `Break`, `Continue`) are declared for the statements that
+/// control flow (`Return`, `Break`, `Continue`, `Goto`) are declared for the statements that
 /// produce them; `Cancelled` is what a statement answers once the caller raised its
 /// token, and it is not an error: no number is attached to it. `BatchAbort` carries an
 /// error that ends the batch, not the statement alone.
@@ -56,6 +56,10 @@ pub enum ExecOutcome {
     Break,
     /// `CONTINUE`, to the next iteration of the enclosing `WHILE`.
     Continue,
+    /// `GOTO`, with the label it named: the statement stops, and so does each statement
+    /// that holds it, up to the caller that owns the list of statements and moves to the
+    /// label (`tests/control.rs`, `a_goto_in_a_block_stops_the_block`).
+    Goto(String),
     /// The caller raised the cancellation token and the statement stopped.
     Cancelled,
     /// An error whose scope is the whole batch.

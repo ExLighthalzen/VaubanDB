@@ -533,6 +533,37 @@ fn explain_writes_one_line_per_node() {
     }
 }
 
+/// A `GOTO` and a label travel through the planner with the name they carry: there is
+/// nothing to plan for either, and a `GOTO` written in a branch is planned with it.
+#[test]
+fn a_goto_and_a_label_keep_their_name_through_the_planner() {
+    let catalog = NoIndexes;
+    let planned = plan(
+        BoundStatement::If {
+            condition: id_equals_one(),
+            then_: Box::new(BoundStatement::Goto {
+                label: "again".to_owned(),
+            }),
+            else_: Some(Box::new(BoundStatement::Label {
+                name: "again".to_owned(),
+            })),
+        },
+        &context(&catalog),
+    )
+    .expect("the IF plans");
+    let PhysicalStatement::If { then_, else_, .. } = &planned else {
+        panic!("expected an If, got {planned:?}")
+    };
+    assert!(
+        matches!(then_.as_ref(), PhysicalStatement::Goto { label } if label == "again"),
+        "{then_:?}"
+    );
+    assert!(
+        matches!(else_.as_deref(), Some(PhysicalStatement::Label { name }) if name == "again"),
+        "{else_:?}"
+    );
+}
+
 #[test]
 fn control_flow_is_planned_branch_by_branch() {
     let block = BoundStatement::Block(vec![

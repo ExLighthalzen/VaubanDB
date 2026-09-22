@@ -822,3 +822,112 @@ fn a_deferred_statement_gets_the_compile_time_checks() {
     );
     assert_eq!(error.number, 127, "{error:?}");
 }
+
+/// A `GOTO` answers [`ExecOutcome::Goto`] with the name it wrote, and a label answers
+/// `NoRows`: neither is acted upon here, since where the jump lands is a position in a
+/// list of statements this crate does not hold.
+#[test]
+fn a_goto_answers_the_label_it_names_and_a_label_runs_nothing() {
+    let mut session = new_session();
+    let (outcome, sink) = run(
+        &mut session,
+        &PhysicalStatement::Goto {
+            label: "again".to_owned(),
+        },
+    );
+    assert!(
+        matches!(&outcome, ExecOutcome::Goto(label) if label == "again"),
+        "{outcome:?}"
+    );
+    assert!(sink.rows.is_empty(), "a GOTO sends no row");
+
+    let (outcome, sink) = run(
+        &mut session,
+        &PhysicalStatement::Label {
+            name: "again".to_owned(),
+        },
+    );
+    assert!(matches!(outcome, ExecOutcome::NoRows), "{outcome:?}");
+    assert!(sink.schema.is_none(), "a label announces no column");
+}
+
+/// A `BEGIN … END` stops at the `GOTO` it holds and hands its label up: the statement
+/// written after the `GOTO` in the same block does not run.
+#[test]
+fn a_goto_in_a_block_stops_the_block() {
+    let mut session = new_session();
+    run(
+        &mut session,
+        &PhysicalStatement::Declare(vec![PhysicalDeclaration {
+            name: "@i".to_owned(),
+            ty: int_ty(),
+            value: Some(int_lit(0)),
+            subplans: Vec::new(),
+        }]),
+    );
+    let block = PhysicalStatement::Block(vec![
+        PhysicalStatement::SetVariable {
+            name: "@i".to_owned(),
+            value: int_lit(1),
+            subplans: Vec::new(),
+        },
+        PhysicalStatement::Goto {
+            label: "after".to_owned(),
+        },
+        PhysicalStatement::SetVariable {
+            name: "@i".to_owned(),
+            value: int_lit(99),
+            subplans: Vec::new(),
+        },
+    ]);
+    let (outcome, _) = run(&mut session, &block);
+    assert!(
+        matches!(&outcome, ExecOutcome::Goto(label) if label == "after"),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        session.variables.get("@i"),
+        Some(&Value::I32(1)),
+        "the assignment written after the GOTO did not run"
+    );
+}
+
+/// A `WHILE` passes a `Goto` up as it passes a `RETURN` up: the loop ends there, without
+/// evaluating its condition again, where a `CONTINUE` would have started another turn.
+#[test]
+fn a_goto_in_a_while_body_leaves_the_loop() {
+    let mut session = new_session();
+    run(
+        &mut session,
+        &PhysicalStatement::Declare(vec![PhysicalDeclaration {
+            name: "@i".to_owned(),
+            ty: int_ty(),
+            value: Some(int_lit(0)),
+            subplans: Vec::new(),
+        }]),
+    );
+    let body = PhysicalStatement::Block(vec![
+        PhysicalStatement::SetVariable {
+            name: "@i".to_owned(),
+            value: add(var_ref("@i"), int_lit(1)),
+            subplans: Vec::new(),
+        },
+        PhysicalStatement::Goto {
+            label: "out".to_owned(),
+        },
+    ]);
+    let while_stmt = PhysicalStatement::While {
+        condition: lt(var_ref("@i"), int_lit(5)),
+        body: Box::new(body),
+    };
+    let (outcome, _) = run(&mut session, &while_stmt);
+    assert!(
+        matches!(&outcome, ExecOutcome::Goto(label) if label == "out"),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        session.variables.get("@i"),
+        Some(&Value::I32(1)),
+        "the body ran once and the loop stopped at the GOTO"
+    );
+}

@@ -152,7 +152,8 @@ use crate::set_options::{SetOutcome, apply_set_statement};
 use crate::sink::{ResultSink, RowSinkAdapter};
 use crate::state::SessionState;
 use crate::statements::{
-    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, first_held_statement_line, next_rowcount,
+    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, batch_labels, declare_variables_of,
+    first_held_statement_line, first_undeclared_goto, last_line, next_rowcount,
     statement_clears_last_error, statement_fragment, statement_line, statement_span,
     statement_text, use_name_line,
 };
@@ -241,6 +242,8 @@ pub(crate) enum Flow {
     Continue,
     /// Stop the batch here; the DONE has been sent.
     Stop,
+    /// Go on at the label of this name, which a `GOTO` just named; the DONE has been sent.
+    Jump(String),
 }
 
 /// One statement after every compilation-stage check has succeeded for the whole batch.
@@ -345,6 +348,15 @@ impl Session {
             // (blank text, comments only): without it the client would wait forever.
             return sink.done(None, false);
         }
+        // Where a `GOTO` lands is read from the statements of this text, so a name none of
+        // its labels declares is known before the first statement runs: 133 is a
+        // compilation error, and the batch produces no result set at all
+        // (`tests/run_batch_pipeline.rs`, `a_goto_to_an_unknown_label_is_133_and_stops_the_batch`).
+        let labels = batch_labels(&batch.statements);
+        if let Some(label) = first_undeclared_goto(&batch.statements, &labels) {
+            let err = SqlError::goto_label_not_declared(label).with_line(last_line(text));
+            return self.fail(&err, sink);
+        }
         let (mut prepared, mut bind_state, mut batch_variables) =
             match self.prepare_batch(text, &batch.statements) {
                 Ok(prepared) => prepared,
@@ -354,11 +366,15 @@ impl Session {
         let mut index = 0;
         while index < prepared.len() {
             // Between two statements, as `fake_engine` did before its own work: an
-            // ATTENTION that arrived during the previous one stops the batch here.
+            // ATTENTION that arrived during the previous one stops the batch here. A
+            // `GOTO` that jumps backwards comes through this check on every turn, so a
+            // batch that loops over itself answers the ATTENTION instead of running on
+            // (`tests/run_batch_pipeline.rs`, `a_batch_that_loops_on_a_goto_answers_the_cancellation`).
             self.cancel.check()?;
             let more = index + 1 < prepared.len();
             let current = &prepared[index];
-            if let Flow::Stop = self.run_prepared(current, more, sink)? {
+            let flow = self.run_prepared(current, more, sink)?;
+            if let Flow::Stop = flow {
                 break;
             }
             let tail_start = index + 1;
@@ -377,7 +393,48 @@ impl Session {
                 prepared.truncate(tail_start);
                 prepared.extend(tail);
             }
-            index += 1;
+            let was = index;
+            index = match flow {
+                Flow::Jump(label) => match labels.get(&label.to_ascii_lowercase()) {
+                    Some(target) => *target,
+                    // Each `GOTO` of the text was checked against this table before the
+                    // batch ran, so a name missing here is a broken precondition.
+                    None => {
+                        let err = SqlError::from(InternalError::Bug(format!(
+                            "run_batch: no label {label} to jump to"
+                        )));
+                        self.fail(&err, sink)?;
+                        break;
+                    }
+                },
+                _ => index + 1,
+            };
+            // A jump forward may land past what has been bound so far, since a batch that
+            // holds an `ALTER TABLE` is bound one statement at a time (`bind_limit_for`).
+            while index >= prepared.len() && prepared.len() < batch.statements.len() {
+                let from = prepared.len();
+                let tail = self.reprepare_tail(
+                    text,
+                    &batch.statements[from..],
+                    &mut bind_state,
+                    &mut batch_variables,
+                )?;
+                if tail.is_empty() {
+                    break;
+                }
+                prepared.extend(tail);
+            }
+            // A variable belongs to the whole batch, so the `DECLARE` a jump stepped over
+            // still enters its names, with no value ([`declare_variables_of`]) — once the
+            // statements up to the target are bound, which the loop above guarantees when
+            // the target lay past them (`tests/run_batch_pipeline.rs`,
+            // `a_goto_over_a_declare_in_a_batch_with_an_alter_table_still_declares_it`).
+            let bound_up_to = index.min(prepared.len());
+            for stepped in prepared.get(was + 1..bound_up_to).unwrap_or_default() {
+                if let PreparedStatement::Bound { statement, .. } = stepped {
+                    declare_variables_of(statement, &mut self.exec);
+                }
+            }
         }
         // A batch may end with a transaction still open; what the end of a batch does with
         // it is `txn_session::end_of_batch`'s decision.
@@ -916,6 +973,23 @@ impl Session {
                     self.state.rowcount = outcome.rowcount;
                 }
                 Ok(flow)
+            }
+            // A `GOTO` ends its statement and hands the name it wrote to the loop of
+            // `run_batch`, which holds the labels of the text. The DONE goes out with
+            // MORE set whatever the position of the `GOTO` in the text: the statement at
+            // the label runs after it, so this is not the last DONE of the response
+            // (`tests/run_batch_pipeline.rs`, `a_goto_written_last_still_leaves_more_on_its_done`).
+            Ok(ExecOutcome::Goto(label)) => {
+                sink.done(None, true)?;
+                self.state.rowcount = next_rowcount(bound, self.state.rowcount, self.exec.rowcount);
+                apply_exec_session(
+                    &mut self.state,
+                    &self.exec,
+                    true,
+                    statement_clears_last_error(bound),
+                );
+                self.exec.identity_updated = false;
+                Ok(Flow::Jump(label))
             }
             Ok(outcome @ (ExecOutcome::Break | ExecOutcome::Continue)) => {
                 let err = SqlError::from(InternalError::Bug(format!(

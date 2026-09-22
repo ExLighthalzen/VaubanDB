@@ -302,6 +302,8 @@ pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult
         }
         PhysicalStatement::Break
         | PhysicalStatement::Continue
+        | PhysicalStatement::Goto { .. }
+        | PhysicalStatement::Label { .. }
         | PhysicalStatement::Return(None)
         | PhysicalStatement::Transaction(_)
         | PhysicalStatement::Execute(_) => Ok(()),

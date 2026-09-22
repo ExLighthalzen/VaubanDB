@@ -17,7 +17,8 @@ use crate::alter::bind_alter_table;
 use crate::bound::BoundStatement;
 use crate::context::BindContext;
 use crate::control::{
-    bind_block, bind_break, bind_continue, bind_if, bind_print, bind_return, bind_while,
+    bind_block, bind_break, bind_continue, bind_goto, bind_if, bind_label, bind_print, bind_return,
+    bind_while,
 };
 use crate::ddl::{
     bind_alter_database, bind_create_database, bind_create_table, bind_drop_database,
@@ -113,6 +114,8 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
         Statement::Rollback { name, .. } => bind_rollback(name.as_ref(), ctx),
         Statement::Save { name, .. } => bind_save(name, ctx),
         Statement::Execute(execute) => bind_execute(execute, ctx),
+        Statement::Goto { label, .. } => Ok(bind_goto(label)),
+        Statement::Label { name, .. } => Ok(bind_label(name)),
         other => Err(unsupported(other)),
     }
 }
@@ -177,12 +180,12 @@ fn unsupported(stmt: &Statement) -> SqlError {
         Statement::Commit { .. } => "COMMIT",
         Statement::Rollback { .. } => "ROLLBACK",
         Statement::Save { .. } => "SAVE TRANSACTION",
+        Statement::Goto { .. } => "GOTO",
+        Statement::Label { .. } => "a GOTO label",
         Statement::Waitfor(_) => "WAITFOR",
         Statement::TryCatch { .. } => "BEGIN TRY … BEGIN CATCH",
         Statement::Throw { .. } => "THROW",
         Statement::RaiseError(_) => "RAISERROR",
-        Statement::Goto { .. } => "GOTO",
-        Statement::Label { .. } => "a GOTO label",
         Statement::Cursor(_) => "a cursor statement",
         Statement::Grant(_) => "GRANT, DENY and REVOKE",
     };

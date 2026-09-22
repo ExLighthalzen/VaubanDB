@@ -1,5 +1,5 @@
-//! Control of flow: `IF … ELSE`, `WHILE`, `BEGIN … END`, `BREAK`, `CONTINUE`, `RETURN` and
-//! `PRINT`.
+//! Control of flow: `IF … ELSE`, `WHILE`, `BEGIN … END`, `BREAK`, `CONTINUE`, `RETURN`,
+//! `PRINT`, `GOTO` and the labels it names.
 //!
 //! # A branch that names a table the catalogue does not hold
 //!
@@ -27,7 +27,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use vauban_errors::{SqlError, SqlResult};
-use vauban_parser::{Expr, Statement};
+use vauban_parser::{Expr, Ident, Statement};
 use vauban_types::{Len, SqlType, TypeInfo};
 
 use crate::bound::{BoundExpr, BoundExprKind, BoundStatement, DeferredStatement};
@@ -150,6 +150,27 @@ pub(crate) fn bind_return(
     match value {
         Some(_) => Err(SqlError::return_with_value_outside_procedure().with_line(line)),
         None => Ok(BoundStatement::Return(None)),
+    }
+}
+
+/// Binds a `GOTO label` into [`BoundStatement::Goto`], carrying the name as written.
+///
+/// Nothing is resolved here: where the jump lands is a position in the list of
+/// statements, which this crate is not handed. A label the batch does not declare is
+/// error 133, raised by the layer that holds that list.
+pub(crate) fn bind_goto(label: &Ident) -> BoundStatement {
+    BoundStatement::Goto {
+        label: label.value.clone(),
+    }
+}
+
+/// Binds a `label:` into [`BoundStatement::Label`], carrying the name as written.
+///
+/// A label declares a place and runs nothing (`tests/bind_control_flow.rs`,
+/// `a_label_binds_to_the_name_it_declares`).
+pub(crate) fn bind_label(name: &Ident) -> BoundStatement {
+    BoundStatement::Label {
+        name: name.value.clone(),
     }
 }
 
