@@ -11,13 +11,13 @@ use vauban_parser::{Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
 use vauban_txn::IsolationLevel;
-use vauban_types::{Len, SqlType, TypeInfo, Value};
+use vauban_types::{TypeInfo, Value};
 
 use crate::batch::{DEFERRED_UNTIL_EXECUTION, Session};
 use crate::eval_context::{SessionEvalContext, apply_exec_session};
 use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
-use crate::procedures::resolve_call_database;
+use crate::procedures::{exec_args_to_proc_args, resolve_call_database};
 use crate::rpc::{ProcAction, ProcArg, ProcParam, StaticResultColumn};
 use crate::set_options::{SetOutcome, apply_set_statement, sync_exec_session};
 use crate::sink::{ResultSink, RowSinkAdapter};
@@ -780,7 +780,7 @@ impl Session {
                 );
             }
         };
-        let proc_args = exec_args_to_proc_args(exec_args);
+        let proc_args = exec_args_to_proc_args(name, exec_args);
         let resolver_args: Vec<ProcArg<'_>> = proc_args
             .iter()
             .map(|arg| ProcArg {
@@ -1025,40 +1025,6 @@ impl Session {
         } else {
             Ok(Flow::Stop)
         }
-    }
-}
-
-struct StoredProcArg {
-    name: Option<String>,
-    ty: TypeInfo,
-    value: Value,
-    output: bool,
-    default: bool,
-}
-
-fn exec_args_to_proc_args(args: &[EvaluatedExecArg]) -> Vec<StoredProcArg> {
-    args.iter()
-        .map(|arg| {
-            let (ty, value, default) = match &arg.value {
-                None => (TypeInfo::new(SqlType::Int, true), Value::Null, true),
-                Some((value, ty)) => (coerce_unicode_literal_ty(ty, value), value.clone(), false),
-            };
-            StoredProcArg {
-                name: arg.name.clone(),
-                ty,
-                value,
-                output: arg.output,
-                default,
-            }
-        })
-        .collect()
-}
-
-fn coerce_unicode_literal_ty(ty: &TypeInfo, value: &Value) -> TypeInfo {
-    if matches!(value, Value::String(_)) && matches!(ty.ty, SqlType::VarChar(_)) {
-        TypeInfo::new(SqlType::NVarChar(Len::Max), ty.nullable)
-    } else {
-        ty.clone()
     }
 }
 

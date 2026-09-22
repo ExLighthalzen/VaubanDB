@@ -677,9 +677,13 @@ fn execute_procedure_is_planned() {
         target: procedure_target("sp_executesql"),
         args: vec![BoundExecArg {
             name: None,
-            value: Some(BoundExprKind::Literal(Value::String(SqlString {
-                text: "SELECT 1".to_owned(),
-            }))),
+            value: Some(BoundExpr {
+                kind: BoundExprKind::Literal(Value::String(SqlString {
+                    text: "SELECT 1".to_owned(),
+                })),
+                ty: TypeInfo::new(SqlType::VarChar(Len::Fixed(8)), true),
+                line: 1,
+            }),
             output: false,
         }],
         return_into: None,

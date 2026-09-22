@@ -14,7 +14,7 @@
 
 use vauban_binder::{BoundExecArg, BoundExecTarget, BoundExecute, BoundExpr, BoundExprKind};
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_types::{Len, SqlType, TypeInfo, Value, default_display};
+use vauban_types::{TypeInfo, Value, default_display};
 
 use crate::context::ExecContext;
 use crate::expr::eval_expr;
@@ -71,6 +71,12 @@ fn eval_args(
     Ok(out)
 }
 
+/// Evaluates one argument, keeping the type the binding gave it.
+///
+/// A constant is evaluated in place and travels under the type its spelling was bound to:
+/// `'x'` reaches the callee as `varchar` and `N'x'` as `nvarchar`
+/// (`tests/execute.rs`, `a_string_constant_argument_travels_under_the_type_of_its_spelling`).
+/// A variable is read from the session, under the type its `DECLARE` wrote.
 fn eval_arg(
     arg: &BoundExecArg,
     line: u32,
@@ -78,19 +84,17 @@ fn eval_arg(
 ) -> SqlResult<EvaluatedExecArg> {
     let output_variable = arg
         .output
-        .then(|| match &arg.value {
+        .then(|| match arg.value.as_ref().map(|expr| &expr.kind) {
             Some(BoundExprKind::Variable { name }) => Some(name.clone()),
             _ => None,
         })
         .flatten();
     let value = match &arg.value {
         None => None,
-        Some(BoundExprKind::Variable { name }) => Some(read_variable(name, line, ctx)?),
-        Some(kind) => {
-            let expr = constant_expr(kind, line);
-            let evaluated = eval_expr(&expr, None, ctx)?;
-            Some((evaluated, expr.ty))
-        }
+        Some(expr) => match &expr.kind {
+            BoundExprKind::Variable { name } => Some(read_variable(name, line, ctx)?),
+            _ => Some((eval_expr(expr, None, ctx)?, expr.ty.clone())),
+        },
     };
     Ok(EvaluatedExecArg {
         name: arg.name.clone(),
@@ -113,57 +117,6 @@ fn read_variable(
         .variable_value(name)
         .ok_or_else(|| bug(&format!("execute: variable `{name}` was not declared")))?;
     Ok((value, ty))
-}
-
-fn constant_expr(kind: &BoundExprKind, line: u32) -> BoundExpr {
-    BoundExpr {
-        kind: kind.clone(),
-        ty: constant_type(kind),
-        line,
-    }
-}
-
-fn constant_type(kind: &BoundExprKind) -> TypeInfo {
-    match kind {
-        BoundExprKind::Literal(value) => type_of_literal(value),
-        BoundExprKind::Negate(inner) => constant_type(&inner.kind),
-        _ => TypeInfo::new(SqlType::Int, true),
-    }
-}
-
-fn type_of_literal(value: &Value) -> TypeInfo {
-    match value {
-        Value::Null => TypeInfo::new(SqlType::Int, true),
-        Value::Bit(_) => TypeInfo::new(SqlType::Bit, true),
-        Value::I8(_) => TypeInfo::new(SqlType::TinyInt, false),
-        Value::I16(_) => TypeInfo::new(SqlType::SmallInt, false),
-        Value::I32(_) => TypeInfo::new(SqlType::Int, false),
-        Value::I64(_) => TypeInfo::new(SqlType::BigInt, false),
-        Value::F32(_) => TypeInfo::new(SqlType::Real, false),
-        Value::F64(_) => TypeInfo::new(SqlType::Float, false),
-        Value::Decimal(_) => TypeInfo::new(
-            SqlType::Decimal {
-                precision: 18,
-                scale: 0,
-            },
-            false,
-        ),
-        Value::Money(_) => TypeInfo::new(SqlType::Money, false),
-        Value::String(s) => {
-            let len = u16::try_from(s.text.len()).unwrap_or(u16::MAX);
-            TypeInfo::new(SqlType::VarChar(Len::Fixed(len.max(1))), true)
-        }
-        Value::Bytes(b) => {
-            let len = u16::try_from(b.len()).unwrap_or(u16::MAX);
-            TypeInfo::new(SqlType::VarBinary(Len::Fixed(len.max(1))), true)
-        }
-        Value::Guid(_) => TypeInfo::new(SqlType::UniqueIdentifier, false),
-        Value::DateTime(_) => TypeInfo::new(SqlType::DateTime, false),
-        Value::DateTime2(_) => TypeInfo::new(SqlType::DateTime2(7), false),
-        Value::DateTimeOffset(_) => TypeInfo::new(SqlType::DateTimeOffset(7), false),
-        Value::Date(_) => TypeInfo::new(SqlType::Date, false),
-        Value::Time(_) => TypeInfo::new(SqlType::Time(7), false),
-    }
 }
 
 fn dynamic_text(expr: &BoundExpr, ctx: &mut ExecContext<'_>) -> SqlResult<String> {
@@ -192,6 +145,7 @@ mod tests {
     use super::*;
     use vauban_binder::SessionOptions;
     use vauban_sysfn::StaticContext;
+    use vauban_types::{Len, SqlType};
 
     #[test]
     fn null_dynamic_text_is_empty() {

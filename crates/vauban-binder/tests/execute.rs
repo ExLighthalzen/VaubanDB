@@ -160,7 +160,7 @@ fn a_constant_argument_keeps_its_value() {
     let last = execute.args.last().expect("an argument");
     assert!(
         matches!(
-            last.value,
+            last.value.as_ref().map(|value| &value.kind),
             Some(BoundExprKind::Literal(_)) | Some(BoundExprKind::Negate(_))
         ),
         "a signed literal is a constant: {last:?}"
@@ -180,7 +180,10 @@ fn a_variable_argument_keeps_its_name() {
     let execute = execute_of("DECLARE @v int; EXEC sp_x @v;");
     let last = execute.args.last().expect("an argument");
     assert!(
-        matches!(&last.value, Some(BoundExprKind::Variable { name }) if name == "@v"),
+        matches!(
+            last.value.as_ref().map(|value| &value.kind),
+            Some(BoundExprKind::Variable { name }) if name == "@v"
+        ),
         "{last:?}"
     );
 }
@@ -287,5 +290,45 @@ fn the_near_token_is_one_token() {
             .message
             .contains("near 'CAST'"),
         "a target quotes its first token"
+    );
+}
+
+/// The type the binding gave the last argument of `text`.
+fn last_argument_type(text: &str) -> TypeInfo {
+    let execute = execute_of(text);
+    let argument = execute.args.last().expect("an argument").clone();
+    argument.value.expect("a value").ty
+}
+
+/// A string constant reaches the callee under the family its spelling asks for: `varchar`
+/// for `'x'`, `nvarchar` for `N'x'`. The two spellings below hold the same characters, so
+/// what tells them apart once bound is the family.
+#[test]
+fn a_string_constant_argument_keeps_the_family_of_its_spelling() {
+    assert_eq!(
+        last_argument_type("EXEC sp_executesql 'SELECT 1';").ty,
+        SqlType::VarChar(Len::Fixed(8))
+    );
+    assert_eq!(
+        last_argument_type("EXEC sp_executesql N'SELECT 1';").ty,
+        SqlType::NVarChar(Len::Fixed(8))
+    );
+}
+
+/// A variable argument keeps the type its `DECLARE` wrote, for the two families and for a
+/// type that is not a string at all.
+#[test]
+fn a_variable_argument_keeps_the_type_of_its_declaration() {
+    assert_eq!(
+        last_argument_type("DECLARE @s varchar(100); EXEC sp_executesql @s;").ty,
+        SqlType::VarChar(Len::Fixed(100))
+    );
+    assert_eq!(
+        last_argument_type("DECLARE @s nvarchar(100); EXEC sp_executesql @s;").ty,
+        SqlType::NVarChar(Len::Fixed(100))
+    );
+    assert_eq!(
+        last_argument_type("DECLARE @i int; EXEC sp_x @i;").ty,
+        SqlType::Int
     );
 }

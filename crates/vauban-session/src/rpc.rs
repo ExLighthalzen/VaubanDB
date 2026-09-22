@@ -5,11 +5,13 @@ use std::sync::OnceLock;
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::ParameterDeclaration;
 use vauban_tds::{Rpc, RpcProc};
-use vauban_types::{Len, SqlType, TypeInfo, Value};
+use vauban_types::{TypeInfo, Value};
 
 use crate::batch::Session;
 use crate::prepared::execute_prepared_action;
-use crate::procedures::{ProcFinish, execute_proc_action, resolve_call_database};
+use crate::procedures::{
+    ProcFinish, coerce_unicode_literal_ty, execute_proc_action, resolve_call_database,
+};
 use crate::sink::ResultSink;
 
 /// One argument of a system procedure call, as the session received it.
@@ -161,7 +163,7 @@ impl Session {
             Ok(database) => database,
             Err(err) => return fail_rpc_error(self, &err, sink),
         };
-        let stored = rpc_params_storage(&rpc.params);
+        let stored = rpc_params_storage(&name, &rpc.params);
         let params: Vec<ProcArg<'_>> = stored
             .iter()
             .map(|arg| ProcArg {
@@ -261,25 +263,17 @@ struct StoredRpcArg {
     default: bool,
 }
 
-fn rpc_params_storage(params: &[vauban_tds::RpcParam]) -> Vec<StoredRpcArg> {
+fn rpc_params_storage(proc: &str, params: &[vauban_tds::RpcParam]) -> Vec<StoredRpcArg> {
     params
         .iter()
         .map(|param| StoredRpcArg {
             name: rpc_param_name(&param.name).map(str::to_owned),
-            ty: coerce_unicode_literal_ty(&param.ty, &param.value),
+            ty: coerce_unicode_literal_ty(proc, &param.ty, &param.value),
             value: param.value.clone(),
             output: param.output,
             default: param.default,
         })
         .collect()
-}
-
-fn coerce_unicode_literal_ty(ty: &TypeInfo, value: &Value) -> TypeInfo {
-    if matches!(value, Value::String(_)) && matches!(ty.ty, SqlType::VarChar(_)) {
-        TypeInfo::new(SqlType::NVarChar(Len::Max), ty.nullable)
-    } else {
-        ty.clone()
-    }
 }
 
 /// Maps wire parameter names to the names the compatibility resolver expects.

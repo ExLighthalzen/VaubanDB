@@ -34,6 +34,20 @@ fn lit(value: Value, ty: TypeInfo) -> BoundExpr {
     }
 }
 
+fn nvarchar_ty(n: u16) -> TypeInfo {
+    TypeInfo::new(SqlType::NVarChar(Len::Fixed(n)), true)
+}
+
+fn var(name: &str, ty: TypeInfo) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Variable {
+            name: name.to_owned(),
+        },
+        ty,
+        line: 1,
+    }
+}
+
 fn str_lit(s: &str) -> BoundExpr {
     lit(
         Value::String(SqlString { text: s.to_owned() }),
@@ -162,14 +176,12 @@ fn arguments_are_evaluated_in_order() {
         args: vec![
             BoundExecArg {
                 name: Some("@a".to_owned()),
-                value: Some(BoundExprKind::Literal(Value::I32(1))),
+                value: Some(int_lit(1)),
                 output: false,
             },
             BoundExecArg {
                 name: Some("@b".to_owned()),
-                value: Some(BoundExprKind::Variable {
-                    name: "@v".to_owned(),
-                }),
+                value: Some(var("@v", int_ty())),
                 output: false,
             },
         ],
@@ -205,9 +217,7 @@ fn output_argument_keeps_the_caller_variable() {
         target: procedure_target("sp_x"),
         args: vec![BoundExecArg {
             name: None,
-            value: Some(BoundExprKind::Variable {
-                name: "@o".to_owned(),
-            }),
+            value: Some(var("@o", int_ty())),
             output: true,
         }],
         return_into: None,
@@ -274,7 +284,7 @@ fn call_procedure_and_run_dynamic_emit_nothing_on_the_sink() {
         target: procedure_target("sp_x"),
         args: vec![BoundExecArg {
             name: None,
-            value: Some(BoundExprKind::Literal(Value::I32(1))),
+            value: Some(int_lit(1)),
             output: false,
         }],
         return_into: None,
@@ -393,4 +403,85 @@ fn exec_of_an_unqualified_name_carries_no_database() {
         panic!("expected CallProcedure, got {outcome:?}");
     };
     assert_eq!(database, None);
+}
+
+/// The arguments of a call, evaluated, with the type each one travels under.
+fn call_argument_types(session: &mut ExecSession, args: Vec<BoundExecArg>) -> Vec<TypeInfo> {
+    let stmt = BoundExecute {
+        target: procedure_target("sp_executesql"),
+        args,
+        return_into: None,
+        line: 1,
+    };
+    let (outcome, _sink) = run(session, &stmt);
+    let ExecOutcome::CallProcedure { args, .. } = outcome else {
+        panic!("expected CallProcedure, got {outcome:?}");
+    };
+    args.into_iter()
+        .map(|arg| arg.value.expect("a value").1)
+        .collect()
+}
+
+fn positional(value: BoundExpr) -> BoundExecArg {
+    BoundExecArg {
+        name: None,
+        value: Some(value),
+        output: false,
+    }
+}
+
+/// A string constant travels under the type the binding gave it, and not under a type read
+/// back from the characters it holds: the same text bound as `varchar` and as `nvarchar`
+/// reaches the session under two types.
+#[test]
+fn a_string_constant_argument_travels_under_the_type_of_its_spelling() {
+    let mut session = ExecSession::default();
+    let text = || {
+        Value::String(SqlString {
+            text: "SELECT 1".to_owned(),
+        })
+    };
+    let types = call_argument_types(
+        &mut session,
+        vec![
+            positional(lit(text(), varchar_ty(8))),
+            positional(lit(text(), nvarchar_ty(8))),
+        ],
+    );
+    assert_eq!(
+        types.iter().map(|ty| ty.ty).collect::<Vec<_>>(),
+        vec![
+            SqlType::VarChar(Len::Fixed(8)),
+            SqlType::NVarChar(Len::Fixed(8))
+        ]
+    );
+}
+
+/// A variable travels under the type its declaration wrote, for either string family.
+#[test]
+fn a_variable_argument_travels_under_the_type_of_its_declaration() {
+    let mut session = ExecSession::default();
+    for (name, ty) in [("@plain", varchar_ty(100)), ("@wide", nvarchar_ty(100))] {
+        session.variables.insert(
+            name.to_owned(),
+            Value::String(SqlString {
+                text: "SELECT 1".to_owned(),
+            }),
+        );
+        session.variable_types.insert(name.to_owned(), ty);
+    }
+    let types = call_argument_types(
+        &mut session,
+        vec![
+            positional(var("@plain", varchar_ty(100))),
+            positional(var("@wide", nvarchar_ty(100))),
+        ],
+    );
+    assert_eq!(
+        types.iter().map(|ty| ty.ty).collect::<Vec<_>>(),
+        vec![
+            SqlType::VarChar(Len::Fixed(100)),
+            SqlType::NVarChar(Len::Fixed(100))
+        ]
+    );
 }

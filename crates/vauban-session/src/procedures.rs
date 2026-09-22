@@ -152,7 +152,7 @@ pub(crate) fn run_batch_procedure(
         Ok(database) => database,
         Err(err) => return finish_batch_exec_error(session, at_line(err, line), more, sink),
     };
-    let stored = exec_args_to_proc_args(exec_args);
+    let stored = exec_args_to_proc_args(name, exec_args);
     let proc_args: Vec<ProcArg<'_>> = stored
         .iter()
         .map(|arg| ProcArg {
@@ -503,20 +503,26 @@ fn proc_params_to_nested(params: &[ProcParam]) -> Vec<NestedParam> {
         .collect()
 }
 
-struct StoredProcArg {
-    name: Option<String>,
-    ty: TypeInfo,
-    value: Value,
-    output: bool,
-    default: bool,
+/// One argument of a system procedure call, kept alive while the resolver borrows it.
+pub(crate) struct StoredProcArg {
+    pub(crate) name: Option<String>,
+    pub(crate) ty: TypeInfo,
+    pub(crate) value: Value,
+    pub(crate) output: bool,
+    pub(crate) default: bool,
 }
 
-fn exec_args_to_proc_args(args: &[EvaluatedExecArg]) -> Vec<StoredProcArg> {
+/// The arguments of an `EXEC` of `proc`, under the types the procedure reads them with.
+pub(crate) fn exec_args_to_proc_args(proc: &str, args: &[EvaluatedExecArg]) -> Vec<StoredProcArg> {
     args.iter()
         .map(|arg| {
             let (ty, value, default) = match &arg.value {
                 None => (TypeInfo::new(SqlType::Int, true), Value::Null, true),
-                Some((value, ty)) => (coerce_unicode_literal_ty(ty, value), value.clone(), false),
+                Some((value, ty)) => (
+                    coerce_unicode_literal_ty(proc, ty, value),
+                    value.clone(),
+                    false,
+                ),
             };
             StoredProcArg {
                 name: arg.name.clone(),
@@ -529,13 +535,43 @@ fn exec_args_to_proc_args(args: &[EvaluatedExecArg]) -> Vec<StoredProcArg> {
         .collect()
 }
 
-/// The executor types string literals as `varchar`; system procedures expect `nvarchar`.
-fn coerce_unicode_literal_ty(ty: &TypeInfo, value: &Value) -> TypeInfo {
-    if matches!(value, Value::String(_)) && matches!(ty.ty, SqlType::VarChar(_)) {
+/// The three procedures that read their text parameter under the type the caller wrote, so
+/// that a `varchar` one is refused instead of converted
+/// (`tests/execute.rs`, `a_varchar_statement_is_refused_by_executesql`; `tests/describe.rs`,
+/// `a_varchar_batch_is_refused_by_describe_first_result_set`,
+/// `a_varchar_batch_is_refused_by_describe_undeclared_parameters`).
+const TEXT_ARGUMENTS_READ_UNCONVERTED: [&str; 3] = [
+    "sp_executesql",
+    "sp_describe_first_result_set",
+    "sp_describe_undeclared_parameters",
+];
+
+/// The type `proc` reads a text argument under.
+///
+/// A catalogue procedure declares its text parameters as `sysname` and a `varchar`
+/// argument reaches its body converted, written as a literal or read from a variable alike
+/// (`tests/execute.rs`, `a_catalogue_procedure_still_reads_a_varchar_argument`); a `char`
+/// argument is not widened here. The procedures of
+/// [`TEXT_ARGUMENTS_READ_UNCONVERTED`] do not convert it: the type stays what the caller
+/// gave (`tests/execute.rs`, `a_varchar_statement_is_refused_by_executesql`).
+pub(crate) fn coerce_unicode_literal_ty(proc: &str, ty: &TypeInfo, value: &Value) -> TypeInfo {
+    let converts = !TEXT_ARGUMENTS_READ_UNCONVERTED.contains(&object_part(proc).as_str());
+    if converts && matches!(value, Value::String(_)) && matches!(ty.ty, SqlType::VarChar(_)) {
         TypeInfo::new(SqlType::NVarChar(Len::Max), ty.nullable)
     } else {
         ty.clone()
     }
+}
+
+/// The object part of a procedure name, unbracketed and lower-cased: `[sys].[sp_tables]`,
+/// `sys.sp_tables` and `sp_tables` answer `sp_tables`.
+fn object_part(name: &str) -> String {
+    let stripped = name.replace(['[', ']'], "");
+    stripped
+        .rsplit('.')
+        .next()
+        .unwrap_or(stripped.as_str())
+        .to_ascii_lowercase()
 }
 
 fn at_line(err: SqlError, line: u32) -> SqlError {

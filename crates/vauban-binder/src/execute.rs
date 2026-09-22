@@ -70,9 +70,13 @@ pub enum BoundExecTarget {
 pub struct BoundExecArg {
     /// The parameter name, `@` included, for a named argument; `None` for a positional one.
     pub name: Option<String>,
-    /// The value: a bound constant or variable, or `None` for `DEFAULT`, which keeps no
-    /// value.
-    pub value: Option<BoundExprKind>,
+    /// The value: a bound constant or variable, with the type binding inferred for it, or
+    /// `None` for `DEFAULT`, which keeps no value. A string constant keeps the family its
+    /// spelling gave it, `varchar` without the `N` prefix and `nvarchar` with it
+    /// (`tests/execute.rs`, `a_string_constant_argument_keeps_the_family_of_its_spelling`);
+    /// a variable keeps the type its `DECLARE` wrote (`tests/execute.rs`,
+    /// `a_variable_argument_keeps_the_type_of_its_declaration`).
+    pub value: Option<BoundExpr>,
     /// `OUTPUT` was written.
     pub output: bool,
 }
@@ -152,16 +156,13 @@ fn bind_args(
         let parameter = i64::try_from(position).unwrap_or(i64::MAX) + 1;
         let (value, is_variable) = match &arg.value {
             Expr::Literal(Literal::Default, _) => (None, false),
-            Expr::Variable { name, .. } => {
-                bind_variable(name, ctx, line)?;
-                (Some(BoundExprKind::Variable { name: name.clone() }), true)
-            }
+            Expr::Variable { name, .. } => (Some(bind_variable(name, ctx, line)?), true),
             other => {
                 let bound = bind_expr(other, ctx, &Scope::empty())?;
                 if !is_constant(&bound.kind) {
                     return Err(syntax_near_argument(other, ctx));
                 }
-                (Some(bound.kind), false)
+                (Some(bound), false)
             }
         };
         if named_seen && arg.name.is_none() {

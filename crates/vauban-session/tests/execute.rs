@@ -9,7 +9,7 @@ use vauban_session::{
 };
 use vauban_storage::MemoryStorage;
 use vauban_tds::{ColumnMeta, EnvChange};
-use vauban_types::{TypeInfo, Value};
+use vauban_types::{SqlType, TypeInfo, Value};
 
 const SPID: i16 = 72;
 
@@ -65,6 +65,9 @@ fn register_test_resolver() {
     static REGISTERED: Once = Once::new();
     REGISTERED.call_once(|| {
         register_system_procedure_resolver(|name, args| {
+            if is_catalogue_name(name) {
+                return Some(catalogue_answer(args));
+            }
             if !name.eq_ignore_ascii_case("sp_executesql")
                 && !name.to_ascii_lowercase().ends_with(".sp_executesql")
             {
@@ -72,6 +75,14 @@ fn register_test_resolver() {
             }
             if let Some(number) = refused_number(args) {
                 return Some(Err(SqlError::new(number, 16, 2, "argument error")));
+            }
+            if let Some(arg) = statement_argument(args)
+                && !is_unicode_text(arg.ty)
+            {
+                return Some(Err(SqlError::procedure_expects_type(
+                    "@statement",
+                    "ntext/nchar/nvarchar",
+                )));
             }
             let mut params = Vec::new();
             for arg in args {
@@ -101,6 +112,44 @@ fn register_test_resolver() {
             Some(Ok(ProcAction::ExecuteSql { statement, params }))
         });
     });
+}
+
+/// The argument carrying the statement of an `sp_executesql` call: the first positional
+/// one, or the one named `@statement` or `@stmt`.
+fn statement_argument<'a>(
+    args: &'a [vauban_session::ProcArg<'a>],
+) -> Option<&'a vauban_session::ProcArg<'a>> {
+    args.iter()
+        .find(|arg| matches!(arg.name, None | Some("@statement") | Some("@stmt")))
+}
+
+fn is_unicode_text(ty: &TypeInfo) -> bool {
+    matches!(ty.ty, SqlType::NVarChar(_) | SqlType::NChar(_))
+}
+
+/// `sp_tables` stands here for the catalogue procedures, whose text parameters are declared
+/// `sysname`: a non-Unicode argument reaches them converted, so the resolver refuses one it
+/// receives under a non-Unicode type.
+fn is_catalogue_name(name: &str) -> bool {
+    let base = name.replace(['[', ']'], "");
+    base.rsplit('.')
+        .next()
+        .is_some_and(|part| part.eq_ignore_ascii_case("sp_tables"))
+}
+
+fn catalogue_answer(args: &[vauban_session::ProcArg<'_>]) -> Result<ProcAction, SqlError> {
+    for arg in args {
+        if matches!(arg.value, Value::String(_)) && !is_unicode_text(arg.ty) {
+            return Err(SqlError::procedure_expects_type(
+                "@table_name",
+                "ntext/nchar/nvarchar",
+            ));
+        }
+    }
+    Ok(ProcAction::ExecuteSql {
+        statement: "SELECT 4 AS tables_seen".to_owned(),
+        params: Vec::new(),
+    })
 }
 
 /// The number an `@refuse = <n>` argument asks the resolver to answer, so a test can read
@@ -270,4 +319,71 @@ fn an_error_of_the_text_a_call_runs_keeps_the_line_of_that_text() {
     let events =
         run("SELECT 1 AS n;\n\nEXEC sp_executesql N'SELECT 1 AS n;\nSELECT 1/0 AS d;', N'';");
     assert!(events.0.contains(&Event::Error(8134, 2)), "{:?}", events.0);
+}
+
+/// Reads the errors a batch sent to the client, with the line of each.
+fn errors(events: &Recording) -> Vec<(u32, u32)> {
+    events
+        .0
+        .iter()
+        .filter_map(|event| match event {
+            Event::Error(number, line) => Some((*number, *line)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn rows(events: &Recording) -> Vec<Vec<Value>> {
+    events
+        .0
+        .iter()
+        .filter_map(|event| match event {
+            Event::Row(values) => Some(values.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The statement of an `sp_executesql` call reaches the resolver under the type the caller
+/// wrote it with, so a non-Unicode one is refused: written without the `N` prefix, or read
+/// from a `varchar` variable, it answers 214. The line is the first of the call, as it is
+/// for the other argument errors a resolution raises
+/// (`argument_errors_of_a_call_leave_with_the_line_their_number_calls_for`, this file).
+#[test]
+fn a_varchar_statement_is_refused_by_executesql() {
+    assert_eq!(
+        errors(&run("EXEC sp_executesql 'SELECT 1 AS n';")),
+        vec![(214, 1)]
+    );
+    assert_eq!(
+        errors(&run(
+            "DECLARE @s varchar(100) = 'SELECT 1 AS n';\nEXEC sp_executesql @s, N'';"
+        )),
+        vec![(214, 1)]
+    );
+}
+
+/// The two Unicode spellings of the same statement run: the refusal above is about the type
+/// the argument carries and not about the call itself.
+#[test]
+fn an_nvarchar_statement_is_run_by_executesql() {
+    let literal = run("EXEC sp_executesql N'SELECT 1 AS n';");
+    assert_eq!(errors(&literal), Vec::new());
+    assert_eq!(rows(&literal), vec![vec![Value::I32(1)]]);
+    let variable = run("DECLARE @s nvarchar(100) = N'SELECT 2 AS n'; EXEC sp_executesql @s, N'';");
+    assert_eq!(errors(&variable), Vec::new());
+    assert_eq!(rows(&variable), vec![vec![Value::I32(2)]]);
+}
+
+/// A catalogue procedure is served a text argument written without the `N` prefix, and one
+/// read from a `varchar` variable: its parameters are declared `sysname` and the argument
+/// reaches it converted.
+#[test]
+fn a_catalogue_procedure_still_reads_a_varchar_argument() {
+    let literal = run("EXEC sys.sp_tables @table_name = 'clients';");
+    assert_eq!(errors(&literal), Vec::new());
+    assert_eq!(rows(&literal), vec![vec![Value::I32(4)]]);
+    let variable = run("DECLARE @t varchar(40) = 'clients'; EXEC sys.sp_tables @table_name = @t;");
+    assert_eq!(errors(&variable), Vec::new());
+    assert_eq!(rows(&variable), vec![vec![Value::I32(4)]]);
 }

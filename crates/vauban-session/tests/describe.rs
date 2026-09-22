@@ -244,6 +244,15 @@ fn resolve_describe(name: &str, args: &[ProcArg<'_>]) -> Option<Result<ProcActio
         "sp_describe_undeclared_parameters" => DescribeKind::UndeclaredParameters,
         _ => return None,
     };
+    if args
+        .first()
+        .is_some_and(|arg| !matches!(arg.ty.ty, SqlType::NVarChar(_) | SqlType::NChar(_)))
+    {
+        return Some(Err(SqlError::procedure_expects_type(
+            "@tsql",
+            "nvarchar(max)",
+        )));
+    }
     let Some(statement) = first_text(args) else {
         return Some(Err(SqlError::procedure_expects_parameter(&base, "@tsql")));
     };
@@ -642,4 +651,47 @@ fn the_wire_token_of_a_column_follows_its_nullability() {
             "row {row}"
         );
     }
+}
+
+/// A batch given to either describe procedure under a non-Unicode type is refused with 214
+/// instead of being described: the type the caller wrote reaches the resolver, where a
+/// `varchar` literal and a `varchar` variable are alike.
+#[test]
+fn a_varchar_batch_is_refused_by_describe_first_result_set() {
+    let mut session = session();
+    let literal = run(
+        &mut session,
+        "EXEC sys.sp_describe_first_result_set 'SELECT 1 AS n'",
+    );
+    assert_eq!(literal.errors, vec![214]);
+    assert!(literal.rows.is_empty(), "no row: {:?}", literal.rows);
+    let variable = run(
+        &mut session,
+        "DECLARE @s varchar(100) = 'SELECT 1 AS n'; EXEC sys.sp_describe_first_result_set @s",
+    );
+    assert_eq!(variable.errors, vec![214]);
+}
+
+#[test]
+fn a_varchar_batch_is_refused_by_describe_undeclared_parameters() {
+    let mut session = session();
+    let sink = run(
+        &mut session,
+        "EXEC sys.sp_describe_undeclared_parameters 'SELECT @x AS x'",
+    );
+    assert_eq!(sink.errors, vec![214]);
+    assert!(sink.rows.is_empty(), "no row: {:?}", sink.rows);
+}
+
+/// The same two batches written with the `N` prefix are described, so the refusal above is
+/// about the type the argument carries.
+#[test]
+fn an_nvarchar_batch_is_still_described() {
+    let mut session = session();
+    let sink = run(
+        &mut session,
+        "EXEC sys.sp_describe_first_result_set N'SELECT 1 AS n'",
+    );
+    assert!(sink.errors.is_empty(), "no error: {:?}", sink.errors);
+    assert_eq!(sink.rows.len(), 1);
 }
