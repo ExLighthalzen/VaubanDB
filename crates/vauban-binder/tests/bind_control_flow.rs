@@ -4,10 +4,12 @@
 //! The bound nodes derive no `PartialEq`: a shape is checked by pattern matching.
 
 use vauban_binder::{
-    BindContext, BoundExprKind, BoundStatement, CatalogView, NoVariables, SessionOptions, bind,
+    BindContext, BoundExprKind, BoundStatement, CatalogView, ColumnBinding, NoVariables,
+    ResolvedTable, ResolvedTableKind, SessionOptions, bind,
 };
+use vauban_catalog::{ColumnId, ObjectId, TableId};
 use vauban_errors::SqlError;
-use vauban_parser::{ParseOptions, Statement, parse_batch};
+use vauban_parser::{ObjectName, ParseOptions, Statement, parse_batch};
 use vauban_sysfn::register_builtins;
 use vauban_types::{Len, SqlType, TypeInfo, Value};
 
@@ -406,6 +408,163 @@ fn a_condition_of_a_nested_if_is_deferred_with_it() {
     };
     assert_eq!(statements.len(), 1, "{statements:?}");
     assert!(matches!(deferred(&statements[0]), Statement::If { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// A statement of a branch or of a loop body over a name the catalogue holds
+// ---------------------------------------------------------------------------
+
+/// A catalogue holding one table, `dbo.t (a int)`, and one taken object name, `ck1`: what
+/// a branch that writes `CREATE TABLE dbo.t`, `SELECT … INTO dbo.t`, `ALTER TABLE dbo.t
+/// ADD a int` or `ADD CONSTRAINT ck1` finds already there.
+struct HoldsOneTable;
+
+impl CatalogView for HoldsOneTable {
+    fn resolve_table(
+        &self,
+        name: &ObjectName,
+        _database: &str,
+        _default_schema: &str,
+    ) -> Option<ResolvedTable> {
+        name.name
+            .value
+            .eq_ignore_ascii_case("t")
+            .then(|| ResolvedTable {
+                object: ObjectId(1),
+                table: Some(TableId(1)),
+                columns: vec![ColumnBinding {
+                    column: ColumnId(1),
+                    index: 0,
+                    name: "a".to_owned(),
+                    ty: TypeInfo::new(SqlType::Int, false),
+                    depth: 0,
+                }],
+                kind: ResolvedTableKind::Table,
+            })
+    }
+
+    fn object_name_taken(&self, name: &str) -> bool {
+        name.eq_ignore_ascii_case("ck1")
+    }
+}
+
+/// A binding context over [`HoldsOneTable`].
+fn holding_ctx(text: &str) -> BindContext<'_> {
+    BindContext {
+        text,
+        catalog: Some(&HoldsOneTable),
+        database: "master",
+        default_schema: "dbo",
+        variables: &NoVariables,
+        options: SessionOptions::default(),
+    }
+}
+
+/// Binds the first statement of `text` against [`HoldsOneTable`], returning the bound form.
+fn bind_holding(text: &str) -> BoundStatement {
+    register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default())
+        .unwrap_or_else(|e| unreachable!("{text} parses, got {e:?}"));
+    bind(&batch.statements[0], &holding_ctx(text))
+        .unwrap_or_else(|e| panic!("{text} should bind, got {e:?}"))
+}
+
+/// Binds the first statement of `text` against [`HoldsOneTable`], returning the error.
+fn err_holding(text: &str) -> SqlError {
+    register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default())
+        .unwrap_or_else(|e| unreachable!("{text} parses, got {e:?}"));
+    bind(&batch.statements[0], &holding_ctx(text))
+        .err()
+        .unwrap_or_else(|| panic!("{text} should not bind"))
+}
+
+/// The statement of a migration script: the `CREATE TABLE` of a name the catalogue already
+/// resolves waits for the control of flow instead of failing the binding, so the `IF` binds
+/// and its branch decides.
+#[test]
+fn a_branch_that_creates_a_table_the_catalogue_holds_binds_deferred() {
+    let stmt = bind_holding("IF OBJECT_ID('dbo.t') IS NULL CREATE TABLE dbo.t (a int)");
+    let BoundStatement::If { then_, .. } = &stmt else {
+        panic!("expected If, got {stmt:?}");
+    };
+    assert!(
+        matches!(deferred(then_), Statement::CreateTable(_)),
+        "the branch kept the CREATE TABLE"
+    );
+}
+
+/// The counter-proof of the pair: the same `CREATE TABLE` written at the head of a batch
+/// answers 2714 state 6 at binding, which is what makes the position the rule.
+#[test]
+fn a_head_create_table_of_a_name_the_catalogue_holds_is_still_2714() {
+    let error = err_holding("CREATE TABLE dbo.t (a int)");
+    assert_eq!((error.number, error.state), (2714, 6), "{error:?}");
+}
+
+/// The loop body and the block carry the same rule as the branch.
+#[test]
+fn a_loop_body_and_a_block_that_create_a_held_name_bind_deferred() {
+    let stmt = bind_holding("WHILE 1 = 0 CREATE TABLE dbo.t (a int)");
+    let BoundStatement::While { body, .. } = &stmt else {
+        panic!("expected While, got {stmt:?}");
+    };
+    assert!(matches!(deferred(body), Statement::CreateTable(_)));
+
+    let stmt = bind_holding("BEGIN CREATE TABLE dbo.t (a int); END");
+    let BoundStatement::Block(statements) = &stmt else {
+        panic!("expected Block, got {stmt:?}");
+    };
+    assert!(matches!(
+        deferred(&statements[0]),
+        Statement::CreateTable(_)
+    ));
+}
+
+/// `SELECT … INTO` a name the catalogue resolves answers the same 2714 state 6 as a
+/// `CREATE TABLE`, and waits the same way.
+#[test]
+fn a_branch_whose_select_into_names_a_held_table_binds_deferred() {
+    let stmt = bind_holding("IF 1 = 0 SELECT a INTO dbo.t FROM dbo.t");
+    let BoundStatement::If { then_, .. } = &stmt else {
+        panic!("expected If, got {stmt:?}");
+    };
+    assert!(matches!(deferred(then_), Statement::Select(_)));
+
+    let error = err_holding("SELECT a INTO dbo.t FROM dbo.t");
+    assert_eq!((error.number, error.state), (2714, 6), "{error:?}");
+}
+
+/// `ALTER TABLE … ADD` of a column the table has (2705 state 4) and `ADD CONSTRAINT` of a
+/// name the database holds (2714 state 5) wait the same way.
+#[test]
+fn a_branch_that_alters_a_table_on_a_held_name_binds_deferred() {
+    let stmt = bind_holding("IF 1 = 0 ALTER TABLE dbo.t ADD a int");
+    let BoundStatement::If { then_, .. } = &stmt else {
+        panic!("expected If, got {stmt:?}");
+    };
+    assert!(matches!(deferred(then_), Statement::AlterTable(_)));
+
+    let stmt = bind_holding("IF 1 = 0 ALTER TABLE dbo.t ADD CONSTRAINT ck1 CHECK (a > 0)");
+    let BoundStatement::If { then_, .. } = &stmt else {
+        panic!("expected If, got {stmt:?}");
+    };
+    assert!(matches!(deferred(then_), Statement::AlterTable(_)));
+}
+
+/// The state is what separates the two 2705: a column list that writes one name twice is a
+/// fault of the text and stays a binding error of the whole statement, in a branch as at
+/// the head of a batch, where the `ALTER TABLE … ADD` of the test above waits.
+#[test]
+fn a_branch_whose_column_list_repeats_a_name_is_still_a_binding_error() {
+    let error = err_holding("IF 1 = 0 CREATE TABLE dbo.x (a int, a int)");
+    assert_eq!((error.number, error.state), (2705, 3), "{error:?}");
+
+    let error = err_holding("IF 1 = 0 ALTER TABLE dbo.t ADD b int, b int");
+    assert_eq!((error.number, error.state), (2705, 3), "{error:?}");
+
+    let error = err_holding("IF 1 = 0 CREATE TABLE dbo.x (a nosuchtype)");
+    assert_eq!(error.number, 2715, "{error:?}");
 }
 
 // ---------------------------------------------------------------------------

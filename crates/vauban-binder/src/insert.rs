@@ -95,6 +95,14 @@
 //! before such an `INSERT` therefore answers 544, where SQL Server, which raises 544
 //! while the statement runs, answers 8134.
 //!
+//! # `SELECT … INTO` over a name the catalogue holds
+//!
+//! The `INTO` target that already resolves answers 2714 state 6 here, the number and the
+//! state a `CREATE TABLE` of that name answers (`ddl.rs`). Written inside `IF`, `WHILE` or
+//! `BEGIN … END`, the statement is not bound here at all: `control.rs` keeps it as it was
+//! parsed until the control of flow reaches it (`tests/bind_control_flow.rs`,
+//! `a_branch_whose_select_into_names_a_held_table_binds_deferred`).
+//!
 //! # The names in 544 and 8101
 //!
 //! 8101 prints the table as it was written, delimiters removed (`INSERT INTO DBO.TI

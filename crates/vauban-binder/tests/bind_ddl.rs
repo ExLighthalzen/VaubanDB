@@ -1,8 +1,14 @@
-//! Binding of `CREATE TABLE`: a second bare `DEFAULT` on one column is kept.
+//! Binding of `CREATE TABLE`: a second bare `DEFAULT` on one column is kept, and which of
+//! the two faults of a name the catalogue already holds decides.
 
-use vauban_binder::{BindContext, BoundStatement, DdlStatement, SessionOptions, bind};
-use vauban_catalog::ConstraintDef;
-use vauban_parser::{ParseOptions, parse_batch};
+use vauban_binder::{
+    BindContext, BoundStatement, CatalogView, ColumnBinding, DdlStatement, NoVariables,
+    ResolvedTable, ResolvedTableKind, SessionOptions, bind,
+};
+use vauban_catalog::{ColumnId, ConstraintDef, ObjectId, TableId};
+use vauban_errors::SqlError;
+use vauban_parser::{ObjectName, ParseOptions, parse_batch};
+use vauban_types::{SqlType, TypeInfo};
 
 /// The `TableDef` of a bound `CREATE TABLE`.
 fn table_def(text: &str) -> vauban_catalog::TableDef {
@@ -35,4 +41,74 @@ fn two_bare_defaults_survive_binding() {
         }
         other => panic!("the second DEFAULT is a nameless constraint, got {other:?}"),
     }
+}
+
+/// A catalogue holding one table, `dbo.t (a int)`.
+struct HoldsT;
+
+impl CatalogView for HoldsT {
+    fn resolve_table(
+        &self,
+        name: &ObjectName,
+        _database: &str,
+        _default_schema: &str,
+    ) -> Option<ResolvedTable> {
+        name.name
+            .value
+            .eq_ignore_ascii_case("t")
+            .then(|| ResolvedTable {
+                object: ObjectId(1),
+                table: Some(TableId(1)),
+                columns: vec![ColumnBinding {
+                    column: ColumnId(1),
+                    index: 0,
+                    name: "a".to_owned(),
+                    ty: TypeInfo::new(SqlType::Int, false),
+                    depth: 0,
+                }],
+                kind: ResolvedTableKind::Table,
+            })
+    }
+}
+
+/// Binds the first statement of `text` against [`HoldsT`].
+fn bind_holding(text: &str) -> Result<BoundStatement, SqlError> {
+    let batch = parse_batch(text, &ParseOptions::default())
+        .unwrap_or_else(|error| panic!("{text} parses, got {}", error.number));
+    bind(
+        &batch.statements[0],
+        &BindContext {
+            text,
+            catalog: Some(&HoldsT),
+            database: "master",
+            default_schema: "dbo",
+            variables: &NoVariables,
+            options: SessionOptions::default(),
+        },
+    )
+}
+
+/// The column list is read before the name is looked up, so a `CREATE TABLE` that both
+/// repeats a column and reuses the name of a table the catalogue holds answers 2705 state
+/// 3: a fault of the text, which stays a binding error even inside a branch, where the
+/// 2714 of the name alone waits for the control of flow.
+#[test]
+fn a_repeated_column_is_answered_before_the_name_the_catalogue_holds() {
+    let error = bind_holding("IF 1 = 0 CREATE TABLE dbo.t (a int, a int);")
+        .expect_err("the repeated column stops the binding");
+    assert_eq!((error.number, error.state), (2705, 3), "{error:?}");
+
+    let error = bind_holding("CREATE TABLE dbo.t (a int, a int);")
+        .expect_err("the repeated column stops the binding");
+    assert_eq!((error.number, error.state), (2705, 3), "{error:?}");
+
+    let bound = bind_holding("IF 1 = 0 CREATE TABLE dbo.t (a int);")
+        .expect("the name alone lets the IF bind");
+    let BoundStatement::If { then_, .. } = &bound else {
+        panic!("expected If, got {bound:?}");
+    };
+    assert!(
+        matches!(then_.as_ref(), BoundStatement::Deferred(_)),
+        "the branch waits, got {then_:?}"
+    );
 }

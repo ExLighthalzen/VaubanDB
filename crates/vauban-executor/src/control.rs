@@ -22,21 +22,26 @@
 //! # A statement left unbound
 //!
 //! [`PhysicalStatement::Deferred`] is a statement of a branch or of a loop body that the
-//! binder left as it was parsed because it named a table the catalogue did not hold.
+//! binder left as it was parsed because the catalogue answered about the name it wrote:
+//! a table it did not hold, or a name it already held (`binder/control.rs`).
 //! [`run_deferred`] binds it, plans it and checks it here, against the catalogue as it
 //! stands when the control of flow reaches it, then runs it like the statement it turned
-//! out to be. Three consequences, each with its test in `tests/control.rs`:
+//! out to be. Four consequences, each with its test in `tests/control.rs`:
 //!
 //! * a branch that is not taken runs nothing, so what it holds stays unbound
 //!   (`a_branch_that_is_not_taken_never_binds_its_statement`);
 //! * a block that reaches such a statement binds it and hands over its rows
 //!   (`a_deferred_statement_binds_when_the_block_reaches_it`);
 //! * a loop reaches it once per turn
-//!   (`a_deferred_statement_in_a_loop_runs_on_every_turn`).
+//!   (`a_deferred_statement_in_a_loop_runs_on_every_turn`);
+//! * a `CREATE TABLE` of a name the catalogue holds answers its 2714 when the branch that
+//!   writes it is taken, and nothing when it is not
+//!   (`a_branch_that_creates_a_table_the_catalogue_holds_answers_2714_when_it_is_taken`).
 //!
 //! A binding that still fails is a run-time error of that statement: it leaves this file
 //! with the number and the line the binder gave it, and the caller decides what the rest
-//! of the batch does.
+//! of the batch does. 2714 ends the batch and 3701 lets it go on, which is what
+//! [`vauban_errors::ErrorDef::batch_scope`] says of each.
 //!
 //! # Variables
 //!

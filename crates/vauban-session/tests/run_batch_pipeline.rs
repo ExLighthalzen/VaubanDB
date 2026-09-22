@@ -977,6 +977,86 @@ fn a_branch_that_fails_on_another_number_still_stops_the_batch_before_it_runs() 
 }
 
 #[test]
+fn a_migration_script_replayed_over_the_table_it_created_does_nothing() {
+    // The idiom of a deployment script, run twice on the same session. The second run
+    // finds `dbo.m1` there, so the branch is not taken: no error reaches the sink and the
+    // single row inserted by the first run is still the only one.
+    let script = "IF OBJECT_ID('dbo.m1') IS NULL BEGIN CREATE TABLE dbo.m1 (a int); \
+         INSERT dbo.m1 VALUES (1); END;";
+    let mut session = session();
+    let (first, result) = run_on(&mut session, script);
+    result.expect("the batch reports through the sink");
+    assert!(
+        !first.iter().any(|event| matches!(event, Event::Error(_))),
+        "{first:#?}"
+    );
+
+    let (second, result) = run_on(&mut session, script);
+    result.expect("the batch reports through the sink");
+    assert!(
+        !second.iter().any(|event| matches!(event, Event::Error(_))),
+        "{second:#?}"
+    );
+
+    let (events, result) = run_on(&mut session, "SELECT a FROM dbo.m1;");
+    result.expect("the batch reports through the sink");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+}
+
+#[test]
+fn a_branch_that_is_taken_over_a_table_the_batch_already_holds_is_2714_at_run_time() {
+    // The table is there when the batch is bound, so the `CREATE TABLE` of the branch
+    // could have failed at compilation; the row of `SELECT 1` says it did not. 2714 is
+    // batch-scoped, so `SELECT 2` does not run.
+    let mut session = session();
+    let (_, result) = run_on(&mut session, "CREATE TABLE dbo.m2 (a int);");
+    result.expect("the setup batch reports through the sink");
+
+    let (events, result) = run_on(
+        &mut session,
+        "SELECT 1;\nIF 1 = 1\n  CREATE TABLE dbo.m2 (a int);\nSELECT 2;",
+    );
+    result.expect("the batch reports through the sink");
+    let error = only_error(&events);
+    assert_eq!((error.number, error.state), (2714, 6), "{events:#?}");
+    assert_eq!(error.line, 3, "{events:#?}");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+}
+
+#[test]
+fn a_branch_that_drops_a_table_nothing_holds_is_3701_and_the_batch_goes_on() {
+    // The neighbouring scope: 3701 is statement-scoped, so the same shape lets `SELECT 2`
+    // run where the 2714 above stops the batch.
+    let events = run("SELECT 1;\nIF 1 = 1 DROP TABLE dbo.m3;\nSELECT 2;");
+    let error = only_error(&events);
+    assert_eq!(error.number, 3701, "{events:#?}");
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(1)], vec![Value::I32(2)]],
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn a_branch_that_repeats_a_column_name_still_stops_the_batch_before_it_runs() {
+    // The counter-proof on the state: 2705 state 3 is a fault of the written column list,
+    // answered while the batch is compiled, so `SELECT 1` produces nothing — where the
+    // 2714 of the test above produced its row. The branch is not even taken.
+    let mut session = session();
+    let (_, result) = run_on(&mut session, "CREATE TABLE dbo.m4 (a int);");
+    result.expect("the setup batch reports through the sink");
+
+    let (events, result) = run_on(
+        &mut session,
+        "SELECT 1;\nIF 1 = 0\n  CREATE TABLE dbo.m4 (a int, a int);\nSELECT 2;",
+    );
+    result.expect("the batch reports through the sink");
+    let error = only_error(&events);
+    assert_eq!((error.number, error.state), (2705, 3), "{events:#?}");
+    assert_eq!(result_sets(&events), 0, "{events:#?}");
+}
+
+#[test]
 fn an_error_of_a_branch_keeps_the_line_the_executor_gave_it() {
     // The `IF` starts on line 2 and holds a `SELECT` on line 3. The divide by zero is
     // answered on line 3, the line of the statement the branch holds, and the batch goes

@@ -6,14 +6,21 @@
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding, DeferredStatement,
-    OutputColumn, OutputSchema, SessionOptions, SortKey,
+    BindContext, BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding,
+    DeferredStatement, OutputColumn, OutputSchema, SessionOptions, SortKey, bind,
 };
-use vauban_catalog::ColumnId;
-use vauban_executor::{CancelToken, CollectSink, ExecContext, ExecOutcome, ExecSession, execute};
+use vauban_catalog::{Catalog, ColumnId};
+use vauban_errors::SqlResult;
+use vauban_executor::{
+    CancelToken, CollectSink, ExecContext, ExecOutcome, ExecSession, execute, execute_collect,
+};
 use vauban_parser::{ParseOptions, parse_batch};
-use vauban_planner::{PhysicalDeclaration, PhysicalPlan, PhysicalStatement};
+use vauban_planner::{
+    NoIndexes, PhysicalDeclaration, PhysicalPlan, PhysicalStatement, PlanContext, plan,
+};
+use vauban_storage::{MemoryStorage, Storage};
 use vauban_sysfn::StaticContext;
+use vauban_txn::{IsolationLevel, TransactionManager};
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
 // ---------------------------------------------------------------------------------------
@@ -821,6 +828,100 @@ fn a_deferred_statement_gets_the_compile_time_checks() {
         &if_over(true, deferred("SELECT TOP (0 - 1) 1;")),
     );
     assert_eq!(error.number, 127, "{error:?}");
+}
+
+// ---------------------------------------------------------------------------------------
+// A statement left unbound over a name the catalogue holds
+// ---------------------------------------------------------------------------------------
+
+/// A bootstrapped catalogue over an in-memory storage: what a statement bound this late is
+/// bound against, and what a `CREATE TABLE` writes into.
+struct Fixture {
+    storage: Arc<dyn Storage>,
+    txn: Arc<TransactionManager>,
+    catalog: Catalog,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let txn = Arc::new(TransactionManager::new(Arc::clone(&storage)));
+        let catalog = Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn))
+            .expect("the catalogue boots on a fresh storage");
+        Self {
+            storage,
+            txn,
+            catalog,
+        }
+    }
+}
+
+/// Parses, binds against the catalogue of `fixture`, plans and runs `text` as one
+/// statement, in a transaction of its own.
+fn run_over_catalog(fixture: &Fixture, text: &str) -> SqlResult<ExecOutcome> {
+    vauban_sysfn::register_builtins();
+    let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = fixture.catalog.snapshot(&handle);
+    let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+    let mut bind_ctx = BindContext::scalar(text, SessionOptions::default());
+    bind_ctx.catalog = Some(&snapshot);
+    let bound = bind(&batch.statements[0], &bind_ctx).expect("the statement binds");
+    let planned = plan(
+        bound,
+        &PlanContext {
+            catalog: &NoIndexes,
+        },
+    )
+    .expect("the statement plans");
+    let snap = fixture.txn.statement_snapshot(&handle);
+    let eval = StaticContext::default();
+    let mut session = ExecSession::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default())
+        .with_engine(fixture.storage.as_ref(), &fixture.txn, &snap)
+        .with_catalog(&fixture.catalog)
+        .with_handle(&handle)
+        .with_session(&mut session);
+    let outcome = execute_collect(&planned, &mut ctx).map(|(outcome, _)| outcome);
+    match &outcome {
+        Ok(_) => fixture.txn.commit(handle).expect("the transaction commits"),
+        Err(_) => fixture.txn.rollback(handle).expect("it rolls back"),
+    }
+    outcome
+}
+
+/// The `CREATE TABLE` of a name the catalogue already holds, written in a branch, answers
+/// 2714 when the branch is taken and nothing when it is not: the number falls while the
+/// statement runs, which is what the pair separates from a binding error of the batch.
+#[test]
+fn a_branch_that_creates_a_table_the_catalogue_holds_answers_2714_when_it_is_taken() {
+    let fixture = Fixture::new();
+    run_over_catalog(&fixture, "CREATE TABLE dbo.t (a int);").expect("the table is created");
+
+    run_over_catalog(&fixture, "IF 1 = 0 CREATE TABLE dbo.t (a int);")
+        .expect("the branch is not taken, so nothing looks the name up");
+
+    let error = run_over_catalog(&fixture, "IF 1 = 1 CREATE TABLE dbo.t (a int);")
+        .expect_err("the branch is taken and the name is there");
+    assert_eq!((error.number, error.state), (2714, 6), "{error:?}");
+}
+
+/// The loop body carries it too, and the `ALTER TABLE … ADD` of a column the table has
+/// answers 2705 state 4 the same way.
+#[test]
+fn a_loop_body_and_an_alter_table_answer_their_number_when_they_are_reached() {
+    let fixture = Fixture::new();
+    run_over_catalog(&fixture, "CREATE TABLE dbo.t (a int);").expect("the table is created");
+
+    let error = run_over_catalog(&fixture, "WHILE 1 = 1 CREATE TABLE dbo.t (a int);")
+        .expect_err("the first turn reaches the statement");
+    assert_eq!((error.number, error.state), (2714, 6), "{error:?}");
+
+    let error = run_over_catalog(&fixture, "IF 1 = 1 ALTER TABLE dbo.t ADD a int;")
+        .expect_err("the branch is taken and the column is there");
+    assert_eq!((error.number, error.state), (2705, 4), "{error:?}");
+
+    run_over_catalog(&fixture, "IF 1 = 0 ALTER TABLE dbo.t ADD a int;")
+        .expect("the branch is not taken, so nothing looks the column up");
 }
 
 /// A `GOTO` answers [`ExecOutcome::Goto`] with the name it wrote, and a label answers

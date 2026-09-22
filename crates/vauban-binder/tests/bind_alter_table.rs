@@ -183,6 +183,23 @@ fn add_existing_column_is_2705() {
     assert_eq!((error.number, error.severity, error.state), (2705, 16, 4));
 }
 
+/// The `IF` around the same `ALTER TABLE` binds: 2705 state 4 names a column the
+/// catalogue holds, and a statement running before the branch may drop it, so the branch
+/// waits for the control of flow instead of failing the binding of the batch.
+#[test]
+fn add_existing_column_in_a_branch_binds_deferred() {
+    assert_branch_is_deferred("IF 1 = 0 ALTER TABLE dbo.t ADD a int NULL;", &catalog());
+}
+
+/// Its counter-proof on the state: a column list that writes one name twice is 2705 state
+/// 3, a fault of the text, and stays a binding error in a branch as at the head of a
+/// batch.
+#[test]
+fn add_two_columns_duplicate_within_the_list_in_a_branch_is_still_2705() {
+    let error = err("IF 1 = 0 ALTER TABLE dbo.t ADD c int, c int;", &catalog());
+    assert_eq!((error.number, error.severity, error.state), (2705, 16, 3));
+}
+
 #[test]
 fn add_unknown_type_is_2715() {
     let error = err("ALTER TABLE dbo.t ADD c nosuch NULL;", &catalog());
@@ -426,6 +443,34 @@ fn duplicate_constraint_name_is_2714() {
         },
     );
     assert_eq!((error.number, error.severity, error.state), (2714, 16, 5));
+}
+
+/// The `IF` around the same `ADD CONSTRAINT` binds: 2714 state 5 joins 2705 state 4 in
+/// waiting for the control of flow.
+#[test]
+fn duplicate_constraint_name_in_a_branch_binds_deferred() {
+    assert_branch_is_deferred(
+        "IF 1 = 0 ALTER TABLE dbo.t ADD CONSTRAINT taken CHECK (a > 0);",
+        &Tables {
+            taken_names: vec!["taken".to_owned()],
+            index_on_b: false,
+        },
+    );
+}
+
+/// Binds `text`, an `IF` whose branch holds one statement, and asserts that the branch
+/// kept that statement unbound.
+fn assert_branch_is_deferred(text: &str, catalog: &Tables) {
+    register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default()).expect("parse");
+    let bound = bind(&batch.statements[0], &ctx(text, catalog)).expect("the IF binds");
+    let BoundStatement::If { then_, .. } = &bound else {
+        panic!("expected If, got {bound:?}");
+    };
+    assert!(
+        matches!(then_.as_ref(), BoundStatement::Deferred(_)),
+        "the branch waits, got {then_:?}"
+    );
 }
 
 /// The two tests below bind against a [`vauban_catalog::CatalogSnapshot`] built from a real

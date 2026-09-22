@@ -30,11 +30,20 @@
 //! statement, and the batch goes on after it (`SELECT 2;` written after the failing
 //! statement still answers its row): a run-time error scoped to its statement.
 //!
-//! 2714 is the one deliberate difference from SQL Server: the binder refuses a
-//! `CREATE TABLE` whose name the catalogue already resolves, **before** anything is
-//! written, where SQL Server refuses it while it runs. A batch that mixes a result set and
-//! a duplicate `CREATE TABLE` therefore answers one result set on SQL Server and zero here
+//! 2714 is a difference this file makes on purpose, and it is bounded to the statement
+//! written at the head of a batch: the binder refuses a `CREATE TABLE` whose name the
+//! catalogue already resolves, **before** anything is written, where SQL Server refuses it
+//! while it runs. A batch that mixes a result set and such a `CREATE TABLE` therefore
+//! answers one result set on SQL Server and zero here
 //! (`ddl::tests::create_table_duplicate_name_is_2714`).
+//!
+//! Written inside `IF`, `WHILE` or `BEGIN … END`, that `CREATE TABLE` is not bound here at
+//! all: `control.rs` keeps it as it was parsed until the control of flow reaches it, which
+//! puts its 2714 back where the table above reads it, at execution
+//! (`tests/bind_control_flow.rs`,
+//! `a_branch_that_creates_a_table_the_catalogue_holds_binds_deferred`). That is what lets a
+//! migration script write `IF OBJECT_ID('dbo.t') IS NULL CREATE TABLE dbo.t (a int);` and
+//! replay it over the table it created.
 //!
 //! `USE` binds whatever the name: [`CatalogView`](crate::CatalogView) answers about tables
 //! and views, not about databases, so the binder cannot tell `USE nosuch` from

@@ -6,6 +6,22 @@
 //!
 //! `ALTER DATABASE … SET` is the other half of the pair and is **not** here: it belongs
 //! with the rest of the database statements, in `ddl.rs`.
+//!
+//! # What is checked here, and what waits for the control of flow
+//!
+//! Two of the numbers this file raises name an object the catalogue already holds: 2705
+//! state 4, an `ADD` of a column the table has, and 2714 state 5, an `ADD CONSTRAINT` of a
+//! name the database holds. Written at the head of a batch, both are binding errors raised
+//! here (`tests/bind_alter_table.rs`, `add_existing_column_is_2705`,
+//! `duplicate_constraint_name_is_2714`). Written inside `IF`, `WHILE` or `BEGIN … END`, the
+//! statement is not bound here at all: `control.rs` keeps it as it was parsed until the
+//! control of flow reaches it, so a branch that is not taken raises neither
+//! (`add_existing_column_in_a_branch_binds_deferred`,
+//! `duplicate_constraint_name_in_a_branch_binds_deferred`).
+//!
+//! The state is what separates 2705 state 4 from 2705 state 3, the column list that writes
+//! one name twice: a fault of the written text, which stays a binding error inside a branch
+//! (`add_two_columns_duplicate_within_the_list_in_a_branch_is_still_2705`).
 
 use vauban_catalog::{
     AlterTable, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, SortedColumn,

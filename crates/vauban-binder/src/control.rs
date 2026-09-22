@@ -1,7 +1,7 @@
 //! Control of flow: `IF … ELSE`, `WHILE`, `BEGIN … END`, `BREAK`, `CONTINUE`, `RETURN`,
 //! `PRINT`, `GOTO` and the labels it names.
 //!
-//! # A branch that names a table the catalogue does not hold
+//! # A branch that names an object the catalogue answers about
 //!
 //! A statement written inside `IF`, `WHILE` or `BEGIN … END` is not bound here when its
 //! binding answers one of [`BOUND_WHEN_REACHED`]: it becomes a
@@ -15,10 +15,17 @@
 //!   the moment the `CREATE TABLE` before it has run
 //!   (`a_block_that_creates_then_inserts_defers_the_insert`).
 //!
-//! The rest of the binding is unchanged: another number is still a binding error of the
-//! whole statement (`a_branch_that_fails_on_another_number_is_still_a_binding_error`), and
-//! so is a name written in the **condition**, which is read before the branch is chosen:
-//! the statement the caller handed over answers 208 rather than binding
+//! The same rule carries the name a branch finds **taken** rather than missing, which is
+//! what a migration script writes: `IF OBJECT_ID('dbo.t') IS NULL CREATE TABLE dbo.t (a
+//! int);` replayed over a `dbo.t` that is already there binds, and its branch is not taken
+//! (`a_branch_that_creates_a_table_the_catalogue_holds_binds_deferred`).
+//!
+//! The rest of the binding is unchanged: a number outside the list is still a binding
+//! error of the whole statement
+//! (`a_branch_that_fails_on_another_number_is_still_a_binding_error`,
+//! `a_branch_whose_column_list_repeats_a_name_is_still_a_binding_error`), and so is a name
+//! written in the **condition**, which is read before the branch is chosen: the statement
+//! the caller handed over answers 208 rather than binding
 //! (`a_condition_over_a_missing_table_is_still_208`). Written one level down, that same
 //! condition travels with its own `IF`, which this file defers as one statement
 //! (`a_condition_of_a_nested_if_is_deferred_with_it`).
@@ -35,13 +42,74 @@ use crate::context::BindContext;
 use crate::expr::{Scope, bind_condition, bind_expr};
 use crate::statement;
 
-/// Numbers that make a statement of a branch or of a loop body wait for its execution
-/// instead of failing the binding: each names a table that is not in the catalogue yet and
-/// may be created before the control of flow gets there.
+/// State of the 2714 a `CREATE TABLE` or a `SELECT … INTO` answers for a name the
+/// catalogue resolves ([`SqlError::object_already_exists`]).
+const CREATE_TABLE_2714_STATE: u8 = 6;
+
+/// State of the 2714 an `ALTER TABLE … ADD CONSTRAINT` answers for a name the database
+/// holds (`alter.rs`).
+const ADD_CONSTRAINT_2714_STATE: u8 = 5;
+
+/// State of the 2705 an `ALTER TABLE … ADD` answers for a column the table has
+/// (`alter.rs`), where state 3 is a column list that writes one name twice.
+const ALTER_TABLE_ADD_2705_STATE: u8 = 4;
+
+/// One entry of [`BOUND_WHEN_REACHED`]: a number, and the state that picks it out when the
+/// same number also names a check which stays a binding error.
+struct DeferredNumber {
+    /// The number the binding answered.
+    number: u32,
+    /// The state to match, or `None` to match the number without reading its state.
+    state: Option<u8>,
+}
+
+impl DeferredNumber {
+    /// Whether `error` is this entry: its number, and its state when the entry names one.
+    fn matches(&self, error: &SqlError) -> bool {
+        self.number == error.number && self.state.is_none_or(|state| state == error.state)
+    }
+}
+
+/// What a statement of a branch or of a loop body waits for its execution to answer,
+/// instead of failing the binding of the whole batch.
 ///
-/// 208 is `INSERT`, `UPDATE`, `DELETE` and `SELECT` over a missing table, 1088 is
-/// `CREATE INDEX` on one, 4902 is `ALTER TABLE` on one.
-const BOUND_WHEN_REACHED: [u32; 3] = [208, 1088, 4902];
+/// The first three name an object the catalogue does not hold and that a statement running
+/// before the branch may create: 208 for `INSERT`, `UPDATE`, `DELETE` and `SELECT`, 1088
+/// for `CREATE INDEX`, 4902 for `ALTER TABLE`. The last three name one it already holds,
+/// the shape a migration script replays: 2714 state 6 for the `CREATE TABLE` and the
+/// `SELECT … INTO` of a name that resolves, 2714 state 5 for the `ADD CONSTRAINT` of a name
+/// the database holds, 2705 state 4 for the `ALTER TABLE … ADD` of a column the table has.
+///
+/// 2705 is why an entry carries a state: under state 3 the same number is a column list
+/// that writes one name twice, a fault of the text that stays a binding error of the batch
+/// (`tests/bind_control_flow.rs`,
+/// `a_branch_whose_column_list_repeats_a_name_is_still_a_binding_error`).
+const BOUND_WHEN_REACHED: [DeferredNumber; 6] = [
+    DeferredNumber {
+        number: 208,
+        state: None,
+    },
+    DeferredNumber {
+        number: 1088,
+        state: None,
+    },
+    DeferredNumber {
+        number: 4902,
+        state: None,
+    },
+    DeferredNumber {
+        number: 2705,
+        state: Some(ALTER_TABLE_ADD_2705_STATE),
+    },
+    DeferredNumber {
+        number: 2714,
+        state: Some(ADD_CONSTRAINT_2714_STATE),
+    },
+    DeferredNumber {
+        number: 2714,
+        state: Some(CREATE_TABLE_2714_STATE),
+    },
+];
 
 thread_local! {
     /// Depth of `WHILE` nesting. Incremented when entering `bind_while`, decremented on
@@ -53,7 +121,7 @@ thread_local! {
 /// its binding answers one of [`BOUND_WHEN_REACHED`] (module header).
 fn bind_nested(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement> {
     match statement::bind(stmt, ctx) {
-        Err(error) if BOUND_WHEN_REACHED.contains(&error.number) => {
+        Err(error) if BOUND_WHEN_REACHED.iter().any(|entry| entry.matches(&error)) => {
             Ok(BoundStatement::Deferred(Box::new(DeferredStatement {
                 text: Arc::from(ctx.text),
                 statement: Box::new(stmt.clone()),
