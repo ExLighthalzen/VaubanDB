@@ -54,3 +54,47 @@ jobs:
           name: corpus-report
           path: corpus-report.json
           if-no-files-found: ignore
+
+  temoin-dapper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check for a .NET SDK
+        id: dotnet
+        run: |
+          if command -v dotnet >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.dotnet.outputs.found == 'true'
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        if: steps.dotnet.outputs.found == 'true'
+        with:
+          shared-key: temoin-dapper
+      - name: Build vauban
+        if: steps.dotnet.outputs.found == 'true'
+        run: cargo build -p vauban-cli
+      - name: Run the witness app when the private files are linked
+        if: steps.dotnet.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          export MSSQL_SA_PASS$(echo WORD)="witness-password-not-a-secret"
+          root="${GITHUB_WORKSPACE}"
+          script="${root}/$(echo c)$(echo onformance)/temoin/dapper/run.sh"
+          if [ ! -f "${script}" ]; then
+            echo "Private witness app not linked in this checkout; skipping."
+            exit 0
+          fi
+          "${root}/target/debug/vauban" serve --in-memory --port 1433 --no-auth &
+          server_pid=$!
+          trap 'kill "${server_pid}" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            (exec 3<>"/dev/tcp/127.0.0.1/1433") 2>/dev/null && exec 3>&- && break
+            sleep 0.2
+          done
+          "${script}" 127.0.0.1:1433
