@@ -99,7 +99,7 @@ pub(crate) fn next_rowcount(stmt: &PhysicalStatement, previous: i64, from_exec: 
 /// The 1-based line the statement starts on, in the text that carries it.
 ///
 /// [`statement_span`] has one arm per variant of the parser, and the line of that span is
-/// the answer here for each variant but `EXEC`, which has its own section below. One rule
+/// the answer here; the `EXEC` section below says what the answer buys there. One rule
 /// for the three texts a session binds: the batch it receives, the nested text of a
 /// parameterized call, and the text of a prepared handle.
 ///
@@ -137,25 +137,21 @@ pub(crate) fn next_rowcount(stmt: &PhysicalStatement, previous: i64, from_exec: 
 /// its own first token, not the line of the statement it runs
 /// (`statements/tests/mod.rs`).
 ///
-/// # `EXEC` is the variant with no line to offer
+/// # `EXEC` answers the line it starts on, and the call sorts out what keeps it
 ///
-/// An `EXEC` of a procedure answers 0, the "no line to offer" of [`at_statement`], so an
-/// error raised by the call leaves on the line the dispatch put on it: an `EXEC` of a
-/// name no procedure carries answers 2812 on the first line of the batch, and not on the
-/// line the `EXEC` sits on (`tests/batch.rs`,
-/// `an_exec_of_an_unknown_procedure_answers_on_the_first_line`;
-/// `statements/tests/mod.rs`, `statement_line_of_an_exec_is_zero`).
+/// An `EXEC` answers the line of its own first token, like the other variants: a name no
+/// procedure carries answers 2812 on the line the `EXEC` sits on, and so does an argument
+/// list the binder refuses (`tests/batch.rs`,
+/// `an_exec_of_an_unknown_procedure_answers_on_the_line_it_sits_on`;
+/// `statements/tests/mod.rs`, `statement_line_of_an_exec_is_the_line_it_starts_on`).
 ///
-/// The line of the statement would be the closer answer for that one, and the wrong one
-/// for the rest: what a call raises about its own arguments — a parameter left without a
-/// value, a declaration that does not parse — is located in the parameterized text, whose
-/// first line is where the client reads it, and forcing the line of the `EXEC` on it
-/// would move it off that line.
+/// That line is the wrong one for what the **call** raises about its arguments — a
+/// parameter left without a value, a declaration that does not parse — which is located
+/// in the parameterized text, whose first line is where the client reads it. The dispatch
+/// keeps those where they are rather than stamping this line on them (`procedures.rs`,
+/// `at_call_line`).
 pub(crate) fn statement_line(stmt: &Statement) -> u32 {
-    match stmt {
-        Statement::Execute(_) => 0,
-        _ => statement_span(stmt).line,
-    }
+    statement_span(stmt).line
 }
 
 /// The 1-based line the **name** of a `USE` statement starts on, in `text`, which is the

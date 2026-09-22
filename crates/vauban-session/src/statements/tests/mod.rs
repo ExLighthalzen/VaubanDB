@@ -75,14 +75,14 @@ fn statement_line_covers_the_control_flow_variants_and_print() {
     }
 }
 
-/// An `EXEC` answers 0, the "no line to offer" of [`at_statement`]: the error of a call
-/// is located in the text the call ran, and stays where that text put it.
+/// An `EXEC` answers the line of its first token, not the line its procedure name sits on:
+/// the statement below opens on line 2 and spreads over line 3.
 #[test]
-fn statement_line_of_an_exec_is_zero() {
+fn statement_line_of_an_exec_is_the_line_it_starts_on() {
     let text = "SELECT 1;\nEXEC\n  dbo.p;";
     let statements = parse(text);
     assert!(matches!(statements[1], Statement::Execute(_)));
-    assert_eq!(statement_line(&statements[1]), 0);
+    assert_eq!(statement_line(&statements[1]), 2);
 }
 
 /// The DDL variants, `USE`, `INSERT`, `UPDATE` and `DELETE` answer the line of their

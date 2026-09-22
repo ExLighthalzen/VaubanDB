@@ -19,7 +19,8 @@ enum Event {
     Row(Vec<Value>),
     Done(Option<u64>, bool),
     DoneInProc,
-    Error(u32),
+    /// Number and line of an error the batch sent to the client.
+    Error(u32, u32),
 }
 
 #[derive(Default)]
@@ -46,7 +47,7 @@ impl ResultSink for Recording {
         Ok(())
     }
     fn error(&mut self, err: &SqlError) -> SqlResult<()> {
-        self.0.push(Event::Error(err.number));
+        self.0.push(Event::Error(err.number, err.line));
         Ok(())
     }
     fn env_change(&mut self, _change: &EnvChange) -> SqlResult<()> {
@@ -68,6 +69,9 @@ fn register_test_resolver() {
                 && !name.to_ascii_lowercase().ends_with(".sp_executesql")
             {
                 return None;
+            }
+            if let Some(number) = refused_number(args) {
+                return Some(Err(SqlError::new(number, 16, 2, "argument error")));
             }
             let mut params = Vec::new();
             for arg in args {
@@ -97,6 +101,20 @@ fn register_test_resolver() {
             Some(Ok(ProcAction::ExecuteSql { statement, params }))
         });
     });
+}
+
+/// The number an `@refuse = <n>` argument asks the resolver to answer, so a test can read
+/// what the dispatch does with an error the resolution raised, whatever its number.
+fn refused_number(args: &[vauban_session::ProcArg<'_>]) -> Option<u32> {
+    args.iter()
+        .find(|arg| {
+            arg.name
+                .is_some_and(|name| name.eq_ignore_ascii_case("@refuse"))
+        })
+        .and_then(|arg| match arg.value {
+            Value::I32(number) => u32::try_from(*number).ok(),
+            _ => None,
+        })
 }
 
 fn session() -> Session {
@@ -200,4 +218,56 @@ fn rowcount_after_exec_of_a_literal_select_is_the_row_count_of_its_last_statemen
         "{:?}",
         events.0
     );
+}
+
+/// The line each number of an argument error leaves with, on a batch whose `EXEC` sits on
+/// line 3: two of them count arguments and leave without a line, two point inside the
+/// parameterized text and leave on its first line.
+///
+/// | number | line |
+/// |---|:-:|
+/// | 8144 (too many arguments) | 0 |
+/// | 8146 (arguments for a text that declares none) | 0 |
+/// | 8178 (a declared parameter left without a value) | 1 |
+/// | 214 (an argument whose type the procedure refuses) | 1 |
+#[test]
+fn argument_errors_of_a_call_leave_with_the_line_their_number_calls_for() {
+    for (number, line) in [(8144, 0), (8146, 0), (8178, 1), (214, 1)] {
+        let events = run(&format!(
+            "SELECT 1 AS n;\n\nEXEC sp_executesql N'SELECT 1 AS n', N'', @refuse = {number};"
+        ));
+        assert!(
+            events.0.contains(&Event::Error(number, line)),
+            "{number}: {:?}",
+            events.0
+        );
+    }
+}
+
+/// A name no procedure carries answers 2812 on the line the `EXEC` sits on, here the third
+/// line of the batch, and not on the first line of the batch.
+#[test]
+fn an_exec_of_an_unknown_procedure_answers_on_the_line_of_its_statement() {
+    let events = run("SELECT 1 AS n;\n\nEXEC dbo.nosuchprocedure;");
+    assert!(events.0.contains(&Event::Error(2812, 3)), "{:?}", events.0);
+}
+
+/// `OUTPUT` written on a constant answers 179 on the line the `EXEC` sits on, here the
+/// third line of the batch.
+#[test]
+fn output_on_a_constant_answers_on_the_line_of_its_statement() {
+    let events = run(
+        "SELECT 1 AS n;\n\nEXEC sp_executesql N'SELECT 1 AS n', N'@o int OUTPUT', @o = 1 OUTPUT;",
+    );
+    assert!(events.0.contains(&Event::Error(179, 3)), "{:?}", events.0);
+}
+
+/// An error raised by a statement of the text a call runs keeps the line that text puts on
+/// it: the divide by zero below sits on the second line of the text, whatever line the
+/// `EXEC` sits on.
+#[test]
+fn an_error_of_the_text_a_call_runs_keeps_the_line_of_that_text() {
+    let events =
+        run("SELECT 1 AS n;\n\nEXEC sp_executesql N'SELECT 1 AS n;\nSELECT 1/0 AS d;', N'';");
+    assert!(events.0.contains(&Event::Error(8134, 2)), "{:?}", events.0);
 }

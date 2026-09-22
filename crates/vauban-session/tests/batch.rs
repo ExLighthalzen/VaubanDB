@@ -934,12 +934,11 @@ async fn a_binding_error_of_a_print_carries_the_line_of_its_statement() {
     running.stop().await;
 }
 
-/// An `EXEC` of a name no procedure carries answers 2812 on the **first** line of the
-/// batch, where the line the `EXEC` sits on would be the closer answer: an `EXEC` offers
-/// no line of its own, and that is what leaves the error of a call that does run on the
-/// line of the text the call ran (rustdoc of `statement_line`).
+/// An `EXEC` of a name no procedure carries answers 2812 on the line the `EXEC` sits on,
+/// the third of the batch below, and not on the first line of the batch. What a call that
+/// does run raises is located in the text it ran instead (rustdoc of `statement_line`).
 #[tokio::test]
-async fn an_exec_of_an_unknown_procedure_answers_on_the_first_line() {
+async fn an_exec_of_an_unknown_procedure_answers_on_the_line_it_sits_on() {
     let running = start().await;
     let mut client = connect_and_login(running.addr).await;
 
@@ -950,7 +949,7 @@ async fn an_exec_of_an_unknown_procedure_answers_on_the_first_line() {
             .any(|token| matches!(token, Tok::Error { number: 2812, .. })),
         "{toks:?}"
     );
-    assert_eq!(first_error_line(&toks), 1);
+    assert_eq!(first_error_line(&toks), 3);
 
     drop(client);
     running.stop().await;

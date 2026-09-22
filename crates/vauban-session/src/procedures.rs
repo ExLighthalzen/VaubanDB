@@ -172,7 +172,7 @@ pub(crate) fn run_batch_procedure(
             let err = SqlError::procedure_not_found(name).with_line(line);
             finish_batch_exec_error(session, err, more, sink)
         }
-        Some(Err(err)) => finish_batch_exec_error(session, at_line(err, line), more, sink),
+        Some(Err(err)) => finish_batch_exec_error(session, at_call_line(err), more, sink),
         Some(Ok(action)) => {
             let outcome = execute_proc_action(
                 session,
@@ -540,6 +540,34 @@ fn coerce_unicode_literal_ty(ty: &TypeInfo, value: &Value) -> TypeInfo {
 
 fn at_line(err: SqlError, line: u32) -> SqlError {
     if line == 0 { err } else { err.with_line(line) }
+}
+
+/// The two numbers a call answers with no line at all: the argument list holds more values
+/// than the procedure takes (8144), or the parameterized text declares no parameter and the
+/// call passed one anyway (8146). Both count arguments instead of pointing at one
+/// (`tests/execute.rs`, `argument_errors_of_a_call_leave_with_the_line_their_number_calls_for`).
+const COUNTED_WITHOUT_A_LINE: [u32; 2] = [8144, 8146];
+
+/// First line of the parameterized text a call carries, where an argument error the
+/// resolution raised without a line of its own is read.
+const FIRST_LINE_OF_THE_CALL: u32 = 1;
+
+/// The line an error raised while the arguments of a system procedure are bound leaves with.
+///
+/// The line of the `EXEC` is not it: what the resolution raises is located in the
+/// parameterized text the call carries, so a declaration the parser refuses on the second
+/// line of `@params` keeps that line, and an error with no line of its own leaves on the
+/// first, wherever in the batch the `EXEC` sits. The numbers of
+/// [`COUNTED_WITHOUT_A_LINE`] leave with no line at all (`tests/execute.rs`,
+/// `argument_errors_of_a_call_leave_with_the_line_their_number_calls_for`).
+fn at_call_line(err: SqlError) -> SqlError {
+    if COUNTED_WITHOUT_A_LINE.contains(&err.number) {
+        return err.with_line(0);
+    }
+    if err.line == 0 {
+        return err.with_line(FIRST_LINE_OF_THE_CALL);
+    }
+    err
 }
 
 enum BodySink<'a> {

@@ -350,3 +350,27 @@ fn sys_prefix_and_brackets_normalise() {
         assert!(resolve_system_procedure(name, &args).is_some(), "{name}");
     }
 }
+
+/// The first argument of `sp_executesql` is refused for its type in both call forms, and
+/// for the two names the named form accepts.
+#[test]
+fn sp_executesql_refuses_a_varchar_statement_in_both_call_forms() {
+    let varchar_type = varchar_ty();
+    let nvarchar_type = nvarchar_ty();
+    let stmt = nvarchar("SELECT 1 AS n");
+    let empty = nvarchar("");
+    for name in [None, Some("@stmt"), Some("@statement")] {
+        let err = resolve_system_procedure(
+            "sp_executesql",
+            &[
+                arg(name, &varchar_type, &stmt, false),
+                arg(name.map(|_| "@params"), &nvarchar_type, &empty, false),
+            ],
+        )
+        .expect("known")
+        .unwrap_err();
+        assert_eq!(err.number, 214, "{name:?}");
+        assert_eq!(err.severity, 16, "{name:?}");
+        assert_eq!(err.state, 2, "{name:?}");
+    }
+}
