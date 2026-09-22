@@ -116,6 +116,7 @@ const TOKEN_LOGINACK: u8 = 0xAD;
 const TOKEN_ROW: u8 = 0xD1;
 const TOKEN_ENVCHANGE: u8 = 0xE3;
 const TOKEN_DONE: u8 = 0xFD;
+const TOKEN_DONEINPROC: u8 = 0xFF;
 /// TYPE_INFO tokens ([MS-TDS] 2.2.5.4.1).
 const INT2TYPE: u8 = 0x34;
 const INT4TYPE: u8 = 0x38;
@@ -299,6 +300,13 @@ enum Tok {
         cur_cmd: u16,
         row_count: u64,
     },
+    /// DONEINPROC, same three fields: a statement of a nested text, or the end of a call
+    /// that text made.
+    DoneInProc {
+        status: u16,
+        cur_cmd: u16,
+        row_count: u64,
+    },
     /// ERROR with `Number`, `State`, `Class`, `MsgText` and `LineNumber`.
     Error {
         number: u32,
@@ -387,11 +395,22 @@ fn tokens(payload: &[u8]) -> Vec<Tok> {
                 }
                 out.push(Tok::Row(values));
             }
-            TOKEN_DONE => {
-                out.push(Tok::Done {
-                    status: u16_at(payload, pos),
-                    cur_cmd: u16_at(payload, pos + 2),
-                    row_count: u64::from_le_bytes(payload[pos + 4..pos + 12].try_into().unwrap()),
+            TOKEN_DONE | TOKEN_DONEINPROC => {
+                let status = u16_at(payload, pos);
+                let cur_cmd = u16_at(payload, pos + 2);
+                let row_count = u64::from_le_bytes(payload[pos + 4..pos + 12].try_into().unwrap());
+                out.push(if kind == TOKEN_DONE {
+                    Tok::Done {
+                        status,
+                        cur_cmd,
+                        row_count,
+                    }
+                } else {
+                    Tok::DoneInProc {
+                        status,
+                        cur_cmd,
+                        row_count,
+                    }
                 });
                 pos += 12;
             }
@@ -950,6 +969,51 @@ async fn an_exec_of_an_unknown_procedure_answers_on_the_line_it_sits_on() {
         "{toks:?}"
     );
     assert_eq!(first_error_line(&toks), 3);
+
+    drop(client);
+    running.stop().await;
+}
+
+/// `EXEC('…')` whose text runs another `EXEC('…')`, followed by one more statement in the
+/// batch: on the wire, the DONEINPROC that closes the inner call carries `DONE_MORE`, the
+/// DONE that closes the outer one carries it too, and the last statement of the batch sends
+/// its row and a DONE without it. A client that stops at the first DONE without `DONE_MORE`
+/// reads the whole response this way.
+#[tokio::test]
+async fn a_two_level_dynamic_call_closes_with_the_more_bit_over_the_wire() {
+    let running = start().await;
+    let mut client = connect_and_login(running.addr).await;
+
+    let response = batch(&mut client, "EXEC('EXEC(''SELECT 1'')');\nSELECT 13;").await;
+    assert_eq!(
+        tokens(&response.payload),
+        vec![
+            Tok::ColMetaData(vec![(0, INT4TYPE, String::new())]),
+            Tok::Row(vec![1]),
+            Tok::DoneInProc {
+                status: DONE_COUNT | DONE_MORE,
+                cur_cmd: CUR_CMD_SELECT,
+                row_count: 1,
+            },
+            Tok::DoneInProc {
+                status: DONE_MORE,
+                cur_cmd: 0,
+                row_count: 0,
+            },
+            Tok::Done {
+                status: DONE_MORE,
+                cur_cmd: 0,
+                row_count: 0,
+            },
+            Tok::ColMetaData(vec![(0, INT4TYPE, String::new())]),
+            Tok::Row(vec![13]),
+            Tok::Done {
+                status: DONE_COUNT,
+                cur_cmd: CUR_CMD_SELECT,
+                row_count: 1,
+            },
+        ]
+    );
 
     drop(client);
     running.stop().await;

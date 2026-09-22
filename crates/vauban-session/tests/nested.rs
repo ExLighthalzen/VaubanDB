@@ -1159,3 +1159,86 @@ fn nested_batch_scope_family_decides_caller_continuation() {
     assert_eq!(error_numbers(&events.0), vec![3701]);
     assert!(has_int_row(&events.0, 3), "{:?}", events.0);
 }
+
+/// The `more` flag of every DONEINPROC of the events, in order.
+fn done_in_proc_more(events: &[Event]) -> Vec<bool> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::DoneInProc(_, more) => Some(*more),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A call made from a text that another call runs: the token that closes the inner call is
+/// a DONEINPROC with `more`, like the one that closes the `SELECT` it ran, and the batch
+/// plays the statement that follows the outer call.
+#[test]
+fn the_token_that_closes_a_two_level_call_carries_more() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC sp_executesql N'EXEC sp_executesql N''SELECT 1 AS n''';\nSELECT 13 AS alive;",
+    );
+    assert_eq!(
+        done_in_proc_more(&events.0),
+        vec![true, true],
+        "{:?}",
+        events.0
+    );
+    assert!(has_int_row(&events.0, 13), "{:?}", events.0);
+}
+
+/// The same two levels with nothing after the outer call: the token that closes the inner
+/// call still carries `more`, since the outer call has its own closing token to send, and
+/// that last one carries none.
+#[test]
+fn the_token_that_closes_a_call_at_the_end_of_a_batch_carries_more() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC sp_executesql N'EXEC sp_executesql N''SELECT 1 AS n''';",
+    );
+    assert_eq!(
+        done_in_proc_more(&events.0),
+        vec![true, true],
+        "{:?}",
+        events.0
+    );
+    assert_eq!(
+        events.0.last(),
+        Some(&Event::Done(None, false)),
+        "{:?}",
+        events.0
+    );
+}
+
+/// Three levels of `sp_executesql`: the two tokens that close the two inner calls carry
+/// `more`, and the batch plays the statement that follows the outermost call.
+#[test]
+fn the_tokens_that_close_a_three_level_call_carry_more() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC sp_executesql N'EXEC sp_executesql N''EXEC sp_executesql N''''SELECT 1 AS n'''''''\
+         ;\nSELECT 13 AS alive;",
+    );
+    assert_eq!(
+        done_in_proc_more(&events.0),
+        vec![true, true, true],
+        "{:?}",
+        events.0
+    );
+    assert!(has_int_row(&events.0, 13), "{:?}", events.0);
+}
+
+/// A two level call whose deepest text raises 8134: the token that closes the failed call
+/// carries `more` too, and the batch plays the statement that follows the outer call.
+#[test]
+fn the_token_that_closes_a_failed_two_level_call_carries_more() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC sp_executesql N'EXEC sp_executesql N''SELECT 1/0 AS n''';\nSELECT 13 AS alive;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![8134], "{:?}", events.0);
+    assert_eq!(done_in_proc_more(&events.0), vec![true], "{:?}", events.0);
+    assert!(has_int_row(&events.0, 13), "{:?}", events.0);
+}

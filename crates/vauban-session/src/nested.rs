@@ -830,7 +830,7 @@ impl Session {
         outcome: &mut NestedOutcome,
     ) -> SqlResult<Flow> {
         let _ = line;
-        let mut wrapper = NestedProcedureSink::new(sink, more, nested_state.options.xact_abort);
+        let mut wrapper = NestedProcedureSink::new(sink);
         let inner = self.run_nested(text, &[], &mut wrapper)?;
         self.finish_nested_procedure_flow(inner, &wrapper, more, nested_state, outcome, &[], None)
     }
@@ -850,8 +850,7 @@ impl Session {
         match action {
             ProcAction::ExecuteSql { statement, params } => {
                 let nested_params = proc_params_to_nested(&params);
-                let mut wrapper =
-                    NestedProcedureSink::new(sink, more, nested_state.options.xact_abort);
+                let mut wrapper = NestedProcedureSink::new(sink);
                 let inner = self.run_nested_in_database(
                     &statement,
                     &nested_params,
@@ -870,8 +869,7 @@ impl Session {
             }
             ProcAction::Template { sql, params } => {
                 let nested_params = proc_params_to_nested(&params);
-                let mut wrapper =
-                    NestedProcedureSink::new(sink, more, nested_state.options.xact_abort);
+                let mut wrapper = NestedProcedureSink::new(sink);
                 let inner =
                     self.run_nested_in_database(&sql, &nested_params, database, &mut wrapper)?;
                 self.finish_nested_procedure_flow(
@@ -1126,21 +1124,19 @@ fn at_procedure_line(err: SqlError, line: u32) -> SqlError {
     if line == 0 { err } else { err.with_line(line) }
 }
 
+/// Forwards the tokens of a call made from inside another call: its closing DONEPROC
+/// becomes a DONEINPROC, since the call it closes is not the outermost one of the request.
 struct NestedProcedureSink<'a> {
     inner: &'a mut dyn ResultSink,
-    more: bool,
-    xact_abort: bool,
     last_error: u32,
     /// See `procedures.rs`, `TrackedSink::pending_error`.
     pending_error: bool,
 }
 
 impl<'a> NestedProcedureSink<'a> {
-    fn new(inner: &'a mut dyn ResultSink, more: bool, xact_abort: bool) -> Self {
+    fn new(inner: &'a mut dyn ResultSink) -> Self {
         Self {
             inner,
-            more,
-            xact_abort,
             last_error: 0,
             pending_error: false,
         }
@@ -1177,10 +1173,18 @@ impl ResultSink for NestedProcedureSink<'_> {
         self.inner.done_in_proc(rowcount, more)
     }
 
+    /// The call that made this one still has its own closing token to send, so another
+    /// DONE follows this one in the response and this one carries `more`: a client that
+    /// stops reading at the first DONE without `more` goes on reading the caller. It
+    /// carries `more` for a text that has another statement to run as for one that stops
+    /// right there, and for a call that ended on an error as for one that ended on a
+    /// result set (`tests/nested.rs`,
+    /// `the_token_that_closes_a_two_level_call_carries_more`,
+    /// `the_token_that_closes_a_call_at_the_end_of_a_batch_carries_more`,
+    /// `the_tokens_that_close_a_three_level_call_carry_more` and
+    /// `the_token_that_closes_a_failed_two_level_call_carries_more`).
     fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
-        let continues =
-            crate::procedures::continues_after_nested(self.more, self.xact_abort, self.last_error);
-        self.inner.done_in_proc(rowcount, continues)
+        self.inner.done_in_proc(rowcount, true)
     }
 
     fn info(&mut self, msg: &vauban_errors::InfoMessage) -> SqlResult<()> {
