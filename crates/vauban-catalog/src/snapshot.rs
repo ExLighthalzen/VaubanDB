@@ -20,7 +20,7 @@
 //!   existence (`tests/snapshot.rs`, `indexes_of_a_table_with_a_primary_key_has_its_index`);
 //! - the **internal tables of `master`** are the `InternalTableDef` the bootstrap created a
 //!   table of `storage` for, read from code ([`internal_table_objects`]) and paired with the
-//!   `TableId` `storage` handed out, by position. They are entries of `tables` as well as of
+//!   `TableId` the registry of `bootstrap.rs` gives for their name. They are entries of `tables` as well as of
 //!   `objects`, so the plan the binder puts in place of `FROM sys.tables` — a `SELECT` over
 //!   `master.dbo.vauban_sys_objects` — resolves to a table the planner can scan (section
 //!   below; `tests/snapshot.rs`, `vauban_sys_databases_resolves_to_a_table_with_its_columns`);
@@ -74,37 +74,42 @@
 //! **before** the objects of the database, so such a table would not be reachable by name;
 //! the refusal belongs to `table.rs`.
 //!
-//! # The identifiers of the system views are the rows of `sys.all_objects`
+//! # The identifiers of the system objects are constants
 //!
-//! [`system_view_objects`] numbers the views by rank: the view of rank `n` in
-//! [`described_views`], counted from `0` over the distinct names, gets `ObjectId(-(n + 1))`.
-//! That is the rule `views/sys_extra.rs` numbers its rows of `vauban_sys_all_objects` with —
-//! its `FIRST_SYSTEM_VIEW_OBJECT_ID` is `-1` and the next ones go down by one — over the list
-//! its `installed_system_views` builds, and [`described_views`] walks the files of `views/` in
-//! that same order. So the identifier a snapshot answers for a view is the `object_id` its row
-//! of `sys.all_objects` publishes, name by name (unit test
-//! `system_view_ids_match_sys_all_objects`, which compares the two lists).
+//! Each system view and each internal table of `master` takes its identifier from
+//! [`SYSTEM_OBJECT_IDS`], one constant per `(schema, name)`, read by [`system_object_id`]. The
+//! identifier is read from that table and not from the order the files of `views/` describe
+//! their objects in: a view described in front of the others leaves their numbers where they
+//! were (unit test `a_view_added_in_front_moves_no_other_identifier`), and a restart answers
+//! the numbers it answered before (unit test `object_id_of_sys_tables_holds_across_a_restart`
+//! in `bootstrap.rs`).
 //!
-//! The numbers of SQL Server are negative and not contiguous, so the rule shares the **sign**
-//! with it and nothing more.
+//! The views are numbered from `-1` downwards and the internal tables from `100_000` upwards.
+//! A user table takes `FIRST_USER_OBJECT_ID` and up (`table.rs`) and a constraint of
+//! `views/sys_constraints.rs` carries `0`, so the ranges are apart (unit test
+//! `the_system_object_ids_are_sorted_apart_and_cover_the_described_objects`). SQL Server
+//! numbers a view below zero and a base table above; the rule shares the sign with it, the
+//! numbers themselves are ours.
 //!
-//! Two consequences of numbering by rank: the identifier of a view holds for one build of the
-//! crate and moves when a file of `views/` starts describing views before it — the seven views
-//! of `views/sys_extra.rs` are the last seven, `-18` to `-24`, and those of the two tables of
-//! the bootstrap `-16` and `-17` (unit test `the_described_views_are_those_of_the_files`) —
-//! and a `CREATE VIEW` will hand out a positive identifier from `FIRST_USER_OBJECT_ID`
-//! (`table.rs`), so the two ranges do not meet.
+//! The bootstrap writes these constants in the rows of `sys.all_objects` and `sys.objects` it
+//! publishes for the system objects (`bootstrap.rs`), so the identifier a snapshot answers for
+//! a view is the `object_id` of its row of `sys.all_objects` (unit test
+//! `system_view_ids_match_sys_all_objects`). A view or an internal table a file of `views/`
+//! starts describing takes a new line of the table; one described without a line resolves to
+//! nothing, which the unit test
+//! `the_system_object_ids_are_sorted_apart_and_cover_the_described_objects` turns into a
+//! failure. A `CREATE VIEW` will hand out a positive identifier from `FIRST_USER_OBJECT_ID`.
 //!
 //! # The internal tables of `master`
 //!
-//! The bootstrap creates one table of `storage` per `InternalTableDef` in `master`, in the
-//! order `bootstrap::internal_table_defs` lists them (`bootstrap.rs`, section "Order of the
-//! tables in `master`"). [`internal_table_objects`] walks the list beside
-//! `Storage::tables(master)` and builds, for the description of position `n`:
+//! The bootstrap creates one table of `storage` per `InternalTableDef` in `master` and
+//! writes its name and its [`TableId`](vauban_storage::TableId) in its registry (`bootstrap.rs`,
+//! section "The registry of the internal tables"). [`internal_table_objects`] walks the
+//! descriptions of `bootstrap::internal_table_defs` and builds, for each one the registry
+//! names:
 //!
-//! - a [`TableMeta`] whose `storage_id` is the [`TableId`](vauban_storage::TableId) at position
-//!   `n` of `Storage::tables(master)` — the pairing `bootstrap::internal_table_id` reads one
-//!   table with — and whose columns are those of the description: its name, its
+//! - a [`TableMeta`] whose `storage_id` is the identifier the registry gives for its name —
+//!   the lookup `bootstrap::internal_table_id` performs for one table — and whose columns are those of the description: its name, its
 //!   [`TypeInfo`](vauban_types::TypeInfo) and its nullability, `ColumnId(ordinal + 1)` and the
 //!   ordinal counted from `0`, the two numberings `table.rs` gives a user table
 //!   (`tests/snapshot.rs`, `vauban_sys_databases_resolves_to_a_table_with_its_columns`);
@@ -118,27 +123,19 @@
 //! `TableShape::clustered_key` and builds no `IndexShape` beside it, so there is no `IndexId`
 //! to carry (`tests/snapshot.rs`, `every_described_internal_table_resolves`).
 //!
-//! ## The identifier is the position, in a range of its own
+//! ## The identifier is a constant, in a range of its own
 //!
-//! The description of position `n` gets `ObjectId(FIRST_INTERNAL_TABLE_OBJECT_ID + n)`, which
-//! is `100_000 + n`. What the range buys is that two entries of one snapshot carry two
-//! identifiers: the user tables of `table.rs` start at `FIRST_USER_OBJECT_ID`, `1_000_000`, the
-//! system views above are numbered from `-1` downwards, and a constraint carries `0`
-//! (`views/sys_constraints.rs`, `NO_OBJECT_ID`), so the 20 internal tables of this build sit
-//! between the views and the user tables with 900_000 numbers of room ahead of them (unit test
-//! `the_internal_tables_are_numbered_from_their_position`, which reads the three constants;
+//! An internal table takes its line of [`SYSTEM_OBJECT_IDS`], from `100_000` up. The range
+//! keeps the entries of one snapshot apart: the user tables of `table.rs` start at
+//! `FIRST_USER_OBJECT_ID`, `1_000_000`, the system views are below zero and a constraint
+//! carries `0` (`views/sys_constraints.rs`, `NO_OBJECT_ID`; unit test
+//! `the_system_object_ids_are_sorted_apart_and_cover_the_described_objects`;
 //! `tests/snapshot.rs`, `a_user_table_and_an_internal_table_do_not_collide`).
 //!
-//! The **sign** is what this rule shares with SQL Server, as for the views: its system base
-//! tables (`sysrowsets`, `sysschobjs`) carry positive, small `object_id`s while a
-//! compatibility view such as `sysobjects` carries a negative one. The numbers themselves
-//! are ours.
-//!
-//! The identifier of an internal table holds for one build of the crate, like that of a system
-//! view: a file of `views/` that starts describing a table moves the tables described after it,
-//! the two tables of the bootstrap closing the list (`bootstrap.rs`). Two snapshots of one
-//! build answer the same identifier for one table, the position being read from the code and
-//! not from a counter (`tests/snapshot.rs`, `every_described_internal_table_resolves`).
+//! The pairing of a description with its table goes through the name: a description the
+//! registry does not name, as in a `master` whose tables were partly created, is skipped
+//! rather than paired with the table of another description (unit test
+//! `a_description_without_its_table_is_skipped`).
 //!
 //! ## Visible in `master`, not published, not dropped
 //!
@@ -223,7 +220,7 @@ use vauban_types::{Collation, Value};
 
 use crate::bootstrap::{
     DATABASES_TABLE, SCHEMAS_TABLE, SYSTEM_DATABASES, SYSTEM_SCHEMAS, databases_columns,
-    internal_table_defs, internal_table_id,
+    internal_table_defs, internal_table_id, registered_internal_tables,
 };
 use crate::catalog::Catalog;
 use crate::def::{InternalTableDef, SystemViewDef};
@@ -234,22 +231,138 @@ use crate::meta::{
 };
 use crate::{constraints, index, table, views};
 
-/// The [`ObjectId`] of the internal table whose description comes first in
-/// `bootstrap::internal_table_defs`; the following ones count up from it.
-///
-/// A range of its own, between the system views and the user tables (module documentation,
-/// section "The identifier is the position, in a range of its own"): `table.rs` hands out
-/// `FIRST_USER_OBJECT_ID` and up, `views/` is numbered from `-1` down, and a constraint of
-/// `views/sys_constraints.rs` carries `0` (unit test
-/// `the_internal_tables_are_numbered_from_their_position`).
-const FIRST_INTERNAL_TABLE_OBJECT_ID: i32 = 100_000;
-
 /// The schema the internal tables of `master` are named in.
 ///
 /// The schema the definitions of `views/` write in their `FROM`
 /// (`FROM master.dbo.vauban_sys_objects`), which is what the binder resolves
 /// (`tests/snapshot.rs`, `vauban_sys_databases_resolves_to_a_table_with_its_columns`).
-const INTERNAL_TABLE_SCHEMA: &str = "dbo";
+pub(crate) const INTERNAL_TABLE_SCHEMA: &str = "dbo";
+
+/// The schema of the system views of [`SYSTEM_OBJECT_IDS`] other than those of the standard.
+const SYS: &str = "sys";
+
+/// The schema of the views of the standard in [`SYSTEM_OBJECT_IDS`].
+const INFORMATION_SCHEMA: &str = "INFORMATION_SCHEMA";
+
+/// The schema of the internal tables in [`SYSTEM_OBJECT_IDS`].
+const DBO: &str = INTERNAL_TABLE_SCHEMA;
+
+/// The `object_id` of each system object, as `(schema, name, object_id)`, sorted by
+/// increasing `object_id` (module documentation, section "The identifiers of the system
+/// objects are constants").
+///
+/// The views from `-1` downwards, the internal tables of `master` from `100_000` upwards. A
+/// new object takes the next free number of its range; a number once given stays with its
+/// object when the descriptions of `views/` change order (unit tests
+/// `the_system_object_ids_are_sorted_apart_and_cover_the_described_objects` and
+/// `a_view_added_in_front_moves_no_other_identifier`).
+pub(crate) const SYSTEM_OBJECT_IDS: &[(&str, &str, i32)] = &[
+    (SYS, "server_role_members", -50),
+    (SYS, "database_role_members", -49),
+    (SYS, "server_principals", -48),
+    (SYS, "database_principals", -47),
+    (INFORMATION_SCHEMA, "VIEWS", -46),
+    (INFORMATION_SCHEMA, "REFERENTIAL_CONSTRAINTS", -45),
+    (INFORMATION_SCHEMA, "KEY_COLUMN_USAGE", -44),
+    (INFORMATION_SCHEMA, "TABLE_CONSTRAINTS", -43),
+    (SYS, "table_types", -42),
+    (SYS, "sequences", -41),
+    (SYS, "synonyms", -40),
+    (SYS, "triggers", -39),
+    (SYS, "dm_os_host_info", -38),
+    (SYS, "dm_os_sys_info", -37),
+    (SYS, "dm_exec_requests", -36),
+    (SYS, "dm_exec_connections", -35),
+    (SYS, "dm_exec_sessions", -34),
+    (SYS, "configurations", -33),
+    (SYS, "filegroups", -32),
+    (SYS, "data_spaces", -31),
+    (SYS, "extended_properties", -30),
+    (SYS, "master_files", -29),
+    (SYS, "database_files", -28),
+    (SYS, "allocation_units", -27),
+    (SYS, "partitions", -26),
+    (SYS, "all_columns", -25),
+    (SYS, "views", -24),
+    (SYS, "all_objects", -23),
+    (SYS, "schemas", -22),
+    (SYS, "databases", -21),
+    (SYS, "parameters", -20),
+    (SYS, "sql_modules", -19),
+    (SYS, "procedures", -18),
+    (SYS, "default_constraints", -17),
+    (SYS, "check_constraints", -16),
+    (SYS, "foreign_key_columns", -15),
+    (SYS, "foreign_keys", -14),
+    (INFORMATION_SCHEMA, "PARAMETERS", -13),
+    (INFORMATION_SCHEMA, "ROUTINES", -12),
+    (INFORMATION_SCHEMA, "COLUMNS", -11),
+    (INFORMATION_SCHEMA, "SCHEMATA", -10),
+    (INFORMATION_SCHEMA, "TABLES", -9),
+    (SYS, "identity_columns", -8),
+    (SYS, "key_constraints", -7),
+    (SYS, "index_columns", -6),
+    (SYS, "indexes", -5),
+    (SYS, "types", -4),
+    (SYS, "columns", -3),
+    (SYS, "tables", -2),
+    (SYS, "objects", -1),
+    (DBO, "vauban_sys_objects", 100_000),
+    (DBO, "vauban_sys_columns", 100_001),
+    (DBO, "vauban_sys_types", 100_002),
+    (DBO, "vauban_sys_indexes", 100_003),
+    (DBO, "vauban_sys_index_columns", 100_004),
+    (DBO, "vauban_sys_key_constraints", 100_005),
+    (DBO, "vauban_sys_identity_columns", 100_006),
+    (DBO, "vauban_is_tables", 100_007),
+    (DBO, "vauban_is_columns", 100_008),
+    (DBO, "vauban_is_routines", 100_009),
+    (DBO, "vauban_is_parameters", 100_010),
+    (DBO, "vauban_sys_foreign_keys", 100_011),
+    (DBO, "vauban_sys_foreign_key_columns", 100_012),
+    (DBO, "vauban_sys_check_constraints", 100_013),
+    (DBO, "vauban_sys_default_constraints", 100_014),
+    (DBO, "vauban_sys_all_objects", 100_015),
+    (DBO, "vauban_sys_all_columns", 100_016),
+    (DBO, "vauban_sys_partitions", 100_017),
+    (DBO, "vauban_sys_allocation_units", 100_018),
+    (DBO, "vauban_sys_files", 100_019),
+    (DBO, "vauban_sys_extended_properties", 100_020),
+    (DBO, "vauban_sys_data_spaces", 100_021),
+    (DBO, "vauban_sys_configurations", 100_022),
+    (DBO, "vauban_sys_os_info", 100_023),
+    (DBO, "vauban_sys_host_info", 100_024),
+    (DBO, "vauban_sys_procedures", 100_025),
+    (DBO, "vauban_sys_sql_modules", 100_026),
+    (DBO, "vauban_sys_parameters", 100_027),
+    (DBO, "vauban_sys_triggers", 100_028),
+    (DBO, "vauban_sys_synonyms", 100_029),
+    (DBO, "vauban_sys_sequences", 100_030),
+    (DBO, "vauban_sys_table_types", 100_031),
+    (DBO, "vauban_is_table_constraints", 100_032),
+    (DBO, "vauban_is_key_column_usage", 100_033),
+    (DBO, "vauban_is_referential_constraints", 100_034),
+    (DBO, "vauban_sys_principals", 100_035),
+    (DBO, "vauban_sys_role_members", 100_036),
+    (DBO, "vauban_sys_databases", 100_037),
+    (DBO, "vauban_sys_schemas", 100_038),
+    (DBO, "vauban_sys_sessions", 100_039),
+    (DBO, "vauban_sys_connections", 100_040),
+];
+
+/// The constant [`SYSTEM_OBJECT_IDS`] gives the system object `schema.name`, `None` for a pair
+/// it does not list.
+///
+/// The two parts are compared without regard to ASCII case, the names of the table being
+/// ASCII (unit test `the_system_object_ids_are_sorted_apart_and_cover_the_described_objects`).
+pub(crate) fn system_object_id(schema: &str, name: &str) -> Option<ObjectId> {
+    SYSTEM_OBJECT_IDS
+        .iter()
+        .find(|(listed_schema, listed_name, _)| {
+            listed_schema.eq_ignore_ascii_case(schema) && listed_name.eq_ignore_ascii_case(name)
+        })
+        .map(|&(_, _, id)| ObjectId(id))
+}
 
 /// The catalogue as it stands for one transaction: the databases, objects and tables its
 /// snapshot makes visible.
@@ -504,9 +617,9 @@ pub(crate) fn build(catalog: &Catalog, txn: &TxnHandle) -> CatalogSnapshot {
 ///
 /// The system views and the internal tables of `master` are added to `objects` before the
 /// user tables, and the three ranges of identifiers are disjoint — negative for a view,
-/// `FIRST_INTERNAL_TABLE_OBJECT_ID` and up for an internal table, `FIRST_USER_OBJECT_ID` and
+/// `100_000` and up for an internal table ([`SYSTEM_OBJECT_IDS`]), `FIRST_USER_OBJECT_ID` and
 /// up for a user table (`table.rs`) — so one entry does not take the place of another (unit
-/// test `the_internal_tables_are_numbered_from_their_position`). A storage whose
+/// test `the_system_object_ids_are_sorted_apart_and_cover_the_described_objects`). A storage whose
 /// `vauban_sys_databases` carries no `master` gets neither the views nor the internal tables,
 /// there being no database to name them in (unit test
 /// `a_catalogue_without_internal_tables_gives_an_empty_snapshot`).
@@ -607,20 +720,18 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
     })
 }
 
-/// The system views the files of `views/` describe, in the order they are numbered.
+/// The system views the files of `views/` describe.
 ///
-/// The order is the one `installed_system_views` of `views/sys_extra.rs` numbers its rows of
-/// `vauban_sys_all_objects` in, so that the identifier of a view is the same on the two
-/// sides (unit test `system_view_ids_match_sys_all_objects`): the six files of `views/`
-/// other than
+/// The order is the one `installed_system_views` of `views/sys_extra.rs` lists its rows of
+/// `vauban_sys_all_objects` in, so that the two lists compare in order (unit test
+/// `system_view_ids_match_sys_all_objects`); the identifiers come from
+/// [`SYSTEM_OBJECT_IDS`] and not from that order. The six files of `views/` other than
 /// `sys_extra.rs`, in the order `views::internal_tables()` lists them, then the two views of
 /// the tables of the bootstrap (`views::sys_core::bootstrap_views`, which `bootstrap.rs` reads
 /// too), then the ten of `sys_extra.rs`, then the six of `dm_exec.rs`, then the four of
 /// `sys_object_kinds.rs`, then the four of `info_schema_constraints.rs`, then the four of
 /// `sys_principals.rs`. A file that describes no view adds nothing here, so the vector grows
-/// with the files of `views/` — and so do the identifiers of the views that follow the new
-/// ones (module documentation, section "The identifiers of the system views are the rows of
-/// `sys.all_objects`").
+/// with the files of `views/`.
 fn described_views() -> Vec<SystemViewDef> {
     let of_the_six_files = [
         views::sys_tables::internal_tables(),
@@ -669,15 +780,17 @@ fn described_views() -> Vec<SystemViewDef> {
 /// `(object_id, name, schema_id)` of each, in the order of `installed_system_views`.
 ///
 /// Read from the description of the internal table that carries the view `sys.all_objects` —
-/// the one table of `views::internal_tables()` whose `views` name it — rather than from that
-/// function, which `views/sys_extra.rs` keeps private. The rows of a user object are added to
+/// the one table of `bootstrap::internal_table_defs()` whose `views` name it, with the
+/// identifiers the bootstrap writes — rather than from that function, which
+/// `views/sys_extra.rs` keeps private. The rows of a user object are added to
 /// the table by the catalogue at runtime, so what is described here is the system part
 /// (`views/sys_extra.rs`, `system_view_rows`; unit test `system_view_ids_match_sys_all_objects`).
 #[cfg(test)]
 fn described_system_view_rows() -> Vec<(i32, String, i32)> {
     use crate::views::sys_extra::objects_columns;
 
-    views::internal_tables()
+    internal_table_defs()
+        .expect("the descriptions of the bootstrap")
         .into_iter()
         .filter(|table| {
             table
@@ -712,10 +825,9 @@ fn described_system_view_rows() -> Vec<(i32, String, i32)> {
 /// (module documentation). The two parts are compared under the collation of `master`, the
 /// database the entries are named in.
 ///
-/// The identifier is `-(rank + 1)`, the rank being the position of the view among the
-/// distinct names, from `0`. A description this rank cannot be written as an `i32` for stops
-/// the numbering rather than repeating an identifier; `described_views()` of this crate is
-/// far shorter than that (unit test `the_rank_rule_numbers_the_distinct_names_from_minus_one`).
+/// The identifier is the constant [`system_object_id`] gives the name. A view
+/// [`SYSTEM_OBJECT_IDS`] does not list is left out rather than given a number another view
+/// could take (unit test `a_view_added_in_front_moves_no_other_identifier`).
 fn system_view_objects(described: &[SystemViewDef], master: &DatabaseMeta) -> Vec<ObjectMeta> {
     let mut objects: Vec<ObjectMeta> = Vec::new();
     for def in described {
@@ -726,11 +838,11 @@ fn system_view_objects(described: &[SystemViewDef], master: &DatabaseMeta) -> Ve
         if already {
             continue;
         }
-        let Ok(rank) = i32::try_from(objects.len().saturating_add(1)) else {
-            break;
+        let Some(id) = system_object_id(&def.name.schema, &def.name.name) else {
+            continue;
         };
         objects.push(ObjectMeta {
-            id: ObjectId(-rank),
+            id,
             kind: ObjectKind::View,
             name: QualifiedName {
                 database: master.name.clone(),
@@ -749,34 +861,32 @@ fn system_view_objects(described: &[SystemViewDef], master: &DatabaseMeta) -> Ve
 /// `bootstrap::internal_table_defs` describes them (module documentation, section "The
 /// internal tables of `master`").
 ///
-/// The [`TableId`](vauban_storage::TableId) of the table of position `n` is the one at
-/// position `n` of `Storage::tables(master)`, which comes back sorted by increasing
-/// identifier, the order the bootstrap created the tables in: the pairing
-/// `bootstrap::internal_table_id` performs for one name, done here for the whole list. A
-/// description with no table at its position — a `master` whose tables were not all created,
-/// or a storage a later build describes more tables than it holds — is skipped rather than
-/// paired with the table of another description (unit test
+/// The [`TableId`](vauban_storage::TableId) of a description is the one the registry of the
+/// bootstrap gives for its name (`bootstrap::registered_internal_tables`, read once for the
+/// whole list), and its identifier the constant of [`system_object_id`]. A description the
+/// registry does not name — a `master` whose tables were partly created — or that has no
+/// constant is skipped rather than paired with the table of another description (unit test
 /// `a_description_without_its_table_is_skipped`).
 ///
 /// # Errors
 ///
-/// The error of `Storage::tables`, and the one `bootstrap::internal_table_defs` answers with.
+/// The error of the registry read, and the one `bootstrap::internal_table_defs` answers with.
 fn internal_table_objects(
     catalog: &Catalog,
     master: &DatabaseMeta,
 ) -> SqlResult<Vec<(ObjectMeta, TableMeta)>> {
-    let created = catalog.storage.tables(master.id)?;
+    let registered = registered_internal_tables(catalog)?;
     let mut built = Vec::new();
-    for (position, def) in internal_table_defs()?.into_iter().enumerate() {
-        let Some(&(storage_id, _)) = created.get(position) else {
+    for def in internal_table_defs()? {
+        let Some(storage_id) = registered
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&def.name))
+            .map(|&(_, id)| id)
+        else {
             continue;
         };
-        let Some(id) = i32::try_from(position)
-            .ok()
-            .and_then(|rank| FIRST_INTERNAL_TABLE_OBJECT_ID.checked_add(rank))
-            .map(ObjectId)
-        else {
-            break;
+        let Some(id) = system_object_id(INTERNAL_TABLE_SCHEMA, &def.name) else {
+            continue;
         };
         let object = ObjectMeta {
             id,
@@ -1004,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rank_rule_numbers_the_distinct_names_from_minus_one() {
+    fn distinct_names_take_their_constant_once() {
         // Three distinct names out of five descriptions: the same view installed in another
         // database, and the same name under the collation of `master`, are one entry.
         let described = vec![
@@ -1028,15 +1138,15 @@ mod tests {
         assert_eq!(
             built,
             vec![
-                (ObjectId(-1), "sys".to_owned(), "tables".to_owned()),
-                (ObjectId(-2), "sys".to_owned(), "objects".to_owned()),
+                (ObjectId(-2), "sys".to_owned(), "tables".to_owned()),
+                (ObjectId(-1), "sys".to_owned(), "objects".to_owned()),
                 (
-                    ObjectId(-3),
+                    ObjectId(-9),
                     "INFORMATION_SCHEMA".to_owned(),
                     "TABLES".to_owned()
                 ),
             ],
-            "one entry per distinct name, numbered by rank, spelled as first described"
+            "one entry per distinct name, numbered by its constant, spelled as first described"
         );
         let in_master: Vec<String> = objects
             .iter()
@@ -1064,22 +1174,22 @@ mod tests {
         let resolved = snapshot
             .resolve_object("master", Some("INFORMATION_SCHEMA"), "TABLES", "dbo")
             .expect("INFORMATION_SCHEMA.TABLES resolves from master");
-        assert_eq!(resolved.id, ObjectId(-1));
+        assert_eq!(resolved.id, ObjectId(-9));
         assert_eq!(resolved.kind, ObjectKind::View);
         assert_eq!(
             snapshot
                 .resolve_object("d", Some("information_schema"), "tables", "dbo")
                 .map(|object| object.id),
-            Some(ObjectId(-1)),
+            Some(ObjectId(-9)),
             "visible from a user database, the case of the two parts folded"
         );
         assert_eq!(
-            snapshot.view_definition(ObjectId(-1)),
+            snapshot.view_definition(ObjectId(-9)),
             Some("SELECT 1 AS one -- INFORMATION_SCHEMA.TABLES")
         );
-        assert!(snapshot.table(ObjectId(-1)).is_none());
+        assert!(snapshot.table(ObjectId(-9)).is_none());
         assert_eq!(
-            snapshot.object_name(ObjectId(-1)),
+            snapshot.object_name(ObjectId(-9)),
             Some(QualifiedName {
                 database: "master".to_owned(),
                 schema: "INFORMATION_SCHEMA".to_owned(),
@@ -1164,14 +1274,19 @@ mod tests {
             "a file of `views/` is registered in `described_views` without being registered \
              in `views::internal_tables()`, or the reverse"
         );
-        // The identifiers are negative and run from -1 without a hole, so two views do not
-        // share one: the rank rule numbers the distinct names (module documentation, section
-        // "The identifiers of the system views are the rows of `sys.all_objects`").
-        let ids: Vec<i32> = objects.iter().map(|object| object.id.0).collect();
-        let by_rank: Vec<i32> = (1..=i32::try_from(names.len()).expect("fits in an i32"))
-            .map(|rank| -rank)
-            .collect();
-        assert_eq!(ids, by_rank);
+        // Each name carries its constant, negative, and two views do not share one (module
+        // documentation, section "The identifiers of the system objects are constants").
+        let mut ids: Vec<i32> = objects.iter().map(|object| object.id.0).collect();
+        for object in &objects {
+            assert_eq!(
+                Some(object.id),
+                system_object_id(&object.name.schema, &object.name.name)
+            );
+        }
+        assert!(ids.iter().all(|&id| id < 0), "{ids:?}");
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), names.len(), "two views share an identifier");
     }
 
     #[test]
@@ -1205,25 +1320,19 @@ mod tests {
             distinct_system_view_count(),
             "{of_the_snapshot:?}"
         );
-        // Counter-proof that the comparison reads something: the rows are there, negative,
-        // and the first of them is the one of `sys.objects`.
-        assert_eq!(
-            of_the_rows.first().map(|&(id, _, _)| id),
-            Some(-1),
-            "{of_the_rows:?}"
-        );
-        assert_eq!(
-            of_the_rows.last().map(|&(id, _, _)| id),
-            Some(-i32::try_from(distinct_system_view_count()).expect("fits in an i32")),
+        // Counter-proof that the comparison reads something: the rows are there, and the one
+        // of `sys.tables` carries its constant.
+        assert!(
+            of_the_rows.contains(&(-2, "tables".to_owned(), schema_id_of("sys"))),
             "{of_the_rows:?}"
         );
     }
 
     #[test]
-    fn the_internal_tables_are_numbered_from_their_position() {
-        // The rule of the module documentation: the description of position `n` is the table
-        // of identifier `FIRST_INTERNAL_TABLE_OBJECT_ID + n`, and the three ranges of
-        // identifiers of a snapshot are apart.
+    fn the_internal_tables_take_their_constant() {
+        // The rule of the module documentation: each description is the table of the
+        // identifier `SYSTEM_OBJECT_IDS` gives its name, and the three ranges of identifiers
+        // of a snapshot are apart.
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let manager = Arc::new(TransactionManager::new(Arc::clone(&storage)));
         let catalog = Catalog::bootstrap(storage, Arc::clone(&manager)).expect("bootstrap");
@@ -1231,17 +1340,17 @@ mod tests {
         let snapshot = build(&catalog, &handle);
 
         let described = internal_table_defs().expect("the descriptions of the bootstrap");
-        let expected: Vec<(ObjectId, String)> = described
+        let mut expected: Vec<(ObjectId, String)> = described
             .iter()
-            .enumerate()
-            .map(|(position, def)| {
-                let rank = i32::try_from(position).expect("a position fits in an i32");
+            .map(|def| {
                 (
-                    ObjectId(FIRST_INTERNAL_TABLE_OBJECT_ID + rank),
+                    system_object_id(INTERNAL_TABLE_SCHEMA, &def.name)
+                        .unwrap_or_else(|| panic!("{} has a constant", def.name)),
                     def.name.clone(),
                 )
             })
             .collect();
+        expected.sort();
         // `master.dbo` also carries the five tables of `bootstrap::MASTER_DBO_SHIPPED_TABLES`,
         // created as ordinary tables (`FIRST_USER_OBJECT_ID` and up): left out of this
         // comparison, which is about the internal tables described in `bootstrap.rs`.
@@ -1254,26 +1363,18 @@ mod tests {
             .map(|meta| (meta.id, meta.name.clone()))
             .collect();
         assert_eq!(held, expected);
-        assert_eq!(held.len(), expected.len(), "{held:?}");
+        assert_eq!(held.len(), described.len(), "{held:?}");
         // The ranges: the views below zero, a constraint at zero
         // (`views/sys_constraints.rs`), the internal tables from 100_000 and the user tables
-        // from 1_000_000, which leaves 900_000 numbers between the two last ones.
+        // from 1_000_000.
         assert!(snapshot.system_views.iter().all(|id| id.0 < 0));
-        let first = held.first().map(|&(id, _)| id.0);
-        assert_eq!(first, Some(100_000), "positive, as in SQL Server");
-        let last = FIRST_INTERNAL_TABLE_OBJECT_ID
-            + i32::try_from(held.len()).expect("the table count fits in an i32")
-            - 1;
+        assert_eq!(held.first().map(|&(id, _)| id.0), Some(100_000));
+        let last = held.last().map_or(0, |&(id, _)| id.0);
         assert!(
             last < crate::table::FIRST_USER_OBJECT_ID,
             "{last} is in the range of the user tables"
         );
-        assert_eq!(
-            crate::table::FIRST_USER_OBJECT_ID - FIRST_INTERNAL_TABLE_OBJECT_ID,
-            900_000
-        );
-        // Two snapshots of two transactions answer the same identifiers: the position is read
-        // from the code, not from a counter.
+        // Two snapshots of two transactions answer the same identifiers.
         let other = build(&catalog, &manager.begin(IsolationLevel::ReadCommitted));
         let again: Vec<(ObjectId, String)> = other
             .tables
@@ -1284,6 +1385,97 @@ mod tests {
             .map(|meta| (meta.id, meta.name.clone()))
             .collect();
         assert_eq!(again, expected);
+    }
+
+    #[test]
+    fn the_system_object_ids_are_sorted_apart_and_cover_the_described_objects() {
+        // Sorted by strictly increasing identifier, which also says no identifier is listed
+        // twice.
+        for pair in SYSTEM_OBJECT_IDS.windows(2) {
+            assert!(pair[0].2 < pair[1].2, "{:?} then {:?}", pair[0], pair[1]);
+        }
+        // A `(schema, name)` pair is listed once, without regard to case.
+        let mut names: Vec<(String, String)> = SYSTEM_OBJECT_IDS
+            .iter()
+            .map(|(schema, name, _)| (schema.to_ascii_lowercase(), name.to_ascii_lowercase()))
+            .collect();
+        names.sort();
+        let listed = names.len();
+        names.dedup();
+        assert_eq!(names.len(), listed, "a name is listed twice");
+        // The ranges: views below zero, internal tables from 100_000 and below the user
+        // tables, and nothing at the `0` of a constraint.
+        for &(schema, name, id) in SYSTEM_OBJECT_IDS {
+            if schema == DBO {
+                assert!(
+                    (100_000..crate::table::FIRST_USER_OBJECT_ID).contains(&id),
+                    "{name} {id}"
+                );
+            } else {
+                assert!(id < 0, "{schema}.{name} {id}");
+            }
+        }
+        // Each described view and each described internal table has its line, and each line
+        // names a described object.
+        let mut described: Vec<(String, String)> =
+            system_view_objects(&described_views(), &master())
+                .into_iter()
+                .map(|object| (object.name.schema, object.name.name))
+                .collect();
+        assert_eq!(
+            described.len(),
+            distinct_system_view_count(),
+            "a described view has no line in SYSTEM_OBJECT_IDS"
+        );
+        let tables = internal_table_defs().expect("the descriptions of the bootstrap");
+        for def in &tables {
+            assert!(
+                system_object_id(DBO, &def.name).is_some(),
+                "{} has no line in SYSTEM_OBJECT_IDS",
+                def.name
+            );
+        }
+        described.extend(tables.into_iter().map(|def| (DBO.to_owned(), def.name)));
+        assert_eq!(
+            described.len(),
+            SYSTEM_OBJECT_IDS.len(),
+            "a line names no object"
+        );
+    }
+
+    #[test]
+    fn a_view_added_in_front_moves_no_other_identifier() {
+        let before = system_view_objects(&described_views(), &master());
+        let mut with_a_new_view = vec![view("master", "sys", "a_view_described_first")];
+        with_a_new_view.extend(described_views());
+        let after = system_view_objects(&with_a_new_view, &master());
+        let ids = |objects: &[ObjectMeta]| -> Vec<(String, String, ObjectId)> {
+            let mut ids: Vec<(String, String, ObjectId)> = objects
+                .iter()
+                .map(|object| {
+                    (
+                        object.name.schema.clone(),
+                        object.name.name.clone(),
+                        object.id,
+                    )
+                })
+                .collect();
+            ids.sort();
+            ids
+        };
+        // The new view has no line in the table, so it takes no identifier, and each other
+        // view keeps the one it had.
+        assert_eq!(ids(&after), ids(&before));
+        assert!(!before.is_empty());
+        // The numbering by rank this replaces moved them: the view of `sys.objects` was `-1`
+        // because it came first.
+        assert_eq!(
+            after
+                .iter()
+                .find(|object| object.name.name == "objects")
+                .map(|object| object.id),
+            Some(ObjectId(-1))
+        );
     }
 
     #[test]
@@ -1315,12 +1507,16 @@ mod tests {
 
     #[test]
     fn a_description_without_its_table_is_skipped() {
-        // A `master` holding three tables while the bootstrap of this build describes twenty:
-        // the three first descriptions are paired with the three tables, by position, and the
-        // rest are left out rather than paired with the table of another description.
+        // A `master` whose registry names three tables while the bootstrap of this build
+        // describes more: the three descriptions the registry names are paired with their
+        // tables, by name, in an order other than the one of the list, and the rest are left out
+        // rather than paired with the table of another description.
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let manager = Arc::new(TransactionManager::new(Arc::clone(&storage)));
         let master = storage.create_database("master").expect("create_database");
+        let registry = storage
+            .create_table(master, &crate::bootstrap::registry_shape())
+            .expect("create_table of the registry");
         let shape = vauban_storage::TableShape {
             columns: vec![vauban_types::TypeInfo::new(
                 vauban_types::SqlType::Int,
@@ -1328,13 +1524,28 @@ mod tests {
             )],
             clustered_key: None,
         };
-        let created: Vec<vauban_storage::TableId> = (0..3)
-            .map(|_| {
-                storage
-                    .create_table(master, &shape)
-                    .expect("create_table of a table of master")
-            })
+        let described = internal_table_defs().expect("the descriptions of the bootstrap");
+        // Registered in the reverse of the order they are described in.
+        let chosen: Vec<&str> = [10, 5, 0]
+            .iter()
+            .map(|&position| described[position].name.as_str())
             .collect();
+        let handle = manager.begin(IsolationLevel::ReadCommitted);
+        let mut created = Vec::new();
+        for name in &chosen {
+            let table = storage
+                .create_table(master, &shape)
+                .expect("create_table of a table of master");
+            storage
+                .insert(
+                    handle.id,
+                    registry,
+                    &crate::bootstrap::registry_row(name, table),
+                )
+                .expect("insert into the registry");
+            created.push(((*name).to_owned(), table));
+        }
+        manager.commit(handle).expect("commit");
         let catalog = Catalog {
             storage,
             txn: Arc::clone(&manager),
@@ -1349,21 +1560,25 @@ mod tests {
         };
 
         let built = internal_table_objects(&catalog, &meta).expect("the three tables");
-        let described = internal_table_defs().expect("the descriptions of the bootstrap");
         assert_eq!(built.len(), 3, "three tables, three entries");
         assert!(described.len() > built.len(), "{}", described.len());
-        for (position, (object, table)) in built.iter().enumerate() {
-            let rank = i32::try_from(position).expect("a position fits in an i32");
-            assert_eq!(object.id, ObjectId(FIRST_INTERNAL_TABLE_OBJECT_ID + rank));
+        for (object, table) in &built {
+            let storage_id = created
+                .iter()
+                .find(|(name, _)| *name == table.name)
+                .map(|&(_, id)| id);
+            assert_eq!(Some(table.storage_id), storage_id, "{}", table.name);
+            assert_eq!(
+                Some(object.id),
+                system_object_id(INTERNAL_TABLE_SCHEMA, &table.name)
+            );
             assert_eq!(object.id, table.id);
             assert_eq!(object.kind, ObjectKind::Table);
             assert_eq!(object.definition, None);
             assert_eq!(object.parent, None);
             assert_eq!(object.database, master);
             assert_eq!(table.database, master);
-            assert_eq!(table.storage_id, created[position]);
-            assert_eq!(table.name, described[position].name);
-            assert_eq!(object.name.name, described[position].name);
+            assert_eq!(object.name.name, table.name);
             assert_eq!(object.name.schema, "dbo");
             assert_eq!(object.name.database, "master");
             assert_eq!(table.clustered, None);
