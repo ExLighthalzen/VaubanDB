@@ -10,8 +10,8 @@ use vauban_planner::{
 
 use vauban_binder::{
     AggregateCall, BoundDeclaration, BoundExpr, BoundExprKind, BoundProjection, BoundStatement,
-    BoundTop, ColumnBinding, CompareOp, JoinKind, LockHints, LogicalOp, LogicalPlan, OutputColumn,
-    OutputSchema, SortKey,
+    BoundSubquery, BoundTop, ColumnBinding, CompareOp, JoinKind, LockHints, LogicalOp, LogicalPlan,
+    OutputColumn, OutputSchema, SortKey,
 };
 use vauban_catalog::ColumnId;
 use vauban_storage::{KeyColumn, TableId};
@@ -231,7 +231,7 @@ fn plan_with(catalog: &dyn PlanCatalog, logical: LogicalPlan) -> PhysicalPlan {
 
 fn exists(inner: LogicalPlan) -> BoundExpr {
     BoundExpr {
-        kind: BoundExprKind::Exists(Box::new(inner)),
+        kind: BoundExprKind::Exists(BoundSubquery::new(inner)),
         ty: bit_type(),
         line: 1,
     }
@@ -239,7 +239,7 @@ fn exists(inner: LogicalPlan) -> BoundExpr {
 
 fn scalar(inner: LogicalPlan) -> BoundExpr {
     BoundExpr {
-        kind: BoundExprKind::ScalarSubquery(Box::new(inner)),
+        kind: BoundExprKind::ScalarSubquery(BoundSubquery::new(inner)),
         ty: int_type(),
         line: 1,
     }
@@ -249,7 +249,7 @@ fn in_subquery(tested: BoundExpr, inner: LogicalPlan, negated: bool) -> BoundExp
     BoundExpr {
         kind: BoundExprKind::InSubquery {
             expr: Box::new(tested),
-            plan: Box::new(inner),
+            plan: BoundSubquery::new(inner),
             negated,
         },
         ty: bit_type(),
@@ -799,6 +799,7 @@ fn subplans_follow_the_expression_order() {
     let planned = plan_with(&FakeCatalog::new(), query);
     let subplans = subplans_in(&planned);
     assert_eq!(subplans.len(), 2);
+    assert_ne!(subplans[0].id, subplans[1].id);
     assert!(
         contains_table(&subplans[0].plan, TABLE_A),
         "the left subquery must be first in the walk"
@@ -807,6 +808,36 @@ fn subplans_follow_the_expression_order() {
         contains_table(&subplans[1].plan, TABLE_B),
         "the right subquery must be second; swapping them fails this test"
     );
+}
+
+/// The binder may copy one subquery node into two places of an expression; both copies
+/// carry one identity, and one plan is built for it.
+#[test]
+fn a_subquery_copied_into_two_places_is_planned_once() {
+    let once = scalar(project_scan(scan_a()));
+    let BoundExprKind::ScalarSubquery(subquery) = &once.kind else {
+        panic!("expected a scalar subquery");
+    };
+    let id = subquery.id;
+    let other = scalar(project_scan(scan_b()));
+    let expr = logical(
+        LogicalOp::And,
+        logical(LogicalOp::And, once.clone(), other),
+        once,
+    );
+    let query = LogicalPlan::Project {
+        input: Box::new(scan_a()),
+        exprs: vec![BoundProjection {
+            expr,
+            name: "both".to_owned(),
+        }],
+        schema: schema(&["both"]),
+    };
+    let planned = plan_with(&FakeCatalog::new(), query);
+    let subplans = subplans_in(&planned);
+    assert_eq!(subplans.len(), 2);
+    assert_eq!(subplans[0].id, id);
+    assert!(contains_table(&subplans[1].plan, TABLE_B));
 }
 
 fn subplans_in(plan: &PhysicalPlan) -> &[SubPlan] {

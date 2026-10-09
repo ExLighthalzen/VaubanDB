@@ -95,7 +95,7 @@ fn eq(left: BoundExpr, right: BoundExpr) -> BoundExpr {
 
 fn exists(inner: PhysicalPlan) -> BoundExpr {
     BoundExpr {
-        kind: BoundExprKind::Exists(Box::new(logical_plan_from_physical(&inner))),
+        kind: BoundExprKind::Exists(bound_subquery(&inner)),
         ty: bit_ty(),
         line: 7,
     }
@@ -103,7 +103,7 @@ fn exists(inner: PhysicalPlan) -> BoundExpr {
 
 fn scalar(inner: PhysicalPlan) -> BoundExpr {
     BoundExpr {
-        kind: BoundExprKind::ScalarSubquery(Box::new(logical_plan_from_physical(&inner))),
+        kind: BoundExprKind::ScalarSubquery(bound_subquery(&inner)),
         ty: int_ty(true),
         line: 7,
     }
@@ -113,7 +113,7 @@ fn in_subquery(tested: BoundExpr, inner: PhysicalPlan, negated: bool) -> BoundEx
     BoundExpr {
         kind: BoundExprKind::InSubquery {
             expr: Box::new(tested),
-            plan: Box::new(logical_plan_from_physical(&inner)),
+            plan: bound_subquery(&inner),
             negated,
         },
         ty: bit_ty(),
@@ -211,7 +211,34 @@ fn subquery_eval(input: PhysicalPlan, _expr: BoundExpr, subplans: Vec<SubPlan>) 
 }
 
 fn subplan(plan: PhysicalPlan, correlated: bool) -> SubPlan {
-    SubPlan { plan, correlated }
+    SubPlan {
+        id: subquery_id(&plan),
+        plan,
+        correlated,
+    }
+}
+
+thread_local! {
+    static SUBQUERY_IDS: std::cell::RefCell<std::collections::HashMap<String, vauban_binder::SubqueryId>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The identity a test gives the subquery whose plan is `plan`: the node built over a plan
+/// and the entry of the `SubqueryEval` built over the same plan share it.
+fn subquery_id(plan: &PhysicalPlan) -> vauban_binder::SubqueryId {
+    SUBQUERY_IDS.with(|ids| {
+        *ids.borrow_mut()
+            .entry(format!("{plan:?}"))
+            .or_insert_with(vauban_binder::SubqueryId::fresh)
+    })
+}
+
+/// A bound subquery over the logical form of `plan`, under [`subquery_id`].
+fn bound_subquery(plan: &PhysicalPlan) -> vauban_binder::BoundSubquery {
+    vauban_binder::BoundSubquery {
+        id: subquery_id(plan),
+        plan: Box::new(logical_plan_from_physical(plan)),
+    }
 }
 
 fn filter(input: PhysicalPlan, predicate: BoundExpr) -> PhysicalPlan {
@@ -803,6 +830,44 @@ fn a_second_subquery_after_a_nested_exists_takes_its_own_plan() {
     let f = seeded();
     let rows = f.run("SELECT x.a FROM t1 x WHERE EXISTS (SELECT 1 FROM t1 y WHERE y.a = x.a AND EXISTS (SELECT 1 FROM t1 z WHERE z.a > y.a)) AND EXISTS (SELECT 1 FROM t1 w WHERE w.a = x.a + 1) ORDER BY x.a;");
     assert_eq!(rows, i32s(&[&[1], &[2]]));
+}
+
+/// Each branch of a `CASE` holds a subquery of its own, and each row takes one branch:
+/// the branches not taken leave the plans of the others where they are.
+#[test]
+fn case_branches_each_take_the_plan_of_their_own_subquery() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT a, CASE WHEN a = 1 THEN (SELECT 10) WHEN a = 2 THEN (SELECT 20) ELSE (SELECT 30) END FROM t1 ORDER BY a;",
+    );
+    assert_eq!(rows, i32s(&[&[1, 10], &[2, 20], &[3, 30]]));
+}
+
+/// The same shape with a correlated subquery in each branch.
+#[test]
+fn case_branches_each_take_their_own_correlated_subquery() {
+    let f = seeded();
+    let rows = f.run(
+        "SELECT x.a, CASE WHEN x.a = 1 THEN (SELECT w.v FROM t3 w WHERE w.k = x.a) WHEN x.a = 2 THEN (SELECT w.v + 1 FROM t3 w WHERE w.k = x.a) ELSE (SELECT w.v + 2 FROM t3 w WHERE w.k = x.a) END FROM t1 x ORDER BY x.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1, 10], &[2, 21], &[3, 32]]));
+}
+
+/// `ISNULL` with a first argument that is not `NULL` leaves its subquery unevaluated; the
+/// subquery that follows still reads its own plan.
+#[test]
+fn a_subquery_after_an_isnull_that_skips_its_own_reads_its_plan() {
+    let f = SqlFixture::new();
+    let rows = f.run("SELECT ISNULL(1, (SELECT 10)) + (SELECT 20);");
+    assert_eq!(rows, i32s(&[&[21]]));
+}
+
+/// Two subqueries in two columns of one select list.
+#[test]
+fn two_subqueries_in_two_columns_each_read_their_plan() {
+    let f = SqlFixture::new();
+    let rows = f.run("SELECT (SELECT 1), (SELECT 2);");
+    assert_eq!(rows, i32s(&[&[1, 2]]));
 }
 
 /// A derived table crossed with a table inside a correlated scalar: the derived

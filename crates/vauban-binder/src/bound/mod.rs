@@ -11,6 +11,7 @@
 //! The two small operator enums, [`CompareOp`] and [`LogicalOp`], do derive the full set.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use vauban_catalog::{AlterTable, ColumnId, IndexDef, QualifiedName, TableDef, TableId};
 use vauban_parser::Statement;
@@ -827,12 +828,12 @@ pub enum BoundExprKind {
     /// `[NOT] EXISTS (SELECT …)`. Predicate..
     ///
     /// `NOT EXISTS` is [`BoundExprKind::Not`] over this variant, as the parser builds it.
-    Exists(Box<LogicalPlan>),
+    Exists(BoundSubquery),
     /// A scalar subquery, `(SELECT …)` in the place of a value..
     ///
     /// The `ty` of the node is the type of the single column of the plan; a plan of
     /// another width answers 116 at bind time.
-    ScalarSubquery(Box<LogicalPlan>),
+    ScalarSubquery(BoundSubquery),
     /// `e [NOT] IN (SELECT …)`. Predicate..
     ///
     /// A variant of its own, and **not** a third field of [`BoundExprKind::In`]: the list
@@ -843,10 +844,49 @@ pub enum BoundExprKind {
         /// The tested value.
         expr: Box<BoundExpr>,
         /// The plan of the subquery, of one column (116 otherwise).
-        plan: Box<LogicalPlan>,
+        plan: BoundSubquery,
         /// True for `NOT IN`.
         negated: bool,
     },
+}
+
+/// The identity of one subquery: told apart from the other subqueries the process binds,
+/// and kept by a clone of the expression that holds it.
+///
+/// The planner keys the plan it builds for a subquery by this identity, and the executor
+/// finds that plan by the identity the evaluated node carries. A subquery left unevaluated
+/// by a short-circuit (a `CASE` branch not taken, the second argument of an `ISNULL` whose
+/// first is not `NULL`) therefore shifts nothing for the subqueries evaluated after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubqueryId(u64);
+
+impl SubqueryId {
+    /// A fresh identity, distinct from the ones handed out before it in this process.
+    #[must_use]
+    pub fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// The plan of a subquery, with the identity the planner and the executor find it by.
+#[derive(Debug, Clone)]
+pub struct BoundSubquery {
+    /// The identity of this subquery; a clone of the node keeps it.
+    pub id: SubqueryId,
+    /// The bound plan of the inner query.
+    pub plan: Box<LogicalPlan>,
+}
+
+impl BoundSubquery {
+    /// Wraps `plan` under a [`SubqueryId::fresh`] identity.
+    #[must_use]
+    pub fn new(plan: LogicalPlan) -> Self {
+        Self {
+            id: SubqueryId::fresh(),
+            plan: Box::new(plan),
+        }
+    }
 }
 
 /// A comparison operator, **normalised**.

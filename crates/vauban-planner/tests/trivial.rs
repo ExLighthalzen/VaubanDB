@@ -288,7 +288,7 @@ fn an_aggregate_over_a_scan_produces_a_hash_aggregate() {
 #[test]
 fn a_subquery_expression_plans() {
     let exists = BoundExpr {
-        kind: BoundExprKind::Exists(Box::new(LogicalPlan::OneRow)),
+        kind: BoundExprKind::Exists(vauban_binder::BoundSubquery::new(LogicalPlan::OneRow)),
         ty: TypeInfo::new(SqlType::Bit, false),
         line: 1,
     };
@@ -317,7 +317,7 @@ fn a_subquery_expression_plans() {
 /// `EXISTS (SELECT …)`, the subquery expression the holders below carry.
 fn exists_expr() -> BoundExpr {
     BoundExpr {
-        kind: BoundExprKind::Exists(Box::new(LogicalPlan::OneRow)),
+        kind: BoundExprKind::Exists(vauban_binder::BoundSubquery::new(LogicalPlan::OneRow)),
         ty: TypeInfo::new(SqlType::Bit, false),
         line: 1,
     }

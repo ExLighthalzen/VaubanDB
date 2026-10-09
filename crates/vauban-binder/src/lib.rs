@@ -87,9 +87,10 @@ mod view;
 
 pub use bound::{
     AggregateCall, BoundCaseArm, BoundDeclaration, BoundExpr, BoundExprKind, BoundProjection,
-    BoundStatement, BoundTop, ColumnBinding, CompareOp, DdlStatement, DeferredStatement,
-    DeletePlan, InsertPlan, JoinKind, LockHints, LogicalOp, LogicalPlan, OutputColumn,
-    OutputSchema, SelectIntoPlan, SetOpKind, SortKey, TxnStatement, UpdatePlan,
+    BoundStatement, BoundSubquery, BoundTop, ColumnBinding, CompareOp, DdlStatement,
+    DeferredStatement, DeletePlan, InsertPlan, JoinKind, LockHints, LogicalOp, LogicalPlan,
+    OutputColumn, OutputSchema, SelectIntoPlan, SetOpKind, SortKey, SubqueryId, TxnStatement,
+    UpdatePlan,
 };
 pub use context::{
     BindContext, CatalogView, NoVariables, ResolvedTable, ResolvedTableKind, SessionOptions,

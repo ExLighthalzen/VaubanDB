@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use vauban_binder::SubqueryId;
 use vauban_binder::{ColumnBinding, OutputSchema, SessionOptions};
 use vauban_catalog::{Catalog, ColumnId};
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
@@ -30,10 +31,29 @@ pub(crate) enum SubqueryLocalsSource {
     JoinInnerScan,
 }
 
+/// The subquery plans of one [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval)
+/// or of one statement expression, shared with the operator that opened the frame, and
+/// the values of the uncorrelated ones, at the same positions.
 struct SubqueryFrame {
-    subplans: Vec<SubPlan>,
-    slot: usize,
+    subplans: Rc<[SubPlan]>,
     cache: Vec<Option<Value>>,
+}
+
+/// Where [`ExecContext::find_subplan`] found the plan of a subquery: the table it is in,
+/// shared rather than copied, and its place in the frame stack, which the cache of an
+/// uncorrelated subquery is read and written at.
+pub(crate) struct FoundSubplan {
+    table: Rc<[SubPlan]>,
+    frame: usize,
+    index: usize,
+}
+
+impl FoundSubplan {
+    /// The plan found.
+    #[must_use]
+    pub(crate) fn subplan(&self) -> &SubPlan {
+        &self.table[self.index]
+    }
 }
 
 /// One row of the outer-row stack.
@@ -646,13 +666,11 @@ impl<'a> ExecContext<'a> {
         self.outer_frames.last().map(|frame| &frame.row)
     }
 
-    /// Opens one [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval) operator.
-    pub(crate) fn open_subquery_eval(&mut self, subplans: &[SubPlan]) {
-        self.subquery_frames.push(SubqueryFrame {
-            subplans: subplans.to_vec(),
-            slot: 0,
-            cache: vec![None; subplans.len()],
-        });
+    /// Opens one [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval) operator over
+    /// the plans it shares.
+    pub(crate) fn open_subquery_eval(&mut self, subplans: Rc<[SubPlan]>) {
+        let cache = vec![None; subplans.len()];
+        self.subquery_frames.push(SubqueryFrame { subplans, cache });
     }
 
     /// Closes the innermost [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval) operator.
@@ -672,16 +690,8 @@ impl<'a> ExecContext<'a> {
     /// first stored (`tests/subquery.rs`, `a_set_run_twice_evaluates_its_subquery_twice`).
     pub(crate) fn open_statement_subplans(&mut self, subplans: &[SubPlan]) -> CorrelationMark {
         let mark = self.correlation_mark();
-        self.open_subquery_eval(subplans);
+        self.open_subquery_eval(Rc::from(subplans));
         mark
-    }
-
-    /// Resets the slot counter for a new row of the innermost
-    /// [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval).
-    pub(crate) fn begin_subquery_row(&mut self) {
-        if let Some(frame) = self.subquery_frames.last_mut() {
-            frame.slot = 0;
-        }
     }
 
     /// Clears subquery state once the operator is exhausted.
@@ -695,36 +705,43 @@ impl<'a> ExecContext<'a> {
         !self.subquery_frames.is_empty()
     }
 
-    /// The next subplan slot for this row.
+    /// The plan of the subquery whose identity is `id`, looked for from the innermost
+    /// frame outwards. Which subqueries were evaluated before this one, or skipped, does
+    /// not enter the lookup (`tests/subquery.rs`,
+    /// `case_branches_each_take_the_plan_of_their_own_subquery`).
     ///
     /// # Errors
     ///
-    /// The internal error 50000 when the walk order diverges from the planner.
-    pub(crate) fn take_subplan(&mut self) -> SqlResult<(SubPlan, usize)> {
-        let frame = self
-            .subquery_frames
-            .last_mut()
-            .ok_or_else(|| bug("ExecContext: no active subquery row"))?;
-        let slot = frame.slot;
-        let Some(subplan) = frame.subplans.get(slot) else {
-            return Err(bug("ExecContext: subquery slot out of range"));
-        };
-        frame.slot += 1;
-        Ok((subplan.clone(), slot))
+    /// The internal error 50000 when no open frame holds a plan of that identity.
+    pub(crate) fn find_subplan(&self, id: SubqueryId) -> SqlResult<FoundSubplan> {
+        for (frame, entry) in self.subquery_frames.iter().enumerate().rev() {
+            if let Some(index) = entry.subplans.iter().position(|sub| sub.id == id) {
+                return Ok(FoundSubplan {
+                    table: Rc::clone(&entry.subplans),
+                    frame,
+                    index,
+                });
+            }
+        }
+        Err(bug("ExecContext: no plan for this subquery"))
     }
 
-    /// A cached uncorrelated subquery value, when one was stored for `slot`.
+    /// A cached uncorrelated subquery value, when one was stored at `found`.
     #[must_use]
-    pub(crate) fn subquery_cached(&self, slot: usize) -> Option<Value> {
-        self.subquery_frames.last()?.cache.get(slot)?.clone()
+    pub(crate) fn subquery_cached(&self, found: &FoundSubplan) -> Option<Value> {
+        self.subquery_frames
+            .get(found.frame)?
+            .cache
+            .get(found.index)?
+            .clone()
     }
 
-    /// Stores the value of an uncorrelated subquery for `slot`.
-    pub(crate) fn store_subquery_cache(&mut self, slot: usize, value: Value) {
+    /// Stores the value of an uncorrelated subquery at `found`.
+    pub(crate) fn store_subquery_cache(&mut self, found: &FoundSubplan, value: Value) {
         if let Some(entry) = self
             .subquery_frames
-            .last_mut()
-            .and_then(|frame| frame.cache.get_mut(slot))
+            .get_mut(found.frame)
+            .and_then(|frame| frame.cache.get_mut(found.index))
         {
             *entry = Some(value);
         }

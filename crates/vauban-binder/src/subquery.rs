@@ -29,7 +29,9 @@ use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{Expr, Ident, SelectStatement, Span, TableRef};
 use vauban_types::{SqlType, TypeInfo};
 
-use crate::bound::{BoundExpr, BoundExprKind, LogicalPlan, OutputColumn, OutputSchema};
+use crate::bound::{
+    BoundExpr, BoundExprKind, BoundSubquery, LogicalPlan, OutputColumn, OutputSchema,
+};
 use crate::context::BindContext;
 use crate::errors::line_of;
 use crate::expr::{Scope, bind_expr, convert_to};
@@ -241,7 +243,7 @@ pub(crate) fn bind_exists(
     let child_scope = Scope::empty().inside(scope.clone());
     let plan = bind_select_with_parent(query, ctx, &child_scope)?;
     Ok(BoundExpr {
-        kind: BoundExprKind::Exists(Box::new(plan)),
+        kind: BoundExprKind::Exists(BoundSubquery::new(plan)),
         ty: vauban_types::TypeInfo::new(vauban_types::SqlType::Bit, false),
         line: line_of(&query.span),
     })
@@ -271,7 +273,7 @@ pub(crate) fn bind_scalar(
     let mut ty = schema.columns[0].ty.clone();
     ty.nullable = true;
     Ok(BoundExpr {
-        kind: BoundExprKind::ScalarSubquery(Box::new(plan)),
+        kind: BoundExprKind::ScalarSubquery(BoundSubquery::new(plan)),
         ty,
         line: line_of(&query.span),
     })
@@ -310,7 +312,7 @@ pub(crate) fn bind_in_subquery(
     Ok(BoundExpr {
         kind: BoundExprKind::InSubquery {
             expr: Box::new(crate::expr::convert_to(expr, &common)),
-            plan: Box::new(plan),
+            plan: BoundSubquery::new(plan),
             negated,
         },
         ty: vauban_types::TypeInfo::new(vauban_types::SqlType::Bit, nullable),

@@ -483,6 +483,7 @@ fn samples() -> Vec<PhysicalPlan> {
         PhysicalPlan::SubqueryEval {
             input: Box::new(physical_scan()),
             subplans: vec![SubPlan {
+                id: vauban_binder::SubqueryId::fresh(),
                 plan: physical_scan(),
                 correlated: false,
             }],

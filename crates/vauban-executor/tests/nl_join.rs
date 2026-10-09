@@ -665,9 +665,32 @@ fn logical_plan_from_physical(plan: &PhysicalPlan) -> vauban_binder::LogicalPlan
     }
 }
 
+thread_local! {
+    static SUBQUERY_IDS: std::cell::RefCell<std::collections::HashMap<String, vauban_binder::SubqueryId>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The identity a test gives the subquery whose plan is `plan`: the node built over a plan
+/// and the entry of the `SubqueryEval` built over the same plan share it.
+fn subquery_id(plan: &PhysicalPlan) -> vauban_binder::SubqueryId {
+    SUBQUERY_IDS.with(|ids| {
+        *ids.borrow_mut()
+            .entry(format!("{plan:?}"))
+            .or_insert_with(vauban_binder::SubqueryId::fresh)
+    })
+}
+
+/// A bound subquery over the logical form of `plan`, under [`subquery_id`].
+fn bound_subquery(plan: &PhysicalPlan) -> vauban_binder::BoundSubquery {
+    vauban_binder::BoundSubquery {
+        id: subquery_id(plan),
+        plan: Box::new(logical_plan_from_physical(plan)),
+    }
+}
+
 fn exists_expr(plan: &PhysicalPlan) -> BoundExpr {
     BoundExpr {
-        kind: BoundExprKind::Exists(Box::new(logical_plan_from_physical(plan))),
+        kind: BoundExprKind::Exists(bound_subquery(plan)),
         ty: TypeInfo::new(SqlType::Bit, true),
         line: 1,
     }
@@ -749,6 +772,7 @@ fn correlated_exists_with_a_cross_join_filter_inside() {
         input: Box::new(subquery_eval(
             outer_scan,
             vec![SubPlan {
+                id: subquery_id(&inner),
                 plan: inner.clone(),
                 correlated: true,
             }],

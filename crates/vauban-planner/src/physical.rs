@@ -16,7 +16,7 @@ use std::ops::Bound;
 
 use vauban_binder::{
     AggregateCall, BoundExecute, BoundExpr, BoundProjection, BoundTop, ColumnBinding, DdlStatement,
-    DeferredStatement, JoinKind, LockHints, OutputSchema, SortKey, TxnStatement,
+    DeferredStatement, JoinKind, LockHints, OutputSchema, SortKey, SubqueryId, TxnStatement,
 };
 use vauban_catalog::{TableDef, TableId};
 use vauban_storage::{Direction, IndexId};
@@ -293,7 +293,7 @@ pub enum PhysicalPlan {
     SubqueryEval {
         /// The rows the expressions are evaluated over.
         input: Box<PhysicalPlan>,
-        /// The plans of the subqueries, in the order the expressions name them.
+        /// The plans of the subqueries, one per [`SubPlan::id`], found by that identity.
         subplans: Vec<SubPlan>,
         /// The columns of `input`, plus one per subquery result.
         schema: OutputSchema,
@@ -348,9 +348,13 @@ pub struct PhysicalDeclaration {
     pub subplans: Vec<SubPlan>,
 }
 
-/// One subquery of a [`PhysicalPlan::SubqueryEval`]. Not produced yet.
+/// One subquery of a [`PhysicalPlan::SubqueryEval`], or of the value of a `SET` or a
+/// `DECLARE`.
 #[derive(Debug, Clone)]
 pub struct SubPlan {
+    /// The identity of the bound node this plan was built from; the executor finds the
+    /// plan of a node by it.
+    pub id: SubqueryId,
     /// The plan of the subquery.
     pub plan: PhysicalPlan,
     /// True when the plan reads a column of the outer row, which makes it run once per

@@ -153,7 +153,7 @@ fn a_correlated_column_resolves_in_the_outer_scope() {
     // The inner plan has a Filter whose predicate references `a.k`.
     let LogicalPlan::Project {
         input: inner_input, ..
-    } = inner.as_ref()
+    } = inner.plan.as_ref()
     else {
         panic!("inner root is not a Project: {inner:?}");
     };
@@ -192,11 +192,11 @@ fn column_depths(plan: &LogicalPlan) -> Vec<(String, u8)> {
         match &expr.kind {
             BoundExprKind::ColumnRef(binding) => out.push((binding.name.clone(), binding.depth)),
             BoundExprKind::Exists(inner) | BoundExprKind::ScalarSubquery(inner) => {
-                from_plan(inner, out);
+                from_plan(&inner.plan, out);
             }
             BoundExprKind::InSubquery { expr, plan, .. } => {
                 from_expr(expr, out);
-                from_plan(plan, out);
+                from_plan(&plan.plan, out);
             }
             BoundExprKind::Compare { left, right, .. }
             | BoundExprKind::Logical { left, right, .. }
@@ -258,7 +258,7 @@ fn an_outer_column_carries_its_scope_depth() {
     let BoundExprKind::ScalarSubquery(inner) = &exprs[1].expr.kind else {
         panic!("second item is not a scalar subquery: {:?}", exprs[1]);
     };
-    let LogicalPlan::Project { input, .. } = inner.as_ref() else {
+    let LogicalPlan::Project { input, .. } = inner.plan.as_ref() else {
         panic!("inner root is not a Project: {inner:?}");
     };
     let LogicalPlan::Aggregate { input, .. } = input.as_ref() else {

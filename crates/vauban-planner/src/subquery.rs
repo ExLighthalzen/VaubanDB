@@ -19,17 +19,18 @@
 //! `exists_ordered_on_an_outer_column_stays_correlated` and
 //! `exists_values_over_an_outer_column_stays_correlated`).
 //!
-//! # Index of [`SubPlan`](crate::SubPlan) entries
+//! # Identity of [`SubPlan`](crate::SubPlan) entries
 //!
-//! [`SubqueryEval`](PhysicalPlan::SubqueryEval) lists its [`SubPlan`](crate::SubPlan)
-//! entries in the order of a depth-first, left-to-right walk of the expression tree.
-//! The executor counts subqueries in that same order; changing one side without the
-//! other silently pairs the wrong plan to the wrong node
+//! Each [`SubPlan`](crate::SubPlan) carries the [`SubqueryId`](vauban_binder::SubqueryId)
+//! of the node it was planned from, and the executor looks a plan up by the identity of
+//! the node it evaluates. The position of an entry in the list is not read: a subquery a
+//! short-circuit leaves unevaluated does not move the ones after it. The list keeps a
+//! depth-first, left-to-right walk of the expression tree, one entry per identity
 //! (`tests/subquery.rs`, `subplans_follow_the_expression_order`).
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundProjection, CompareOp, LogicalOp, LogicalPlan, OutputColumn,
-    OutputSchema,
+    BoundExpr, BoundExprKind, BoundProjection, BoundSubquery, CompareOp, LogicalOp, LogicalPlan,
+    OutputColumn, OutputSchema,
 };
 use vauban_errors::SqlResult;
 use vauban_types::{SqlType, TypeInfo};
@@ -185,20 +186,20 @@ fn try_decorrelate_conjunct(
 ) -> SqlResult<Option<PhysicalPlan>> {
     match &conjunct.kind {
         BoundExprKind::Exists(inner) => {
-            if is_correlated(inner) {
+            if is_correlated(&inner.plan) {
                 return Ok(None);
             }
-            let inner = plan_node(inner, ctx)?;
+            let inner = plan_node(&inner.plan, ctx)?;
             Ok(Some(semi_join(outer, inner, PhysicalJoinKind::Semi, None)))
         }
         BoundExprKind::Not(inner) => {
             let BoundExprKind::Exists(plan) = &inner.kind else {
                 return Ok(None);
             };
-            if is_correlated(plan) {
+            if is_correlated(&plan.plan) {
                 return Ok(None);
             }
-            let inner = plan_node(plan, ctx)?;
+            let inner = plan_node(&plan.plan, ctx)?;
             Ok(Some(semi_join(
                 outer,
                 inner,
@@ -211,11 +212,11 @@ fn try_decorrelate_conjunct(
             plan,
             negated: false,
         } => {
-            if is_correlated(plan) {
+            if is_correlated(&plan.plan) {
                 return Ok(None);
             }
-            let inner = plan_node(plan, ctx)?;
-            let on = in_subquery_equality(expr, plan, outer)?;
+            let inner = plan_node(&plan.plan, ctx)?;
+            let on = in_subquery_equality(expr, &plan.plan, outer)?;
             Ok(Some(semi_join(
                 outer,
                 inner,
@@ -501,11 +502,11 @@ fn expr_holds_external_column(expr: &BoundExpr, level: u8) -> bool {
     match &expr.kind {
         BoundExprKind::ColumnRef(binding) => binding.depth > level,
         BoundExprKind::Exists(plan) | BoundExprKind::ScalarSubquery(plan) => {
-            plan_holds_external_column(plan, level.saturating_add(1))
+            plan_holds_external_column(&plan.plan, level.saturating_add(1))
         }
         BoundExprKind::InSubquery { expr, plan, .. } => {
             expr_holds_external_column(expr, level)
-                || plan_holds_external_column(plan, level.saturating_add(1))
+                || plan_holds_external_column(&plan.plan, level.saturating_add(1))
         }
         BoundExprKind::Negate(inner)
         | BoundExprKind::BitNot(inner)
@@ -561,7 +562,7 @@ fn expr_holds_external_column(expr: &BoundExpr, level: u8) -> bool {
     }
 }
 
-/// The subqueries of `expr`, in depth-first left-to-right order
+/// The subqueries of `expr`, one per identity, in depth-first left-to-right order
 /// (`tests/subquery.rs`, `subplans_follow_the_expression_order`).
 fn collect_subplans(expr: &BoundExpr, ctx: &PlanContext<'_>) -> SqlResult<Vec<SubPlan>> {
     let mut subplans = Vec::new();
@@ -575,15 +576,16 @@ fn collect_subplans_from_expr(
     out: &mut Vec<SubPlan>,
 ) -> SqlResult<()> {
     match &expr.kind {
-        BoundExprKind::Exists(plan) => {
-            out.push(subplan(plan, ctx)?);
+        BoundExprKind::Exists(subquery) | BoundExprKind::ScalarSubquery(subquery) => {
+            push_subplan(subquery, ctx, out)?;
         }
-        BoundExprKind::ScalarSubquery(plan) => {
-            out.push(subplan(plan, ctx)?);
-        }
-        BoundExprKind::InSubquery { expr, plan, .. } => {
+        BoundExprKind::InSubquery {
+            expr,
+            plan: subquery,
+            ..
+        } => {
             collect_subplans_from_expr(expr, ctx, out)?;
-            out.push(subplan(plan, ctx)?);
+            push_subplan(subquery, ctx, out)?;
         }
         BoundExprKind::Negate(inner)
         | BoundExprKind::BitNot(inner)
@@ -645,11 +647,23 @@ fn collect_subplans_from_expr(
     Ok(())
 }
 
-fn subplan(plan: &LogicalPlan, ctx: &PlanContext<'_>) -> SqlResult<SubPlan> {
-    Ok(SubPlan {
-        plan: plan_node(plan, ctx)?,
-        correlated: is_correlated(plan),
-    })
+/// Plans `subquery` into `out` under its identity, once: a node the binder copied into
+/// two places of the expression carries the same identity at both, and one plan serves
+/// both (`tests/subquery.rs`, `a_subquery_copied_into_two_places_is_planned_once`).
+fn push_subplan(
+    subquery: &BoundSubquery,
+    ctx: &PlanContext<'_>,
+    out: &mut Vec<SubPlan>,
+) -> SqlResult<()> {
+    if out.iter().any(|known| known.id == subquery.id) {
+        return Ok(());
+    }
+    out.push(SubPlan {
+        id: subquery.id,
+        plan: plan_node(&subquery.plan, ctx)?,
+        correlated: is_correlated(&subquery.plan),
+    });
+    Ok(())
 }
 
 fn subquery_eval_schema(input: &PhysicalPlan, subplans: &[SubPlan]) -> OutputSchema {

@@ -12,6 +12,7 @@
 //! `correlated_exists_two_levels_deep_over_the_same_table`).
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use vauban_binder::{AggregateCall, BoundExpr, BoundExprKind, ColumnBinding, OutputSchema};
 use vauban_catalog::ColumnId;
@@ -21,7 +22,7 @@ use vauban_errors::{SqlError, SqlResult};
 use vauban_planner::{PhysicalPlan, SubPlan};
 use vauban_types::{Value, compare};
 
-use crate::context::{CANCEL_CHECK_ROWS, ExecContext, SubqueryLocalsSource};
+use crate::context::{CANCEL_CHECK_ROWS, ExecContext, FoundSubplan, SubqueryLocalsSource};
 use crate::errors::at;
 use crate::expr::{as_condition, eval_expr, from_condition};
 use crate::operator::{Operator, build_operator};
@@ -30,7 +31,9 @@ use crate::row::Row;
 /// Pushes the outer row and subquery state for each row of `input`.
 pub struct SubqueryEval<'a> {
     input: Box<dyn Operator<'a> + 'a>,
-    subplans: Vec<SubPlan>,
+    /// Copied out of the plan once, when the operator is built, and shared with the frame
+    /// each `open` pushes.
+    subplans: Rc<[SubPlan]>,
     schema: OutputSchema,
     input_bindings: Vec<ColumnBinding>,
     rows_since_cancel: u64,
@@ -53,7 +56,7 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
     };
     Ok(Box::new(SubqueryEval {
         input: build_operator(input)?,
-        subplans: subplans.clone(),
+        subplans: Rc::from(subplans.as_slice()),
         schema: schema.clone(),
         input_bindings: scan_column_bindings(input),
         rows_since_cancel: 0,
@@ -66,7 +69,7 @@ impl<'a> Operator<'a> for SubqueryEval<'a> {
         self.input.open(ctx)?;
         self.rows_since_cancel = 0;
         self.outer_pushed = false;
-        ctx.open_subquery_eval(&self.subplans);
+        ctx.open_subquery_eval(Rc::clone(&self.subplans));
         Ok(())
     }
 
@@ -87,7 +90,6 @@ impl<'a> Operator<'a> for SubqueryEval<'a> {
             ctx.clear_subquery_state();
             return Ok(None);
         }
-        ctx.begin_subquery_row();
         ctx.push_outer(row.clone(), self.input_bindings.clone());
         self.outer_pushed = true;
         Ok(Some(row))
@@ -102,17 +104,17 @@ impl<'a> Operator<'a> for SubqueryEval<'a> {
     }
 }
 
-/// Evaluates one [`SubPlan`] slot, reusing the cache for an uncorrelated plan.
-pub(crate) fn eval_subplan_slot(
-    subplan: &SubPlan,
-    slot: usize,
+/// Evaluates the plan `found` designates, reusing the cache for an uncorrelated plan.
+pub(crate) fn eval_found_subplan(
+    found: &FoundSubplan,
     row: Option<&Row>,
     ctx: &mut ExecContext<'_>,
     line: u32,
     exists: bool,
 ) -> SqlResult<Value> {
+    let subplan = found.subplan();
     if !subplan.correlated {
-        if let Some(cached) = ctx.subquery_cached(slot) {
+        if let Some(cached) = ctx.subquery_cached(found) {
             return Ok(cached);
         }
         let value = if exists {
@@ -120,7 +122,7 @@ pub(crate) fn eval_subplan_slot(
         } else {
             eval_scalar_plan(&subplan.plan, row, ctx, Some(line))?
         };
-        ctx.store_subquery_cache(slot, value.clone());
+        ctx.store_subquery_cache(found, value.clone());
         return Ok(value);
     }
     if exists {
@@ -270,30 +272,29 @@ fn eval_in_subquery_plan_inner(
     Ok(from_condition(held))
 }
 
-/// Evaluates a bound subquery node while a [`SubqueryEval`] row is active.
+/// Evaluates a bound subquery node while a [`SubqueryEval`] row is active, with the plan
+/// the identity of the node designates.
 pub(crate) fn eval_subquery_expr(
     expr: &BoundExpr,
     row: Option<&Row>,
     ctx: &mut ExecContext<'_>,
 ) -> SqlResult<Value> {
     match &expr.kind {
-        BoundExprKind::Exists(_) => {
-            let (subplan, slot) = ctx.take_subplan()?;
-            eval_subplan_slot(&subplan, slot, row, ctx, expr.line, true)
-                .map_err(|e| at(e, expr.line))
+        BoundExprKind::Exists(subquery) => {
+            let found = ctx.find_subplan(subquery.id)?;
+            eval_found_subplan(&found, row, ctx, expr.line, true).map_err(|e| at(e, expr.line))
         }
-        BoundExprKind::ScalarSubquery(_) => {
-            let (subplan, slot) = ctx.take_subplan()?;
-            eval_subplan_slot(&subplan, slot, row, ctx, expr.line, false)
-                .map_err(|e| at(e, expr.line))
+        BoundExprKind::ScalarSubquery(subquery) => {
+            let found = ctx.find_subplan(subquery.id)?;
+            eval_found_subplan(&found, row, ctx, expr.line, false).map_err(|e| at(e, expr.line))
         }
         BoundExprKind::InSubquery {
             expr: tested,
-            plan: _,
+            plan: subquery,
             negated,
         } => {
-            let (subplan, _slot) = ctx.take_subplan()?;
-            let value = eval_in_subquery_plan(&subplan.plan, tested, row, ctx, expr.line)?;
+            let found = ctx.find_subplan(subquery.id)?;
+            let value = eval_in_subquery_plan(&found.subplan().plan, tested, row, ctx, expr.line)?;
             if *negated {
                 Ok(from_condition(as_condition(&value)?.map(|b| !b)))
             } else {
@@ -540,16 +541,18 @@ mod tests {
         );
 
         let plan = values_plan(&[99]);
+        let id = vauban_binder::SubqueryId::fresh();
         let subplan = SubPlan {
+            id,
             plan,
             correlated: false,
         };
-        ctx.open_subquery_eval(std::slice::from_ref(&subplan));
-        ctx.begin_subquery_row();
-        let first = eval_subplan_slot(&subplan, 0, None, &mut ctx, 1, false).expect("first");
-        assert_eq!(ctx.subquery_cached(0), Some(Value::I32(99)));
-        ctx.begin_subquery_row();
-        let second = eval_subplan_slot(&subplan, 0, None, &mut ctx, 1, false).expect("second");
+        ctx.open_subquery_eval(Rc::from(vec![subplan]));
+        let found = ctx.find_subplan(id).expect("found");
+        let first = eval_found_subplan(&found, None, &mut ctx, 1, false).expect("first");
+        assert_eq!(ctx.subquery_cached(&found), Some(Value::I32(99)));
+        let found = ctx.find_subplan(id).expect("found again");
+        let second = eval_found_subplan(&found, None, &mut ctx, 1, false).expect("second");
         assert_eq!(first, Value::I32(99));
         assert_eq!(second, Value::I32(99));
     }

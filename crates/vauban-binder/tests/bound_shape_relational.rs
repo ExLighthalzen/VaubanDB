@@ -10,9 +10,9 @@
 
 use vauban_binder::{
     AggregateCall, BindContext, BoundDeclaration, BoundExpr, BoundExprKind, BoundProjection,
-    BoundStatement, CatalogView, ColumnBinding, DeletePlan, InsertPlan, JoinKind, LockHints,
-    LogicalPlan, NoVariables, OutputColumn, OutputSchema, ResolvedTable, ResolvedTableKind,
-    SessionOptions, SetOpKind, SortKey, TxnStatement, UpdatePlan, bind,
+    BoundStatement, BoundSubquery, CatalogView, ColumnBinding, DeletePlan, InsertPlan, JoinKind,
+    LockHints, LogicalPlan, NoVariables, OutputColumn, OutputSchema, ResolvedTable,
+    ResolvedTableKind, SessionOptions, SetOpKind, SortKey, TxnStatement, UpdatePlan, bind,
 };
 use vauban_catalog::{ColumnId, ObjectId, TableId};
 use vauban_errors::SqlResult;
@@ -221,7 +221,7 @@ fn every_relational_plan_variant_reports_its_schema() {
 /// is a value: `WHERE (SELECT 1)` answers 4145 as `WHERE 1` does (`bound/mod.rs`).
 #[test]
 fn a_subquery_predicate_is_a_predicate_and_a_scalar_one_is_not() {
-    let plan = || Box::new(source("c"));
+    let plan = || BoundSubquery::new(source("c"));
     let predicate = |kind| BoundExpr {
         kind,
         ty: TypeInfo::new(SqlType::Bit, false),
