@@ -23,11 +23,14 @@
 //!
 //! # Directory
 //!
-//! `RowId -> Rid` of the **most recent** version of each row, held in memory: [`HeapTable::open`]
-//! attaches to a heap with an empty directory and does not rebuild the rows it holds
-//! ([`HeapTable::resume_after_recovery`] does, after a recovery). Older versions have
-//! no directory entry: [`HeapTable::get`] and [`HeapTable::scan`] read the chains by walking
-//! the heap ([`HeapTable::stored_versions`]), which is what "no index" costs here.
+//! Two maps held in memory. `RowId -> Rid` names the **most recent** version of each row,
+//! which is what a write starts from. `(RowId, seq) -> Rid` names **each** version the heap
+//! holds, so that [`HeapTable::get`], [`HeapTable::version`] and the versions of one row are
+//! read by a lookup in that map and one heap page per version, not by a walk of the heap
+//! (`super::index::tests::point_seek_on_100000_rows_reads_at_most_height_plus_two_pages`).
+//! [`HeapTable::scan`] walks the heap. [`HeapTable::open`] attaches to a heap with both maps
+//! empty and does not rebuild them ([`HeapTable::resume_after_recovery`] does, after a
+//! recovery).
 //!
 //! # Setting `xmax`
 //!
@@ -93,7 +96,7 @@
 //!   the first call of the engine on a table ([`HeapTable::resume_after_recovery`]), while a
 //!   table attached by hand, as the tests of this file do, keeps what `open` leaves.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use vauban_errors::InternalError;
 
@@ -296,8 +299,8 @@ pub(crate) struct TxnState {
 /// carries no lifetime. The table is built around `&DiskStorage` and this state at each call
 /// ([`super::DiskStorage::with_rows`]).
 ///
-/// `directory` is read by the heap store: [`super::clustered::ClusteredTable`] keeps its own
-/// directory in a B+tree of the instance instead.
+/// `directory` and `versions` are read by the heap store: [`super::clustered::ClusteredTable`]
+/// keeps its own directory in a B+tree of the instance instead.
 #[derive(Debug)]
 pub(crate) struct TableState {
     /// The next [`RowId`] to hand out; it grows, so an id taken away by a rollback is not
@@ -309,6 +312,9 @@ pub(crate) struct TableState {
     /// Where the most recent version of each logical row sits, for the heap store; the
     /// clustered store keeps that map in a B+tree of the instance.
     pub(crate) directory: HashMap<RowId, Rid>,
+    /// Where each version of each row sits, by `(RowId, seq)`, for the heap store: what an
+    /// index entry names is looked up here rather than by a walk of the heap.
+    pub(crate) versions: BTreeMap<(RowId, u64), Rid>,
     /// The transactions that wrote in this table and have not been forgotten, by [`TxnId`].
     pub(crate) txns: HashMap<TxnId, TxnState>,
     /// What the writes since the last `take_index_changes` mean for an index.
@@ -337,6 +343,7 @@ impl Default for TableState {
             next_row_id: 1,
             next_seq: 1,
             directory: HashMap::new(),
+            versions: BTreeMap::new(),
             txns: HashMap::new(),
             index_log: Vec::new(),
             resumed: false,
@@ -383,13 +390,12 @@ impl<'storage> HeapTable<'storage> {
     /// Attaches to the heap of `table` whose head page is `first_page`, leaving the pages as
     /// they stand.
     ///
-    /// The directory and the counters start empty and live in memory. What a table reopened
-    /// this way answers, with one row committed before the `open`
-    /// (`open_serves_the_rows_but_hands_out_row_id_one_again`): [`HeapTable::get`] and
-    /// [`HeapTable::scan`] serve the row, because they walk the heap;
-    /// [`HeapTable::latest_version`] answers `None` and [`HeapTable::update`] and
-    /// [`HeapTable::delete`] answer [`InternalError::Bug`], because they go through the
-    /// directory; and the next [`HeapTable::insert`] hands out `RowId(1)` a second time, so
+    /// The two maps of the directory and the counters start empty and live in memory. What a
+    /// table reopened this way answers, with one row committed before the `open`
+    /// (`open_serves_the_rows_but_hands_out_row_id_one_again`): [`HeapTable::scan`] serves the
+    /// row, because it walks the heap; [`HeapTable::get`] and [`HeapTable::latest_version`]
+    /// answer `None` and [`HeapTable::update`] and [`HeapTable::delete`] answer
+    /// [`InternalError::Bug`], because they go through the directory; and the next [`HeapTable::insert`] hands out `RowId(1)` a second time, so
     /// the heap then holds two chains under that id and `scan` answers two rows for it.
     /// [`super::DiskStorage::with_rows`] is what rebuilds the directory and the counters
     /// before a call of the engine reaches the table.
@@ -446,11 +452,14 @@ impl<'storage> HeapTable<'storage> {
         self.storage.register_recovered(winners, losers)?;
         self.clear_losers_xmax(losers)?;
         self.state.directory.clear();
+        self.state.versions.clear();
         for version in self.stored_versions(None)? {
+            let (row, seq) = (version.header.row, version.header.seq);
+            self.state.versions.insert((row, seq), version.rid);
             if self.status(version.header.xmin) == TxnStatus::Aborted {
                 continue;
             }
-            self.state.directory.insert(version.header.row, version.rid);
+            self.state.directory.insert(row, version.rid);
         }
         Ok(())
     }
@@ -662,20 +671,49 @@ impl<'storage> HeapTable<'storage> {
 
     /// The content of `id` as `snap` sees it, `None` when no version of the row is visible.
     ///
-    /// The chain of the row is walked and filtered by [`Snapshot::is_visible`]: at most one
-    /// version answers, by the chain invariant of the crate root.
+    /// The chain of the row is read through the directory of the versions, from the most
+    /// recent version back, and filtered by [`Snapshot::is_visible`]: at most one version
+    /// answers, by the chain invariant of the crate root.
     ///
     /// # Errors
     ///
-    /// The errors of [`Heap::get`] and [`super::encode::decode_row`].
+    /// [`InternalError::Corruption`] for a directory entry whose record is gone; the errors of
+    /// [`Heap::get`] and [`super::encode::decode_row`].
     pub(crate) fn get(&self, snap: &Snapshot, id: RowId) -> Result<Option<Row>, InternalError> {
         let status = |t| self.status(t);
-        for version in self.stored_versions(Some(id))? {
+        for version in self.stored_versions(Some(id))?.iter().rev() {
             if snap.is_visible(version.header.xmin, version.header.xmax, &status) {
                 return version.row().map(Some);
             }
         }
         Ok(None)
+    }
+
+    /// The version `seq` of the row `id`, `None` when the directory of the versions does not
+    /// hold it.
+    ///
+    /// One lookup in [`TableState::versions`] and one read of the heap record it names.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Corruption`] for an entry whose record is gone or carries another
+    /// version; the errors of [`Heap::get`] and [`super::encode::decode_row`].
+    pub(crate) fn version(
+        &self,
+        id: RowId,
+        seq: u64,
+    ) -> Result<Option<VersionView>, InternalError> {
+        let Some(&rid) = self.state.versions.get(&(id, seq)) else {
+            return Ok(None);
+        };
+        let stored = self.stored_at(rid, id, seq)?;
+        Ok(Some(VersionView {
+            row: id,
+            seq,
+            xmin: stored.header.xmin,
+            xmax: stored.header.xmax,
+            data: stored.row()?,
+        }))
     }
 
     /// The rows `snap` sees, by increasing [`RowId`], one entry per visible logical row.
@@ -855,8 +893,10 @@ impl<'storage> HeapTable<'storage> {
     /// The versions the heap holds, of the row `only` or of the whole table, by increasing
     /// `(RowId, seq)`.
     ///
-    /// This is how `super::index` reads what an entry points at: the visibility fields of a
+    /// This is how `super::index` reads the versions of a table: the visibility fields of a
     /// version and its columns, without the heap address and the encoding, which stay here.
+    /// The versions of one row are read through the directory of the versions; those of the
+    /// whole table by a walk of the heap.
     ///
     /// # Errors
     ///
@@ -1049,6 +1089,7 @@ impl<'storage> HeapTable<'storage> {
     ) -> Result<Rid, InternalError> {
         let bytes = encode_version(header, row);
         let rid = self.heap.insert(&bytes)?;
+        self.state.versions.insert((header.row, header.seq), rid);
         self.note_page(txn, rid.page, lsn)?;
         Ok(rid)
     }
@@ -1068,6 +1109,9 @@ impl<'storage> HeapTable<'storage> {
         let patched = with_xmax(&stored.bytes, xmax)?;
         self.remove_version(txn, lsn, stored)?;
         let rid = self.heap.insert(&patched)?;
+        self.state
+            .versions
+            .insert((stored.header.row, stored.header.seq), rid);
         self.note_page(txn, rid.page, lsn)?;
         Ok(rid)
     }
@@ -1190,7 +1234,8 @@ impl<'storage> HeapTable<'storage> {
         Ok(current)
     }
 
-    /// Removes one version from the heap, the page it sat on flagged for `txn` at `lsn`.
+    /// Removes one version from the heap and from the directory of the versions, the page it
+    /// sat on flagged for `txn` at `lsn`.
     fn remove_version(
         &mut self,
         txn: TxnId,
@@ -1206,6 +1251,9 @@ impl<'storage> HeapTable<'storage> {
                 self.table()
             ));
         }
+        self.state
+            .versions
+            .remove(&(stored.header.row, stored.header.seq));
         self.note_page(txn, stored.rid.page, lsn)
     }
 
@@ -1228,8 +1276,19 @@ impl<'storage> HeapTable<'storage> {
     }
 
     /// The versions the heap holds, of the row `only` or of each row, sorted by increasing
-    /// `RowId` then increasing `seq`: the chains, in order, without index.
+    /// `RowId` then increasing `seq`: the chains, in order.
+    ///
+    /// The versions of one row are read through [`TableState::versions`]; the versions of each
+    /// row by a walk of the heap.
     fn stored_versions(&self, only: Option<RowId>) -> Result<Vec<StoredVersion>, InternalError> {
+        if let Some(id) = only {
+            return self
+                .state
+                .versions
+                .range((id, 0)..=(id, u64::MAX))
+                .map(|(&(row, seq), &rid)| self.stored_at(rid, row, seq))
+                .collect();
+        }
         let mut versions = Vec::new();
         for rid in self.heap.scan()? {
             let Some(bytes) = self.heap.get(rid)? else {
@@ -1242,6 +1301,28 @@ impl<'storage> HeapTable<'storage> {
         }
         versions.sort_by_key(|version| (version.header.row, version.header.seq));
         Ok(versions)
+    }
+
+    /// The version the directory of the versions places at `rid`, checked to be the version
+    /// `seq` of `id`.
+    fn stored_at(&self, rid: Rid, id: RowId, seq: u64) -> Result<StoredVersion, InternalError> {
+        let Some(bytes) = self.heap.get(rid)? else {
+            return corruption(format!(
+                "version {seq} of row {id} of table {} points at {rid}, which holds no record",
+                self.table()
+            ));
+        };
+        let header = VersionHeader::read_from(&bytes)?;
+        if header.row != id || header.seq != seq {
+            return corruption(format!(
+                "version {seq} of row {id} of table {} points at {rid}, which holds version {} \
+                 of row {}",
+                self.table(),
+                header.seq,
+                header.row
+            ));
+        }
+        Ok(StoredVersion { rid, header, bytes })
     }
 
     /// Number of undo entries `txn` has written in this table.
@@ -1310,8 +1391,11 @@ impl<'storage> HeapTable<'storage> {
             // directory is rebuilt from what the heap holds now, as
             // [`HeapTable::resume_after_recovery`] rebuilds it after the redo.
             self.state.directory.clear();
+            self.state.versions.clear();
             for version in self.stored_versions(None)? {
-                self.state.directory.insert(version.header.row, version.rid);
+                let (row, seq) = (version.header.row, version.header.seq);
+                self.state.versions.insert((row, seq), version.rid);
+                self.state.directory.insert(row, version.rid);
             }
         }
         Ok(removed)
@@ -1329,6 +1413,10 @@ impl super::index::VersionSource for HeapTable<'_> {
 
     fn versions(&self, only: Option<RowId>) -> Result<Vec<VersionView>, InternalError> {
         HeapTable::versions(self, only)
+    }
+
+    fn version(&self, row: RowId, seq: u64) -> Result<Option<VersionView>, InternalError> {
+        HeapTable::version(self, row, seq)
     }
 
     fn status(&self, t: TxnId) -> TxnStatus {

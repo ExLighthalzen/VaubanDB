@@ -917,3 +917,113 @@ fn payload_round_trips_and_sorts_by_row_then_seq() {
         "unexpected error: {short:?}"
     );
 }
+
+// --- pages read by a point seek -------------------------------------------------------
+
+/// Number of pages the buffer pool of `storage` holds.
+///
+/// A pool fills its frames in order and reuses one only once it holds its capacity, so below
+/// that capacity this is the number of distinct pages read since the pool was built. The count
+/// is taken from the `Debug` form of the pool, which prints one `Frame { .. }` per frame and
+/// none of the bytes of a page.
+fn resident_pages(storage: &DiskStorage) -> usize {
+    format!("{:?}", storage.pool).matches("Frame {").count()
+}
+
+/// Levels of the tree rooted at `root`, the root and the leaf both counted.
+fn tree_height(storage: &DiskStorage, root: PageId) -> usize {
+    let mut height = 1;
+    let mut page = root;
+    loop {
+        let pin = storage.pool.pin(page).expect("pin a page of the tree");
+        let child = pin
+            .with_page(|page| match page.kind().expect("page kind") {
+                PageKind::BTreeInternal => Some(leftmost_child(page)),
+                _ => None,
+            })
+            .expect("read a page of the tree");
+        match child {
+            Some(child) => {
+                page = child;
+                height += 1;
+            }
+            None => return height,
+        }
+    }
+}
+
+/// A point seek on an index of 100 000 rows reads the pages of one descent of the index tree,
+/// at most one more leaf, and the heap page of the version it names: `height + 2` at most,
+/// where reading the versions of the whole table would read each heap page.
+///
+/// The instance is reopened before the seek so that its pool starts empty, and the state of
+/// the table is carried over, as the instance carries it between two calls. An insert looks
+/// for room from the head page of the heap on; to keep that walk short, the load attaches the
+/// table at the page of the last row written every [`REATTACH`] rows, the pages staying
+/// chained from the head.
+#[test]
+fn point_seek_on_100000_rows_reads_at_most_height_plus_two_pages() {
+    const ROWS: i32 = 100_000;
+    const BATCH: i32 = 5_000;
+    const REATTACH: i32 = 100;
+    let dir = TempDir::created("index-seek-pages");
+    let opts = DiskOptions { buffer_pages: 8192 };
+    let shape = index_shape(&[(0, false)], false);
+    let (state, table_shape, head, root, height) = {
+        let storage = DiskStorage::open(dir.path(), opts).expect("create an instance");
+        let mut table = table_of(&storage, 2);
+        let head = table.heap().first_page();
+        let table_shape = table.shape().clone();
+        let mut index =
+            DiskIndex::create(&storage, INDEX, &shape, &table).expect("create the index");
+        let mut txn = 10;
+        let mut last = None;
+        for value in 0..ROWS {
+            if value % REATTACH == 0
+                && let Some(id) = last
+            {
+                let state = table.into_state();
+                let tail = state.directory[&id].page;
+                let heap = super::super::heap::Heap::open(&storage, TABLE, tail);
+                table = HeapTable::resume(&storage, heap, table_shape.clone(), state);
+            }
+            last = Some(
+                insert_row(&mut table, &mut index, txn, &row(&[value, value])).expect("insert"),
+            );
+            if (value + 1) % BATCH == 0 {
+                table.commit(TxnId(txn)).expect("commit");
+                txn += 1;
+            }
+        }
+        storage.checkpoint().expect("checkpoint");
+        let height = tree_height(&storage, index.root());
+        (table.into_state(), table_shape, head, index.root(), height)
+    };
+    assert!(height >= 2, "a tree of 100 000 entries has internal pages");
+
+    let storage = DiskStorage::open(dir.path(), opts).expect("reopen the instance");
+    let heap = super::super::heap::Heap::open(&storage, TABLE, head);
+    let table = HeapTable::resume(&storage, heap, table_shape.clone(), state);
+    let index = DiskIndex::open(&storage, INDEX, &shape, root, &table_shape).expect("open");
+    let before = resident_pages(&storage);
+    let rows = index
+        .seek(
+            &table,
+            &snap(1_000, &[]),
+            &point(&[54_321]),
+            Direction::Forward,
+        )
+        .expect("seek");
+    let read = resident_pages(&storage) - before;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, row(&[54_321, 54_321]));
+    assert!(
+        read <= height + 2,
+        "a point seek read {read} pages, the index tree has {height} levels"
+    );
+    // The whole table is still reachable from the head page.
+    assert_eq!(
+        table.scan(&snap(1_000, &[])).expect("scan").len(),
+        usize::try_from(ROWS).expect("row count")
+    );
+}

@@ -249,6 +249,57 @@ fn update_keeps_row_id_and_old_version() {
     );
 }
 
+/// A version is read by its row and its `seq` through the directory of the versions, which
+/// follows the record when an `update` or a `delete` moves it, and loses the versions a
+/// rollback takes away.
+#[test]
+fn version_by_row_and_seq_reads_the_directory_of_the_versions() {
+    let (_dir, storage) = instance("version-by-seq");
+    let mut table = table_of(&storage);
+    let id = table.insert(TxnId(4), &row(1)).expect("insert");
+    table.commit(TxnId(4)).expect("commit");
+    table.update(TxnId(5), id, &row(2)).expect("update");
+    table.commit(TxnId(5)).expect("commit");
+    let seqs: Vec<u64> = table
+        .versions(Some(id))
+        .expect("versions")
+        .iter()
+        .map(|version| version.seq)
+        .collect();
+    assert_eq!(seqs.len(), 2);
+
+    let old = table.version(id, seqs[0]).expect("old").expect("held");
+    assert_eq!(
+        (old.xmin, old.xmax, old.data),
+        (TxnId(4), Some(TxnId(5)), row(1))
+    );
+    let new = table.version(id, seqs[1]).expect("new").expect("held");
+    assert_eq!((new.xmin, new.xmax, new.data), (TxnId(5), None, row(2)));
+
+    // A delete rewrites the current version elsewhere; the lookup follows it.
+    table.delete(TxnId(6), id).expect("delete");
+    let deleted = table.version(id, seqs[1]).expect("deleted").expect("held");
+    assert_eq!(deleted.xmax, Some(TxnId(6)));
+    // An update rolled back takes its version away from the directory.
+    table.rollback(TxnId(6)).expect("rollback the delete");
+    table.update(TxnId(7), id, &row(3)).expect("update");
+    let undone = table.versions(Some(id)).expect("versions")[2].seq;
+    table.rollback(TxnId(7)).expect("rollback the update");
+    assert_eq!(table.version(id, undone).expect("undone"), None);
+    assert_eq!(
+        table
+            .version(id, seqs[1])
+            .expect("restored")
+            .expect("held")
+            .xmax,
+        None
+    );
+    assert_eq!(
+        table.version(RowId(99), seqs[0]).expect("unknown row"),
+        None
+    );
+}
+
 #[test]
 fn rid_of_a_row_may_move_on_update() {
     let (_dir, storage) = instance("version-rid-moves");
@@ -571,9 +622,9 @@ fn open_serves_the_rows_but_hands_out_row_id_one_again() {
 
     let mut reopened = HeapTable::open(&storage, TABLE, head, int_shape());
     let after = snap(9, 100, &[]);
-    // The heap is walked, so the row is served; the directory is empty, so what goes
+    // The scan walks the heap, so the row is served; the directory is empty, so what goes
     // through it is not.
-    assert_eq!(reopened.get(&after, id).expect("get"), Some(row(1)));
+    assert_eq!(reopened.get(&after, id).expect("get"), None);
     assert_eq!(reopened.scan(&after).expect("scan"), vec![(id, row(1))]);
     assert_eq!(reopened.latest_version(id).expect("latest"), None);
     assert!(matches!(

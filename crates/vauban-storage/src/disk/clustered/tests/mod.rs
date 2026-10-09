@@ -257,6 +257,52 @@ fn get_by_row_id_after_move() {
     );
 }
 
+/// A version is found by its row and its `seq` by following the chain from the directory,
+/// under whichever key each version holds; a `seq` the chain does not hold answers `None`, and
+/// the versions of one row come back oldest first.
+#[test]
+fn version_by_row_and_seq_follows_the_chain() {
+    let (_dir, storage) = instance("clustered-version-by-seq");
+    let mut table = table_of(&storage, pair_shape());
+    let id = table.insert(TxnId(1), &pair(1, 10)).expect("insert");
+    table.commit(TxnId(1)).expect("commit the insert");
+    table.update(TxnId(2), id, &pair(9, 10)).expect("move to 9");
+    table.commit(TxnId(2)).expect("commit the first update");
+    table.update(TxnId(3), id, &pair(5, 11)).expect("move to 5");
+    table.commit(TxnId(3)).expect("commit the second update");
+    let other = table
+        .insert(TxnId(4), &pair(3, 30))
+        .expect("insert another row");
+    table.commit(TxnId(4)).expect("commit the other insert");
+
+    let seqs: Vec<u64> = table
+        .versions(Some(id))
+        .expect("versions of the row")
+        .iter()
+        .map(|version| version.seq)
+        .collect();
+    assert_eq!(seqs.len(), 3);
+    assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+    let expected = [pair(1, 10), pair(9, 10), pair(5, 11)];
+    for (seq, data) in seqs.iter().zip(expected) {
+        let version = table
+            .version(id, *seq)
+            .expect("version")
+            .expect("the chain holds it");
+        assert_eq!((version.row, version.seq, version.data), (id, *seq, data));
+    }
+    let oldest = table.version(id, seqs[0]).expect("oldest").expect("held");
+    assert_eq!((oldest.xmin, oldest.xmax), (TxnId(1), Some(TxnId(2))));
+    assert_eq!(table.version(id, 99).expect("unknown seq"), None);
+    assert_eq!(table.version(RowId(77), 1).expect("unknown row"), None);
+    // The `seq` of another row is not a version of this one.
+    let other_seq = table.versions(Some(other)).expect("other")[0].seq;
+    assert_eq!(
+        table.version(id, other_seq).expect("seq of another row"),
+        None
+    );
+}
+
 #[test]
 fn splits_keep_the_order_and_the_directory() {
     let (_dir, storage) = instance("clustered-splits");

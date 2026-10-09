@@ -284,8 +284,8 @@ pub(crate) fn free_tree(storage: &DiskStorage, root: PageId) -> Result<(), Inter
     Ok(())
 }
 
-/// What an index reads of the table it belongs to: the identifier, the shape, the versions
-/// and the status of a transaction.
+/// What an index reads of the table it belongs to: the identifier, the shape, the versions,
+/// one version by the pair an entry names, and the status of a transaction.
 ///
 /// This trait sits between [`DiskIndex`] and the stores so that one index serves a heap and a
 /// clustered table alike (`super::tests::index_seek_on_clustered_table`). Implemented by
@@ -301,6 +301,16 @@ pub(crate) trait VersionSource {
     ///
     /// Those of the store the versions are read from.
     fn versions(&self, only: Option<RowId>) -> Result<Vec<VersionView>, InternalError>;
+    /// The version `seq` of the row `row`, read through the directory of the store rather
+    /// than among the versions of the table, `None` when the store does not hold it.
+    ///
+    /// This is what [`DiskIndex::seek`] and [`DiskIndex::check_duplicate`] read for each entry
+    /// of the key they look up.
+    ///
+    /// # Errors
+    ///
+    /// Those of the store the version is read from.
+    fn version(&self, row: RowId, seq: u64) -> Result<Option<VersionView>, InternalError>;
     /// The status of `t` as [`Snapshot::is_visible`] must see it.
     fn status(&self, t: TxnId) -> TxnStatus;
 }
@@ -504,8 +514,10 @@ impl<'storage> DiskIndex<'storage> {
     ///
     /// The rows of `range` that `snap` sees, in the order `dir` asks for.
     ///
-    /// The entries of the range are read out of the tree, then each one is looked up among the
-    /// versions of the table and kept when [`Snapshot::is_visible`] answers `true`; the row
+    /// The entries of the range are read out of the tree, then the version each one names is
+    /// read through [`VersionSource::version`] and kept when [`Snapshot::is_visible`] answers
+    /// `true`, so a point seek reads one descent of the tree and the versions of its key
+    /// (`tests::point_seek_on_100000_rows_reads_at_most_height_plus_two_pages`); the row
     /// handed back is the content of **that** version, not of the current one, so a snapshot
     /// older than an update reads the old columns
     /// (`tests::update_leaves_the_old_key_to_an_older_snapshot`). The answer is materialised
@@ -527,16 +539,13 @@ impl<'storage> DiskIndex<'storage> {
         dir: Direction,
     ) -> SqlResult<Vec<(RowId, Row)>> {
         let entries = self.tree.seek(range, dir)?;
-        let versions = by_payload(table.versions(None)?);
         let status = |t| table.status(t);
         let mut out = Vec::with_capacity(entries.len());
         for (_, payload) in &entries {
             let (row, seq) = read_payload(payload)?;
-            let Some(version) = versions.get(&(row, seq)) else {
-                return Err(self.missing_version(table, row, seq).into());
-            };
+            let version = self.version_of(table, row, seq)?;
             if snap.is_visible(version.xmin, version.xmax, &status) {
-                out.push((row, version.data.clone()));
+                out.push((row, version.data));
             }
         }
         Ok(out)
@@ -608,12 +617,12 @@ impl<'storage> DiskIndex<'storage> {
         Ok(None)
     }
 
-    /// The version an entry points at, read from the heap.
+    /// The version an entry points at, read through [`VersionSource::version`].
     ///
     /// # Errors
     ///
-    /// [`InternalError::Corruption`] when the heap holds no such version, which is a broken
-    /// invariant of this module; the errors of the heap otherwise.
+    /// [`InternalError::Corruption`] when the store holds no such version, which is a broken
+    /// invariant of this module; the errors of the store otherwise.
     fn version_of(
         &self,
         table: &dyn VersionSource,
@@ -621,9 +630,7 @@ impl<'storage> DiskIndex<'storage> {
         seq: u64,
     ) -> Result<VersionView, InternalError> {
         table
-            .versions(Some(row))?
-            .into_iter()
-            .find(|version| version.seq == seq)
+            .version(row, seq)?
             .ok_or_else(|| self.missing_version(table, row, seq))
     }
 

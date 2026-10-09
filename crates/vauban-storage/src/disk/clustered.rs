@@ -889,28 +889,105 @@ impl<'storage> ClusteredTable<'storage> {
     /// Same view as [`super::version::HeapTable::versions`], so that `super::index` reads a
     /// clustered table through [`super::index::VersionSource`] as it reads a heap: this is
     /// what lets a non-clustered index be created on, and kept up to date over, a clustered
-    /// table (`super::tests::index_seek_on_clustered_table`).
+    /// table (`super::tests::index_seek_on_clustered_table`). The versions of one row are read
+    /// by following its chain from the directory ([`ClusteredTable::chain`]); those of the
+    /// whole table by a walk of the tree.
     ///
     /// # Errors
     ///
-    /// Those of [`BTree::seek`] and of [`decode_row`].
+    /// Those of [`ClusteredTable::chain`], of [`BTree::seek`] and of [`decode_row`].
     pub(crate) fn versions(&self, only: Option<RowId>) -> Result<Vec<VersionView>, InternalError> {
+        if let Some(id) = only {
+            let mut versions = self
+                .chain(id, 0)?
+                .iter()
+                .map(|payload| self.view_of(payload))
+                .collect::<Result<Vec<_>, _>>()?;
+            versions.reverse();
+            return Ok(versions);
+        }
         let mut versions = Vec::new();
         for (_, payload) in self.tree.seek(&KeyRange::Full, Direction::Forward)? {
             let payload = VersionPayload::decode(&payload)?;
             if only.is_some_and(|row| row != payload.header.row) {
                 continue;
             }
-            versions.push(VersionView {
-                row: payload.header.row,
-                seq: payload.header.seq,
-                xmin: payload.header.xmin,
-                xmax: payload.header.xmax,
-                data: self.columns_of(&payload)?,
-            });
+            versions.push(self.view_of(&payload)?);
         }
         versions.sort_by_key(|version| (version.row, version.seq));
         Ok(versions)
+    }
+
+    /// The version `seq` of the row `id`, `None` when its chain does not hold it.
+    ///
+    /// The chain is followed from the version the directory names back to `seq`: one seek of
+    /// the directory, then one seek of the tree per version newer than `seq`, and one for
+    /// `seq` itself (`version_by_row_and_seq_follows_the_chain`).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`ClusteredTable::chain`] and of [`decode_row`].
+    pub(crate) fn version(
+        &self,
+        id: RowId,
+        seq: u64,
+    ) -> Result<Option<VersionView>, InternalError> {
+        match self.chain(id, seq)?.last() {
+            Some(payload) if payload.header.seq == seq => self.view_of(payload).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// The versions of `id` from the one the directory names back to the first whose `seq` is
+    /// `down_to` or below, most recent first.
+    ///
+    /// The walk ends at the version that starts the chain, and at a link that names an entry
+    /// the tree does not hold, the shape a `vacuum` leaves when it takes the old end of a chain
+    /// away. A row the directory does not hold answers an empty chain.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Corruption`] for a directory entry that names an entry the tree does
+    /// not hold and for a link whose `seq` is not below the one of the version carrying it;
+    /// the errors of [`BTree::seek`] otherwise.
+    fn chain(&self, id: RowId, down_to: u64) -> Result<Vec<VersionPayload>, InternalError> {
+        let Some(key) = self.directory_entry(id)? else {
+            return Ok(Vec::new());
+        };
+        let mut payload = self.entry_at(&key, id)?.parsed()?;
+        let mut chain = Vec::new();
+        loop {
+            let seq = payload.header.seq;
+            let prev = std::mem::take(&mut payload.prev);
+            chain.push(payload);
+            if seq <= down_to || prev.is_empty() {
+                return Ok(chain);
+            }
+            let previous = seq_of(&prev)?;
+            if previous >= seq {
+                return corruption(format!(
+                    "version {seq} of row {id} of table {} links back to version {previous}, \
+                     which is not older than it",
+                    self.table
+                ));
+            }
+            let found = self.tree.seek(&KeyRange::Point(prev), Direction::Forward)?;
+            let Some(entry) = found.into_iter().next() else {
+                return Ok(chain);
+            };
+            payload = StoredVersion::read(entry)?.parsed()?;
+        }
+    }
+
+    /// The view `super::index` reads of one version.
+    fn view_of(&self, payload: &VersionPayload) -> Result<VersionView, InternalError> {
+        Ok(VersionView {
+            row: payload.header.row,
+            seq: payload.header.seq,
+            xmin: payload.header.xmin,
+            xmax: payload.header.xmax,
+            data: self.columns_of(payload)?,
+        })
     }
 
     /// The tail of the chain of `id`, regardless of the statuses: the transaction that wrote
@@ -1647,6 +1724,10 @@ impl super::index::VersionSource for ClusteredTable<'_> {
 
     fn versions(&self, only: Option<RowId>) -> Result<Vec<VersionView>, InternalError> {
         ClusteredTable::versions(self, only)
+    }
+
+    fn version(&self, row: RowId, seq: u64) -> Result<Option<VersionView>, InternalError> {
+        ClusteredTable::version(self, row, seq)
     }
 
     fn status(&self, t: TxnId) -> TxnStatus {
