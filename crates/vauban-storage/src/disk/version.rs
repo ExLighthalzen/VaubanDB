@@ -18,8 +18,9 @@
 //! | 16 | `xmax` | the transaction that replaced or deleted it, [`NO_XMAX`] while it is current |
 //! | 24 | `seq` | serial number of the version in the table, not handed out twice |
 //!
-//! `seq` is what orders the chain: a heap record may move (see "Setting `xmax`" below), so
-//! the address of a version says nothing about its age.
+//! `seq` is what orders the chain: a version an update creates takes the address the heap
+//! hands out (see "Setting `xmax`" below), so the address of a version says nothing about its
+//! age.
 //!
 //! # Directory
 //!
@@ -34,10 +35,11 @@
 //!
 //! # Setting `xmax`
 //!
-//! The heap ([`super::heap`]) writes and deletes records; it has no in-place rewrite. Marking a
-//! version as replaced or deleted therefore deletes its record and inserts the patched bytes
-//! ([`HeapTable::set_xmax`]), which may put the version at another [`Rid`]; the `RowId` is
-//! untouched (`update_keeps_row_id_and_old_version`, `rid_of_a_row_may_move_on_update`).
+//! Marking a version as replaced or deleted writes the eight bytes of its `xmax` in place
+//! ([`HeapTable::set_xmax`], [`super::heap::Heap::overwrite`]): the version keeps its [`Rid`]
+//! (`the_records_name_the_pages_they_change_and_the_xmax_is_set_in_place`). The version an
+//! update creates is a new record, at another [`Rid`]; the `RowId` is untouched
+//! (`update_keeps_row_id_and_old_version`, `rid_of_a_row_may_move_on_update`).
 //!
 //! # Transactions
 //!
@@ -50,8 +52,10 @@
 //! # Write-ahead logging
 //!
 //! A write appends its record to the journal ([`super::wal`], payload in
-//! [`super::wal_payload`]) **before** it changes the heap, and the page it changes is tied to
-//! the LSN of that record by [`HeapTable::note_page`]. [`HeapTable::commit`] appends a
+//! [`super::wal_payload`]) **before** it changes the heap. The record names the pages and the
+//! slots the write changes, the address of a new version being taken first by
+//! [`super::heap::Heap::reserve`], and each page it changes takes the LSN of that record in
+//! the change itself; [`HeapTable::note_page`] then flags the page. [`HeapTable::commit`] appends a
 //! `Commit` and `sync_all`s the journal before it returns, so what a committed transaction
 //! wrote is on disk (`commit_fsyncs_wal`); `data` is not synced, the pages leaving the pool
 //! afterwards.
@@ -60,7 +64,7 @@
 //! rollback or of a rollback to a savepoint, and a vacuum — appends a record of its own too,
 //! naming the version, the slot and what became of the version
 //! ([`super::wal_payload::SlotRelease`]): a [`WalRecordKind::Compensation`] for each version
-//! the undo takes out or rewrites, a [`WalRecordKind::Purge`] for each version a vacuum takes
+//! the undo takes out or whose `xmax` it unsets, a [`WalRecordKind::Purge`] for each version a vacuum takes
 //! out. The page is tied to that record before the slot is freed, and the journal is
 //! `sync_all`ed before the pages leave the `in_progress` flag, so a page that reaches `data`
 //! with a slot freed is a page whose record is durable
@@ -117,7 +121,7 @@ use super::heap::{Heap, Rid};
 use super::index::IndexChange;
 use super::page::{Lsn, PageId};
 use super::wal::WalRecordKind;
-use super::wal_payload::{Release, RowChange, SlotRelease};
+use super::wal_payload::{PageOp, Release, RowChange, SlotRelease};
 use crate::{Row, RowId, Snapshot, TableId, TableShape, TxnId, TxnStatus};
 
 /// Number of bytes a version carries before its columns: `row`, `xmin`, `xmax`, `seq`.
@@ -130,7 +134,7 @@ pub(crate) const VERSION_PREFIX_LEN: usize = 32;
 pub(crate) const NO_XMAX: u64 = u64::MAX;
 
 /// Offset of the `xmax` field in the prefix of a version.
-const OFF_XMAX: usize = 16;
+pub(crate) const OFF_XMAX: usize = 16;
 
 /// A caller bug: a violated precondition of this module.
 fn bug<T>(msg: impl Into<String>) -> Result<T, InternalError> {
@@ -481,7 +485,7 @@ impl<'storage> HeapTable<'storage> {
     /// — the write did not commit — but [`HeapTable::check_current`] refuses an `update` on
     /// it as stale, because the field is set by the reader regardless of its writer's status.
     /// The recovery
-    /// rewrites each such version with its `xmax` cleared, so the row is writable again as
+    /// unsets the `xmax` of each such version in place, so the row is writable again as
     /// soon as the instance opens (`a_loser_xmax_on_data_is_cleared`).
     fn clear_losers_xmax(&mut self, losers: &[TxnId]) -> Result<(), InternalError> {
         let losers: std::collections::BTreeSet<TxnId> = losers.iter().copied().collect();
@@ -492,24 +496,13 @@ impl<'storage> HeapTable<'storage> {
             if !losers.contains(&x) {
                 continue;
             }
-            let Some(columns) = version.bytes.get(VERSION_PREFIX_LEN..) else {
-                return Err(InternalError::Corruption(format!(
-                    "version {} of row {} of table {} is shorter than its prefix",
-                    version.header.seq,
-                    version.header.row,
-                    self.table()
-                )));
-            };
-            let header = VersionHeader {
-                xmax: None,
-                ..version.header
-            };
-            let mut patched = Vec::with_capacity(version.bytes.len());
-            header.write_to(&mut patched);
-            patched.extend_from_slice(columns);
-            // The recovery replays the journal and appends nothing: `Lsn(0)`.
-            self.heap.free_slot(version.rid, Lsn(0))?;
-            self.heap.insert(&patched)?;
+            let patched = with_xmax(&version.bytes, None)?;
+            self.heap.overwrite(
+                version.rid,
+                OFF_XMAX,
+                &patched[OFF_XMAX..OFF_XMAX + 8],
+                Lsn(0),
+            )?;
         }
         Ok(())
     }
@@ -602,8 +595,16 @@ impl<'storage> HeapTable<'storage> {
             xmax: None,
             seq: self.take_seq()?,
         };
-        let lsn = self.log_row(WalRecordKind::Insert, txn, &header, Some(row))?;
-        let rid = self.write_version(txn, lsn, &header, row)?;
+        let bytes = encode_version(&header, row);
+        let rid = self.heap.reserve(bytes.len())?;
+        let lsn = self.log_row(
+            WalRecordKind::Insert,
+            txn,
+            &header,
+            Some(row),
+            &[PageOp::Put { rid }],
+        )?;
+        self.write_version(txn, lsn, rid, &header, &bytes)?;
         self.state.next_row_id = next;
         self.state.directory.insert(id, rid);
         self.note_index_change(IndexChange::Added {
@@ -642,9 +643,18 @@ impl<'storage> HeapTable<'storage> {
         };
         // One record for the pair (`xmax` on the replaced version, the new version), so the
         // two heap writes carry the LSN of the record that describes them both.
-        let lsn = self.log_row(WalRecordKind::Update, txn, &header, Some(row))?;
+        let bytes = encode_version(&header, row);
+        let rid = self.heap.reserve(bytes.len())?;
+        let ops = [
+            PageOp::SetXmax {
+                rid: current.rid,
+                seq: current.header.seq,
+            },
+            PageOp::Put { rid },
+        ];
+        let lsn = self.log_row(WalRecordKind::Update, txn, &header, Some(row), &ops)?;
         self.set_xmax(txn, lsn, &current, Some(txn))?;
-        let rid = self.write_version(txn, lsn, &header, row)?;
+        self.write_version(txn, lsn, rid, &header, &bytes)?;
         self.state.directory.insert(id, rid);
         self.note_index_change(IndexChange::Added {
             row: id,
@@ -675,7 +685,11 @@ impl<'storage> HeapTable<'storage> {
             xmax: Some(txn),
             ..current.header
         };
-        let lsn = self.log_row(WalRecordKind::Delete, txn, &hidden, None)?;
+        let ops = [PageOp::SetXmax {
+            rid: current.rid,
+            seq: current.header.seq,
+        }];
+        let lsn = self.log_row(WalRecordKind::Delete, txn, &hidden, None, &ops)?;
         let rid = self.set_xmax(txn, lsn, &current, Some(txn))?;
         self.state.directory.insert(id, rid);
         self.log(txn, UndoEntry::Delete(id))
@@ -881,7 +895,7 @@ impl<'storage> HeapTable<'storage> {
     /// the undo runs (`rollback_appends_abort`), so that a transaction whose `Begin` is
     /// followed by neither a `Commit` nor an `Abort` is one a crash interrupted, which is what
     /// the recovery sorts the losers by. The undo then appends one
-    /// [`WalRecordKind::Compensation`] per version it takes out or rewrites, and `sync_all`s
+    /// [`WalRecordKind::Compensation`] per version it takes out or whose `xmax` it unsets, and `sync_all`s
     /// the journal again before the `in_progress` flag of the pages comes down
     /// ([`HeapTable::finish`]): a page another transaction shares may have reached `data`
     /// holding the versions of this one, and the redo takes them out by these records
@@ -1042,16 +1056,18 @@ impl<'storage> HeapTable<'storage> {
 
     /// Appends the record of one row write and answers its LSN.
     ///
-    /// Called **before** the heap is changed: the record of a change reaches the file first,
-    /// and the LSN it answers is what [`HeapTable::note_page`] writes in the header of each
-    /// page the change touches. `row` is the content of the version for an `Insert` and an
-    /// `Update`, `None` for a `Delete` ([`super::wal_payload`]).
+    /// Called **before** the heap is changed, once the addresses the write changes are known
+    /// ([`Heap::reserve`] for a new version): the record of a change reaches the file first,
+    /// naming the pages it changes in `ops`, and the LSN it answers is what each of those pages
+    /// takes as its `page_lsn` in the change itself. `row` is the content of the version for
+    /// an `Insert` and an `Update`, `None` for a `Delete` ([`super::wal_payload`]).
     fn log_row(
         &mut self,
         kind: WalRecordKind,
         txn: TxnId,
         header: &VersionHeader,
         row: Option<&Row>,
+        ops: &[PageOp],
     ) -> Result<Lsn, InternalError> {
         let mut columns = Vec::new();
         if let Some(row) = row {
@@ -1062,7 +1078,7 @@ impl<'storage> HeapTable<'storage> {
             header: *header,
             columns,
         }
-        .encode();
+        .encode_with(ops);
         self.storage.wal.append(kind, txn, &payload)
     }
 
@@ -1095,27 +1111,32 @@ impl<'storage> HeapTable<'storage> {
         }
     }
 
-    /// Writes one version in the heap and marks the page it landed on as written by `txn` at
-    /// the LSN of the record that describes the write.
+    /// Writes the version `bytes` at `rid`, the address [`Heap::reserve`] answered before the
+    /// record was logged, and marks its page as written by `txn` at the LSN of that record.
     fn write_version(
         &mut self,
         txn: TxnId,
         lsn: Lsn,
+        rid: Rid,
         header: &VersionHeader,
-        row: &Row,
-    ) -> Result<Rid, InternalError> {
-        let bytes = encode_version(header, row);
-        let rid = self.heap.insert(&bytes)?;
+        bytes: &[u8],
+    ) -> Result<(), InternalError> {
+        if !self.heap.put(rid, bytes, lsn)? {
+            return bug(format!(
+                "version {} of row {} of table {} does not fit at {rid}, the address reserved \
+                 for it",
+                header.seq,
+                header.row,
+                self.table()
+            ));
+        }
         self.state.versions.insert((header.row, header.seq), rid);
-        self.note_page(txn, rid.page, lsn)?;
-        Ok(rid)
+        self.note_page(txn, rid.page, lsn)
     }
 
-    /// Rewrites the version `stored` with another `xmax` and answers where it went.
-    ///
-    /// The heap has no in-place rewrite: the record is deleted and the patched bytes are
-    /// inserted, so the [`Rid`] may change while the `RowId` in the prefix does not. The
-    /// caller updates the directory when the rewritten version is the current one.
+    /// Writes another `xmax` in the prefix of the version `stored`, in place, and answers
+    /// where it sits: at its [`Rid`]
+    /// (`the_records_name_the_pages_they_change_and_the_xmax_is_set_in_place`).
     fn set_xmax(
         &mut self,
         txn: TxnId,
@@ -1124,13 +1145,18 @@ impl<'storage> HeapTable<'storage> {
         xmax: Option<TxnId>,
     ) -> Result<Rid, InternalError> {
         let patched = with_xmax(&stored.bytes, xmax)?;
-        self.remove_version(txn, lsn, stored)?;
-        let rid = self.heap.insert(&patched)?;
-        self.state
-            .versions
-            .insert((stored.header.row, stored.header.seq), rid);
-        self.note_page(txn, rid.page, lsn)?;
-        Ok(rid)
+        let field = &patched[OFF_XMAX..OFF_XMAX + 8];
+        if !self.heap.overwrite(stored.rid, OFF_XMAX, field, lsn)? {
+            return corruption(format!(
+                "version {} of row {} is not at {} in table {}",
+                stored.header.seq,
+                stored.header.row,
+                stored.rid,
+                self.table()
+            ));
+        }
+        self.note_page(txn, stored.rid.page, lsn)?;
+        Ok(stored.rid)
     }
 
     /// Ties `page` to the journal record of LSN `lsn`, flags it as written by a transaction
@@ -1186,7 +1212,7 @@ impl<'storage> HeapTable<'storage> {
     /// Each version the undo takes out of its slot is journalled first, by a
     /// [`WalRecordKind::Compensation`] whose LSN the pages of the undo carry: the version
     /// created by an `Insert` or an `Update` leaves the heap ([`Release::Removed`]), the
-    /// version whose `xmax` an `Update` or a `Delete` set is written again without it
+    /// version whose `xmax` an `Update` or a `Delete` set has it unset in place
     /// ([`Release::XmaxCleared`]). The caller `sync_all`s the journal once the walk is done.
     fn undo(&mut self, txn: TxnId, entry: UndoEntry) -> Result<(), InternalError> {
         match entry {

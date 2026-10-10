@@ -69,19 +69,30 @@
 //! `many_rows_span_pages`). Compaction stays inside one page: moving a record to another page
 //! would change its [`Rid`], which this heap does not do.
 //!
+//! # Reserve, then put
+//!
+//! A write of the version layer is physiological: its journal record names the page and the
+//! slot it changes ([`super::wal_payload`]). [`Heap::reserve`] answers that address before the
+//! record is written, without writing the record in the page, and [`Heap::put`] then writes at
+//! it; [`Heap::insert`] is the two in one call. [`Heap::put`] writes at a given slot over the
+//! record the page held there (`tests::put_over_a_record_replaces_it`), and [`Heap::overwrite`] changes bytes of a record in place, which is how
+//! the version layer sets an `xmax` and what the redo ([`super::recover`]) replays.
+//!
 //! # Pins and the no-steal rule
 //!
 //! Each entry point pins the pages it reads or changes through [`super::buffer::BufferPool`]
 //! and releases them before it answers: [`Heap::insert`], [`Heap::get`], [`Heap::delete`],
 //! [`Heap::free_slot`] and [`Heap::scan`] answer a [`Rid`], a `Vec<u8>`, a `bool` for each of
-//! the two frees and a `Vec<Rid>`, not a [`super::buffer::PinGuard`]. A page [`Heap::insert`] or [`Heap::delete`] changed is marked
-//! dirty at `Lsn(0)` — the journal record that describes the change is written by the caller,
-//! [`super::version::HeapTable`] — and the page that **took the record** has its `in_progress`
-//! flag cleared: the heap carries no transaction of its own, so the caller sets the flag back
-//! on the page it wrote. [`Heap::free_slot`] differs: it marks the page at the LSN its caller
-//! hands it and leaves the flag as it stands, so that a freed slot does not reach `data` ahead
-//! of the record that frees it. [`Heap::link_page`] leaves the flag too: it changes the page
-//! that comes before a fresh one, which the caller does not visit afterwards
+//! the two frees and a `Vec<Rid>`, not a [`super::buffer::PinGuard`]. A page a call changed is
+//! marked dirty: [`Heap::put`], [`Heap::overwrite`] and [`Heap::free_slot`] at the LSN their
+//! caller hands them, the number of the journal record [`super::version::HeapTable`] wrote for
+//! the change, which the page takes in the change itself; the other calls at `Lsn(0)`. The page
+//! that **took the record** has its `in_progress` flag cleared by [`Heap::put`],
+//! [`Heap::overwrite`], [`Heap::insert`] and [`Heap::delete`]: the heap carries no transaction
+//! of its own, so the caller sets the flag back on the page it wrote. [`Heap::free_slot`]
+//! leaves the flag as it stands, so that a freed slot does not reach `data` ahead of the record
+//! that frees it. [`Heap::link_page`] leaves the flag too: it changes the page that comes
+//! before a fresh one, which the caller does not visit afterwards
 //! (`a_transaction_over_two_heap_pages_keeps_the_flag_on_both_of_them`).
 
 use std::fmt;
@@ -265,22 +276,43 @@ impl<'storage> Heap<'storage> {
     /// that reaches the end of the chain without placing it grows the heap by one page,
     /// chained there (`many_rows_span_pages` reaches 5 pages for 500 rows of 64 bytes).
     ///
+    /// This is [`Heap::reserve`] then [`Heap::put`] at `Lsn(0)`: the page LSN is left where it
+    /// stands.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Heap::reserve`] and of [`Heap::put`].
+    pub(crate) fn insert(&self, bytes: &[u8]) -> Result<Rid, InternalError> {
+        let rid = self.reserve(bytes.len())?;
+        if !self.put(rid, bytes, Lsn(0))? {
+            return Err(InternalError::Bug(format!(
+                "record of {} bytes does not fit at {rid} of table {}, the slot reserved for it",
+                bytes.len(),
+                self.table
+            )));
+        }
+        Ok(rid)
+    }
+
+    /// The address a record of `len` bytes would take, without writing it.
+    ///
+    /// The pages are walked as [`Heap::insert`] walks them, and a walk that finds no room grows
+    /// the heap by one empty page, chained at the end: that growth is the one change of this
+    /// call. A record past [`MAX_INLINE_LEN`] is reserved the room of its stub. The address
+    /// stays free for [`Heap::put`] as long as nothing else writes in the heap in between; the
+    /// version layer calls the two under the lock of its table
+    /// ([`super::DiskStorage::with_rows`]), logging its record naming that address between them.
+    ///
     /// # Errors
     ///
     /// The errors of the buffer pool and of [`super::alloc::allocate`], and
     /// [`InternalError::Bug`] for a record that does not fit in a page this call has just
     /// formatted, which [`MAX_INLINE_LEN`] rules out.
-    pub(crate) fn insert(&self, bytes: &[u8]) -> Result<Rid, InternalError> {
-        let (payload, overflow) = if bytes.len() > MAX_INLINE_LEN {
-            let head = self.write_overflow_chain(bytes)?;
-            (stub(bytes.len(), head)?, true)
-        } else {
-            (bytes.to_vec(), false)
-        };
-
+    pub(crate) fn reserve(&self, len: usize) -> Result<Rid, InternalError> {
+        let stored = if len > MAX_INLINE_LEN { STUB_LEN } else { len };
         let mut page_id = self.first_page;
         loop {
-            if let Some(slot) = self.try_place(page_id, &payload, overflow)? {
+            if let Some(slot) = self.room_in(page_id, stored)? {
                 return Ok(Rid {
                     page: page_id,
                     slot,
@@ -295,14 +327,199 @@ impl<'storage> Heap<'storage> {
         let fresh = alloc::allocate(self.storage)?;
         self.format_page(fresh)?;
         self.link_page(page_id, fresh)?;
-        match self.try_place(fresh, &payload, overflow)? {
+        match self.room_in(fresh, stored)? {
             Some(slot) => Ok(Rid { page: fresh, slot }),
             None => Err(InternalError::Bug(format!(
-                "record of {} bytes does not fit in the fresh heap page {fresh} of table {}",
-                payload.len(),
+                "record of {stored} bytes does not fit in the fresh heap page {fresh} of table {}",
                 self.table
             ))),
         }
+    }
+
+    /// Writes `bytes` at `rid`, over the record the slot held if it held one, and answers
+    /// whether it fitted.
+    ///
+    /// The slot directory of the page grows to reach the slot, and the page is compacted when
+    /// its free span is too small. A record past [`MAX_INLINE_LEN`] gets a fresh chain of
+    /// overflow pages, written once the page is known to take its stub. When `lsn` is past the
+    /// `page_lsn` of the page, the page takes it in the same change as the bytes, so the pool
+    /// does not hold the bytes under an older number; `Lsn(0)` leaves the number as it stands.
+    ///
+    /// A page without the room answers `false` and is left as it was.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Corruption`] when the page is not a heap page, and the errors of the
+    /// buffer pool and of [`super::alloc::allocate`].
+    pub(crate) fn put(&self, rid: Rid, bytes: &[u8], lsn: Lsn) -> Result<bool, InternalError> {
+        let overflow = bytes.len() > MAX_INLINE_LEN;
+        let stored = if overflow { STUB_LEN } else { bytes.len() };
+        let pin = self.storage.pool.pin(rid.page)?;
+        self.check_heap(&pin)?;
+        let fits = pin.with_page(|page| fits_at(page, rid.slot, stored))?;
+        drop(pin);
+        if !fits {
+            return Ok(false);
+        }
+        let payload = if overflow {
+            stub(bytes.len(), self.write_overflow_chain(bytes)?)?
+        } else {
+            bytes.to_vec()
+        };
+        let pin = self.storage.pool.pin(rid.page)?;
+        let placed = pin.with_page_mut(|page| {
+            let placed = place_at(page, rid.slot, &payload, overflow);
+            if placed && lsn > page.lsn() {
+                page.set_lsn(lsn);
+            }
+            placed
+        })?;
+        if !placed {
+            return Err(InternalError::Bug(format!(
+                "record of {} bytes does not fit at {rid} of table {} after the room was checked",
+                payload.len(),
+                self.table
+            )));
+        }
+        self.storage.pool.mark_dirty(rid.page, lsn)?;
+        self.storage.pool.set_in_progress(rid.page, false)?;
+        Ok(true)
+    }
+
+    /// Writes `bytes` at offset `at` of the record of `rid`, in place, and answers whether the
+    /// slot held a record.
+    ///
+    /// The bytes of a record written in its page are changed there; those of an overflow
+    /// record are changed in the first page of its chain, which holds its first
+    /// [`OVERFLOW_CAPACITY`] bytes. When `lsn` is past the `page_lsn` of a page changed, the
+    /// page takes it in the same change, and the heap page of `rid` takes it too in the
+    /// overflow case, so that its number covers the change of the record it names.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Corruption`] when the page is not a heap page, when the slot points
+    /// outside the records of its page, and when the range `at..at + bytes.len()` is past the
+    /// record or past the first page of its chain. The errors of the buffer pool otherwise.
+    pub(crate) fn overwrite(
+        &self,
+        rid: Rid,
+        at: usize,
+        bytes: &[u8],
+        lsn: Lsn,
+    ) -> Result<bool, InternalError> {
+        let pin = self.storage.pool.pin(rid.page)?;
+        self.check_heap(&pin)?;
+        let found = pin.with_page(|page| read_record(page, rid.slot))?;
+        let head = match found? {
+            None => return Ok(false),
+            Some(Record::Inline(record)) => {
+                if at + bytes.len() > record.len() {
+                    return Err(self.past_the_record(rid, at, bytes.len(), record.len()));
+                }
+                pin.with_page_mut(|page| {
+                    let start = usize::from(read_slot(page, rid.slot).offset) + at;
+                    page.0[start..start + bytes.len()].copy_from_slice(bytes);
+                    if lsn > page.lsn() {
+                        page.set_lsn(lsn);
+                    }
+                })?;
+                None
+            }
+            Some(Record::Overflow { total, head }) => {
+                if at + bytes.len() > total.min(OVERFLOW_CAPACITY) {
+                    return Err(self.past_the_record(rid, at, bytes.len(), total));
+                }
+                pin.with_page_mut(|page| {
+                    if lsn > page.lsn() {
+                        page.set_lsn(lsn);
+                    }
+                })?;
+                Some(head)
+            }
+        };
+        self.storage.pool.mark_dirty(rid.page, lsn)?;
+        self.storage.pool.set_in_progress(rid.page, false)?;
+        drop(pin);
+        if let Some(head) = head {
+            let pin = self.storage.pool.pin(head)?;
+            let kind = pin.with_page(Page::kind)??;
+            if kind != PageKind::Overflow {
+                return Err(InternalError::Corruption(format!(
+                    "page {head} of an overflow chain of table {} carries kind {kind:?}",
+                    self.table
+                )));
+            }
+            pin.with_page_mut(|page| {
+                let start = usize::from(OVERFLOW_PAYLOAD_START) + at;
+                page.0[start..start + bytes.len()].copy_from_slice(bytes);
+                if lsn > page.lsn() {
+                    page.set_lsn(lsn);
+                }
+            })?;
+            self.storage.pool.mark_dirty(head, lsn)?;
+        }
+        Ok(true)
+    }
+
+    /// The `page_lsn` of `id` when it is a heap page, `None` when it is a page of another kind.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the buffer pool.
+    pub(crate) fn page_lsn(&self, id: PageId) -> Result<Option<Lsn>, InternalError> {
+        let pin = self.storage.pool.pin(id)?;
+        let (kind, lsn) = pin.with_page(|page| (page.kind(), page.lsn()))?;
+        Ok((kind? == PageKind::Heap).then_some(lsn))
+    }
+
+    /// The chain of heap pages as the redo finds it, a page that is not a heap page formatted
+    /// as an empty one where the walk meets it.
+    ///
+    /// A page the chain names may read back as [`PageKind::Free`] after a crash: its link
+    /// reached `data` and its formatting did not. The walk formats it, `page_lsn` 0, and stops
+    /// there, the pages behind it being out of reach of its lost link; the redo chains each of
+    /// those back when a record names it ([`Heap::redo_adopt`]). A page met twice ends the walk
+    /// too.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the buffer pool.
+    pub(crate) fn redo_chain(&self) -> Result<Vec<PageId>, InternalError> {
+        let mut pages: Vec<PageId> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut current = Some(self.first_page);
+        while let Some(id) = current {
+            if !seen.insert(id) {
+                self.end_chain_at(*pages.last().unwrap_or(&id))?;
+                break;
+            }
+            pages.push(id);
+            if self.page_lsn(id)?.is_none() {
+                self.format_unlogged(id)?;
+                break;
+            }
+            current = self.next_page(id)?;
+        }
+        Ok(pages)
+    }
+
+    /// Chains `page` after `last`, the end of the chain the redo has, and ends the chain there.
+    ///
+    /// `page` is a heap page a row record names and the walk of [`Heap::redo_chain`] did not
+    /// reach. A page that is not a heap page is formatted as an empty one, `page_lsn` 0; a heap
+    /// page keeps its records and loses its link, the pages behind it being chained the same
+    /// way when a record names them.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the buffer pool.
+    pub(crate) fn redo_adopt(&self, last: PageId, page: PageId) -> Result<(), InternalError> {
+        if self.page_lsn(page)?.is_none() {
+            self.format_unlogged(page)?;
+        } else {
+            self.end_chain_at(page)?;
+        }
+        self.link_page(last, page)
     }
 
     /// The record at `rid`, or `None` when its slot is free or past the directory of its page.
@@ -353,9 +570,8 @@ impl<'storage> Heap<'storage> {
     /// LSN `lsn` under the same pin and its `in_progress` flag left as it stands.
     ///
     /// `lsn` is the record that describes the release, appended by the caller before this call:
-    /// the record of the write that moves the version ([`super::version::HeapTable::update`],
-    /// [`super::version::HeapTable::delete`]), the compensation of an undo or the purge of a
-    /// vacuum. The pool then keeps the page out of `data` until that record is durable
+    /// the compensation of an undo or the purge of a vacuum, which the redo replays at that
+    /// number too. The pool then keeps the page out of `data` until that record is durable
     /// (`a_freed_slot_ties_the_page_to_the_lsn_it_is_given`). `Lsn(0)` is what the recovery
     /// passes, which replays the journal and appends nothing. The flag is left as it stands
     /// because the caller that flags its pages has set it before the call, and clearing it here
@@ -368,9 +584,9 @@ impl<'storage> Heap<'storage> {
         self.free(rid, lsn, false)
     }
 
-    /// The body of [`Heap::delete`] and [`Heap::free_slot`]: the slot freed, the page marked
-    /// dirty at `lsn`, its flag cleared when `clear_flag` says so, then the overflow pages
-    /// handed back.
+    /// The body of [`Heap::delete`] and [`Heap::free_slot`]: the slot freed and the page
+    /// taking `lsn` in the same change when it is past its `page_lsn`, its flag cleared when
+    /// `clear_flag` says so, then the overflow pages handed back.
     fn free(&self, rid: Rid, lsn: Lsn, clear_flag: bool) -> Result<bool, InternalError> {
         let pin = self.storage.pool.pin(rid.page)?;
         self.check_heap(&pin)?;
@@ -379,7 +595,12 @@ impl<'storage> Heap<'storage> {
             drop(pin);
             return Ok(false);
         };
-        pin.with_page_mut(|page| write_slot(page, rid.slot, 0, 0))?;
+        pin.with_page_mut(|page| {
+            write_slot(page, rid.slot, 0, 0);
+            if lsn > page.lsn() {
+                page.set_lsn(lsn);
+            }
+        })?;
         self.storage.pool.mark_dirty(rid.page, lsn)?;
         if clear_flag {
             self.storage.pool.set_in_progress(rid.page, false)?;
@@ -481,21 +702,42 @@ impl<'storage> Heap<'storage> {
         Ok(())
     }
 
-    /// Tries to put `payload` in the page `id`, answering the slot it took.
-    fn try_place(
-        &self,
-        id: PageId,
-        payload: &[u8],
-        overflow: bool,
-    ) -> Result<Option<u16>, InternalError> {
+    /// The slot a record of `stored` bytes would take in the page `id`, `None` when the page
+    /// has no room for it even once compacted.
+    fn room_in(&self, id: PageId, stored: usize) -> Result<Option<u16>, InternalError> {
         let pin = self.storage.pool.pin(id)?;
         self.check_heap(&pin)?;
-        let placed = pin.with_page_mut(|page| place(page, payload, overflow))?;
-        if placed.is_some() {
-            self.storage.pool.mark_dirty(id, Lsn(0))?;
-            self.storage.pool.set_in_progress(id, false)?;
-        }
-        Ok(placed)
+        let slot = pin.with_page(|page| slot_for(page, stored))?;
+        Ok(slot)
+    }
+
+    /// Writes an empty heap page over `id`, `page_lsn` 0: a page the redo finds in the place of
+    /// a heap page whose formatting did not reach `data`.
+    fn format_unlogged(&self, id: PageId) -> Result<(), InternalError> {
+        let pin = self.storage.pool.pin(id)?;
+        pin.with_page_mut(|page| {
+            format_heap_page(page);
+            page.set_lsn(Lsn(0));
+        })?;
+        self.storage.pool.mark_dirty(id, Lsn(0))?;
+        Ok(())
+    }
+
+    /// Writes [`END_OF_CHAIN`] as the link of the heap page `id`.
+    fn end_chain_at(&self, id: PageId) -> Result<(), InternalError> {
+        let pin = self.storage.pool.pin(id)?;
+        pin.with_page_mut(|page| set_heap_next(page, None))?;
+        self.storage.pool.mark_dirty(id, Lsn(0))?;
+        Ok(())
+    }
+
+    /// The error of an [`Heap::overwrite`] past the bytes it may change.
+    fn past_the_record(&self, rid: Rid, at: usize, len: usize, record: usize) -> InternalError {
+        InternalError::Corruption(format!(
+            "bytes {at}..{} of the record at {rid} of table {} are past what it holds in place,              {record} bytes",
+            at + len,
+            self.table
+        ))
     }
 
     /// The page that follows `id` in the chain of heap pages.
@@ -639,39 +881,70 @@ fn format_heap_page(page: &mut Page) {
     set_heap_next(page, None);
 }
 
-/// Puts `payload` in `page` if it fits, compacting the page once if it has to, and answers the
-/// slot it took.
-fn place(page: &mut Page, payload: &[u8], overflow: bool) -> Option<u16> {
-    let len = u16::try_from(payload.len()).ok()?;
+/// The slot a record of `len` bytes would take in `page`: the first free slot, or a new one at
+/// the end of the directory; `None` when the page has no room for it even once compacted.
+fn slot_for(page: &Page, len: usize) -> Option<u16> {
     let slot_count = page.slot_count();
-    let reuse = (0..slot_count).find(|&index| read_slot(page, index).is_free());
-    let needed = if reuse.is_some() {
-        len
-    } else {
-        len.saturating_add(SLOT_SIZE)
-    };
+    let slot = (0..slot_count)
+        .find(|&index| read_slot(page, index).is_free())
+        .unwrap_or(slot_count);
+    fits_at(page, slot, len).then_some(slot)
+}
 
-    if free_span(page) < needed {
+/// Whether a record of `len` bytes fits at `slot` of `page`, over the record the slot holds if
+/// it holds one, the page compacted if it has to be.
+fn fits_at(page: &Page, slot: u16, len: usize) -> bool {
+    let slot_count = page.slot_count();
+    let live: usize = (0..slot_count)
+        .filter(|&index| index != slot)
+        .map(|index| read_slot(page, index))
+        .filter(|entry| !entry.is_free())
+        .map(Slot::len)
+        .sum();
+    let slots = usize::from(slot_count.max(slot.saturating_add(1)));
+    let directory = usize::from(SLOT_SIZE) * slots;
+    len <= MAX_INLINE_LEN
+        && slot < u16::MAX
+        && usize::from(HEAP_PAYLOAD_START) + live + len + directory <= PAGE_SIZE
+}
+
+/// Writes `payload` at `slot` of `page`, over the record the slot held, and answers whether it
+/// fitted; a page without the room is left as it was.
+///
+/// The directory grows to reach the slot, the slots it adds between its old end and `slot`
+/// being free ones, and the page is compacted when its free span is too small.
+fn place_at(page: &mut Page, slot: u16, payload: &[u8], overflow: bool) -> bool {
+    if !fits_at(page, slot, payload.len()) {
+        return false;
+    }
+    // `fits_at` checked the length against `MAX_INLINE_LEN`, so it fits in a `u16`.
+    let len = payload.len() as u16;
+    let slot_count = page.slot_count();
+    if slot < slot_count {
+        write_slot(page, slot, 0, 0);
+    }
+    let added = if slot < slot_count {
+        0
+    } else {
+        slot - slot_count + 1
+    };
+    if free_span(page) < len + SLOT_SIZE * added {
         compact(page);
-        if free_span(page) < needed {
-            return None;
+    }
+    if added > 0 {
+        let upper = heap_upper(page) - SLOT_SIZE * added;
+        set_heap_upper(page, upper);
+        page.set_slot_count(slot + 1);
+        for index in slot_count..=slot {
+            write_slot(page, index, 0, 0);
         }
     }
-
     let at = page.lower();
     page.0[usize::from(at)..usize::from(at) + payload.len()].copy_from_slice(payload);
     page.set_lower(at + len);
     let stored = if overflow { len | OVERFLOW_FLAG } else { len };
-    let index = match reuse {
-        Some(index) => index,
-        None => {
-            page.set_slot_count(slot_count + 1);
-            set_heap_upper(page, heap_upper(page) - SLOT_SIZE);
-            slot_count
-        }
-    };
-    write_slot(page, index, at, stored);
-    Some(index)
+    write_slot(page, slot, at, stored);
+    true
 }
 
 /// Moves the live records of `page` down against [`HEAP_PAYLOAD_START`], rewriting the offsets

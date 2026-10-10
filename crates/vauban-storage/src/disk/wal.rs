@@ -1,11 +1,12 @@
 //! The write-ahead journal of an on-disk instance: `<dir>/wal`, an append-only file of
-//! logical records.
+//! records.
 //!
-//! The journal is **logical**: a record names what changed (a row inserted in a table, a
-//! transaction committed), not the bytes of a page. What the payload of a row record holds is
-//! [`super::wal_payload`], and [`super::version::HeapTable`] is what appends a record before it
-//! changes a page; here the file, the record format, the log sequence numbers and `sync_all`
-//! are what is written.
+//! A record names what changed (a row inserted in a table, a transaction committed), not the
+//! bytes of a page; a row record of a heap table also names the pages it changed and the
+//! operation it made on each, which is what the redo compares with their `page_lsn`. What the
+//! payload of a row record holds is [`super::wal_payload`], and
+//! [`super::version::HeapTable`] is what appends a record before it changes a page; here the
+//! file, the record format, the log sequence numbers and `sync_all` are what is written.
 //!
 //! # Record format, little-endian
 //!
@@ -194,7 +195,7 @@ pub(crate) enum WalRecordKind {
     /// The transaction was rolled back to a savepoint.
     RollbackTo = 15,
     /// The undo of a rollback, or of a rollback to a savepoint, took a version out of a heap
-    /// slot: the version left the heap, or was written again with its `xmax` unset. The
+    /// slot: the version left the heap, or had its `xmax` unset in place. The
     /// payload is a [`super::wal_payload::SlotRelease`].
     Compensation = 16,
     /// A vacuum took a version out of a heap slot. The payload is a

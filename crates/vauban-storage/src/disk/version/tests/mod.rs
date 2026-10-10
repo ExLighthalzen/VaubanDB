@@ -1015,6 +1015,52 @@ fn the_page_of_a_write_carries_the_lsn_of_its_record() {
     );
 }
 
+#[test]
+fn the_records_name_the_pages_they_change_and_the_xmax_is_set_in_place() {
+    let (_dir, storage) = instance("version-page-ops");
+    let mut table = table_of(&storage);
+    let id = table.insert(TxnId(4), &row(1)).expect("insert");
+    let first = table.state.directory[&id];
+    table.commit(TxnId(4)).expect("commit 4");
+    table.update(TxnId(5), id, &row(2)).expect("update");
+    let second = table.state.directory[&id];
+    table.delete(TxnId(5), id).expect("delete");
+    table.commit(TxnId(5)).expect("commit 5");
+
+    // The replaced version keeps its address: its `xmax` is written in place.
+    assert_eq!(table.state.versions[&(id, 1)], first);
+    assert_eq!(table.state.versions[&(id, 2)], second);
+    assert_eq!(table.state.directory[&id], second);
+
+    let records = journal(&storage);
+    let ops = |at: usize| {
+        RowChange::decode_with_ops(&records[at].payload)
+            .expect("decode")
+            .1
+    };
+    assert_eq!(ops(1), vec![PageOp::Put { rid: first }]);
+    assert_eq!(
+        ops(4),
+        vec![
+            PageOp::SetXmax { rid: first, seq: 1 },
+            PageOp::Put { rid: second }
+        ]
+    );
+    assert_eq!(
+        ops(5),
+        vec![PageOp::SetXmax {
+            rid: second,
+            seq: 2
+        }]
+    );
+    // Each page takes the number of the last record that changed it.
+    let pin = storage.pool.pin(first.page).expect("pin");
+    assert_eq!(
+        pin.with_page(|page| page.lsn()).expect("read"),
+        records[5].lsn
+    );
+}
+
 // --- Records of the slots an undo or a vacuum frees -----------------------------------
 
 /// The payloads of the records of `kind` the journal holds, in order, with their `txn`.

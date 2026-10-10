@@ -526,3 +526,158 @@ fn a_slot_tells_free_from_empty_and_carries_the_overflow_bit() {
     assert_eq!(OFF_OVERFLOW_NEXT, 32);
     assert_eq!(OFF_HEAP_NEXT, 34);
 }
+
+/// The `page_lsn` of the page `id`, read through the pool.
+fn lsn_of(storage: &DiskStorage, id: PageId) -> Lsn {
+    let pin = storage.pool.pin(id).expect("pin the page");
+    pin.with_page(Page::lsn).expect("read the page")
+}
+
+#[test]
+fn put_past_the_directory_adds_free_slots_up_to_its_slot() {
+    let (_dir, storage) = instance("heap-put-past");
+    let heap = heap_of(&storage);
+    let rid = Rid {
+        page: heap.first_page(),
+        slot: 3,
+    };
+    assert!(heap.put(rid, &payload(20, 1), Lsn(0)).expect("put"));
+    assert_eq!(heap.get(rid).expect("get"), Some(payload(20, 1)));
+    assert_eq!(heap.scan().expect("scan"), vec![rid]);
+    for slot in 0..3 {
+        assert!(
+            slot_of(&storage, Rid { slot, ..rid }).is_free(),
+            "slot {slot}"
+        );
+    }
+    // The next insert takes the first of the free slots.
+    let next = heap.insert(&payload(8, 2)).expect("insert");
+    assert_eq!(next.slot, 0);
+}
+
+#[test]
+fn put_over_a_record_replaces_it() {
+    let (_dir, storage) = instance("heap-put-over");
+    let heap = heap_of(&storage);
+    let rid = heap.insert(&payload(40, 1)).expect("insert");
+    let other = heap.insert(&payload(10, 2)).expect("insert");
+    assert!(heap.put(rid, &payload(12, 9), Lsn(0)).expect("put"));
+    assert_eq!(heap.get(rid).expect("get"), Some(payload(12, 9)));
+    assert_eq!(heap.get(other).expect("get"), Some(payload(10, 2)));
+    assert_eq!(heap.scan().expect("scan"), vec![rid, other]);
+}
+
+#[test]
+fn put_without_room_answers_false_and_leaves_the_page() {
+    let (_dir, storage) = instance("heap-put-full");
+    let heap = heap_of(&storage);
+    let big = heap.insert(&payload(8000, 1)).expect("insert");
+    let before = storage
+        .pool
+        .pin(big.page)
+        .expect("pin")
+        .with_page(Clone::clone)
+        .expect("read");
+    let rid = Rid {
+        page: big.page,
+        slot: 1,
+    };
+    assert!(!heap.put(rid, &payload(500, 2), Lsn(9)).expect("put"));
+    let after = storage
+        .pool
+        .pin(big.page)
+        .expect("pin")
+        .with_page(Clone::clone)
+        .expect("read");
+    assert_eq!(after, before);
+}
+
+#[test]
+fn reserve_answers_the_slot_insert_then_takes() {
+    let (_dir, storage) = instance("heap-reserve");
+    let heap = heap_of(&storage);
+    let first = heap.insert(&payload(16, 1)).expect("insert");
+    heap.insert(&payload(16, 2)).expect("insert");
+    assert!(heap.delete(first).expect("delete"));
+    let reserved = heap.reserve(16).expect("reserve");
+    assert_eq!(reserved, first, "the free slot is reused");
+    // Reserving writes nothing: the slot is still free.
+    assert_eq!(heap.get(reserved).expect("get"), None);
+    assert_eq!(heap.insert(&payload(16, 3)).expect("insert"), reserved);
+    // A record past the inline limit is reserved the room of its stub.
+    let long = heap.reserve(MAX_INLINE_LEN + 1).expect("reserve");
+    assert_eq!(long.page, heap.first_page());
+}
+
+#[test]
+fn put_and_overwrite_carry_the_lsn_to_the_page() {
+    let (_dir, storage) = instance("heap-put-lsn");
+    let heap = heap_of(&storage);
+    let head = heap.first_page();
+    let rid = heap.reserve(16).expect("reserve");
+    assert!(heap.put(rid, &payload(16, 1), Lsn(7)).expect("put"));
+    assert_eq!(lsn_of(&storage, head), Lsn(7));
+    // `Lsn(0)` and a smaller number leave the page where it is.
+    let other = heap.insert(&payload(16, 2)).expect("insert");
+    assert!(
+        heap.overwrite(other, 0, &[9, 9], Lsn(5))
+            .expect("overwrite")
+    );
+    assert_eq!(lsn_of(&storage, head), Lsn(7));
+    assert!(
+        heap.overwrite(rid, 2, &[4, 4, 4], Lsn(8))
+            .expect("overwrite")
+    );
+    assert_eq!(lsn_of(&storage, head), Lsn(8));
+    let mut expected = payload(16, 1);
+    expected[2..5].copy_from_slice(&[4, 4, 4]);
+    assert_eq!(heap.get(rid).expect("get"), Some(expected));
+    assert_eq!(heap.page_lsn(head).expect("page lsn"), Some(Lsn(8)));
+}
+
+#[test]
+fn overwrite_of_an_overflow_record_changes_the_first_page_of_its_chain() {
+    let (_dir, storage) = instance("heap-overwrite-overflow");
+    let heap = heap_of(&storage);
+    let row = payload(MAX_INLINE_LEN + 100, 4);
+    let rid = heap.insert(&row).expect("insert a long row");
+    assert!(heap.overwrite(rid, 16, &[1; 8], Lsn(3)).expect("overwrite"));
+    let mut expected = row.clone();
+    expected[16..24].fill(1);
+    assert_eq!(heap.get(rid).expect("get"), Some(expected));
+    assert_eq!(lsn_of(&storage, rid.page), Lsn(3));
+    // Past the first page of the chain is refused.
+    let err = heap
+        .overwrite(rid, OVERFLOW_CAPACITY, &[1], Lsn(3))
+        .expect_err("past the first page");
+    assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
+    // A free slot answers false.
+    let short = heap.insert(&payload(16, 5)).expect("insert");
+    assert!(heap.delete(short).expect("delete"));
+    assert!(!heap.overwrite(short, 0, &[1], Lsn(4)).expect("overwrite"));
+}
+
+#[test]
+fn the_redo_formats_a_free_page_of_the_chain_and_ends_the_chain_there() {
+    let (_dir, storage) = instance("heap-redo-chain");
+    let heap = heap_of(&storage);
+    for seed in 0..3 {
+        heap.insert(&payload(5000, seed)).expect("insert");
+    }
+    let pages = pages_of(&heap);
+    assert_eq!(pages.len(), 3);
+    // The second page reads back as a free page, as the allocator left it on `data`.
+    let pin = storage.pool.pin(pages[1]).expect("pin");
+    pin.with_page_mut(|page| *page = Page::empty(PageKind::Free, pages[1]))
+        .expect("free the page");
+    storage.pool.mark_dirty(pages[1], Lsn(0)).expect("dirty");
+    drop(pin);
+
+    assert_eq!(heap.redo_chain().expect("chain"), pages[..2].to_vec());
+    assert_eq!(heap.page_lsn(pages[1]).expect("lsn"), Some(Lsn(0)));
+    assert_eq!(pages_of(&heap), pages[..2].to_vec());
+    // The third page is chained back after the second, holding its record.
+    heap.redo_adopt(pages[1], pages[2]).expect("adopt");
+    assert_eq!(pages_of(&heap), pages);
+    assert_eq!(heap.scan().expect("scan").len(), 2);
+}

@@ -21,19 +21,56 @@
 //!    DDL records are replayed on the catalogue, which gives the head page of each heap
 //!    ([`redo_ddl`]).
 //! 2. **Redo.** The row records of the winners are applied to the heaps, in journal order,
+//!    each to the pages it names when their `page_lsn` is behind it ([`RedoHeap::apply`]),
 //!    and so are the records that free a heap slot ([`WalRecordKind::Compensation`],
 //!    [`WalRecordKind::Purge`]) of each transaction, winner or not ([`RedoHeap::release`]).
+//!
+//! # Page numbers
+//!
+//! A row record of a heap table names the pages it changed and what it did on each
+//! ([`super::wal_payload::PageOp`]); each page took the number of the record in the change
+//! itself ([`super::heap::Heap::put`], [`super::heap::Heap::overwrite`]). A page whose
+//! `page_lsn` is at or past the number of a record is left as it stands by that record: the
+//! page reached `data` after the change of the record. A page behind it gets the operation and
+//! the number. A page on `data` newer than the records is therefore not changed by them: a
+//! version a vacuum took away after its insert reached `data` is not put back by the insert
+//! record (`tests::a_page_on_data_before_the_crash_is_left_as_it_stands_by_the_redo`), and a
+//! second redo over the pages of the first gives the same pages
+//! (`tests::a_redo_played_twice_gives_the_same_pages`).
+//!
+//! The operations write at a slot, or the `xmax` of the version at a slot, so applying one to
+//! a page that already holds it rewrites the slot with what it held
+//! (`super::heap::tests::put_over_a_record_replaces_it`). The number is written in the change
+//! that writes the bytes, so a page does not leave the pool holding a record its number does
+//! not cover.
+//!
+//! The writes that free room in a heap page are journalled too (below), so a page behind a
+//! record holds the versions it held when the record was written, less the versions of losers
+//! the redo leaves out. A `Put` therefore finds the room its record found, and one that does
+//! not is a page its journal does not describe: the redo refuses it rather than placing the
+//! version elsewhere ([`InternalError::Corruption`],
+//! `tests::a_put_without_room_at_its_slot_is_corruption`). A version sits where its record
+//! put it, and the records that follow find it at that slot.
+//!
+//! The chain of the heap is not journalled (`page_lsn` covers the records of a page, not the
+//! link that leads to it): a page of the chain that reads back as a free page is formatted
+//! again, and a page a record names that the chain on `data` does not reach is chained back
+//! ([`super::heap::Heap::redo_chain`],
+//! `tests::a_chained_page_whose_formatting_missed_data_is_formatted_again`,
+//! `tests::a_page_on_data_out_of_the_chain_on_data_is_chained_back`).
 //!
 //! # Records that free a slot
 //!
 //! The undo of a rollback, of a rollback to a savepoint, and a vacuum journal each version they
-//! take out of a heap slot ([`super::wal_payload::SlotRelease`]). The redo replays them at their
-//! place in the journal, by `(RowId, seq)` like the row records: a version the heap holds is
-//! taken out, or written again with its `xmax` unset when the record says so and the heap
-//! holds it with the `xmax` the record names; a version the heap does not hold leaves the
-//! record without effect ([`Recovery::released`] counts the ones that changed the heap). They
-//! are replayed for a loser too, and inside a range a rollback to a savepoint cancels: a
-//! compensation is what that rollback did, not one of the writes it took back.
+//! take out of a heap slot, or whose `xmax` they unset ([`super::wal_payload::SlotRelease`]).
+//! The redo replays them at their place in the journal, on the slot they name, when the
+//! `page_lsn` of its page is behind them, as it does the row records: the version the slot holds
+//! is taken out, or has its `xmax` unset when it carries the `xmax` the record names, and the
+//! page takes the number of the record. A slot that does not hold the version, a write of a
+//! loser the redo left out, leaves the record without effect ([`Recovery::released`] counts
+//! the ones that changed the heap). They are replayed for a loser too, and inside a range a
+//! rollback to a savepoint cancels: a compensation is what that rollback did, not one of the
+//! writes it took back.
 //!
 //! What this gives back is the room: a page another transaction shares may reach `data`
 //! holding the versions a rollback later took out, and a write after the rollback may have
@@ -53,9 +90,8 @@
 //! (`a_transaction_astride_the_checkpoint_leaves_its_insert_before_redo_lsn` in
 //! [`super`]). A row committed before a checkpoint is not assumed to be on `data` either: a
 //! transaction still running on the page of a committed row holds that page back at the
-//! checkpoint. The redo therefore repeats what a checkpoint already wrote, which it may do
-//! because it is idempotent: a version the heap already holds under its `(RowId, seq)` is
-//! skipped ([`Recovery::skipped`], `double_open_is_idempotent`).
+//! checkpoint. The redo therefore reads records a checkpoint already wrote, and skips them
+//! by the number of their page ([`Recovery::skipped`], `double_open_is_idempotent`).
 //!
 //! The journal is not truncated by this build, so its first record is the first record of the
 //! instance. A starting point bounded by the oldest running transaction — the payload of the
@@ -116,10 +152,10 @@ use super::DiskStorage;
 use super::clustered::ClusteredTable;
 use super::heap::{Heap, Rid};
 use super::meta::{Catalogue, IndexEntry, TableEntry};
-use super::page::{Lsn, PageId, PageKind};
-use super::version::{VERSION_PREFIX_LEN, VersionHeader};
+use super::page::{Lsn, PageId};
+use super::version::{NO_XMAX, OFF_XMAX, VERSION_PREFIX_LEN, VersionHeader};
 use super::wal::{WalRecord, WalRecordKind};
-use super::wal_payload::{Release, RowChange, SlotRelease};
+use super::wal_payload::{PageOp, Release, RowChange, SlotRelease};
 use crate::{DbId, RowId, TableId, TableShape, TxnId};
 
 /// What the recovery found and did, kept by [`super::DiskStorage`] for the caller that rebuilds
@@ -139,9 +175,10 @@ pub(crate) struct Recovery {
     /// Head page of the heap of each table the catalogue holds once the DDL of the journal
     /// has been replayed, by table ([`redo_ddl`]). A table the journal drops is not there.
     pub(crate) tables: BTreeMap<TableId, PageId>,
-    /// Row records of winners the redo wrote to a heap.
+    /// Row records of winners the redo wrote to a heap or a tree.
     pub(crate) applied: usize,
-    /// Row records of winners the heap already held, `(RowId, seq)` for `(RowId, seq)`.
+    /// Row records of winners whose pages already carried their number, or, for a clustered
+    /// table, whose version the tree already held.
     pub(crate) skipped: usize,
     /// Row records of winners naming a table no [`WalRecordKind::CreateTable`] record names.
     pub(crate) unplaced: usize,
@@ -459,6 +496,9 @@ impl Scan {
 
 /// Second pass: the row records of the winners, in journal order, applied to the heaps.
 ///
+/// A record of a heap table goes through [`RedoHeap::apply`], which compares the `page_lsn` of
+/// each page the record names with its number.
+///
 /// The heap of each table the journal names is attached first, whether a record of a winner
 /// reaches it or not: a head page that stayed in the pool of the instance that crashed is
 /// formatted there, so that the table reads back as the empty heap it was
@@ -497,7 +537,7 @@ fn redo(
             // A heap the catalogue no longer holds, or a clustered table, which journals no
             // such record: nothing to take out.
             if let Some(redo) = heaps.get_mut(&release.table)
-                && redo.release(&release)?
+                && redo.release(record, &release)?
             {
                 recovery.released += 1;
             }
@@ -511,7 +551,7 @@ fn redo(
         {
             continue;
         }
-        let change = RowChange::decode(&record.payload)?;
+        let (change, ops) = RowChange::decode_with_ops(&record.payload)?;
         if clustered_tables.contains(&change.table) {
             clustered_changes
                 .entry(change.table)
@@ -523,16 +563,7 @@ fn redo(
             recovery.unplaced += 1;
             continue;
         };
-        let written = match kind {
-            WalRecordKind::Insert => redo.insert(&change)?,
-            WalRecordKind::Update => {
-                redo.hide_previous(change.header.row, change.header.seq, record.txn)?;
-                redo.insert(&change)?
-            }
-            // The header of a delete record carries the version it hides, its `xmax` set.
-            _ => redo.hide(change.header.row, change.header.seq, record.txn)?,
-        };
-        if written {
+        if redo.apply(record, &change, &ops)? {
             recovery.applied += 1;
         } else {
             recovery.skipped += 1;
@@ -600,187 +631,198 @@ fn redo(
     Ok(())
 }
 
-/// Where one version sits and what its prefix says, as the redo tracks it.
-#[derive(Debug, Clone, Copy)]
-struct Placed {
-    /// Address of the version in the heap.
-    rid: Rid,
-    /// Its prefix, `xmax` included.
-    header: VersionHeader,
-}
-
-/// The redo of one heap table: its heap and the versions the heap holds, by `(RowId, seq)`.
+/// The redo of one heap table: its heap and the chain of its pages.
 ///
-/// The directory is built by walking the heap before the first record is applied and kept up to
-/// date by the redo itself, so that the heap is walked once per table rather than once per
-/// record. It is thrown away at the end of
-/// the recovery; the directory [`super::version::HeapTable`] works from is rebuilt by
-/// [`super::version::HeapTable::resume_after_recovery`], which walks the heap after the redo.
+/// A row record names the heap pages it changed ([`PageOp`]); the redo applies the operations
+/// of a page when the `page_lsn` of that page is below the number of the record, and each
+/// page it changes takes that number. The numbers are read for each page of a record before
+/// the first of its operations is applied, so the two operations of an update that landed on
+/// one page are decided by one comparison. The records that free a slot are decided the same
+/// way ([`RedoHeap::release`]).
 #[derive(Debug)]
 struct RedoHeap<'storage> {
     /// The heap the versions go to.
     heap: Heap<'storage>,
-    /// The versions the heap holds, by row then serial.
-    versions: BTreeMap<(RowId, u64), Placed>,
+    /// The pages of its chain, as [`Heap::redo_chain`] found them and the redo extended them.
+    chain: BTreeSet<PageId>,
+    /// The last page of that chain.
+    last: PageId,
 }
 
 impl<'storage> RedoHeap<'storage> {
-    /// Attaches to the heap of `table`, formatting its head page when that page is not one.
+    /// Attaches to the heap of `table` and walks its chain.
     ///
-    /// A head page whose formatting stayed in the pool of the instance that crashed reads back
-    /// as the [`PageKind::Free`] page [`super::alloc::allocate`] wrote when it grew the file,
-    /// and the redo formats it as the empty heap the writes of the journal are replayed on
-    /// (`reopen_after_commit_without_checkpoint`).
+    /// A page of the chain whose formatting stayed in the pool of the instance that crashed
+    /// reads back as a [`super::page::PageKind::Free`] page, and the redo formats it as an empty heap page
+    /// ([`Heap::redo_chain`]), the head page included (`reopen_after_commit_without_checkpoint`).
     fn over(
         storage: &'storage DiskStorage,
         table: TableId,
         first_page: PageId,
     ) -> Result<Self, InternalError> {
-        let pin = storage.pool.pin(first_page)?;
-        let kind = pin.with_page(|page| page.kind())?;
-        drop(pin);
-        let heap = if kind? == PageKind::Heap {
-            Heap::open(storage, table, first_page)
-        } else {
-            Heap::create(storage, table, first_page)?
-        };
-        let mut versions = BTreeMap::new();
-        for rid in heap.scan()? {
-            let Some(bytes) = heap.get(rid)? else {
-                continue;
-            };
-            let header = VersionHeader::read_from(&bytes)?;
-            versions.insert((header.row, header.seq), Placed { rid, header });
-        }
-        Ok(Self { heap, versions })
+        let heap = Heap::open(storage, table, first_page);
+        let pages = heap.redo_chain()?;
+        let last = pages.last().copied().unwrap_or(first_page);
+        Ok(Self {
+            heap,
+            chain: pages.into_iter().collect(),
+            last,
+        })
     }
 
-    /// Writes the version of `change` when the heap does not hold it yet, and answers whether
-    /// it wrote.
-    fn insert(&mut self, change: &RowChange) -> Result<bool, InternalError> {
-        let key = (change.header.row, change.header.seq);
-        if self.versions.contains_key(&key) {
-            return Ok(false);
-        }
-        let mut bytes = Vec::with_capacity(VERSION_PREFIX_LEN + change.columns.len());
-        change.header.write_to(&mut bytes);
-        bytes.extend_from_slice(&change.columns);
-        let rid = self.heap.insert(&bytes)?;
-        self.versions.insert(
-            key,
-            Placed {
-                rid,
-                header: change.header,
-            },
-        );
-        Ok(true)
-    }
-
-    /// Sets `xmax` on the version `(row, seq)`, and answers whether it wrote.
+    /// Applies the operations of `record` whose page is behind it, and answers whether one was.
     ///
-    /// A version that already carries an `xmax` is left as it stands: the write it records had
-    /// reached `data` before the crash. The heap has no rewrite in place, so the version is
-    /// deleted and the patched bytes inserted, as [`super::version::HeapTable`] does; its
-    /// [`Rid`] may change, its `(RowId, seq)` does not.
-    fn hide(&mut self, row: RowId, seq: u64, txn: TxnId) -> Result<bool, InternalError> {
-        let Some(placed) = self.versions.get(&(row, seq)).copied() else {
+    /// # Errors
+    ///
+    /// [`InternalError::Corruption`] for a record that names no page, for a `Put` that does
+    /// not fit at its slot and for a `SetXmax` on a slot that does not hold the version it
+    /// names; the errors of the heap otherwise.
+    fn apply(
+        &mut self,
+        record: &WalRecord,
+        change: &RowChange,
+        ops: &[PageOp],
+    ) -> Result<bool, InternalError> {
+        if ops.is_empty() {
             return Err(InternalError::Corruption(format!(
-                "the journal hides version {seq} of row {row} of table {}, which the heap does \
-                 not hold",
+                "the row record at lsn {} names table {} and no page of its heap",
+                record.lsn,
                 self.heap.table()
             )));
-        };
-        self.rewrite(placed, txn)
-    }
-
-    /// Sets `xmax` on the version of `row` that comes before `seq`: the one an update replaces.
-    ///
-    /// The record of an update names the version it creates, not the one it replaces, which is
-    /// the current one of the chain when the record is replayed ([`super::wal_payload`]): here,
-    /// the largest serial of `row` below `seq`. A row whose earlier version is out of the heap
-    /// — its insert belonging to a transaction that is no winner — leaves nothing to hide.
-    fn hide_previous(&mut self, row: RowId, seq: u64, txn: TxnId) -> Result<bool, InternalError> {
-        let previous = self
-            .versions
-            .range((row, 0)..(row, seq))
-            .next_back()
-            .map(|(_, placed)| *placed);
-        match previous {
-            Some(placed) => self.rewrite(placed, txn),
-            None => Ok(false),
         }
+        let mut behind = BTreeSet::new();
+        for op in ops {
+            let page = op.page();
+            if self.is_behind(page, record.lsn)? {
+                behind.insert(page);
+            }
+        }
+        let mut applied = false;
+        for op in ops {
+            if !behind.contains(&op.page()) {
+                continue;
+            }
+            applied = true;
+            match *op {
+                PageOp::Put { rid } => self.put(change, rid, record.lsn)?,
+                PageOp::SetXmax { rid, seq } => {
+                    self.set_xmax((change.header.row, seq), rid, Some(record.txn), record.lsn)?;
+                }
+            }
+        }
+        Ok(applied)
     }
 
     /// Replays a record that frees a heap slot, and answers whether it changed the heap.
     ///
-    /// The version is looked up by `(RowId, seq)`, not at the slot the record names: the redo
-    /// of this build places versions through the heap, which may put one at another address
-    /// than the instance that wrote the record did. A [`Release::Removed`] takes the version
-    /// out; a [`Release::XmaxCleared`] writes it again without its `xmax` when that `xmax` is the
-    /// one the record names, a later writer's being left in place.
-    fn release(&mut self, release: &SlotRelease) -> Result<bool, InternalError> {
+    /// The record is applied when the `page_lsn` of the page of its slot is behind it, as a
+    /// row record is: a [`Release::Removed`] frees the slot, a [`Release::XmaxCleared`] unsets
+    /// the `xmax` in place when the version carries the one the record names. A slot that
+    /// does not hold the version leaves the record without effect: the write that put it there
+    /// was a loser's, which the redo left out.
+    fn release(
+        &mut self,
+        record: &WalRecord,
+        release: &SlotRelease,
+    ) -> Result<bool, InternalError> {
         let key = (release.header.row, release.header.seq);
-        let Some(placed) = self.versions.get(&key).copied() else {
+        if !self.is_behind(release.at.page, record.lsn)? {
+            return Ok(false);
+        }
+        let Some(held) = self.held(release.at)? else {
             return Ok(false);
         };
+        if (held.row, held.seq) != key {
+            return Ok(false);
+        }
         match release.release {
-            Release::Removed => {
-                self.heap.free_slot(placed.rid, Lsn(0))?;
-                self.versions.remove(&key);
-                Ok(true)
-            }
+            Release::Removed => self.heap.free_slot(release.at, record.lsn),
             Release::XmaxCleared => {
-                if placed.header.xmax.is_none() || placed.header.xmax != release.header.xmax {
+                if held.xmax.is_none() || held.xmax != release.header.xmax {
                     return Ok(false);
                 }
-                self.patch(placed, None)?;
+                self.set_xmax(key, release.at, None, record.lsn)?;
                 Ok(true)
             }
         }
     }
 
-    /// Rewrites `placed` with `xmax` set to `txn`, when it does not carry one already.
-    fn rewrite(&mut self, placed: Placed, txn: TxnId) -> Result<bool, InternalError> {
-        if placed.header.xmax.is_some() {
-            return Ok(false);
-        }
-        self.patch(placed, Some(txn))?;
-        Ok(true)
+    /// Whether `page` is behind the record of number `lsn`, the page chained first when the
+    /// walk did not reach it.
+    fn is_behind(&mut self, page: PageId, lsn: Lsn) -> Result<bool, InternalError> {
+        self.attach(page)?;
+        Ok(self.heap.page_lsn(page)?.unwrap_or(Lsn(0)) < lsn)
     }
 
-    /// Writes `placed` again with `xmax` set to `xmax`, its columns untouched.
-    fn patch(&mut self, placed: Placed, xmax: Option<TxnId>) -> Result<(), InternalError> {
-        let Some(bytes) = self.heap.get(placed.rid)? else {
-            return Err(InternalError::Corruption(format!(
-                "version {} of row {} of table {} is not at {} any more",
-                placed.header.seq,
-                placed.header.row,
-                self.heap.table(),
-                placed.rid
-            )));
-        };
-        let Some(columns) = bytes.get(VERSION_PREFIX_LEN..) else {
-            return Err(InternalError::Corruption(format!(
-                "version {} of row {} of table {} is {} bytes, shorter than the \
-                 {VERSION_PREFIX_LEN}-byte version prefix",
-                placed.header.seq,
-                placed.header.row,
-                self.heap.table(),
-                bytes.len()
-            )));
-        };
-        let header = VersionHeader {
-            xmax,
-            ..placed.header
-        };
-        let mut patched = Vec::with_capacity(bytes.len());
-        header.write_to(&mut patched);
-        patched.extend_from_slice(columns);
-        self.heap.free_slot(placed.rid, Lsn(0))?;
-        let rid = self.heap.insert(&patched)?;
-        self.versions
-            .insert((header.row, header.seq), Placed { rid, header });
+    /// Puts `page` in the chain when the walk did not reach it.
+    fn attach(&mut self, page: PageId) -> Result<(), InternalError> {
+        if self.chain.contains(&page) {
+            return Ok(());
+        }
+        self.heap.redo_adopt(self.last, page)?;
+        self.chain.insert(page);
+        self.last = page;
         Ok(())
+    }
+
+    /// Writes the version of `change` at `rid`.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Corruption`] when the slot has no room for it: the page holds versions
+    /// its journal does not account for.
+    fn put(&mut self, change: &RowChange, rid: Rid, lsn: Lsn) -> Result<(), InternalError> {
+        let mut bytes = Vec::with_capacity(VERSION_PREFIX_LEN + change.columns.len());
+        change.header.write_to(&mut bytes);
+        bytes.extend_from_slice(&change.columns);
+        if self.heap.put(rid, &bytes, lsn)? {
+            return Ok(());
+        }
+        Err(InternalError::Corruption(format!(
+            "the record at lsn {lsn} puts version {} of row {} of table {} at {rid}, where the \
+             page has no room for its {} bytes",
+            change.header.seq,
+            change.header.row,
+            self.heap.table(),
+            bytes.len()
+        )))
+    }
+
+    /// Writes `xmax` in the `xmax` field of the version `key`, which sits at `rid`.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Corruption`] when the slot does not hold that version.
+    fn set_xmax(
+        &mut self,
+        key: (RowId, u64),
+        rid: Rid,
+        xmax: Option<TxnId>,
+        lsn: Lsn,
+    ) -> Result<(), InternalError> {
+        if self
+            .held(rid)?
+            .is_none_or(|held| (held.row, held.seq) != key)
+        {
+            return Err(InternalError::Corruption(format!(
+                "the record at lsn {lsn} sets the xmax of version {} of row {} of table {} at \
+                 {rid}, which the heap does not hold there",
+                key.1,
+                key.0,
+                self.heap.table()
+            )));
+        }
+        let field = xmax.map_or(NO_XMAX, |txn| txn.0).to_le_bytes();
+        self.heap.overwrite(rid, OFF_XMAX, &field, lsn)?;
+        Ok(())
+    }
+
+    /// The prefix of the version at `rid`, `None` for a free slot.
+    fn held(&self, rid: Rid) -> Result<Option<VersionHeader>, InternalError> {
+        match self.heap.get(rid)? {
+            Some(bytes) => Ok(Some(VersionHeader::read_from(&bytes)?)),
+            None => Ok(None),
+        }
     }
 }
 

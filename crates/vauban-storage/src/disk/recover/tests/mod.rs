@@ -1,5 +1,6 @@
-use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+use vauban_types::{SqlString, SqlType, TypeInfo, Value};
 
+use super::super::page::Page;
 use super::super::temp::TempDir;
 use super::super::version::HeapTable;
 use super::super::{DiskOptions, alloc};
@@ -168,7 +169,7 @@ fn checkpoint_then_commit_then_reopen() {
     let recovery = storage.recovery().clone();
     assert_eq!(recovery.winners, vec![TxnId(4), TxnId(5)]);
     // The redo starts at the first record, so the insert of the first transaction is
-    // replayed too; the heap already holding it, that record is skipped.
+    // read too; its page reached `data` carrying its number, so that record is skipped.
     assert_eq!(recovery.applied + recovery.skipped, 2);
     assert_eq!(
         recovery.skipped, 1,
@@ -282,7 +283,7 @@ fn a_checkpoint_between_two_opens_turns_the_redo_into_a_skip() {
     }
 
     let storage = open(&dir);
-    // The version reached `data`, so the second redo finds it under its `(RowId, seq)`.
+    // The page reached `data` carrying the number of the insert, so the second redo skips it.
     assert_eq!(
         (storage.recovery().applied, storage.recovery().skipped),
         (0, 1)
@@ -527,15 +528,869 @@ fn a_create_table_record_of_a_dropped_table_leaves_no_heap() {
     assert_eq!(head, PageId(0));
 }
 
-// --- Records that free a heap slot ---------------------------------------------------
+/// The bytes of a page but its checksum field, which a write to `data` fills in and a change in
+/// the pool leaves stale.
+fn body(page: &Page) -> Vec<u8> {
+    let mut bytes = page.0.to_vec();
+    bytes[24..28].fill(0);
+    bytes
+}
 
-/// A table of one `varchar(max)`, whose rows take the room their text asks for.
+/// The heap pages of [`TABLE`] that hold a record, each as the pool holds it now.
+fn pool_pages(storage: &DiskStorage, head: PageId) -> BTreeMap<PageId, Vec<u8>> {
+    let heap = Heap::open(storage, TABLE, head);
+    let mut pages: BTreeSet<PageId> = heap
+        .scan()
+        .expect("scan the heap")
+        .into_iter()
+        .map(|rid| rid.page)
+        .collect();
+    pages.insert(head);
+    pages
+        .into_iter()
+        .map(|id| {
+            let pin = storage.pool.pin(id).expect("pin the page");
+            (id, pin.with_page(body).expect("read the page"))
+        })
+        .collect()
+}
+
+/// Inserts `count` rows of `txn` and commits them, answering their identifiers.
+fn insert_rows(table: &mut HeapTable<'_>, txn: TxnId, count: i32) -> Vec<RowId> {
+    let ids = (0..count)
+        .map(|value| table.insert(txn, &row(value)).expect("insert"))
+        .collect();
+    table.commit(txn).expect("commit");
+    ids
+}
+
+#[test]
+fn a_page_on_data_before_the_crash_is_left_as_it_stands_by_the_redo() {
+    let dir = TempDir::created("recover-page-on-data");
+    let (head, on_data, kept) = {
+        let storage = open(&dir);
+        let head = install(&storage);
+        let mut table = HeapTable::open(&storage, TABLE, head, int_shape());
+        let gone = table.insert(TxnId(4), &row(11)).expect("insert");
+        table.commit(TxnId(4)).expect("commit");
+        table.delete(TxnId(5), gone).expect("delete");
+        table.commit(TxnId(5)).expect("commit");
+        let kept = table.insert(TxnId(6), &row(12)).expect("insert");
+        table.commit(TxnId(6)).expect("commit");
+        // The vacuum takes the deleted version out of the page, which the checkpoint writes:
+        // `data` holds a page newer than the insert and the delete of the journal.
+        assert_eq!(table.vacuum(TxnId(10)).expect("vacuum").len(), 1);
+        storage.checkpoint().expect("checkpoint");
+        let on_data = storage.data.read_page(head).expect("read the page on data");
+        (head, on_data, kept)
+    };
+
+    let storage = open(&dir);
+    let recovery = storage.recovery().clone();
+    assert_eq!(recovery.winners, vec![TxnId(4), TxnId(5), TxnId(6)]);
+    assert_eq!((recovery.applied, recovery.skipped), (0, 3));
+    let pin = storage.pool.pin(head).expect("pin the head page");
+    assert_eq!(
+        pin.with_page(body).expect("read the page"),
+        body(&on_data),
+        "the redo does not touch a page whose number covers the records"
+    );
+    drop(pin);
+    let table = resumed(&storage);
+    // The vacuumed version is not put back by the insert record that created it.
+    let versions = table.versions(None).expect("versions");
+    assert_eq!(versions.len(), 1, "{versions:?}");
+    assert_eq!(
+        table.scan(&snap(9, 100)).expect("scan"),
+        vec![(kept, row(12))]
+    );
+}
+
+#[test]
+fn records_behind_the_page_on_data_are_skipped_and_the_ones_past_it_applied() {
+    let dir = TempDir::created("recover-page-between");
+    let (first, second) = {
+        let storage = open(&dir);
+        let head = install(&storage);
+        let mut table = HeapTable::open(&storage, TABLE, head, int_shape());
+        let first = table.insert(TxnId(4), &row(11)).expect("insert");
+        table.commit(TxnId(4)).expect("commit");
+        // The page reaches `data` between the two writes: the crash comes after the write of
+        // the page for the first record and before it for the second.
+        storage.pool.flush(head).expect("flush the head page");
+        let second = table.insert(TxnId(5), &row(12)).expect("insert");
+        table.update(TxnId(5), first, &row(13)).expect("update");
+        table.commit(TxnId(5)).expect("commit");
+        (first, second)
+    };
+
+    let storage = open(&dir);
+    assert_eq!(
+        (storage.recovery().applied, storage.recovery().skipped),
+        (2, 1)
+    );
+    let table = resumed(&storage);
+    assert_eq!(
+        table.scan(&snap(9, 100)).expect("scan"),
+        vec![(first, row(13)), (second, row(12))]
+    );
+    // The update set the `xmax` of the first version in place and added the second one.
+    assert_eq!(table.versions(Some(first)).expect("versions").len(), 2);
+}
+
+#[test]
+fn a_redo_played_twice_gives_the_same_pages() {
+    let dir = TempDir::created("recover-twice-pages");
+    let head = {
+        let storage = open(&dir);
+        let head = install(&storage);
+        let mut table = HeapTable::open(&storage, TABLE, head, int_shape());
+        let ids = insert_rows(&mut table, TxnId(4), 600);
+        for id in ids.iter().step_by(7) {
+            table.update(TxnId(5), *id, &row(-1)).expect("update");
+        }
+        table.commit(TxnId(5)).expect("commit");
+        for id in ids.iter().skip(3).step_by(11) {
+            table.delete(TxnId(6), *id).expect("delete");
+        }
+        table.commit(TxnId(6)).expect("commit");
+        // A loser, whose records the redo leaves out.
+        table.insert(TxnId(7), &row(99)).expect("insert");
+        head
+    };
+
+    let (first, pages, rows) = {
+        let storage = open(&dir);
+        let recovery = storage.recovery().clone();
+        assert!(recovery.applied > 0, "{recovery:?}");
+        let pages = pool_pages(&storage, head);
+        assert!(pages.len() >= 3, "the heap spans {} pages", pages.len());
+        let rows = resumed(&storage).scan(&snap(9, 100)).expect("scan");
+        (recovery, pages, rows)
+    };
+    // Dropped without a checkpoint: the second redo starts again from the same `data`.
+    let second = {
+        let storage = open(&dir);
+        let recovery = storage.recovery().clone();
+        assert_eq!(pool_pages(&storage, head), pages);
+        assert_eq!(resumed(&storage).scan(&snap(9, 100)).expect("scan"), rows);
+        // The pages of this redo reach `data` this time.
+        storage.checkpoint().expect("checkpoint");
+        recovery
+    };
+    assert_eq!(
+        (second.applied, second.skipped),
+        (first.applied, first.skipped)
+    );
+
+    let storage = open(&dir);
+    let third = storage.recovery().clone();
+    assert_eq!(
+        (third.applied, third.skipped),
+        (0, first.applied + first.skipped),
+        "the pages on data carry the numbers of the records"
+    );
+    assert_eq!(resumed(&storage).scan(&snap(9, 100)).expect("scan"), rows);
+}
+
+#[test]
+fn a_chained_page_whose_formatting_missed_data_is_formatted_again() {
+    let dir = TempDir::created("recover-lost-format");
+    let (ids, head) = {
+        let storage = open(&dir);
+        let head = install(&storage);
+        let mut table = HeapTable::open(&storage, TABLE, head, int_shape());
+        let ids = insert_rows(&mut table, TxnId(4), 600);
+        // The head page reaches `data` with its link to the second page; the second page
+        // does not, and reads back as the free page the allocator wrote.
+        storage.pool.flush(head).expect("flush the head page");
+        (ids, head)
+    };
+    let storage = open(&dir);
+    let second = Heap::open(&storage, TABLE, head)
+        .redo_chain()
+        .expect("chain")[1];
+    assert_ne!(second, head);
+    let table = resumed(&storage);
+    let rows = table.scan(&snap(9, 100)).expect("scan");
+    assert_eq!(rows.len(), ids.len());
+    assert_eq!(
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        ids,
+        "each row of the second page is put back"
+    );
+}
+
+#[test]
+fn a_page_on_data_out_of_the_chain_on_data_is_chained_back() {
+    let dir = TempDir::created("recover-lost-link");
+    let ids = {
+        let storage = open(&dir);
+        let head = install(&storage);
+        let mut table = HeapTable::open(&storage, TABLE, head, int_shape());
+        let ids = insert_rows(&mut table, TxnId(4), 600);
+        // The pages but the head reach `data`; the head page, which holds the link, does not.
+        let rest: BTreeSet<PageId> = Heap::open(&storage, TABLE, head)
+            .scan()
+            .expect("scan")
+            .into_iter()
+            .map(|rid| rid.page)
+            .filter(|page| *page != head)
+            .collect();
+        assert!(!rest.is_empty());
+        for page in rest {
+            storage.pool.flush(page).expect("flush a page");
+        }
+        ids
+    };
+    let storage = open(&dir);
+    let recovery = storage.recovery().clone();
+    assert!(
+        recovery.applied > 0 && recovery.skipped > 0,
+        "the head page is redone, the others skipped: {recovery:?}"
+    );
+    assert_eq!(recovery.applied + recovery.skipped, ids.len());
+    let table = resumed(&storage);
+    let rows = table.scan(&snap(9, 100)).expect("scan");
+    assert_eq!(rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ids);
+}
+
+/// A table of one `varchar(max)`, whose rows of 20 000 characters go to overflow pages.
 fn text_shape() -> TableShape {
     TableShape {
-        columns: vec![TypeInfo::new(SqlType::VarChar(Len::Max), true)],
+        columns: vec![TypeInfo::new(
+            SqlType::VarChar(vauban_types::Len::Max),
+            true,
+        )],
         clustered_key: None,
     }
 }
+
+/// A row of 20 000 copies of `c`.
+fn long_row(c: char) -> Row {
+    Row(vec![Value::String(vauban_types::SqlString {
+        text: c.to_string().repeat(20_000),
+    })])
+}
+
+#[test]
+fn long_rows_are_redone_with_their_xmax_and_twice_alike() {
+    let dir = TempDir::created("recover-long-rows");
+    let (kept, replaced) = {
+        let storage = open(&dir);
+        let head = alloc::allocate(&storage).expect("allocate the head page");
+        drop(HeapTable::create(&storage, TABLE, head, text_shape()).expect("create"));
+        install_single_heap(&storage, TABLE, head, text_shape()).expect("install");
+        let mut table = HeapTable::open(&storage, TABLE, head, text_shape());
+        let kept = table.insert(TxnId(4), &long_row('a')).expect("insert");
+        let replaced = table.insert(TxnId(4), &long_row('b')).expect("insert");
+        table.commit(TxnId(4)).expect("commit");
+        // The two rows reach `data`; the update and the delete that follow do not.
+        storage.checkpoint().expect("checkpoint");
+        table
+            .update(TxnId(5), replaced, &long_row('c'))
+            .expect("update");
+        table.delete(TxnId(5), kept).expect("delete");
+        table.commit(TxnId(5)).expect("commit");
+        (kept, replaced)
+    };
+
+    for _ in 0..2 {
+        let storage = open(&dir);
+        let recovery = storage.recovery().clone();
+        assert_eq!((recovery.applied, recovery.skipped), (2, 2));
+        let head = recovery.heap_of(TABLE).expect("heap of the table");
+        let mut table = HeapTable::open(&storage, TABLE, head, text_shape());
+        table
+            .resume_after_recovery(
+                recovery.next_row_id,
+                recovery.next_seq,
+                &recovery.winners,
+                &recovery.losers,
+            )
+            .expect("resume");
+        assert_eq!(
+            table.scan(&snap(9, 100)).expect("scan"),
+            vec![(replaced, long_row('c'))]
+        );
+        let versions = table.versions(None).expect("versions");
+        assert_eq!(
+            versions.iter().map(|v| (v.row, v.xmax)).collect::<Vec<_>>(),
+            vec![
+                (kept, Some(TxnId(5))),
+                (replaced, Some(TxnId(5))),
+                (replaced, None)
+            ]
+        );
+        // Dropped without a checkpoint: the second pass redoes the same records.
+    }
+}
+
+/// A row of `len` copies of `c`.
+fn text_row(c: char, len: usize) -> Row {
+    Row(vec![Value::String(vauban_types::SqlString {
+        text: c.to_string().repeat(len),
+    })])
+}
+
+#[test]
+fn a_put_on_a_page_older_than_a_vacuum_takes_the_room_its_purges_give_back() {
+    let dir = TempDir::created("recover-put-relocated");
+    let (head, survivors, fresh) = {
+        let storage = open(&dir);
+        let head = alloc::allocate(&storage).expect("allocate the head page");
+        drop(HeapTable::create(&storage, TABLE, head, text_shape()).expect("create"));
+        install_single_heap(&storage, TABLE, head, text_shape()).expect("install");
+        let mut table = HeapTable::open(&storage, TABLE, head, text_shape());
+        let ids: Vec<RowId> = (0..50)
+            .map(|_| table.insert(TxnId(4), &text_row('a', 100)).expect("insert"))
+            .collect();
+        table.commit(TxnId(4)).expect("commit");
+        // The full page reaches `data`; the deletes, the vacuum and the inserts that reuse
+        // the room it freed stay in the pool.
+        storage.checkpoint().expect("checkpoint");
+        for id in ids.iter().step_by(2) {
+            table.delete(TxnId(5), *id).expect("delete");
+        }
+        table.commit(TxnId(5)).expect("commit");
+        assert_eq!(table.vacuum(TxnId(10)).expect("vacuum").len(), 25);
+        let fresh: Vec<RowId> = (0..8)
+            .map(|_| table.insert(TxnId(6), &text_row('b', 300)).expect("insert"))
+            .collect();
+        table.commit(TxnId(6)).expect("commit");
+        let pages: BTreeSet<PageId> = Heap::open(&storage, TABLE, head)
+            .scan()
+            .expect("scan")
+            .into_iter()
+            .map(|rid| rid.page)
+            .collect();
+        assert_eq!(
+            pages,
+            BTreeSet::from([head]),
+            "the inserts reused the head page"
+        );
+        let survivors: Vec<RowId> = ids.iter().skip(1).step_by(2).copied().collect();
+        (head, survivors, fresh)
+    };
+
+    for _ in 0..2 {
+        let storage = open(&dir);
+        let recovery = storage.recovery().clone();
+        let mut table = HeapTable::open(&storage, TABLE, head, text_shape());
+        table
+            .resume_after_recovery(
+                recovery.next_row_id,
+                recovery.next_seq,
+                &recovery.winners,
+                &recovery.losers,
+            )
+            .expect("resume");
+        let rows = table.scan(&snap(9, 100)).expect("scan");
+        let mut expected: Vec<(RowId, Row)> = survivors
+            .iter()
+            .map(|id| (*id, text_row('a', 100)))
+            .chain(fresh.iter().map(|id| (*id, text_row('b', 300))))
+            .collect();
+        expected.sort_by_key(|(id, _)| *id);
+        assert_eq!(rows, expected);
+        // The page on `data` still holds the deleted versions; the purges of the journal take
+        // them out before the inserts that reused their room are replayed at their slots.
+        assert!(storage.recovery().released >= 25);
+        assert_eq!(record_pages(&storage, head), BTreeSet::from([head]));
+        // Dropped without a checkpoint: the second pass starts again from the same `data`.
+    }
+}
+
+/// The heap pages of [`TABLE`] that hold a record.
+fn record_pages(storage: &DiskStorage, head: PageId) -> BTreeSet<PageId> {
+    Heap::open(storage, TABLE, head)
+        .scan()
+        .expect("scan the heap")
+        .into_iter()
+        .map(|rid| rid.page)
+        .collect()
+}
+
+/// Checks that the heap holds each version `(RowId, seq)` once.
+fn assert_each_version_once(storage: &DiskStorage, head: PageId, at: &str) {
+    let heap = Heap::open(storage, TABLE, head);
+    let mut seen: BTreeMap<(RowId, u64), Rid> = BTreeMap::new();
+    for rid in heap.scan().expect("scan") {
+        let bytes = heap.get(rid).expect("get").expect("a record");
+        let header = VersionHeader::read_from(&bytes).expect("prefix");
+        if let Some(first) = seen.insert((header.row, header.seq), rid) {
+            panic!(
+                "{at}: version {} of row {} at {first} and at {rid}",
+                header.seq, header.row
+            );
+        }
+    }
+}
+
+/// The table of an instance reopened over `head`, resumed from its recovery.
+fn resumed_text(storage: &DiskStorage, head: PageId) -> HeapTable<'_> {
+    let recovery = storage.recovery().clone();
+    let mut table = HeapTable::open(storage, TABLE, head, text_shape());
+    table
+        .resume_after_recovery(
+            recovery.next_row_id,
+            recovery.next_seq,
+            &recovery.winners,
+            &recovery.losers,
+        )
+        .expect("resume");
+    table
+}
+
+/// A heap of two pages on `data`, then deletes, a vacuum and inserts that reuse the room of
+/// the head page and fill the second one, all left in the pool; `delete_one` adds a committed
+/// delete of one of the rows the head page took back. Answers the head page and the rows a
+/// reader sees.
+fn vacuum_then_reuse(dir: &TempDir, delete_one: bool) -> (PageId, Vec<(RowId, Row)>) {
+    let storage = open(dir);
+    let head = alloc::allocate(&storage).expect("allocate the head page");
+    drop(HeapTable::create(&storage, TABLE, head, text_shape()).expect("create"));
+    install_single_heap(&storage, TABLE, head, text_shape()).expect("install");
+    let mut table = HeapTable::open(&storage, TABLE, head, text_shape());
+    let mut ids = Vec::new();
+    while record_pages(&storage, head).len() < 2 {
+        ids.push(table.insert(TxnId(4), &text_row('a', 100)).expect("insert"));
+    }
+    let on_head: Vec<RowId> = ids[..ids.len() - 1].to_vec();
+    for _ in 0..3 {
+        ids.push(table.insert(TxnId(4), &text_row('a', 100)).expect("insert"));
+    }
+    table.commit(TxnId(4)).expect("commit");
+    storage.checkpoint().expect("checkpoint");
+    let mut expected: BTreeMap<RowId, Row> =
+        ids.iter().map(|id| (*id, text_row('a', 100))).collect();
+    for id in on_head.iter().step_by(2) {
+        table.delete(TxnId(5), *id).expect("delete");
+        expected.remove(id);
+    }
+    table.commit(TxnId(5)).expect("commit");
+    table.vacuum(TxnId(10)).expect("vacuum");
+    let mut reused = Vec::new();
+    for _ in 0..8 {
+        let id = table.insert(TxnId(6), &text_row('b', 300)).expect("insert");
+        expected.insert(id, text_row('b', 300));
+        reused.push(id);
+    }
+    for _ in 0..20 {
+        let id = table.insert(TxnId(6), &text_row('c', 100)).expect("insert");
+        expected.insert(id, text_row('c', 100));
+    }
+    table.commit(TxnId(6)).expect("commit");
+    if delete_one {
+        let id = reused[reused.len() - 1];
+        table.delete(TxnId(7), id).expect("delete");
+        table.commit(TxnId(7)).expect("commit");
+        expected.remove(&id);
+    }
+    let expected: Vec<(RowId, Row)> = expected.into_iter().collect();
+    assert_eq!(table.scan(&snap(9, 100)).expect("scan"), expected);
+    (head, expected)
+}
+
+/// Reopens `dir` twice without a checkpoint and checks the rows and the addresses each time.
+fn reopen_twice(dir: &TempDir, head: PageId, expected: &[(RowId, Row)]) {
+    for pass in 0..2 {
+        let storage = open(dir);
+        assert_each_version_once(&storage, head, &format!("pass {pass}"));
+        let rows = resumed_text(&storage, head)
+            .scan(&snap(9, 100))
+            .expect("scan");
+        assert_eq!(rows, expected, "pass {pass}");
+    }
+}
+
+#[test]
+fn a_version_in_room_a_vacuum_gave_back_survives_the_later_puts_on_its_page() {
+    let dir = TempDir::created("recover-relocated-later-put");
+    let (head, expected) = vacuum_then_reuse(&dir, false);
+    reopen_twice(&dir, head, &expected);
+}
+
+#[test]
+fn a_version_in_room_a_vacuum_gave_back_deleted_later_is_hidden_after_the_redo() {
+    let dir = TempDir::created("recover-relocated-deleted");
+    let (head, expected) = vacuum_then_reuse(&dir, true);
+    reopen_twice(&dir, head, &expected);
+}
+
+/// A generator of numbers for the crash test, the same sequence for the same seed.
+struct Lcg(u64);
+
+impl Lcg {
+    /// A number below `bound`.
+    fn below(&mut self, bound: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) % bound
+    }
+}
+
+/// Copies the files of the instance in `from` to a fresh directory: what `data`, the journal
+/// and `vauban.ctl` hold at that point, the pool left out.
+fn crash_image(from: &TempDir, label: &str) -> TempDir {
+    let image = TempDir::created(label);
+    for entry in std::fs::read_dir(from.path()).expect("list the instance") {
+        let entry = entry.expect("an entry");
+        std::fs::copy(entry.path(), image.path().join(entry.file_name())).expect("copy a file");
+    }
+    image
+}
+
+/// Opens `image` twice and checks that each recovery serves `committed`, each version once.
+///
+/// With `life`, the instance then lives again over the image: rows of 100 to 800 bytes are
+/// inserted and committed, one committed row is deleted, a transaction of inserts and an update
+/// is rolled back, a vacuum runs, more rows are inserted and committed, some pages reach
+/// `data`, and the process goes away without a checkpoint; two more recoveries then serve the
+/// rows of both lives, each version once.
+fn check_image(
+    image: &TempDir,
+    head: PageId,
+    committed: &BTreeMap<RowId, Row>,
+    at: &str,
+    life: Option<u64>,
+) {
+    let mut committed = committed.clone();
+    let check = |committed: &BTreeMap<RowId, Row>, when: &str| {
+        let expected: Vec<(RowId, Row)> = committed
+            .iter()
+            .map(|(id, row)| (*id, row.clone()))
+            .collect();
+        for pass in 0..2 {
+            let storage = open(image);
+            assert_each_version_once(&storage, head, &format!("{at}, {when}, pass {pass}"));
+            let rows = resumed_text(&storage, head)
+                .scan(&snap(999_999, 1_000_000))
+                .expect("scan");
+            assert_eq!(rows, expected, "{at}, {when}, pass {pass}");
+        }
+    };
+    check(&committed, "first life");
+    let Some(seed) = life else {
+        return;
+    };
+    {
+        let storage = open(image);
+        let mut table = resumed_text(&storage, head);
+        let mut rng = Lcg(seed);
+        let txn = TxnId(900_000);
+        for _ in 0..12 {
+            let value = text_row('z', 100 + rng.below(700) as usize);
+            let id = table.insert(txn, &value).expect("insert after the redo");
+            committed.insert(id, value);
+        }
+        if let Some(&id) = committed.keys().next() {
+            table.delete(txn, id).expect("delete after the redo");
+            committed.remove(&id);
+        }
+        table.commit(txn).expect("commit after the redo");
+        // A rolled-back transaction, a vacuum, then inserts that take the room both gave back.
+        let loser = TxnId(900_001);
+        for _ in 0..3 {
+            let value = text_row('y', 300 + rng.below(500) as usize);
+            table.insert(loser, &value).expect("insert to roll back");
+        }
+        if let Some(&id) = committed.keys().last() {
+            table
+                .update(loser, id, &text_row('y', 700))
+                .expect("update to roll back");
+        }
+        table.rollback(loser).expect("rollback after the redo");
+        table.vacuum(TxnId(900_002)).expect("vacuum after the redo");
+        let txn = TxnId(900_003);
+        for _ in 0..4 {
+            let value = text_row('x', 100 + rng.below(700) as usize);
+            let id = table.insert(txn, &value).expect("insert after the vacuum");
+            committed.insert(id, value);
+        }
+        table.commit(txn).expect("commit after the vacuum");
+        for page in record_pages(&storage, head) {
+            if rng.below(2) == 0 {
+                storage
+                    .pool
+                    .flush(page)
+                    .expect("flush a page after the redo");
+            }
+        }
+    }
+    check(&committed, "second life");
+}
+
+/// What one step of [`crash_at_each_write`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Insert(usize),
+    Update,
+    Delete,
+    Commit,
+    Rollback,
+}
+
+/// Runs a seeded sequence of inserts, updates, deletes, commits, rollbacks and vacuums, with a
+/// crash image after each write of the journal and after each write of a page, and checks
+/// each image twice. Answers the number of images.
+///
+/// The sequence goes by phases of 30 steps: inserts of rows of 100 to 300 bytes, then deletes
+/// and updates, then inserts of rows of 300 to 800 bytes. Between two phases the open
+/// transaction commits, a vacuum runs, and with `checkpoints` a checkpoint writes the pool
+/// before the deletes, so that `data` holds pages older than the vacuum whose room the large
+/// rows take back. One page of the heap is written after a step one time in three. With
+/// `lives`, one image in five also lives again after its first recovery ([`check_image`]).
+fn crash_at_each_write(seed: u64, checkpoints: bool, lives: bool) -> usize {
+    let dir = TempDir::created(&format!("recover-crash-{seed}-{checkpoints}-{lives}"));
+    let storage = open(&dir);
+    let head = alloc::allocate(&storage).expect("allocate the head page");
+    drop(HeapTable::create(&storage, TABLE, head, text_shape()).expect("create"));
+    install_single_heap(&storage, TABLE, head, text_shape()).expect("install");
+    let mut table = HeapTable::open(&storage, TABLE, head, text_shape());
+    let mut rng = Lcg(seed);
+    let mut committed: BTreeMap<RowId, Row> = BTreeMap::new();
+    let mut pending: Option<(TxnId, BTreeMap<RowId, Option<Row>>)> = None;
+    let mut next_txn = 10u64;
+    let mut images = 0usize;
+    let mut flushed = 0usize;
+    let label = format!("recover-crash-image-{seed}-{checkpoints}-{lives}");
+    for step in 0..180usize {
+        let phase = (step / 30) % 3;
+        if step % 30 == 0 && step > 0 {
+            if let Some((txn, changes)) = pending.take() {
+                table.commit(txn).expect("commit");
+                apply_changes(&mut committed, changes);
+            }
+            next_txn += 1;
+            table.vacuum(TxnId(next_txn)).expect("vacuum");
+            if checkpoints && phase == 1 {
+                storage.checkpoint().expect("checkpoint");
+            }
+        }
+        let roll = rng.below(20);
+        let chosen = match phase {
+            0 => match roll {
+                0..=16 => Step::Insert(100 + rng.below(200) as usize),
+                17..=18 => Step::Commit,
+                _ => Step::Rollback,
+            },
+            1 => match roll {
+                0..=9 => Step::Delete,
+                10..=13 => Step::Update,
+                14..=17 => Step::Commit,
+                18 => Step::Rollback,
+                _ => Step::Insert(100),
+            },
+            _ => match roll {
+                0..=15 => Step::Insert(300 + rng.below(500) as usize),
+                16..=18 => Step::Commit,
+                _ => Step::Rollback,
+            },
+        };
+        let (txn, changes) = pending.get_or_insert_with(|| {
+            next_txn += 1;
+            (TxnId(next_txn), BTreeMap::new())
+        });
+        let txn = *txn;
+        let visible: Vec<RowId> = committed
+            .keys()
+            .chain(changes.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|id| changes.get(id).is_none_or(Option::is_some))
+            .collect();
+        let letter = char::from(b'a' + rng.below(26) as u8);
+        let picked =
+            (!visible.is_empty()).then(|| visible[rng.below(visible.len() as u64) as usize]);
+        match (chosen, picked) {
+            (Step::Insert(len), _) => {
+                let value = text_row(letter, len);
+                let id = table.insert(txn, &value).expect("insert");
+                changes.insert(id, Some(value));
+            }
+            (Step::Update, Some(id)) => {
+                let value = text_row(letter, 100 + rng.below(200) as usize);
+                table.update(txn, id, &value).expect("update");
+                changes.insert(id, Some(value));
+            }
+            (Step::Delete, Some(id)) => {
+                table.delete(txn, id).expect("delete");
+                changes.insert(id, None);
+            }
+            (Step::Commit, _) => {
+                table.commit(txn).expect("commit");
+                if let Some((_, changes)) = pending.take() {
+                    apply_changes(&mut committed, changes);
+                }
+            }
+            (Step::Rollback, _) => {
+                table.rollback(txn).expect("rollback");
+                pending = None;
+            }
+            _ => continue,
+        }
+        let image = crash_image(&dir, &label);
+        let life = (lives && step % 5 == 0).then_some(seed * 1_000 + step as u64);
+        check_image(
+            &image,
+            head,
+            &committed,
+            &format!("seed {seed}, after step {step}"),
+            life,
+        );
+        images += 1;
+        if rng.below(3) != 0 {
+            continue;
+        }
+        // One page of the heap goes to `data`, when the pool may write it.
+        let pages: Vec<PageId> = Heap::open(&storage, TABLE, head)
+            .redo_chain()
+            .expect("chain");
+        let page = pages[rng.below(pages.len() as u64) as usize];
+        if storage.pool.flush(page).is_ok() {
+            flushed += 1;
+            let image = crash_image(&dir, &label);
+            check_image(
+                &image,
+                head,
+                &committed,
+                &format!("seed {seed}, page {page} written after step {step}"),
+                None,
+            );
+            images += 1;
+        }
+    }
+    assert!(flushed > 0, "seed {seed}: no page was written");
+    images
+}
+
+/// Folds the changes of a committed transaction into the rows a reader sees.
+fn apply_changes(committed: &mut BTreeMap<RowId, Row>, changes: BTreeMap<RowId, Option<Row>>) {
+    for (id, change) in changes {
+        match change {
+            Some(row) => committed.insert(id, row),
+            None => committed.remove(&id),
+        };
+    }
+}
+
+#[test]
+fn a_crash_at_each_write_of_the_journal_or_of_a_page_recovers_the_committed_rows() {
+    let mut images = 0;
+    for seed in 1..=3 {
+        images += crash_at_each_write(seed, false, false);
+        images += crash_at_each_write(seed, true, false);
+    }
+    assert!(images > 6 * 150, "{images} crash images");
+}
+
+#[test]
+fn a_life_after_a_redo_over_room_a_vacuum_gave_back_recovers_each_version_once() {
+    let dir = TempDir::created("recover-zz-second-life");
+    let (head, expected) = vacuum_then_reuse(&dir, false);
+    let mut expected: BTreeMap<RowId, Row> = expected.into_iter().collect();
+    {
+        // The pages but the head reach `data` after the first redo, and the life after it
+        // writes on them; the head page on `data` is still the one older than the vacuum.
+        let storage = open(&dir);
+        let mut table = resumed_text(&storage, head);
+        let got: BTreeMap<RowId, Row> = table
+            .scan(&snap(9, 100))
+            .expect("scan")
+            .into_iter()
+            .collect();
+        assert_eq!(got, expected, "after the first recovery");
+        for page in record_pages(&storage, head) {
+            if page != head {
+                storage.pool.flush(page).expect("flush one page");
+            }
+        }
+        for _ in 0..150 {
+            let id = table
+                .insert(TxnId(500), &text_row('d', 100))
+                .expect("insert");
+            expected.insert(id, text_row('d', 100));
+        }
+        table.commit(TxnId(500)).expect("commit");
+    }
+    let expected: Vec<(RowId, Row)> = expected.into_iter().collect();
+    for pass in 0..2 {
+        let storage = open(&dir);
+        assert_each_version_once(&storage, head, &format!("pass {pass}"));
+        let rows = resumed_text(&storage, head)
+            .scan(&snap(999, 1000))
+            .expect("scan");
+        assert_eq!(rows, expected, "pass {pass}");
+    }
+}
+
+#[test]
+fn a_crash_after_a_second_life_over_each_image_recovers_the_committed_rows() {
+    for seed in 1..=3 {
+        crash_at_each_write(seed, false, true);
+        crash_at_each_write(seed, true, true);
+    }
+}
+
+#[test]
+fn a_put_without_room_at_its_slot_is_corruption() {
+    let dir = TempDir::created("recover-put-without-room");
+    {
+        let storage = open(&dir);
+        let head = alloc::allocate(&storage).expect("allocate the head page");
+        drop(HeapTable::create(&storage, TABLE, head, text_shape()).expect("create"));
+        install_single_heap(&storage, TABLE, head, text_shape()).expect("install");
+        let mut table = HeapTable::open(&storage, TABLE, head, text_shape());
+        while record_pages(&storage, head).len() < 2 {
+            table
+                .insert(TxnId(4), &text_row('a', 1000))
+                .expect("insert");
+        }
+        table.commit(TxnId(4)).expect("commit");
+        storage.checkpoint().expect("checkpoint");
+        // A committed insert whose record names the full head page.
+        let mut columns = Vec::new();
+        super::super::encode::encode_row(&text_row('b', 3000), &mut columns);
+        let payload = RowChange {
+            table: TABLE,
+            header: VersionHeader {
+                row: RowId(500),
+                xmin: TxnId(9),
+                xmax: None,
+                seq: 500,
+            },
+            columns,
+        }
+        .encode_with(&[PageOp::Put {
+            rid: Rid {
+                page: head,
+                slot: 40,
+            },
+        }]);
+        storage
+            .wal
+            .append(WalRecordKind::Insert, TxnId(9), &payload)
+            .expect("append the insert");
+        storage
+            .wal
+            .append_durable(WalRecordKind::Commit, TxnId(9), &[])
+            .expect("append the commit");
+    }
+    for _ in 0..2 {
+        match DiskStorage::open(dir.path(), DiskOptions::default()) {
+            Err(InternalError::Corruption(message)) => {
+                assert!(message.contains("has no room"), "{message}");
+            }
+            other => panic!("expected a corruption, got {other:?}"),
+        }
+    }
+}
+
+// --- Records that free a heap slot ---------------------------------------------------
 
 /// A row holding `len` times `fill`.
 fn text(len: usize, fill: char) -> Row {
@@ -553,7 +1408,7 @@ fn install_text(storage: &DiskStorage) -> PageId {
 }
 
 /// The table of rows of [`text_shape`] of a reopened instance, resumed from the recovery.
-fn resumed_text(storage: &DiskStorage) -> HeapTable<'_> {
+fn resumed_text_from_recovery(storage: &DiskStorage) -> HeapTable<'_> {
     let recovery = storage.recovery();
     let head = recovery.heap_of(TABLE).expect("the journal names the heap");
     let mut table = HeapTable::open(storage, TABLE, head, text_shape());
@@ -589,7 +1444,9 @@ fn placed_from(storage: &DiskStorage, head: PageId) -> Vec<(Rid, VersionHeader)>
 
 /// What a settled snapshot reads in the table of rows of [`text_shape`].
 fn settled_text(storage: &DiskStorage) -> Vec<(RowId, Row)> {
-    resumed_text(storage).scan(&snap(99, 100)).expect("scan")
+    resumed_text_from_recovery(storage)
+        .scan(&snap(99, 100))
+        .expect("scan")
 }
 
 #[test]
@@ -685,7 +1542,7 @@ fn a_rollback_then_a_second_life_then_a_crash_recovers_the_committed_rows() {
         // a crash.
         let storage = open(&dir);
         assert_eq!(storage.recovery().released, 2);
-        let mut table = resumed_text(&storage);
+        let mut table = resumed_text_from_recovery(&storage);
         let large = text(1900, 'z');
         expected.push((table.insert(TxnId(8), &large).expect("insert"), large));
         table.commit(TxnId(8)).expect("commit 8");
