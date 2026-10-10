@@ -636,3 +636,122 @@ fn case_insensitive_key_matches_under_the_default_collation() {
         ]
     );
 }
+
+/// `VALUES` of `(k, v)` rows, `k` of type `ty`, `v` an `int`.
+fn keyed_values(ty: &TypeInfo, rows: &[(Value, i32)]) -> PhysicalPlan {
+    let literal = |value: Value, ty: &TypeInfo| BoundExpr {
+        kind: BoundExprKind::Literal(value),
+        ty: ty.clone(),
+        line: 1,
+    };
+    PhysicalPlan::Values {
+        rows: rows
+            .iter()
+            .map(|(k, v)| vec![literal(k.clone(), ty), literal(Value::I32(*v), &int())])
+            .collect(),
+        schema: OutputSchema {
+            columns: vec![
+                OutputColumn {
+                    name: "k".to_owned(),
+                    ty: ty.clone(),
+                },
+                OutputColumn {
+                    name: "v".to_owned(),
+                    ty: int(),
+                },
+            ],
+        },
+    }
+}
+
+/// The payloads `(probe v, build v)` of an inner hash join on `k` of type `ty`.
+fn joined_payloads(
+    ty: &TypeInfo,
+    build: &[(Value, i32)],
+    probe: &[(Value, i32)],
+) -> Vec<(i32, i32)> {
+    let key = |index: usize| BoundExpr {
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            ty: ty.clone(),
+            ..binding(index)
+        }),
+        ty: ty.clone(),
+        line: 1,
+    };
+    // The probe row comes first in the joined row: its key is column 0, the build key
+    // column 2.
+    let plan = hash_join_plan(
+        keyed_values(ty, build),
+        keyed_values(ty, probe),
+        PhysicalJoinKind::Inner,
+        vec![(key(0), key(2))],
+        None,
+    );
+    let eval = StaticContext::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default());
+    let mut sink = CollectSink::new();
+    execute(&PhysicalStatement::Query(plan), &mut ctx, &mut sink).expect("the plan runs");
+    let mut payloads: Vec<(i32, i32)> = sink
+        .rows
+        .iter()
+        .map(|row| match (&row[1], &row[3]) {
+            (Value::I32(p), Value::I32(b)) => (*p, *b),
+            other => panic!("two int payloads, got {other:?}"),
+        })
+        .collect();
+    payloads.sort_unstable();
+    payloads
+}
+
+/// Under a case-insensitive collation `'x'` matches `'X'` and `'y'` matches `'Y '`; under
+/// a case-sensitive one, neither does.
+#[test]
+fn string_keys_match_under_the_collation_of_the_build_key() {
+    let text = |t: &str| Value::String(vauban_types::SqlString { text: t.to_owned() });
+    let build = [(text("x"), 1), (text("y"), 2)];
+    let probe = [(text("X"), 10), (text("Y "), 20), (text("z"), 30)];
+    for (collation, expected) in [
+        ("SQL_Latin1_General_CP1_CI_AS", vec![(10, 1), (20, 2)]),
+        ("Latin1_General_CS_AS", vec![]),
+    ] {
+        let mut ty = varchar();
+        ty.collation = Some(vauban_types::Collation::parse(collation).expect("known"));
+        assert_eq!(
+            joined_payloads(&ty, &build, &probe),
+            expected,
+            "{collation}"
+        );
+    }
+}
+
+/// `1.0` matches `1.00`, and `-0.0` matches `0.0`.
+#[test]
+fn numeric_keys_match_whatever_their_scale_or_sign_of_zero() {
+    let decimal = |mantissa, scale| {
+        Value::Decimal(vauban_types::Decimal {
+            mantissa,
+            precision: 6,
+            scale,
+        })
+    };
+    let dec = TypeInfo::new(
+        SqlType::Decimal {
+            precision: 6,
+            scale: 2,
+        },
+        true,
+    );
+    assert_eq!(
+        joined_payloads(
+            &dec,
+            &[(decimal(10, 1), 1), (decimal(11, 1), 2)],
+            &[(decimal(100, 2), 10), (decimal(120, 2), 20)]
+        ),
+        vec![(10, 1)]
+    );
+    let float = TypeInfo::new(SqlType::Float, true);
+    assert_eq!(
+        joined_payloads(&float, &[(Value::F64(0.0), 1)], &[(Value::F64(-0.0), 10)]),
+        vec![(10, 1)]
+    );
+}

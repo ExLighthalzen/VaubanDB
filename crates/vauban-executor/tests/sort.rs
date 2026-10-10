@@ -496,3 +496,41 @@ fn cancel_stops_the_materialisation() {
         .expect("a cancellation is not an error");
     assert!(matches!(outcome, ExecOutcome::Cancelled), "{outcome:?}");
 }
+
+/// `VALUES (v)` of one column of type `ty`.
+fn typed_values(ty: &TypeInfo, vals: &[Value]) -> PhysicalPlan {
+    let rows: Vec<Vec<BoundExpr>> = vals
+        .iter()
+        .map(|v| {
+            vec![BoundExpr {
+                kind: BoundExprKind::Literal(v.clone()),
+                ty: ty.clone(),
+                line: 1,
+            }]
+        })
+        .collect();
+    PhysicalPlan::Values {
+        rows,
+        schema: schema_of(&["v"], std::slice::from_ref(ty)),
+    }
+}
+
+/// `SELECT DISTINCT c` over `'x'`, `'X'`, `'y'`: two rows under a case-insensitive
+/// collation, the first row of each value kept; three under a case-sensitive one.
+#[test]
+fn distinct_keeps_one_row_per_value_under_the_collation() {
+    let text = |t: &str| Value::String(SqlString { text: t.to_owned() });
+    for (collation, expected) in [
+        ("SQL_Latin1_General_CP1_CI_AS", vec!["x", "y"]),
+        ("Latin1_General_CS_AS", vec!["x", "X", "y"]),
+    ] {
+        let mut ty = TypeInfo::new(SqlType::VarChar(vauban_types::Len::Fixed(10)), true);
+        ty.collation = Some(vauban_types::Collation::parse(collation).expect("known"));
+        let plan = PhysicalPlan::Distinct(Box::new(typed_values(
+            &ty,
+            &[text("x"), text("X"), text("y")],
+        )));
+        let expected: Vec<Row> = expected.into_iter().map(|t| vec![text(t)]).collect();
+        assert_eq!(collect(&plan), expected, "{collation}");
+    }
+}

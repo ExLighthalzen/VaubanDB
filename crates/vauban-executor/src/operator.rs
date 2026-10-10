@@ -1,5 +1,6 @@
 //! The `Operator` trait, the dispatch that builds one operator per node of the physical
-//! plan, and the two helpers the hashing operators share.
+//! plan, the hash table the hashing operators share (`hash_table`), and two public
+//! helpers on the equality of keys ([`bucket_hash`], [`keys_equal`]).
 //!
 //! # Volcano
 //!
@@ -36,6 +37,8 @@ use vauban_types::{Collation, TypeInfo, Value, compare};
 use crate::context::ExecContext;
 use crate::ops;
 use crate::row::Row;
+
+pub(crate) mod hash_table;
 
 /// One node of a running plan: opened once, pulled row by row, closed once.
 ///
@@ -110,7 +113,8 @@ pub fn build_operator<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a>
 }
 
 /// A coarse hash of a value, invariant under the collation: two values that
-/// [`keys_equal`] finds equal hash the same, and the hash decides the bucket alone.
+/// [`keys_equal`] finds equal hash the same. The operators of this crate key their rows
+/// with `hash_table::KeyEncoder` instead, which reads the collation of the column.
 ///
 /// The hash reads the family of the value and, inside a family, what the comparison of
 /// `types::compare` reads too, coarsened where that comparison ignores something:

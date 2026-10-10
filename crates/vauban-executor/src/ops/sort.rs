@@ -6,6 +6,14 @@
 //! The sort is **stable** (`slice::sort_by`): rows of equal sort key keep their input
 //! order. This is an implementation choice, not a property of SQL Server, which does not
 //! guarantee the order of rows whose keys are equal.
+//!
+//! # Distinct
+//!
+//! `Distinct` keys each row on its visible columns, under the collation of each column,
+//! in the shared `operator::hash_table`: two `NULL`s are one value, `'x'` and `'X'` are one
+//! value under a case-insensitive collation, and the first row of each value is the one
+//! kept (`tests/sort.rs`, `distinct_keeps_one_row_per_value_under_the_collation`). The row
+//! identifiers a row carries after its visible columns are kept and not keyed.
 
 use std::collections::VecDeque;
 
@@ -16,7 +24,8 @@ use vauban_types::{Collation, Value, compare};
 
 use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
 use crate::expr::eval_expr;
-use crate::operator::{Operator, bucket_hash, build_operator, keys_equal};
+use crate::operator::hash_table::{KeyEncoder, KeySet};
+use crate::operator::{Operator, build_operator};
 use crate::plan::{RowBudget, eval_budget};
 use crate::row::Row;
 
@@ -266,21 +275,15 @@ impl<'a> Operator<'a> for Distinct<'a> {
         self.input.open(ctx)?;
         self.input_open = true;
 
-        let schema = self.input.schema();
-        let types: Vec<_> = schema.columns.iter().map(|c| c.ty.clone()).collect();
-        let mut seen_buckets: Vec<Vec<Row>> = Vec::new();
+        let columns = &self.input.schema().columns;
+        let width = columns.len();
+        let mut encoder = KeyEncoder::new(columns.iter().map(|column| &column.ty));
+        let mut seen = KeySet::new();
         let mut rows: Vec<Row> = Vec::new();
 
         while let Some(row) = self.input.next(ctx)? {
-            let hash = row_hash(&row, &types);
-            let bucket_idx = (hash as usize) % 1024;
-            if bucket_idx >= seen_buckets.len() {
-                seen_buckets.resize(bucket_idx + 1, Vec::new());
-            }
-            let bucket = &seen_buckets[bucket_idx];
-            let is_dup = bucket.iter().any(|seen| rows_equal(seen, &row, &types));
-            if !is_dup {
-                seen_buckets[bucket_idx].push(row.clone());
+            let key = encoder.encode(&row[..width.min(row.len())])?;
+            if seen.insert(key) {
                 rows.push(row);
             }
 
@@ -395,33 +398,6 @@ fn equal_key_values(a: &[Value], b: &[Value], collations: &[Collation]) -> bool 
         }
     }
     true
-}
-
-/// Whether two rows are equal on each column, using [`keys_equal`].
-///
-/// For `DISTINCT`, two `NULL` values are equal, which differs from [`keys_equal`]
-/// (`NULL ≠ NULL` in comparison semantics).
-fn rows_equal(a: &Row, b: &Row, types: &[vauban_types::TypeInfo]) -> bool {
-    for (i, ty) in types.iter().enumerate() {
-        let Some(va) = a.get(i) else { return false };
-        let Some(vb) = b.get(i) else { return false };
-        if matches!(va, Value::Null) && matches!(vb, Value::Null) {
-            continue;
-        }
-        if !keys_equal(va, vb, ty).unwrap_or(false) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Computes a hash of the row for bucketing in Distinct, using [`bucket_hash`].
-fn row_hash(row: &Row, _types: &[vauban_types::TypeInfo]) -> u64 {
-    let mut h: u64 = 0;
-    for val in row.iter() {
-        h = h.wrapping_mul(31).wrapping_add(bucket_hash(val));
-    }
-    h
 }
 
 // -----------------------------------------------------------------------

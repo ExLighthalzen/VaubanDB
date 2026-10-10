@@ -304,3 +304,97 @@ fn setops_over_table_scans() {
     sort_rows(&mut intersect_rows);
     assert_eq!(intersect_rows, vec![vec![Value::I32(2)]]);
 }
+
+// -----------------------------------------------------------------------
+// Keys under the type of the column
+// -----------------------------------------------------------------------
+
+fn typed_values(ty: &TypeInfo, vals: &[Value]) -> PhysicalPlan {
+    let rows: Vec<Vec<BoundExpr>> = vals
+        .iter()
+        .map(|v| {
+            vec![BoundExpr {
+                kind: BoundExprKind::Literal(v.clone()),
+                ty: ty.clone(),
+                line: 1,
+            }]
+        })
+        .collect();
+    PhysicalPlan::Values {
+        rows,
+        schema: typed_schema(ty),
+    }
+}
+
+fn typed_schema(ty: &TypeInfo) -> OutputSchema {
+    OutputSchema {
+        columns: vec![OutputColumn {
+            name: "v".to_owned(),
+            ty: ty.clone(),
+        }],
+    }
+}
+
+fn decimal(mantissa: i128, precision: u8, scale: u8) -> Value {
+    Value::Decimal(vauban_types::Decimal {
+        mantissa,
+        precision,
+        scale,
+    })
+}
+
+/// `1.0 INTERSECT 1.00` is one row, `1.0 EXCEPT 1.00` none: the key of a decimal is its
+/// value, its scale left out.
+#[test]
+fn intersect_finds_equal_decimals_of_different_scales() {
+    let ty = TypeInfo::new(
+        SqlType::Decimal {
+            precision: 6,
+            scale: 2,
+        },
+        true,
+    );
+    let left = || typed_values(&ty, &[decimal(10, 5, 1)]);
+    let right = || typed_values(&ty, &[decimal(100, 6, 2)]);
+    let schema = typed_schema(&ty);
+    let intersect = PhysicalPlan::Intersect {
+        inputs: vec![left(), right()],
+        all: false,
+        schema: schema.clone(),
+    };
+    assert_eq!(collect_scalar(&intersect), vec![vec![decimal(10, 5, 1)]]);
+    let except = PhysicalPlan::Except {
+        inputs: vec![left(), right()],
+        all: false,
+        schema,
+    };
+    assert!(collect_scalar(&except).is_empty());
+}
+
+/// `'x' INTERSECT 'X'` under a case-insensitive collation is one row, and `'x', 'X'
+/// EXCEPT 'y'` is one row: the left rows `'x'` and `'X'` are one value.
+#[test]
+fn set_operators_compare_strings_under_the_collation_of_the_column() {
+    let text = |t: &str| Value::String(vauban_types::SqlString { text: t.to_owned() });
+    let mut ty = TypeInfo::new(SqlType::VarChar(vauban_types::Len::Fixed(10)), true);
+    ty.collation =
+        Some(vauban_types::Collation::parse("SQL_Latin1_General_CP1_CI_AS").expect("known"));
+    let intersect = PhysicalPlan::Intersect {
+        inputs: vec![
+            typed_values(&ty, &[text("x")]),
+            typed_values(&ty, &[text("X")]),
+        ],
+        all: false,
+        schema: typed_schema(&ty),
+    };
+    assert_eq!(collect_scalar(&intersect), vec![vec![text("x")]]);
+    let except = PhysicalPlan::Except {
+        inputs: vec![
+            typed_values(&ty, &[text("x"), text("X")]),
+            typed_values(&ty, &[text("y")]),
+        ],
+        all: false,
+        schema: typed_schema(&ty),
+    };
+    assert_eq!(collect_scalar(&except), vec![vec![text("x")]]);
+}

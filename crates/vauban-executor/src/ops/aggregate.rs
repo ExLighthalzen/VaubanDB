@@ -1,6 +1,11 @@
 //! `HashAggregate` and `StreamAggregate`: grouping and the aggregate functions.
-
-use std::collections::HashMap;
+//!
+//! `HashAggregate` groups its rows in the shared `operator::hash_table`, keyed by the values
+//! of the `GROUP BY` under the collation of each expression, and hands out its groups in
+//! the order their first row arrived. The values an aggregate with `DISTINCT` has already
+//! seen are kept in a key set under the collation of its argument, so that
+//! `COUNT(DISTINCT c)` counts `'x'` and `'X'` once under a case-insensitive collation
+//! (`tests/aggregate.rs`, `count_distinct_counts_once_what_the_collation_finds_equal`).
 
 use vauban_binder::{AggregateCall, BoundExpr, OutputSchema};
 use vauban_errors::{InfoMessage, InternalError, SqlResult};
@@ -10,7 +15,8 @@ use vauban_types::{Collation, SqlType, TypeInfo, Value, compare};
 
 use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
 use crate::expr::eval_expr;
-use crate::operator::{Operator, bucket_hash, build_operator};
+use crate::operator::hash_table::{HashTable, KeyEncoder, KeySet};
+use crate::operator::{Operator, build_operator};
 use crate::row::Row;
 
 /// Whether two grouping keys are equal: NULL equals NULL (unlike `=` semantics).
@@ -31,24 +37,6 @@ fn group_keys_equal(a: &[Value], b: &[Value], group_by: &[BoundExpr]) -> SqlResu
         }
     }
     Ok(true)
-}
-
-/// Hash of a grouping key.
-fn group_hash(key: &[Value]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    if key.is_empty() {
-        return 0;
-    }
-    let mut h = 0u64;
-    for v in key {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        match v {
-            Value::Null => 0u8.hash(&mut hasher),
-            other => bucket_hash(other).hash(&mut hasher),
-        }
-        h = h.wrapping_mul(31).wrapping_add(hasher.finish());
-    }
-    h
 }
 
 fn eval_keys(
@@ -75,10 +63,26 @@ impl AggregateState for UnreachableState {
     }
 }
 
+/// The type an aggregate reads: that of its argument, `int` for `COUNT(*)`.
+fn argument_type(call: &AggregateCall) -> TypeInfo {
+    match &call.arg {
+        Some(expr) => expr.ty.clone(),
+        None => TypeInfo::new(SqlType::Int, false),
+    }
+}
+
+/// One key encoder per aggregate, for the values its `DISTINCT` has seen.
+fn distinct_encoders(aggregates: &[AggregateCall]) -> Vec<KeyEncoder> {
+    aggregates
+        .iter()
+        .map(|call| KeyEncoder::new([&argument_type(call)]))
+        .collect()
+}
+
 struct Group {
     key: Vec<Value>,
     states: Vec<Box<dyn AggregateState>>,
-    distinct_seen: Vec<Vec<Value>>,
+    distinct_seen: Vec<KeySet>,
 }
 
 impl Group {
@@ -89,14 +93,10 @@ impl Group {
                 let factory = call.def.aggregate.ok_or_else(|| {
                     InternalError::Bug(format!("{} is not an aggregate", call.def.name))
                 })?;
-                let arg_ty = match &call.arg {
-                    Some(expr) => expr.ty.clone(),
-                    None => TypeInfo::new(SqlType::Int, false),
-                };
-                factory(&arg_ty)
+                factory(&argument_type(call))
             })
             .collect::<SqlResult<Vec<_>>>()?;
-        let distinct_seen = aggregates.iter().map(|_| Vec::new()).collect();
+        let distinct_seen = aggregates.iter().map(|_| KeySet::new()).collect();
         Ok(Group {
             key,
             states,
@@ -108,6 +108,7 @@ impl Group {
         &mut self,
         row: &Row,
         aggregates: &[AggregateCall],
+        encoders: &mut [KeyEncoder],
         ctx: &mut ExecContext<'_>,
         null_flag: &mut bool,
     ) -> SqlResult<()> {
@@ -117,10 +118,10 @@ impl Group {
                 None => Value::I32(1),
             };
             if call.distinct {
-                if self.distinct_seen[i].contains(&value) {
+                let key = encoders[i].encode([&value])?;
+                if !self.distinct_seen[i].insert(key) {
                     continue;
                 }
-                self.distinct_seen[i].push(value.clone());
             }
             self.states[i].step(&value)?;
             if !*null_flag && self.states[i].null_eliminated() {
@@ -158,34 +159,12 @@ struct HashAggregate<'a> {
     input: Box<dyn Operator<'a> + 'a>,
     group_by: Vec<BoundExpr>,
     aggregates: Vec<AggregateCall>,
+    /// Writes the key of a group, under the collation of each `GROUP BY` expression.
+    group_encoder: KeyEncoder,
+    distinct_encoders: Vec<KeyEncoder>,
     schema: OutputSchema,
     state: HashState,
     input_open: bool,
-}
-
-fn hash_bucket<'a>(
-    buckets: &'a mut HashMap<u64, Vec<Group>>,
-    key: Vec<Value>,
-    hash: u64,
-    aggregates: &[AggregateCall],
-    group_by: &[BoundExpr],
-) -> SqlResult<&'a mut Group> {
-    let bucket = buckets.entry(hash).or_default();
-    if key.is_empty() && group_by.is_empty() {
-        if bucket.is_empty() {
-            bucket.push(Group::new(key, aggregates)?);
-        }
-        return Ok(&mut bucket[0]);
-    }
-    let pos = bucket
-        .iter()
-        .position(|g| group_keys_equal(&g.key, &key, group_by).unwrap_or(false));
-    if let Some(idx) = pos {
-        Ok(&mut bucket[idx])
-    } else {
-        bucket.push(Group::new(key, aggregates)?);
-        Ok(bucket.last_mut().unwrap())
-    }
 }
 
 impl<'a> Operator<'a> for HashAggregate<'a> {
@@ -193,14 +172,21 @@ impl<'a> Operator<'a> for HashAggregate<'a> {
         self.input.open(ctx)?;
         self.input_open = true;
 
-        let mut buckets: HashMap<u64, Vec<Group>> = HashMap::new();
+        let mut groups: HashTable<Group> = HashTable::new();
         let mut null_flag = false;
 
         while let Some(row) = self.input.next(ctx)? {
-            let key = eval_keys(&self.group_by, &row, ctx)?;
-            let hash = group_hash(&key);
-            let group = hash_bucket(&mut buckets, key, hash, &self.aggregates, &self.group_by)?;
-            group.accumulate(&row, &self.aggregates, ctx, &mut null_flag)?;
+            let values = eval_keys(&self.group_by, &row, ctx)?;
+            let key = self.group_encoder.encode(&values)?;
+            let aggregates = &self.aggregates;
+            let (group, _) = groups.entry(key, || Group::new(values, aggregates))?;
+            group.accumulate(
+                &row,
+                &self.aggregates,
+                &mut self.distinct_encoders,
+                ctx,
+                &mut null_flag,
+            )?;
 
             if (row.len() as u64).is_multiple_of(CANCEL_CHECK_ROWS) && ctx.cancelled() {
                 self.state = HashState::Exhausted;
@@ -209,20 +195,16 @@ impl<'a> Operator<'a> for HashAggregate<'a> {
         }
 
         let mut rows: Vec<Row> = Vec::new();
-        if self.group_by.is_empty() && buckets.is_empty() {
+        if self.group_by.is_empty() && groups.is_empty() {
             // No GROUP BY, empty input → one row with COUNT=0, others NULL.
             let mut group = Group::new(Vec::new(), &self.aggregates)?;
             let row = group.finish(&self.aggregates, &mut null_flag)?;
             rows.push(row);
         }
 
-        let mut bucket_list: Vec<_> = buckets.into_iter().collect();
-        bucket_list.sort_by_key(|(h, _)| *h);
-        for (_hash, mut bucket) in bucket_list {
-            for group in &mut bucket {
-                let row = group.finish(&self.aggregates, &mut null_flag)?;
-                rows.push(row);
-            }
+        for mut group in groups.into_values() {
+            let row = group.finish(&self.aggregates, &mut null_flag)?;
+            rows.push(row);
         }
 
         if null_flag {
@@ -285,6 +267,7 @@ struct StreamAggregate<'a> {
     input: Box<dyn Operator<'a> + 'a>,
     group_by: Vec<BoundExpr>,
     aggregates: Vec<AggregateCall>,
+    distinct_encoders: Vec<KeyEncoder>,
     schema: OutputSchema,
     state: StreamState,
     input_open: bool,
@@ -303,7 +286,13 @@ impl<'a> StreamAggregate<'a> {
         first_row: Row,
         ctx: &mut ExecContext<'a>,
     ) -> SqlResult<Row> {
-        group.accumulate(&first_row, &self.aggregates, ctx, &mut self.null_flag)?;
+        group.accumulate(
+            &first_row,
+            &self.aggregates,
+            &mut self.distinct_encoders,
+            ctx,
+            &mut self.null_flag,
+        )?;
 
         loop {
             let Some(next_row) = self.input.next(ctx)? else {
@@ -322,7 +311,13 @@ impl<'a> StreamAggregate<'a> {
                 });
                 return group.finish(&self.aggregates, &mut self.null_flag);
             }
-            group.accumulate(&next_row, &self.aggregates, ctx, &mut self.null_flag)?;
+            group.accumulate(
+                &next_row,
+                &self.aggregates,
+                &mut self.distinct_encoders,
+                ctx,
+                &mut self.null_flag,
+            )?;
         }
     }
 }
@@ -405,6 +400,8 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
             schema,
         } => Ok(Box::new(HashAggregate {
             input: build_operator(input)?,
+            group_encoder: KeyEncoder::new(group_by.iter().map(|expr| &expr.ty)),
+            distinct_encoders: distinct_encoders(aggregates),
             group_by: group_by.clone(),
             aggregates: aggregates.clone(),
             schema: schema.clone(),
@@ -419,6 +416,7 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         } => Ok(Box::new(StreamAggregate {
             input: build_operator(input)?,
             group_by: group_by.clone(),
+            distinct_encoders: distinct_encoders(aggregates),
             aggregates: aggregates.clone(),
             schema: schema.clone(),
             state: StreamState::Started,

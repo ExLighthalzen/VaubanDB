@@ -1,19 +1,21 @@
 //! `Union`, `Except` and `Intersect`: the set operators.
 //!
 //! `UNION [ALL]` streams its operands in order without materialising them. `EXCEPT` and
-//! `INTERSECT` materialise the right operand into a hash table keyed by
-//! [`rows_equal`](rows_equal), where two `NULL` values compare equal for set membership
-//! (`tests/setop.rs`, `nulls_are_equal_for_union_and_intersect`), and stream the left
-//! operand with an implicit `DISTINCT` on the answer
+//! `INTERSECT` key the rows of the right operand in the shared `operator::hash_table`, on
+//! the columns of the result under the collation of each, where two `NULL` values are equal
+//! for set membership (`tests/setop.rs`, `nulls_are_equal_for_union_and_intersect`) and
+//! `1.0` equals `1.00` (`tests/setop.rs`,
+//! `intersect_finds_equal_decimals_of_different_scales`), and stream the left operand with
+//! an implicit `DISTINCT` on the answer
 //! (`tests/setop.rs`, `except_does_not_repeat_left_duplicates`).
 
-use vauban_binder::OutputSchema;
+use vauban_binder::{OutputColumn, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::PhysicalPlan;
-use vauban_types::{TypeInfo, Value};
 
 use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
-use crate::operator::{Operator, bucket_hash, build_operator, keys_equal};
+use crate::operator::hash_table::{KeyEncoder, KeySet};
+use crate::operator::{Operator, build_operator};
 use crate::row::Row;
 
 // -----------------------------------------------------------------------
@@ -101,7 +103,6 @@ struct Except<'a> {
     right: Box<dyn Operator<'a> + 'a>,
     schema: OutputSchema,
     right_rows: RowSet,
-    emitted: RowSet,
     state: SideSetOpState,
     left_open: bool,
 }
@@ -112,7 +113,6 @@ struct Intersect<'a> {
     right: Box<dyn Operator<'a> + 'a>,
     schema: OutputSchema,
     right_rows: RowSet,
-    emitted: RowSet,
     state: SideSetOpState,
     left_open: bool,
 }
@@ -129,12 +129,10 @@ impl<'a> Except<'a> {
         right: Box<dyn Operator<'a> + 'a>,
         schema: OutputSchema,
     ) -> Self {
-        let types: Vec<_> = schema.columns.iter().map(|c| c.ty.clone()).collect();
         Self {
             left,
             right,
-            right_rows: RowSet::new(types.clone()),
-            emitted: RowSet::new(types),
+            right_rows: RowSet::new(&schema.columns),
             schema,
             state: SideSetOpState::Pending,
             left_open: false,
@@ -148,12 +146,10 @@ impl<'a> Intersect<'a> {
         right: Box<dyn Operator<'a> + 'a>,
         schema: OutputSchema,
     ) -> Self {
-        let types: Vec<_> = schema.columns.iter().map(|c| c.ty.clone()).collect();
         Self {
             left,
             right,
-            right_rows: RowSet::new(types.clone()),
-            emitted: RowSet::new(types),
+            right_rows: RowSet::new(&schema.columns),
             schema,
             state: SideSetOpState::Pending,
             left_open: false,
@@ -166,7 +162,7 @@ impl<'a> Operator<'a> for Except<'a> {
         self.right.open(ctx)?;
         let mut count = 0u64;
         while let Some(row) = self.right.next(ctx)? {
-            self.right_rows.insert(row);
+            self.right_rows.insert(&row)?;
             count += 1;
             if count.is_multiple_of(CANCEL_CHECK_ROWS) && ctx.cancelled() {
                 self.right.close();
@@ -190,7 +186,7 @@ impl<'a> Operator<'a> for Except<'a> {
                 }
                 let mut count = 0u64;
                 while let Some(row) = self.left.next(ctx)? {
-                    if !self.right_rows.contains(&row) && self.emitted.insert(row.clone()) {
+                    if self.right_rows.answers(&row, false)? {
                         return Ok(Some(row));
                     }
                     count += 1;
@@ -223,7 +219,7 @@ impl<'a> Operator<'a> for Intersect<'a> {
         self.right.open(ctx)?;
         let mut count = 0u64;
         while let Some(row) = self.right.next(ctx)? {
-            self.right_rows.insert(row);
+            self.right_rows.insert(&row)?;
             count += 1;
             if count.is_multiple_of(CANCEL_CHECK_ROWS) && ctx.cancelled() {
                 self.right.close();
@@ -247,7 +243,7 @@ impl<'a> Operator<'a> for Intersect<'a> {
                 }
                 let mut count = 0u64;
                 while let Some(row) = self.left.next(ctx)? {
-                    if self.right_rows.contains(&row) && self.emitted.insert(row.clone()) {
+                    if self.right_rows.answers(&row, true)? {
                         return Ok(Some(row));
                     }
                     count += 1;
@@ -279,72 +275,41 @@ impl<'a> Operator<'a> for Intersect<'a> {
 // Row set
 // -----------------------------------------------------------------------
 
-/// A set of rows compared with set semantics: two `NULL` values are equal.
+/// The keys of the right operand and of the left rows already answered, compared with set
+/// semantics: two `NULL` values are equal, and strings compare under the collation of
+/// their column.
 struct RowSet {
-    buckets: Vec<Vec<Row>>,
-    types: Vec<TypeInfo>,
+    encoder: KeyEncoder,
+    /// How many leading values of a row are keyed: the visible columns.
+    width: usize,
+    right: KeySet,
+    emitted: KeySet,
 }
 
 impl RowSet {
-    fn new(types: Vec<TypeInfo>) -> Self {
+    fn new(columns: &[OutputColumn]) -> Self {
         Self {
-            buckets: Vec::new(),
-            types,
+            encoder: KeyEncoder::new(columns.iter().map(|column| &column.ty)),
+            width: columns.len(),
+            right: KeySet::new(),
+            emitted: KeySet::new(),
         }
     }
 
-    fn insert(&mut self, row: Row) -> bool {
-        if self.contains(&row) {
-            return false;
-        }
-        let hash = row_hash(&row, &self.types);
-        let bucket_idx = (hash as usize) % 1024;
-        if bucket_idx >= self.buckets.len() {
-            self.buckets.resize(bucket_idx + 1, Vec::new());
-        }
-        self.buckets[bucket_idx].push(row);
-        true
+    /// Records a row of the right operand.
+    fn insert(&mut self, row: &Row) -> SqlResult<()> {
+        let key = self.encoder.encode(&row[..self.width.min(row.len())])?;
+        self.right.insert(key);
+        Ok(())
     }
 
-    fn contains(&self, row: &Row) -> bool {
-        let hash = row_hash(row, &self.types);
-        let bucket_idx = (hash as usize) % 1024;
-        if bucket_idx >= self.buckets.len() {
-            return false;
-        }
-        self.buckets[bucket_idx]
-            .iter()
-            .any(|seen| rows_equal(seen, row, &self.types))
+    /// Whether a row of the left operand is answered: its value is on the right
+    /// (`INTERSECT`, `present` true) or absent from it (`EXCEPT`, `present` false), and
+    /// no earlier left row of the same value was answered.
+    fn answers(&mut self, row: &Row, present: bool) -> SqlResult<bool> {
+        let key = self.encoder.encode(&row[..self.width.min(row.len())])?;
+        Ok(self.right.contains(key) == present && self.emitted.insert(key))
     }
-}
-
-/// Whether two rows are equal on each column for set membership.
-///
-/// Two `NULL` values are equal here, which differs from [`keys_equal`] alone.
-fn rows_equal(a: &Row, b: &Row, types: &[TypeInfo]) -> bool {
-    for (i, ty) in types.iter().enumerate() {
-        let Some(va) = a.get(i) else {
-            return false;
-        };
-        let Some(vb) = b.get(i) else {
-            return false;
-        };
-        if matches!(va, Value::Null) && matches!(vb, Value::Null) {
-            continue;
-        }
-        if !keys_equal(va, vb, ty).unwrap_or(false) {
-            return false;
-        }
-    }
-    true
-}
-
-fn row_hash(row: &Row, _types: &[TypeInfo]) -> u64 {
-    let mut h: u64 = 0;
-    for val in row.iter() {
-        h = h.wrapping_mul(31).wrapping_add(bucket_hash(val));
-    }
-    h
 }
 
 // -----------------------------------------------------------------------

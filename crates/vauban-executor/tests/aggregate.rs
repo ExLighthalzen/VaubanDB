@@ -537,3 +537,113 @@ fn case_insensitive_group_key() {
     );
     assert_eq!(rows[0][1], Value::I32(2), "two rows in the group");
 }
+
+fn text(t: &str) -> Value {
+    Value::String(SqlString { text: t.to_owned() })
+}
+
+fn varchar_under(name: &str) -> TypeInfo {
+    let mut ty = TypeInfo::new(SqlType::VarChar(vauban_types::Len::Fixed(10)), true);
+    ty.collation = Some(Collation::parse(name).expect("a known collation"));
+    ty
+}
+
+/// `'x'`, `'X'` and `'y'` under a case-insensitive collation: `COUNT(DISTINCT c)` is 2,
+/// under the hash and the stream operators; under a case-sensitive collation it is 3.
+#[test]
+fn count_distinct_counts_once_what_the_collation_finds_equal() {
+    register_builtins();
+    for (collation, expected) in [
+        ("SQL_Latin1_General_CP1_CI_AS", 2),
+        ("Latin1_General_CS_AS", 3),
+    ] {
+        let ty = varchar_under(collation);
+        let fixture = Fixture::new(std::slice::from_ref(&ty));
+        for word in ["x", "X", "y"] {
+            fixture.insert(&[text(word)]);
+        }
+        let count = || vec![aggregate_call("COUNT", Some(col(0, &ty)), true)];
+        let scan = || scan(fixture.table, std::slice::from_ref(&ty));
+        for plan in [
+            hash_agg(scan(), vec![], count(), &[], &[int_nn()]),
+            stream_agg(scan(), vec![], count(), &[], &[int_nn()]),
+        ] {
+            let rows = collect(&plan, &fixture);
+            assert_eq!(rows, vec![vec![Value::I32(expected)]], "{collation}");
+        }
+    }
+}
+
+/// `GROUP BY c` over `'x'`, `'X'`, `'y'`: two groups under a case-insensitive collation,
+/// handed out in the order their first row arrived.
+#[test]
+fn group_by_forms_one_group_per_value_under_the_collation() {
+    register_builtins();
+    let ty = varchar_under("SQL_Latin1_General_CP1_CI_AS");
+    let fixture = Fixture::new(std::slice::from_ref(&ty));
+    for word in ["x", "y", "X"] {
+        fixture.insert(&[text(word)]);
+    }
+    let plan = hash_agg(
+        scan(fixture.table, std::slice::from_ref(&ty)),
+        vec![col(0, &ty)],
+        vec![aggregate_call("COUNT", None, false)],
+        std::slice::from_ref(&ty),
+        &[int_nn()],
+    );
+    let rows = collect(&plan, &fixture);
+    assert_eq!(
+        rows,
+        vec![
+            vec![text("x"), Value::I32(2)],
+            vec![text("y"), Value::I32(1)],
+        ]
+    );
+}
+
+/// `1.0` and `1.00` are one group, and `-0.0` and `0.0` are one group.
+#[test]
+fn group_by_forms_one_group_per_number_whatever_its_scale() {
+    register_builtins();
+    let decimal = |mantissa, scale| {
+        Value::Decimal(vauban_types::Decimal {
+            mantissa,
+            precision: 6,
+            scale,
+        })
+    };
+    let cases = [
+        (
+            TypeInfo::new(
+                SqlType::Decimal {
+                    precision: 6,
+                    scale: 2,
+                },
+                true,
+            ),
+            [decimal(10, 1), decimal(100, 2), decimal(101, 2)],
+        ),
+        (
+            TypeInfo::new(SqlType::Float, true),
+            [Value::F64(0.0), Value::F64(-0.0), Value::F64(1.0)],
+        ),
+    ];
+    for (ty, values) in cases {
+        let fixture = Fixture::new(std::slice::from_ref(&ty));
+        for value in &values {
+            fixture.insert(std::slice::from_ref(value));
+        }
+        let plan = hash_agg(
+            scan(fixture.table, std::slice::from_ref(&ty)),
+            vec![col(0, &ty)],
+            vec![aggregate_call("COUNT", None, false)],
+            std::slice::from_ref(&ty),
+            &[int_nn()],
+        );
+        let counts: Vec<Value> = collect(&plan, &fixture)
+            .into_iter()
+            .map(|row| row[1].clone())
+            .collect();
+        assert_eq!(counts, vec![Value::I32(2), Value::I32(1)], "{ty:?}");
+    }
+}

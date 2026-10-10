@@ -1,14 +1,16 @@
 //! `HashJoin`: a hash join that builds a hash table from one input and probes with the
 //! other. `NULL` keys do not match. `Full` answers the internal error 50000.
 //!
-//! The hash table lives entirely in memory; spilling to disk is not implemented for V1.
+//! The table is the shared `operator::hash_table`: a key is the sort keys of the key
+//! values under the collation of each build key, so `'x'` matches `'X'` under a
+//! case-insensitive collation and `1.0` matches `1.00`
+//! (`tests/hash_join.rs`, `string_keys_match_under_the_collation_of_the_build_key`). It lives
+//! in memory; spilling to disk is not implemented for V1.
 //!
 //! The joined row is the probe row then the build row, visible values first; the row
 //! identifiers each side carries follow them, those of the probe side first, as in a
 //! nested-loop join (`tests/row_id.rs`,
 //! `the_row_id_of_a_joined_table_crosses_the_joins_the_filter_and_the_sort`).
-
-use std::collections::HashMap;
 
 use vauban_binder::{BoundExpr, BoundExprKind, CompareOp, LogicalOp, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
@@ -17,7 +19,8 @@ use vauban_types::Value;
 
 use crate::context::ExecContext;
 use crate::expr::eval_expr;
-use crate::operator::{Operator, bucket_hash, build_operator, keys_equal};
+use crate::operator::hash_table::{HashTable, KeyEncoder};
+use crate::operator::{Operator, build_operator};
 use crate::ops::not_implemented;
 use crate::row::{JoinSide, Row, join_rows};
 
@@ -36,28 +39,21 @@ pub(crate) struct HashJoin<'a> {
     /// How many row identifiers the build rows carry after their visible values.
     build_tail: usize,
 
-    // Built during open
-    build_buckets: HashMap<u64, Vec<usize>>,
-    build_rows: Vec<(Vec<Value>, Row)>,
+    /// Writes the key of either side, under the collation of each build key.
+    encoder: KeyEncoder,
+
+    // Built during open: the build rows, and the positions of those of each key.
+    build_table: HashTable<Vec<usize>>,
+    build_rows: Vec<Row>,
 
     // Probe-phase state
     probe_row: Option<Row>,
-    probe_keys: Vec<Value>,
-    bucket: Vec<usize>,
+    /// The entry of the table the probe row's key found, if any.
+    bucket: Option<usize>,
     bucket_pos: usize,
     probe_matched: bool,
 
     exhausted: bool,
-}
-
-/// The combined hash of several key values: the hash of each value folded in with
-/// `wrapping_mul(31)` folds each key hash into one bucket value.
-fn combined_hash(keys: &[Value]) -> u64 {
-    let mut h: u64 = 0;
-    for key in keys {
-        h = h.wrapping_mul(31).wrapping_add(bucket_hash(key));
-    }
-    h
 }
 
 /// Evaluates `keys` against `row`, the row of one side before the join concatenates it:
@@ -99,12 +95,10 @@ impl<'a> HashJoin<'a> {
                     let Some(key_values) = key_values else {
                         continue;
                     };
-                    let hash = combined_hash(&key_values);
-                    self.build_buckets
-                        .entry(hash)
-                        .or_default()
-                        .push(self.build_rows.len());
-                    self.build_rows.push((key_values, row));
+                    let key = self.encoder.encode(&key_values)?;
+                    let (positions, _) = self.build_table.entry(key, || Ok(Vec::new()))?;
+                    positions.push(self.build_rows.len());
+                    self.build_rows.push(row);
                 }
             }
         }
@@ -178,38 +172,24 @@ impl<'a> Operator<'a> for HashJoin<'a> {
                     self.probe_row = None;
                     continue;
                 };
-                self.probe_keys = values;
-
-                // Look up the bucket for the combined hash.
-                let hash = combined_hash(&self.probe_keys);
-                self.bucket = self.build_buckets.get(&hash).cloned().unwrap_or_default();
+                let key = self.encoder.encode(&values)?;
+                self.bucket = self.build_table.find(key);
                 self.bucket_pos = 0;
                 self.probe_matched = false;
             }
 
             let row = self.probe_row.as_ref().unwrap();
 
-            // Try each entry in the bucket.
-            while self.bucket_pos < self.bucket.len() {
-                let build_idx = self.bucket[self.bucket_pos];
+            // Each build row of the probe key: the keys are equal, the residual decides.
+            let positions = self
+                .bucket
+                .and_then(|entry| self.build_table.get(entry))
+                .map_or(&[][..], Vec::as_slice);
+            while self.bucket_pos < positions.len() {
+                let build_row = &self.build_rows[positions[self.bucket_pos]];
                 self.bucket_pos += 1;
 
-                let (build_keys, build_row) = &self.build_rows[build_idx];
-
-                // Check each key pair with keys_equal.
-                let mut keys_ok = true;
-                for (i, (build_key_expr, _)) in self.keys.iter().enumerate() {
-                    if !keys_equal(&self.probe_keys[i], &build_keys[i], &build_key_expr.ty)? {
-                        keys_ok = false;
-                        break;
-                    }
-                }
-
-                if !keys_ok {
-                    continue;
-                }
-
-                // Keys match. Apply the residual if present.
+                // Apply the residual if present.
                 if let Some(residual) = &self.residual {
                     let concat = self.concat(row, Some(build_row));
                     let ok = eval_expr(residual, Some(&concat), ctx)?;
@@ -583,6 +563,7 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
     }
     let residual = merge_residual(residual.clone(), extra_residual, template);
 
+    let encoder = KeyEncoder::new(hash_keys.iter().map(|(build_key, _)| &build_key.ty));
     Ok(Box::new(HashJoin {
         build: build_operator(build)?,
         probe: build_operator(probe)?,
@@ -594,11 +575,11 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         right_width,
         probe_tail: probe.row_id_count(),
         build_tail: build.row_id_count(),
-        build_buckets: HashMap::new(),
+        encoder,
+        build_table: HashTable::new(),
         build_rows: Vec::new(),
         probe_row: None,
-        probe_keys: Vec::new(),
-        bucket: Vec::new(),
+        bucket: None,
         bucket_pos: 0,
         probe_matched: false,
         exhausted: false,
