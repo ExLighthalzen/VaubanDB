@@ -531,6 +531,7 @@ mod tests {
             state: 2,
             message: "Database context is now 'master'.".into(),
             line: 1,
+            procedure: None,
         };
         let change = EnvChange::Language {
             old: String::new(),

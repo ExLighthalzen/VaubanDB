@@ -131,6 +131,7 @@ mod tests {
                 state: 2,
                 message: "Changed database context to 'master'.".into(),
                 line: 1,
+                procedure: None,
             }),
             Token::Done {
                 status: DoneStatus::FINAL,

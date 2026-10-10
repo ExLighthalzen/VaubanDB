@@ -85,6 +85,7 @@ fn login_response(login: &Login7, packet_size: u16) -> Vec<Token> {
             state: 2,
             message: format!("Changed database context to '{database}'."),
             line: 1,
+            procedure: None,
         }),
         Token::EnvChange(EnvChange::Collation {
             old: None,
@@ -100,6 +101,7 @@ fn login_response(login: &Login7, packet_size: u16) -> Vec<Token> {
             state: 1,
             message: "Changed language setting to us_english.".into(),
             line: 1,
+            procedure: None,
         }),
         Token::EnvChange(EnvChange::PacketSize {
             old: DEFAULT_PACKET_SIZE,

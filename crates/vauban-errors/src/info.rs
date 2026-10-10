@@ -18,8 +18,14 @@ pub struct InfoMessage {
     pub state: u8,
     /// Final message text, in English, with all arguments already substituted.
     pub message: String,
-    /// Line in the batch that produced the message, 1-based; `0` when unknown.
+    /// Line that produced the message, 1-based; `0` when unknown. Inside a procedure, the
+    /// line counts from the start of the procedure's definition, as for
+    /// [`SqlError::line`](crate::SqlError::line).
     pub line: u32,
+    /// Name of the procedure that sent the message, `None` outside a procedure, including
+    /// in a dynamic batch run by `EXEC('...')` or `sp_executesql`. The INFO token carries
+    /// it in its `ProcName` field, empty for `None`.
+    pub procedure: Option<String>,
 }
 
 impl InfoMessage {

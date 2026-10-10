@@ -80,6 +80,7 @@ fn response_has_the_eight_tokens_of_sql_server_2022_in_order() {
             state: 2,
             message: changed_database_context("master", 2, 1).message,
             line: 1,
+            procedure: None,
         })
     );
     assert_eq!(
@@ -104,6 +105,7 @@ fn response_has_the_eight_tokens_of_sql_server_2022_in_order() {
             state: 1,
             message: changed_language_setting("us_english").message,
             line: 1,
+            procedure: None,
         })
     );
     assert_eq!(

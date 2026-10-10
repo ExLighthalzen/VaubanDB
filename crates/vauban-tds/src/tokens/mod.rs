@@ -359,6 +359,7 @@ mod tests {
                 state: 1,
                 message: "hello".into(),
                 line: 1,
+                procedure: None,
             }),
             Token::Error(SqlError::new(50000, 16, 1, "boom")),
         ];

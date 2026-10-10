@@ -147,6 +147,7 @@ pub(crate) fn execute<'a>(
                 state: 1,
                 message,
                 line: expr.line,
+                procedure: None,
             })?;
             Ok(ExecOutcome::NoRows)
         }

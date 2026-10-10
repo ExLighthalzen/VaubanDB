@@ -41,7 +41,7 @@ pub(crate) fn encode(
             state: info.state,
             class: info.severity,
             message: &info.message,
-            procedure: "",
+            procedure: info.procedure.as_deref().unwrap_or(""),
             line: info.line,
         },
         Token::Error(error) => Fields {
@@ -100,6 +100,7 @@ mod tests {
             state: 2,
             message: "Changed database context to 'master'.".into(),
             line: 1,
+            procedure: None,
         })
     }
 
@@ -127,6 +128,37 @@ mod tests {
         let baseline = encode_one(&info_5701(0));
         assert_eq!(&out[..8], &baseline[..8]);
         assert_eq!(&out[9..], &baseline[9..]);
+    }
+
+    #[test]
+    fn info_with_procedure_vector() {
+        let out = encode_one(&Token::Info(InfoMessage {
+            number: 0,
+            severity: 0,
+            state: 1,
+            message: "x".into(),
+            line: 3,
+            procedure: Some("p".into()),
+        }));
+        let expected = [
+            0xAB, 0x12, 0x00, // TokenType, Length = 4 + 1 + 1 + 2 + 2 + 1 + 3 + 4 = 18
+            0x00, 0x00, 0x00, 0x00, // Number = 0
+            0x01, // State
+            0x00, // Class
+            0x01, 0x00, // MsgText length = 1
+            0x78, 0x00, // MsgText = "x"
+            0x00, // ServerName length = 0
+            0x01, 0x70, 0x00, // ProcName length = 1, "p"
+            0x03, 0x00, 0x00, 0x00, // LineNumber = 3
+        ];
+        assert_eq!(&out[..], &expected[..]);
+    }
+
+    #[test]
+    fn info_without_procedure_has_empty_proc_name() {
+        let out = encode_one(&info_5701(0));
+        // ServerName length, ProcName length, then LineNumber = 1.
+        assert_eq!(&out[out.len() - 6..], &[0x00, 0x00, 0x01, 0x00, 0x00, 0x00]);
     }
 
     #[test]

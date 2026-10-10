@@ -14,6 +14,7 @@ fn info_message_supports_equality_and_clone() {
         state: 1,
         message: "hello".to_string(),
         line: 1,
+        procedure: None,
     };
     assert_eq!(msg.clone(), msg);
 }

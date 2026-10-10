@@ -214,6 +214,7 @@ fn catalogue_info(number: u32) -> InfoMessage {
             state: 1,
             message: def.template.to_string(),
             line: 0,
+            procedure: None,
         },
         None => InfoMessage {
             number,
@@ -221,6 +222,7 @@ fn catalogue_info(number: u32) -> InfoMessage {
             state: 1,
             message: format!("message {number} missing from the catalogue"),
             line: 0,
+            procedure: None,
         },
     }
 }

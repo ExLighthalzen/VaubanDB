@@ -208,6 +208,7 @@ pub(crate) fn from_catalog_info(number: u32, state: u8, args: &[Arg<'_>]) -> Inf
             state,
             message: format_message(def.template, args),
             line: 0,
+            procedure: None,
         },
         None => InfoMessage {
             number,
@@ -215,6 +216,7 @@ pub(crate) fn from_catalog_info(number: u32, state: u8, args: &[Arg<'_>]) -> Inf
             state,
             message: format!("Internal error: message {number} is not in the catalog"),
             line: 0,
+            procedure: None,
         },
     }
 }

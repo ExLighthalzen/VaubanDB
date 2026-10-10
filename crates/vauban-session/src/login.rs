@@ -148,6 +148,7 @@ fn catalogue_info(number: u32, arg: &str, state: u8, line: u32) -> InfoMessage {
         state,
         message,
         line,
+        procedure: None,
     }
 }
 /// Default language of a fresh instance.

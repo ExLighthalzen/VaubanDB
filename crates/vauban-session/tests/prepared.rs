@@ -709,6 +709,7 @@ fn minimal_login_tokens() -> Vec<Token> {
             state: 2,
             message: "Changed database context to 'master'.".into(),
             line: 1,
+            procedure: None,
         }),
         Token::EnvChange(EnvChange::Collation {
             old: None,
@@ -724,6 +725,7 @@ fn minimal_login_tokens() -> Vec<Token> {
             state: 1,
             message: "Changed language setting to us_english.".into(),
             line: 1,
+            procedure: None,
         }),
         Token::EnvChange(EnvChange::PacketSize {
             old: 4096,

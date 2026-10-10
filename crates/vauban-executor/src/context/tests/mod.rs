@@ -111,6 +111,7 @@ fn infos_are_queued_in_order() {
         state: 1,
         message: "first".to_owned(),
         line: 0,
+        procedure: None,
     };
     let second = InfoMessage {
         number: 2,
