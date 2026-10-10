@@ -524,6 +524,18 @@ const CATALOG: &[ErrorDef] = &[
         exception: None,
     },
     ErrorDef {
+        number: 217,
+        severity: 16,
+        template: "Calls nest deeper than the limit of %d levels: a procedure, function, trigger or view cannot open one more.",
+        // A call past the limit stops the batch with the levels it called, and rolls the
+        // transaction back under `XACT_ABORT OFF` as under `ON`: `BEGIN TRAN;` then a
+        // dynamic text that runs itself again leaves `@@TRANCOUNT` at 0 in the next batch.
+        exception: Some(ErrorBehavior {
+            rolls_back_transaction: true,
+            ..BATCH
+        }),
+    },
+    ErrorDef {
         number: 220,
         severity: 16,
         template: "Value out of range for data type %ls: %ld.",

@@ -7,6 +7,7 @@ fn all_constructors() -> Vec<SqlError> {
         SqlError::incorrect_syntax_near("tok", 1),
         SqlError::invalid_object_name("dbo.t"),
         SqlError::invalid_column_name("c"),
+        SqlError::nesting_level_exceeded(32),
         SqlError::cannot_insert_null("c", "db.dbo.t", "INSERT"),
         SqlError::unique_violation("PRIMARY KEY", "PK_t", "dbo.t", "(1)"),
         SqlError::duplicate_key_index("dbo.t", "IX_t", "(1)"),
@@ -3519,4 +3520,15 @@ fn ddl_and_name_resolution_severity_overrides() {
             "error {number} takes no severity override"
         );
     }
+}
+
+/// A call past the nesting limit is 217, severity 16, state 1, and its text names the limit.
+#[test]
+fn a_call_past_the_nesting_limit_names_the_limit() {
+    let err = SqlError::nesting_level_exceeded(32);
+    assert_eq!((err.number, err.severity, err.state), (217, 16, 1));
+    assert_eq!(
+        err.message,
+        "Calls nest deeper than the limit of 32 levels: a procedure, function, trigger or view cannot open one more."
+    );
 }

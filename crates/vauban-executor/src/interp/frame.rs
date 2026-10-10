@@ -30,14 +30,15 @@
 //! `TEXTSIZE` and their neighbours) are the session's to give back when a call returns.
 //!
 //! `ExecSession::max_nest_level` bounds the depth: a call that would go past it is
-//! refused before the callee runs, by an internal error that ends the program which made
-//! it (`interp::frame::tests::a_call_past_the_nesting_limit_is_refused`).
+//! refused before the callee runs, by error 217, which the interpreter decides as the
+//! error of the `EXECUTE` that made the call: it ends the batch
+//! (`interp::frame::tests::a_call_past_the_nesting_limit_is_refused`).
 
 use std::collections::HashMap;
 use std::mem;
 
 use vauban_binder::{BatchVariables, SessionOptions};
-use vauban_errors::{InternalError, SqlError, SqlResult};
+use vauban_errors::{SqlError, SqlResult};
 use vauban_txn::{IsolationLevel, LockTimeout};
 use vauban_types::{TypeInfo, Value};
 
@@ -205,8 +206,9 @@ impl Frame {
     ///
     /// # Errors
     ///
-    /// The internal error 50000 when the session state is missing, or when the callee
-    /// would run deeper than `ExecSession::max_nest_level`; nothing is set aside then.
+    /// The internal error 50000 when the session state is missing, and 217 when the
+    /// callee would run deeper than `ExecSession::max_nest_level`; nothing is set aside
+    /// then.
     pub(crate) fn enter(ctx: &mut ExecContext<'_>) -> SqlResult<Self> {
         let options = ctx.options;
         let database = ctx.eval.current_database().to_owned();
@@ -214,9 +216,7 @@ impl Frame {
         if let Some(limit) = session.max_nest_level
             && session.nest_level >= limit
         {
-            return Err(SqlError::from(InternalError::Bug(format!(
-                "a call would nest deeper than the limit of {limit} levels"
-            ))));
+            return Err(SqlError::nesting_level_exceeded(limit));
         }
         session.nest_level += 1;
         Ok(Self {

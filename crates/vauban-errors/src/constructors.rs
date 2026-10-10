@@ -2787,6 +2787,18 @@ impl SqlError {
         from_catalog(205, 1, &[])
     }
 
+    /// Error 217, severity 16, state 1: a call would open a level past `limit`, the
+    /// deepest level a procedure, a dynamic text or `sp_executesql` may run at.
+    ///
+    /// `limit` is the `%d` of the template.
+    ///
+    /// ```text
+    /// Calls nest deeper than the limit of 32 levels: a procedure, function, trigger or view cannot open one more.
+    /// ```
+    pub fn nesting_level_exceeded(limit: u32) -> Self {
+        from_catalog(217, 1, &[Arg::Int(i64::from(limit))])
+    }
+
     /// Error 266, severity 16, state 2
     /// (`EXEC('CREATE PROCEDURE dbo.p266 AS BEGIN TRANSACTION;'); EXEC dbo.p266;`): a
     /// procedure left the transaction count somewhere else than it found it.

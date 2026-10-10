@@ -64,6 +64,7 @@ const CONTRACT: &[(u32, u8, &[&str])] = &[
     (213, 16, &[]),
     (214, 16, &["%ls", "%ls"]),
     (215, 16, &["%.*ls"]),
+    (217, 16, &["%d"]),
     (220, 16, &["%ls", "%ld"]),
     (226, 16, &["%ls"]),
     (232, 16, &["%ls", "%f"]),
@@ -466,8 +467,8 @@ fn an_uncatalogued_number_stops_the_batch() {
 }
 
 /// Scope, phase, transaction doomed under `TRY…CATCH`, widened by `XACT_ABORT ON`, for the
-/// errors whose behaviour applications rely on. Of these, 1205 alone rolls the transaction
-/// back by itself.
+/// errors whose behaviour applications rely on. Of these, 217 and 1205 roll the
+/// transaction back by themselves.
 #[test]
 fn known_errors_carry_their_behaviour() {
     use ErrorPhase::{Compilation, Execution};
@@ -506,6 +507,7 @@ fn known_errors_carry_their_behaviour() {
         (266, Statement, Execution, true, false),
         // The batch stops.
         (127, Batch, Execution, false, true),
+        (217, Batch, Execution, true, true),
         (241, Batch, Execution, true, true),
         (245, Batch, Execution, true, true),
         (1014, Batch, Execution, true, true),
@@ -524,7 +526,7 @@ fn known_errors_carry_their_behaviour() {
                 phase,
                 dooms_transaction: dooms,
                 xact_abort_widens: widens,
-                rolls_back_transaction: number == 1205,
+                rolls_back_transaction: matches!(number, 217 | 1205),
             },
             "error {number}"
         );
@@ -565,12 +567,12 @@ fn an_exception_differs_from_the_default_of_its_severity() {
 
 /// The entries that roll the open transaction back by themselves, `XACT_ABORT OFF` included.
 #[test]
-fn the_deadlock_victim_alone_rolls_its_transaction_back() {
+fn a_call_past_the_nesting_limit_and_the_deadlock_victim_roll_their_transaction_back() {
     let rolling: Vec<u32> = CATALOG
         .iter()
         .filter(|def| def.behavior().rolls_back_transaction)
         .map(|def| def.number)
         .collect();
-    assert_eq!(rolling, [1205]);
+    assert_eq!(rolling, [217, 1205]);
     assert!(!error_behavior(1222).rolls_back_transaction);
 }

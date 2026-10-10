@@ -296,7 +296,7 @@ fn a_call_past_the_nesting_limit_is_refused() {
     assert_eq!(levels, [1, 2]);
     assert_eq!(first_column(&sink), [Value::I32(1), Value::I32(2)]);
     let numbers: Vec<u32> = sink.errors().iter().map(|error| error.number).collect();
-    assert_eq!(numbers, [50000]);
+    assert_eq!(numbers, [217]);
     assert!(matches!(end, ProgramEnd::Aborted(_)), "{end:?}");
     assert_eq!(session.nest_level, 0);
 

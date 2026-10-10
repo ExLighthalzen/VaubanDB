@@ -16,10 +16,14 @@
 //!
 //! A call written in a program runs inside the level the interpreter of the executor
 //! opened for it (`interp/frame.rs`), one level deeper than the statement that made it; a
-//! call an RPC makes opens its level here. The depth therefore grows with each text that
-//! calls another (`tests/nested.rs`, `a_dynamic_text_runs_its_own_dynamic_texts_three_deep`),
-//! and `ExecSession::max_nest_level` refuses a call that would go past it
-//! (`procedures::tests::a_call_past_the_nesting_limit_is_refused`).
+//! call an RPC makes opens its level here. `sp_executesql` is a procedure that runs its
+//! text one level further down: its text runs two levels below the statement that called
+//! it, where `EXEC('…')` runs its text one level below (`Body::levels`). The depth
+//! therefore grows with each text that calls another (`tests/nested.rs`,
+//! `a_dynamic_text_runs_its_own_dynamic_texts_three_deep`), and
+//! `ExecSession::max_nest_level` refuses a call that would go past it with 217, which ends
+//! the batch and rolls its transaction back (`procedures::tests::a_call_past_the_nesting_limit_is_refused`,
+//! `procedures::tests::sp_executesql_runs_its_text_two_levels_down`).
 //!
 //! How the level ended is the interpreter's answer to the program that made the call
 //! (`vauban_executor::ProgramEnd`): an error that stops its level alone lets the caller go
@@ -35,7 +39,7 @@ use vauban_tds::{ColumnFlags, ColumnMeta, RpcParam};
 use vauban_txn::IsolationLevel;
 use vauban_types::{Len, SqlType, TypeInfo, Value};
 
-use crate::batch::{Level, Session, cancelled};
+use crate::batch::{Level, Session, cancelled, error_status};
 use crate::eval_context::apply_exec_session;
 use crate::prepared::returned_output;
 use crate::sink::ResultSink;
@@ -91,7 +95,7 @@ impl Session {
         params: &[NestedParam],
         sink: &mut dyn ResultSink,
     ) -> SqlResult<NestedOutcome> {
-        let (outcome, _) = run_level(self, text, params, None, false, sink)?;
+        let (outcome, _) = run_level(self, text, params, None, Body::Procedure, false, sink)?;
         if !outcome.failed {
             sink.return_status(outcome.return_status)?;
         }
@@ -102,10 +106,46 @@ impl Session {
     }
 }
 
+/// What runs a called text, which says how deep below its caller the text runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Body {
+    /// `EXEC('…')`: the text runs one level below the statement that wrote it.
+    Dynamic,
+    /// `sp_executesql`: the procedure runs one level below its caller, and its text one
+    /// level below the procedure.
+    ExecuteSql,
+    /// A system procedure whose body is a text, or a prepared statement: one level below
+    /// the caller.
+    Procedure,
+}
+
+impl Body {
+    /// How many levels below its caller the text runs.
+    const fn levels(self) -> u32 {
+        match self {
+            Self::Dynamic | Self::Procedure => 1,
+            Self::ExecuteSql => 2,
+        }
+    }
+
+    /// The procedure an error of the level it opens names, when it is a procedure.
+    const fn procedure(self) -> Option<&'static str> {
+        match self {
+            Self::ExecuteSql => Some("sp_executesql"),
+            Self::Dynamic | Self::Procedure => None,
+        }
+    }
+}
+
 /// Runs `text` in a level of its own (module documentation, "A called level"), on
 /// `database` when the call named one and on the caller's otherwise, its statements closed
 /// in `sink`; the end of the level is the caller's to send. `in_program` tells that the
-/// interpreter already opened the level, its variables set aside and its depth counted.
+/// interpreter already opened the first level of `body`, its variables set aside and its
+/// depth counted; the levels of `body` past that one are counted here.
+///
+/// A text that would run deeper than `ExecSession::max_nest_level` does not run: its call
+/// is refused with 217, line 1, naming `sp_executesql` when that procedure opened the level
+/// (`procedures::tests::sp_executesql_runs_its_text_two_levels_down`).
 ///
 /// A `database` named by the call is the current database of the text while it runs,
 /// without the 5701 a `USE` sends (`compat/tests/catalog_procs.rs`,
@@ -125,9 +165,18 @@ fn run_level(
     text: &str,
     params: &[NestedParam],
     database: Option<&str>,
+    body: Body,
     in_program: bool,
     sink: &mut dyn ResultSink,
 ) -> SqlResult<(NestedOutcome, ProgramEnd)> {
+    let added = if in_program {
+        body.levels() - 1
+    } else {
+        body.levels()
+    };
+    if let Some(err) = past_the_nesting_limit(session.exec(), added, body) {
+        return refuse_level(session, err, in_program, sink);
+    }
     let trancount_before = session.state().trancount;
     let mut level_state = session.state().clone();
     if let Some(database) = database {
@@ -137,9 +186,7 @@ fn run_level(
     let exec = session.exec_mut();
     let variables = std::mem::take(&mut exec.variables);
     let variable_types = std::mem::take(&mut exec.variable_types);
-    if !in_program {
-        exec.nest_level += 1;
-    }
+    exec.nest_level += added;
     for param in params {
         exec.variables
             .insert(param.name.clone(), param.value.clone());
@@ -153,9 +200,7 @@ fn run_level(
     let exec = session.exec_mut();
     exec.variables = variables;
     exec.variable_types = variable_types;
-    if !in_program {
-        exec.nest_level = exec.nest_level.saturating_sub(1);
-    }
+    exec.nest_level = exec.nest_level.saturating_sub(added);
     let level_state = std::mem::replace(session.state_mut(), caller_state);
     // The transaction belongs to the connection, not to a level: the caller goes on in the
     // one its callee ended with. A transaction the called level closed is closed for its
@@ -198,6 +243,44 @@ fn run_level(
             outcome.failed = true;
         }
     }
+    Ok((outcome, end))
+}
+
+/// The 217 of a text that would run `added` levels below the running one, past
+/// `ExecSession::max_nest_level`; `None` when it stays within the limit.
+fn past_the_nesting_limit(exec: &ExecSession, added: u32, body: Body) -> Option<SqlError> {
+    let limit = exec.max_nest_level?;
+    if exec.nest_level.saturating_add(added) <= limit {
+        return None;
+    }
+    let err = SqlError::nesting_level_exceeded(limit).with_line(1);
+    Some(match body.procedure() {
+        Some(procedure) => err.with_procedure(procedure),
+        None => err,
+    })
+}
+
+/// A level refused before its text ran: the error stays unsent for the program that made
+/// the call, which decides its reach as for the `EXECUTE` it wrote; the text of an RPC has
+/// no such program, and its error is sent here.
+fn refuse_level(
+    session: &Session,
+    err: SqlError,
+    in_program: bool,
+    sink: &mut dyn ResultSink,
+) -> SqlResult<(NestedOutcome, ProgramEnd)> {
+    let outcome = NestedOutcome {
+        outputs: Vec::new(),
+        return_status: error_status(&err),
+        rowcount: session.state().rowcount,
+        failed: true,
+        had_result_set: false,
+    };
+    if in_program {
+        return Ok((outcome, ProgramEnd::Refused(err)));
+    }
+    sink.error(&err)?;
+    let end = ProgramEnd::ended_by(err, session.state().options.xact_abort);
     Ok((outcome, end))
 }
 
@@ -361,10 +444,22 @@ fn run_action(
 ) -> SqlResult<(CallEnd, BatchProcOutcome)> {
     match action {
         ProcAction::ExecuteSql { statement, params } => {
-            execute_nested_sql(session, &statement, &params, database, finish, sink)
+            let call = NestedSql {
+                statement: &statement,
+                params: &params,
+                database,
+                body: Body::ExecuteSql,
+            };
+            execute_nested_sql(session, &call, finish, sink)
         }
         ProcAction::Template { sql, params } => {
-            execute_nested_sql(session, &sql, &params, database, finish, sink)
+            let call = NestedSql {
+                statement: &sql,
+                params: &params,
+                database,
+                body: Body::Procedure,
+            };
+            execute_nested_sql(session, &call, finish, sink)
         }
         ProcAction::Static { columns, rows } => {
             execute_static(session, &columns, &rows, finish, sink)
@@ -468,7 +563,7 @@ pub(crate) fn run_batch_dynamic(
     sink: &mut dyn ResultSink,
 ) -> SqlResult<(CallEnd, BatchProcOutcome)> {
     let mut tracked = TrackedSink::new(sink);
-    let (nested, end) = run_level(session, text, &[], None, true, &mut tracked)?;
+    let (nested, end) = run_level(session, text, &[], None, Body::Dynamic, true, &mut tracked)?;
     let error_number = tracked.last_error;
     let nocount = session.state().options.nocount;
     close_level(sink, in_proc, nocount, &end)?;
@@ -487,24 +582,36 @@ pub(crate) fn run_batch_dynamic(
     Ok((Ok(end), outcome))
 }
 
-/// Runs the text of `sp_executesql`, or of a procedure written in T-SQL, in a level of its
-/// own whose variables are `params`, and closes the call as `finish` says.
+/// The text of `sp_executesql`, or of a procedure written in T-SQL, with what it runs on.
+struct NestedSql<'a> {
+    /// The text.
+    statement: &'a str,
+    /// Its parameters, its first variables.
+    params: &'a [ProcParam],
+    /// The database the call named, `None` for the caller's.
+    database: Option<&'a str>,
+    /// What runs it.
+    body: Body,
+}
+
+/// Runs the text of `call` in a level of its own whose variables are its parameters, and
+/// closes the call as `finish` says.
 fn execute_nested_sql(
     session: &mut Session,
-    statement: &str,
-    params: &[ProcParam],
-    database: Option<&str>,
+    call: &NestedSql<'_>,
     finish: ProcFinish<'_>,
     sink: &mut dyn ResultSink,
 ) -> SqlResult<(CallEnd, BatchProcOutcome)> {
+    let params = call.params;
     let nested_params = proc_params_to_nested(params);
     let in_program = matches!(finish, ProcFinish::Batch { .. });
     let mut tracked = TrackedSink::new(sink);
     let (nested, end) = run_level(
         session,
-        statement,
+        call.statement,
         &nested_params,
-        database,
+        call.database,
+        call.body,
         in_program,
         &mut tracked,
     )?;

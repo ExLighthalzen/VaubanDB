@@ -206,7 +206,8 @@ pub struct ExecSession {
     /// How many calls deep the running level is: 0 for the batch, one more for each
     /// `EXECUTE` a program runs (`interp/frame.rs`).
     pub nest_level: u32,
-    /// The deepest level a call may open, unbounded when `None`.
+    /// The deepest level a call may open, unbounded when `None`; 32 by default
+    /// (`context::tests::calls_nest_at_most_32_levels_by_default`). A call past it is 217.
     pub max_nest_level: Option<u32>,
 }
 
@@ -236,6 +237,10 @@ impl ExecSession {
     }
 }
 
+/// The deepest level a call opens in a new session: the batch is level 0, and
+/// `EXEC('…')` runs its text one level below the statement that wrote it.
+const DEFAULT_MAX_NEST_LEVEL: u32 = 32;
+
 impl Default for ExecSession {
     fn default() -> Self {
         Self {
@@ -254,7 +259,7 @@ impl Default for ExecSession {
             lock_timeout: LockTimeout::Infinite,
             nocount: false,
             nest_level: 0,
-            max_nest_level: None,
+            max_nest_level: Some(DEFAULT_MAX_NEST_LEVEL),
         }
     }
 }

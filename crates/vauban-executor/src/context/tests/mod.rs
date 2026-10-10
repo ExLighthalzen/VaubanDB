@@ -122,3 +122,11 @@ fn infos_are_queued_in_order() {
     assert_eq!(ctx.take_infos(), vec![first, second]);
     assert!(ctx.take_infos().is_empty());
 }
+
+/// A new session bounds calls at 32 levels below the batch, which it starts at.
+#[test]
+fn calls_nest_at_most_32_levels_by_default() {
+    let session = ExecSession::default();
+    assert_eq!(session.nest_level, 0);
+    assert_eq!(session.max_nest_level, Some(32));
+}
