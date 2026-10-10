@@ -1506,3 +1506,84 @@ fn an_internal_table_cannot_be_dropped() {
     );
     assert!(snapshot.table(internal).is_some());
 }
+
+/// What `take_resolved_tables` hands back: the storage table of each user table a name
+/// reached, each once, nothing for a system view or a name that resolves to nothing, and an
+/// empty list once drained. With the foreign keys, `child` brings `parent`, which its key
+/// references, and `parent` brings `child`, which references it.
+#[test]
+fn the_resolved_tables_are_the_user_tables_a_name_reached() {
+    let (catalog, manager) = instance();
+    database(&catalog, &manager, "d");
+    let other = table(&catalog, &manager, &def("d", "dbo", "other"));
+    let parent = table(&catalog, &manager, &def_with_a_key("d", "dbo", "parent"));
+    let mut child_def = def("d", "dbo", "child");
+    child_def.constraints = vec![ConstraintDef::ForeignKey {
+        name: None,
+        columns: vec!["a".to_owned()],
+        referenced: QualifiedName {
+            database: "d".to_owned(),
+            schema: "dbo".to_owned(),
+            name: "parent".to_owned(),
+        },
+        referenced_columns: vec!["a".to_owned()],
+        on_delete: vauban_parser::RefAction::NoAction,
+        on_update: vauban_parser::RefAction::NoAction,
+    }];
+    let child = table(&catalog, &manager, &child_def);
+
+    let reader = begin(&manager);
+    let snapshot = catalog.snapshot(&reader);
+    for name in ["other", "OTHER", "nosuch"] {
+        let _ = snapshot.resolve_object("d", None, name, "dbo");
+    }
+    assert!(
+        snapshot
+            .resolve_object("d", Some("sys"), "tables", "dbo")
+            .is_some()
+    );
+    assert_eq!(snapshot.take_resolved_tables(true), vec![other.storage_id]);
+    assert!(snapshot.take_resolved_tables(true).is_empty(), "drained");
+
+    let _ = snapshot.resolve_object("d", None, "child", "dbo");
+    assert_eq!(snapshot.take_resolved_tables(false), vec![child.storage_id]);
+    let _ = snapshot.resolve_object("d", None, "child", "dbo");
+    assert_eq!(
+        snapshot.take_resolved_tables(true),
+        vec![child.storage_id, parent.storage_id]
+    );
+    let _ = snapshot.resolve_object("d", None, "parent", "dbo");
+    assert_eq!(
+        snapshot.take_resolved_tables(true),
+        vec![parent.storage_id, child.storage_id]
+    );
+    manager.commit(reader).expect("commit of the reader");
+}
+
+/// A name another open transaction has created without committing does not resolve, and
+/// counts with the storage table of that transaction; it stops counting once that
+/// transaction has rolled back. The creating transaction itself finds the table.
+#[test]
+fn a_name_another_transaction_creates_is_pending() {
+    let (catalog, manager) = instance();
+    database(&catalog, &manager, "d");
+    let writer = begin(&manager);
+    let meta = catalog
+        .create_table(&writer, &def("d", "dbo", "x"))
+        .expect("create_table");
+
+    let reader = begin(&manager);
+    let snapshot = catalog.snapshot(&reader);
+    assert!(snapshot.resolve_object("d", None, "X", "dbo").is_none());
+    assert_eq!(snapshot.take_resolved_tables(false), vec![meta.storage_id]);
+
+    let own = catalog.snapshot(&writer);
+    assert!(own.resolve_object("d", None, "x", "dbo").is_some());
+    assert_eq!(own.take_resolved_tables(false), vec![meta.storage_id]);
+
+    manager.rollback(writer).expect("rollback of the create");
+    let after = catalog.snapshot(&reader);
+    assert!(after.resolve_object("d", None, "x", "dbo").is_none());
+    assert!(after.take_resolved_tables(false).is_empty());
+    manager.commit(reader).expect("commit of the reader");
+}

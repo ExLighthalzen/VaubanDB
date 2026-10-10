@@ -429,3 +429,88 @@ fn the_deferred_drop_runs_before_the_waiter_wakes() {
         "the table was already dropped when the reader woke"
     );
 }
+
+// --------------------------------------------- The wait of a binding
+
+/// The wait of a binding on a table no transaction modifies answers at once, without a
+/// wait, and leaves nothing held.
+#[test]
+fn a_wait_at_binding_on_a_free_table_holds_nothing() {
+    let mgr = manager();
+    let reader = mgr.begin(IsolationLevel::ReadCommitted);
+    let waited = mgr
+        .wait_for_schema_stability(&reader, T, LockTimeout::Infinite, &LockWait::none())
+        .expect("the table is free");
+    assert!(!waited);
+    assert!(mgr.locks().held(reader.id).is_empty());
+}
+
+/// The wait of a binding on a table another transaction modifies lasts until that
+/// transaction ends, answers that it waited, and leaves nothing held.
+#[test]
+fn a_wait_at_binding_waits_for_the_end_of_the_ddl() {
+    let mgr = manager();
+    let ddl = mgr.begin(IsolationLevel::ReadCommitted);
+    mgr.schema_modify_lock(&ddl, T).expect("the table is free");
+
+    let reader = mgr.begin(IsolationLevel::ReadCommitted);
+    let rx = {
+        let (mgr, reader) = (Arc::clone(&mgr), reader.clone());
+        in_background(move || {
+            mgr.wait_for_schema_stability(&reader, T, LockTimeout::Infinite, &LockWait::none())
+                .map_err(|e| e.number)
+        })
+    };
+    await_waiter(mgr.locks(), reader.id);
+    still_waiting(&rx, "the binding");
+    mgr.rollback(ddl).expect("rollback");
+    assert_eq!(rx.recv_timeout(SOON).expect("the wait ends"), Ok(true));
+    assert!(mgr.locks().held(reader.id).is_empty());
+}
+
+/// Under a lock timeout, the wait of a binding behind a `Sch-M` ends with 1222, state 56;
+/// a timeout of zero refuses at once with the same error.
+#[test]
+fn a_wait_at_binding_that_times_out_is_1222_state_56() {
+    let mgr = manager();
+    let ddl = mgr.begin(IsolationLevel::ReadCommitted);
+    mgr.schema_modify_lock(&ddl, T).expect("the table is free");
+    let reader = mgr.begin(IsolationLevel::ReadCommitted);
+    for timeout in [LockTimeout::Millis(100), LockTimeout::NoWait] {
+        let started = Instant::now();
+        let err = mgr
+            .wait_for_schema_stability(&reader, T, timeout, &LockWait::none())
+            .expect_err("the Sch-M is in the way");
+        assert_eq!((err.number, err.severity, err.state), (1222, 16, 56));
+        if timeout == LockTimeout::NoWait {
+            assert!(started.elapsed() < Duration::from_millis(100));
+        } else {
+            assert!(started.elapsed() >= Duration::from_millis(100));
+        }
+        assert!(mgr.locks().held(reader.id).is_empty());
+    }
+}
+
+/// A transaction that already holds a mode on the table is not made to wait, and keeps
+/// what it holds: its own `Sch-M`, and the `IX` of a write.
+#[test]
+fn a_wait_at_binding_leaves_the_locks_already_held() {
+    let mgr = manager();
+    let ddl = mgr.begin(IsolationLevel::ReadCommitted);
+    mgr.schema_modify_lock(&ddl, T).expect("the table is free");
+    let waited = mgr
+        .wait_for_schema_stability(&ddl, T, LockTimeout::NoWait, &LockWait::none())
+        .expect("its own Sch-M");
+    assert!(!waited);
+    assert_eq!(table_modes(&mgr, &ddl), vec![LockMode::SchM]);
+    mgr.commit(ddl).expect("commit");
+
+    let writer = mgr.begin(IsolationLevel::ReadCommitted);
+    mgr.write_lock(&writer, T, R, &LockIntent::default(), &LockWait::none())
+        .expect("the row is free");
+    let waited = mgr
+        .wait_for_schema_stability(&writer, T, LockTimeout::NoWait, &LockWait::none())
+        .expect("the IX of the write");
+    assert!(!waited);
+    assert_eq!(table_modes(&mgr, &writer), vec![LockMode::IX]);
+}

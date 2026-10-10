@@ -100,6 +100,24 @@
 //!   error of either scope stops the batch
 //!   (`xact_abort_stops_a_statement_scoped_runtime_error`).
 //!
+//! # A binding waits for the schema of what it names
+//!
+//! A statement that names a table another session is creating, altering or dropping in a
+//! transaction it has not ended waits, from its binding, for the end of that transaction,
+//! then answers what the catalogue holds by then: the rows of a table whose `DROP` was rolled
+//! back, 208 for one whose `CREATE` was, and an `INSERT` that waited for an `ALTER TABLE`
+//! writes its row in the table the `ALTER` left (`tests/ddl_visibility.rs`). The catalogue
+//! snapshot keeps the user tables each binding reached
+//! (`vauban_catalog::CatalogSnapshot::take_resolved_tables`); [`Session::bind_one_stable`]
+//! waits for the `Sch-M` of each one and binds the statement again after a wait. The limit is
+//! the `SET LOCK_TIMEOUT` the session had when the batch arrived: 1222 state 56, state 47 for
+//! a `CREATE TABLE`. A wait that closes a cycle with the open transaction of the session is a
+//! deadlock, and its victim is rolled back as at run time.
+//!
+//! The `Sch-S` is given back once the binding is over: a `DROP` or an `ALTER TABLE` that
+//! another session starts after a statement was bound and before it runs is met by the
+//! statement when it locks a row, and not before.
+//!
 //! # Where the column metadata of a statement goes out
 //!
 //! **Between compilation and execution**, which is what decides whether a failing
@@ -175,7 +193,7 @@ use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
 use crate::procedures::NestedParam;
 use crate::server::Engine;
-use crate::set_options::{SetOutcome, apply_set_option};
+use crate::set_options::{SetOutcome, apply_set_option, lock_timeout_from_ms};
 use crate::sink::{
     CUR_CMD_DELETE, CUR_CMD_INSERT, CUR_CMD_SELECT, CUR_CMD_SELECT_INTO, CUR_CMD_UPDATE,
     ResultSink, StatementSinkAdapter,
@@ -189,7 +207,8 @@ use crate::statements::{
 };
 use crate::txn_session::{self, StatementTxn};
 use vauban_binder::{
-    BatchVariables, BindContext, BoundExecute, BoundExpr, BoundStatement, OutputSchema,
+    BatchVariables, BindContext, BoundExecute, BoundExpr, BoundStatement, DdlStatement,
+    OutputSchema,
 };
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{ErrorScope, InfoMessage, InternalError, SqlError, SqlResult, error_behavior};
@@ -199,6 +218,7 @@ use vauban_executor::{
 };
 use vauban_parser::{SetOptionStatement, Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
+use vauban_storage::TableId;
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
 use vauban_txn::{IsolationLevel, TxnHandle};
 use vauban_types::{TypeInfo, Value};
@@ -215,6 +235,13 @@ const CREATE_INDEX_MISSING_TABLE: u32 = 1088;
 /// (`errors`, `SqlError::cannot_find_object_to_alter_table`). Deferred the same way as
 /// [`INVALID_OBJECT_NAME`].
 const ALTER_TABLE_MISSING_TABLE: u32 = 4902;
+
+/// Number of the error a lock wait answers once `SET LOCK_TIMEOUT` has run out.
+const LOCK_REQUEST_TIMEOUT: u32 = 1222;
+
+/// State of the 1222 a `CREATE TABLE` answers when the wait of its binding runs out, where
+/// the other statements answer state 56.
+const LOCK_TIMEOUT_STATE_OF_A_CREATE: u8 = 47;
 
 /// Number of the error a `GOTO` answers when no label of the text carries its name.
 const GOTO_LABEL_NOT_DECLARED: u32 = 133;
@@ -631,11 +658,10 @@ impl Session {
         let mut state = self.state.clone();
         let mut batch_variables = declared_parameters(params)?;
         let binding = self.engine.txn.begin(IsolationLevel::ReadCommitted);
-        let snapshot = self.binding_snapshot(&binding);
         let prepared = self.bind_batch(
             text,
             statements,
-            &snapshot,
+            &binding,
             &mut state,
             &mut batch_variables,
             None,
@@ -659,11 +685,10 @@ impl Session {
         batch_variables: &mut BatchVariables,
     ) -> SqlResult<Vec<PreparedStatement>> {
         let binding = self.engine.txn.begin(IsolationLevel::ReadCommitted);
-        let snapshot = self.binding_snapshot(&binding);
         let prepared = self.bind_batch(
             text,
             statements,
-            &snapshot,
+            &binding,
             state,
             batch_variables,
             bind_limit_for(statements),
@@ -672,16 +697,19 @@ impl Session {
         prepared
     }
 
+    /// Binds the statements of `statements` against the catalogue `binding` reads
+    /// ([`Session::binding_snapshot`]), each through [`Session::bind_one_stable`].
     fn bind_batch(
         &self,
         text: &str,
         statements: &[Statement],
-        snapshot: &CatalogSnapshot,
+        binding: &TxnHandle,
         state: &mut SessionState,
         batch_variables: &mut BatchVariables,
         mut limit: Option<usize>,
     ) -> SqlResult<Vec<PreparedStatement>> {
         let mut prepared = Vec::with_capacity(statements.len());
+        let mut snapshot = self.binding_snapshot(binding);
 
         for (index, original) in statements.iter().enumerate() {
             if limit == Some(0) {
@@ -692,7 +720,14 @@ impl Session {
             let line = statement_line(original);
             let source = statement_fragment(text, original, statements.get(index + 1));
             let padded = format!("{}{}", "\n".repeat(line.saturating_sub(1) as usize), source);
-            let one = match self.bind_one(&padded, raw, snapshot, state, batch_variables) {
+            let one = match self.bind_one_stable(
+                &padded,
+                raw,
+                &mut snapshot,
+                binding,
+                state,
+                batch_variables,
+            ) {
                 Ok(one) => one,
                 // A table the catalogue does not hold yet, or a name an earlier statement
                 // may free, is not a compilation error: the statement is kept as text and
@@ -836,27 +871,102 @@ impl Session {
     ) -> SqlResult<PreparedStatement> {
         let mut state = self.state.clone();
         let mut variables = variables.clone();
-        if let Some(session_txn) = &self.state.txn {
-            let snapshot = self.engine.catalog.snapshot(&session_txn.handle);
-            return self.bind_one(
-                padded,
-                raw.to_owned(),
-                &snapshot,
-                &mut state,
-                &mut variables,
-            );
-        }
         let binding = self.engine.txn.begin(IsolationLevel::ReadCommitted);
-        let snapshot = self.engine.catalog.snapshot(&binding);
-        let prepared = self.bind_one(
+        let mut snapshot = self.binding_snapshot(&binding);
+        let prepared = self.bind_one_stable(
             padded,
             raw.to_owned(),
-            &snapshot,
+            &mut snapshot,
+            &binding,
             &mut state,
             &mut variables,
         );
         self.engine.txn.commit(binding)?;
         prepared
+    }
+
+    /// Binds one statement with [`Session::bind_one`], then waits for the `Sch-M` another
+    /// transaction holds on a user table the binding named, and binds the statement again,
+    /// against a new `snapshot`, once a wait is over (module documentation, "A binding
+    /// waits for the schema of what it names").
+    ///
+    /// A write also waits on the tables its `FOREIGN KEY` checks read
+    /// (`CatalogSnapshot::take_resolved_tables`). `state` and `batch_variables` are put back
+    /// as they were before a binding that is done again.
+    ///
+    /// # Errors
+    ///
+    /// The error of the binding, or the one of the wait: 1222 state 56 under the
+    /// `SET LOCK_TIMEOUT` of the session, state 47 for a `CREATE TABLE`
+    /// (`tests/ddl_visibility.rs`, `a_wait_at_binding_under_a_lock_timeout_is_1222`), 1205
+    /// for a deadlock victim (`a_crossed_create_deadlock_leaves_one_table_per_name`).
+    fn bind_one_stable(
+        &self,
+        padded: &str,
+        raw: String,
+        snapshot: &mut CatalogSnapshot,
+        binding: &TxnHandle,
+        state: &mut SessionState,
+        batch_variables: &mut BatchVariables,
+    ) -> SqlResult<PreparedStatement> {
+        loop {
+            let state_before = state.clone();
+            let variables_before = batch_variables.clone();
+            let _ = snapshot.take_resolved_tables(false);
+            let bound = self.bind_one(padded, raw.clone(), snapshot, state, batch_variables);
+            let writes = matches!(
+                &bound,
+                Ok(PreparedStatement::Bound {
+                    statement: PhysicalStatement::Insert(_)
+                        | PhysicalStatement::Update(_)
+                        | PhysicalStatement::Delete(_)
+                })
+            );
+            let tables = snapshot.take_resolved_tables(writes);
+            match self.wait_for_schema(binding, &tables) {
+                Ok(false) => return bound,
+                Ok(true) => {}
+                Err(mut err) => {
+                    if err.number == LOCK_REQUEST_TIMEOUT && creates_a_table(&bound) {
+                        err.state = LOCK_TIMEOUT_STATE_OF_A_CREATE;
+                    }
+                    return Err(err);
+                }
+            }
+            *state = state_before;
+            *batch_variables = variables_before;
+            *snapshot = self.binding_snapshot(binding);
+        }
+    }
+
+    /// Waits, table by table, until no other transaction holds the `Sch-M` of `tables`,
+    /// and answers whether one of them had to be waited for.
+    ///
+    /// The wait is made in the open transaction of the session when there is one, so that a
+    /// cycle it closes is a deadlock the lock manager sees, and in `binding` otherwise,
+    /// which holds nothing else. Its limit is the `SET LOCK_TIMEOUT` of the live session,
+    /// not the one a `SET` earlier in the same batch has given the binding state.
+    fn wait_for_schema(&self, binding: &TxnHandle, tables: &[TableId]) -> SqlResult<bool> {
+        let owner = self
+            .state
+            .txn
+            .as_ref()
+            .map_or(binding, |session_txn| &session_txn.handle);
+        let timeout = lock_timeout_from_ms(self.state.options.lock_timeout);
+        let wait = self.cancel.token().lock_wait();
+        let mut waited = false;
+        for table in tables {
+            match self
+                .engine
+                .txn
+                .wait_for_schema_stability(owner, *table, timeout, &wait)
+            {
+                Ok(this_one) => waited |= this_one,
+                Err(_) if self.cancel.is_cancelled() => return Err(cancelled()),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(waited)
     }
 
     /// Moves the session to `database` and tells the client, which is what a `USE` does.
@@ -1005,9 +1115,21 @@ impl Session {
     ///
     /// The DONE carries no row count and no `MORE`. Run-time execution errors take the
     /// path of the program instead; this helper closes preparation and RPC errors.
+    ///
+    /// An error whose catalogue entry rolls the transaction back, the 1205 of a binding
+    /// chosen as a deadlock victim, does so after its ERROR token, as at run time
+    /// ([`BatchHost`], `raise`).
     fn fail(&mut self, err: &SqlError, sink: &mut dyn ResultSink) -> SqlResult<()> {
         self.state.last_error = err.number;
         sink.error(err)?;
+        if error_behavior(err.number).rolls_back_transaction {
+            txn_session::roll_back_after_error(
+                &mut self.state,
+                &self.engine,
+                &mut self.exec,
+                sink,
+            )?;
+        }
         sink.done(None, false)
     }
 }
@@ -1938,6 +2060,18 @@ fn moves_the_catalogue(statement: &Statement) -> bool {
 /// prepared one statement at a time up to the last of them.
 pub(crate) fn bind_limit_for(statements: &[Statement]) -> Option<usize> {
     batch_moves_the_catalogue(statements).then_some(1)
+}
+
+/// Whether `bound` is a `CREATE TABLE`: a statement bound as one, or refused with the 2714
+/// state 6 of a name already taken.
+fn creates_a_table(bound: &SqlResult<PreparedStatement>) -> bool {
+    match bound {
+        Ok(PreparedStatement::Bound {
+            statement: PhysicalStatement::Ddl(DdlStatement::CreateTable { .. }),
+        }) => true,
+        Err(err) => err.number == 2714 && err.state == 6,
+        Ok(_) => false,
+    }
 }
 
 /// The catalogue a statement is bound against, for a session in `state`: what the open

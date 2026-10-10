@@ -14,6 +14,7 @@
 //! | `DROP TABLE`, `TRUNCATE TABLE`, `ALTER TABLE` | `Sch-M` | the executor |
 //! | the rebuild-and-copy an `ALTER TABLE` needs | `Sch-M` | the catalogue |
 //! | `CREATE INDEX`, `DROP INDEX` | `Sch-M` | the executor |
+//! | the binding of a statement, on each user table it names | `Sch-S`, given back at once | the session |
 //!
 //! The calls themselves are **not** placed here: this file ships
 //! [`TransactionManager::schema_stability_lock`],
@@ -80,14 +81,16 @@
 //! versioned rows, so a table whose `CREATE` is not committed is out of the snapshots of the
 //! other transactions (`crates/vauban-catalog/tests/snapshot.rs`,
 //! `an_uncommitted_create_is_seen_by_its_transaction_alone`). The catalogue takes the `Sch-M`
-//! of the storage table a `CREATE`, `DROP` or `ALTER TABLE` works on; a reader that resolves a
-//! name in the catalogue asks for no `Sch-S`, so it meets that `Sch-M` only when it locks a
-//! row of the table.
+//! of the storage table a `CREATE`, `DROP` or `ALTER TABLE` works on. The binding of a
+//! statement meets that `Sch-M` through [`TransactionManager::wait_for_schema_stability`],
+//! once per user table it names, and binds again once the wait is over; the `Sch-S` is not
+//! kept for the execution, so a `DDL` that starts between the binding and the execution of a
+//! statement is met when the statement locks a row of the table, and not before.
 
-use vauban_errors::SqlResult;
+use vauban_errors::{SqlError, SqlResult};
 use vauban_storage::TableId;
 
-use crate::lock::{LockMode, LockResource, LockWait};
+use crate::lock::{LockMode, LockOutcome, LockResource, LockWait};
 use crate::{LockTimeout, TransactionManager, TxnHandle};
 
 /// The wait a schema lock of this transaction is given.
@@ -150,6 +153,58 @@ impl TransactionManager {
     /// Those of [`TransactionManager::schema_stability_lock`].
     pub fn schema_modify_lock(&self, txn: &TxnHandle, table: TableId) -> SqlResult<()> {
         self.schema_lock(txn, table, LockMode::SchM)
+    }
+
+    /// Waits, as the binding of a statement that names `table` does, until no other
+    /// transaction holds the `Sch-M` of that table, then gives the `Sch-S` it took back;
+    /// answers whether it had to wait.
+    ///
+    /// Nothing is asked when `txn` already holds a mode on the table: what it holds stands
+    /// in the way of a `Sch-M` of another transaction, and giving a lock back here would
+    /// give that mode back with it (`tests/schema_lock.rs`,
+    /// `a_wait_at_binding_leaves_the_locks_already_held`). A free table answers `false`
+    /// and leaves nothing held (`a_wait_at_binding_on_a_free_table_holds_nothing`); a
+    /// table under the `Sch-M` of another transaction waits for its end and answers `true`
+    /// (`a_wait_at_binding_waits_for_the_end_of_the_ddl`). The caller binds again after a
+    /// `true`: the catalogue it bound against may have changed during the wait.
+    ///
+    /// `timeout` is the `SET LOCK_TIMEOUT` of the session, passed here because `txn` does
+    /// not carry it (`session_timeout`), and `wait` the cancellation token of the request.
+    ///
+    /// # Errors
+    ///
+    /// 1222, severity 16, state 56 when `timeout` runs out (`tests/schema_lock.rs`,
+    /// `a_wait_at_binding_that_times_out_is_1222_state_56`), 1205 for a transaction chosen
+    /// as a deadlock victim, and the internal error of a cancelled wait.
+    pub fn wait_for_schema_stability(
+        &self,
+        txn: &TxnHandle,
+        table: TableId,
+        timeout: LockTimeout,
+        wait: &LockWait,
+    ) -> SqlResult<bool> {
+        let resource = LockResource::Table(table);
+        if self
+            .locks()
+            .held(txn.id)
+            .iter()
+            .any(|(held, _)| *held == resource)
+        {
+            return Ok(false);
+        }
+        let free =
+            self.locks()
+                .try_acquire(txn.id, resource, LockMode::SchS, LockTimeout::NoWait, wait)
+                == LockOutcome::Granted;
+        if !free {
+            if timeout == LockTimeout::NoWait {
+                return Err(SqlError::lock_request_timeout_on_object());
+            }
+            self.locks()
+                .lock(txn.id, resource, LockMode::SchS, timeout, wait)?;
+        }
+        self.locks().unlock(txn.id, resource)?;
+        Ok(!free)
     }
 
     /// Takes one schema mode on the table resource, the body the two methods above share.

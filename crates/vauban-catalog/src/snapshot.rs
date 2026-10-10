@@ -182,6 +182,18 @@
 //! is invisible to the snapshot is invisible too, its three-part name having no first part to
 //! be written with.
 //!
+//! # What a binding waits for
+//!
+//! A snapshot does not wait: its rows are copied in when it is built. What it keeps is the
+//! list of the user tables its name resolutions reached
+//! ([`CatalogSnapshot::take_resolved_tables`]), so that the session can wait, before it runs
+//! a statement it bound, for the `Sch-M` another transaction holds on one of them, and bind
+//! again once that transaction has ended. A name the snapshot does not find counts too when
+//! another open transaction has created or dropped a table of that name without committing:
+//! the snapshot carries those names, read under the same lock as the tables, and the storage
+//! table whose `Sch-M` their transaction holds (`tests/snapshot.rs`,
+//! `a_name_another_transaction_creates_is_pending`).
+//!
 //! # Comparison of names
 //!
 //! A database name is compared under [`Collation::DEFAULT`], the collation of `master`, as
@@ -212,9 +224,10 @@
 //! belongs to `table.rs`.
 
 use std::collections::BTreeMap;
+use std::sync::{Mutex, PoisonError};
 
 use vauban_errors::{InternalError, SqlResult};
-use vauban_storage::DbId;
+use vauban_storage::{DbId, TableId};
 use vauban_txn::TxnHandle;
 use vauban_types::{Collation, Value};
 
@@ -409,6 +422,31 @@ pub struct CatalogSnapshot {
     /// (`crates/vauban-binder/tests/bind_alter_table.rs`,
     /// `drop_constraint_binds_a_create_table_foreign_key`).
     constraint_names: BTreeMap<ObjectId, QualifiedName>,
+    /// What a binding waits for (section of the same name), behind one pointer: a snapshot
+    /// is held inline by the enums of the crates that read it.
+    waits: Box<BindingWaits>,
+}
+
+/// The two halves of what a binding against a [`CatalogSnapshot`] waits for.
+#[derive(Debug, Default)]
+struct BindingWaits {
+    /// The tables another open transaction has created or dropped without committing, read
+    /// under the same lock as the tables of the snapshot: a name
+    /// [`CatalogSnapshot::resolve_object`] does not find may be one of them.
+    pending: Vec<table::PendingName>,
+    /// What the name resolutions made through the snapshot reached, in order, until
+    /// [`CatalogSnapshot::take_resolved_tables`] drains it.
+    resolved: Mutex<Vec<Resolved>>,
+}
+
+/// One user table a name resolution reached, kept by [`CatalogSnapshot::resolve_object`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolved {
+    /// A table of the snapshot.
+    Table(ObjectId),
+    /// The storage table of a name the snapshot does not hold and another open transaction
+    /// has created or dropped.
+    Pending(TableId),
 }
 
 impl CatalogSnapshot {
@@ -467,6 +505,10 @@ impl CatalogSnapshot {
     /// `a_system_view_is_visible_from_a_user_database`). The objects of the database are read
     /// next, so a user table whose schema is not `sys` keeps its own identifier
     /// (`tests/snapshot.rs`, `a_user_table_named_like_a_system_view_does_not_shadow_it`).
+    ///
+    /// A user table it reaches, and the storage table of a name it does not find that another
+    /// open transaction has created or dropped, are kept for
+    /// [`CatalogSnapshot::take_resolved_tables`] (section "What a binding waits for").
     pub fn resolve_object(
         &self,
         db: &str,
@@ -477,13 +519,102 @@ impl CatalogSnapshot {
         let database = self.database(db)?;
         let collation = database.collation;
         let schema = schema.unwrap_or(default_schema);
-        self.system_view(collation, schema, name).or_else(|| {
+        let found = self.system_view(collation, schema, name).or_else(|| {
             self.objects.values().find(|object| {
                 object.database == database.id
                     && same_name(collation, &object.name.schema, schema)
                     && same_name(collation, &object.name.name, name)
             })
-        })
+        });
+        let reached: Vec<Resolved> = match found {
+            Some(object) if object.id.0 >= table::FIRST_USER_OBJECT_ID => {
+                vec![Resolved::Table(object.id)]
+            }
+            Some(_) => Vec::new(),
+            None => self
+                .waits
+                .pending
+                .iter()
+                .filter(|pending| {
+                    pending.database == database.id
+                        && same_name(collation, &pending.schema, schema)
+                        && same_name(collation, &pending.name, name)
+                })
+                .map(|pending| Resolved::Pending(pending.storage))
+                .collect(),
+        };
+        if !reached.is_empty() {
+            self.waits
+                .resolved
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(reached);
+        }
+        found
+    }
+
+    /// The storage tables the name resolutions made through this snapshot reached since the
+    /// last call, each once, in the order they were first reached; the record is emptied.
+    ///
+    /// A user table [`CatalogSnapshot::resolve_object`] found counts with the storage table
+    /// of the version this snapshot holds; a name it did not find counts with the storage
+    /// table of each table of that name another open transaction has created or dropped
+    /// without committing. A system view and an internal table of `master` do not count.
+    /// With `with_foreign_keys`, a table found also brings the tables its `FOREIGN KEY`
+    /// constraints reference and the tables whose `FOREIGN KEY` references it, the ones a
+    /// write of its rows checks (`tests/snapshot.rs`,
+    /// `the_resolved_tables_are_the_user_tables_a_name_reached`,
+    /// `a_name_another_transaction_creates_is_pending`).
+    pub fn take_resolved_tables(&self, with_foreign_keys: bool) -> Vec<TableId> {
+        let reached = std::mem::take(
+            &mut *self
+                .waits
+                .resolved
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        let mut tables: Vec<TableId> = Vec::new();
+        let mut push = |table: TableId| {
+            if !tables.contains(&table) {
+                tables.push(table);
+            }
+        };
+        for resolved in reached {
+            match resolved {
+                Resolved::Pending(storage) => push(storage),
+                Resolved::Table(id) => {
+                    let Some(meta) = self.tables.get(&id) else {
+                        continue;
+                    };
+                    push(meta.storage_id);
+                    if !with_foreign_keys {
+                        continue;
+                    }
+                    for constraint in &meta.constraints {
+                        if let crate::meta::ConstraintMeta::ForeignKey {
+                            referenced_table, ..
+                        } = constraint
+                            && let Some(referenced) = self.tables.get(referenced_table)
+                        {
+                            push(referenced.storage_id);
+                        }
+                    }
+                    for other in self.tables.values() {
+                        let references = other.constraints.iter().any(|constraint| {
+                            matches!(
+                                constraint,
+                                crate::meta::ConstraintMeta::ForeignKey { referenced_table, .. }
+                                    if *referenced_table == id
+                            )
+                        });
+                        if references {
+                            push(other.storage_id);
+                        }
+                    }
+                }
+            }
+        }
+        tables
     }
 
     /// The system view written `schema.name`, `None` when the two parts match no entry of
@@ -650,7 +781,7 @@ pub(crate) fn build(catalog: &Catalog, txn: &TxnHandle) -> CatalogSnapshot {
 fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
     let databases = databases_of(catalog, txn)?;
     let visible = table::reload::visible_tables(catalog, txn)?;
-    let (live, mut indexes, constraint_names) = {
+    let (live, mut indexes, constraint_names, pending) = {
         let mut store = table::store(catalog);
         table::refresh(catalog, &mut store)?;
         index::refresh(catalog, &mut store)?;
@@ -691,7 +822,8 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
             .filter(|object| databases.iter().any(|db| db.id == object.database))
             .map(|object| (object.id, object.name.clone()))
             .collect();
-        (live, indexes, constraint_names)
+        let pending = table::pending_names(catalog, &store, txn.id);
+        (live, indexes, constraint_names, pending)
     };
     let mut objects = BTreeMap::new();
     let mut system_views = Vec::new();
@@ -740,6 +872,10 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
         tables,
         indexes,
         constraint_names,
+        waits: Box::new(BindingWaits {
+            pending,
+            resolved: Mutex::default(),
+        }),
     })
 }
 
@@ -1730,6 +1866,7 @@ mod tests {
             tables: BTreeMap::new(),
             indexes: BTreeMap::new(),
             constraint_names: BTreeMap::new(),
+            ..CatalogSnapshot::default()
         }
     }
 

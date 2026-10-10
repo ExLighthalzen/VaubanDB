@@ -737,6 +737,38 @@ pub(crate) fn refresh(catalog: &Catalog, store: &mut TableStore) -> SqlResult<()
     Ok(())
 }
 
+/// A table another open transaction has created or dropped without committing: the name a
+/// statement of `me` waits on when it writes it, and the storage table whose `Sch-M` that
+/// other transaction holds (module documentation, "Schema locks").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingName {
+    /// The database of the table.
+    pub(crate) database: DbId,
+    /// The schema, as the `CREATE TABLE` wrote it.
+    pub(crate) schema: String,
+    /// The name, as the `CREATE TABLE` wrote it.
+    pub(crate) name: String,
+    /// The storage table of the current version.
+    pub(crate) storage: TableId,
+}
+
+/// The tables of `store` another open transaction than `me` has created or dropped without
+/// committing (`tests/snapshot.rs`, `a_name_another_transaction_creates_is_pending`).
+pub(crate) fn pending_names(catalog: &Catalog, store: &TableStore, me: TxnId) -> Vec<PendingName> {
+    let open = open_transactions(catalog);
+    store
+        .entries
+        .values()
+        .filter(|entry| entry.pending_for(me, &open))
+        .map(|entry| PendingName {
+            database: entry.meta.database,
+            schema: entry.meta.schema.clone(),
+            name: entry.meta.name.clone(),
+            storage: entry.meta.storage_id,
+        })
+        .collect()
+}
+
 /// The transactions the manager holds open.
 fn open_transactions(catalog: &Catalog) -> BTreeSet<TxnId> {
     catalog
