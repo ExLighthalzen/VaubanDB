@@ -5,67 +5,14 @@
 //! `SELECT 1 WHERE NULL = NULL` therefore answers a result set of one column and **no
 //! row**, exactly like `SELECT 1 WHERE 1 = 0` (`tests/execute_select.rs`).
 
-use vauban_binder::{BoundExpr, BoundExprKind, OutputSchema};
+use vauban_binder::{BoundExpr, OutputSchema};
 use vauban_errors::SqlResult;
 use vauban_planner::PhysicalPlan;
 
-use crate::context::{CANCEL_CHECK_ROWS, ExecContext, SubqueryLocalsSource};
+use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
 use crate::expr::{as_condition, eval_expr};
 use crate::operator::{Operator, build_operator};
 use crate::row::Row;
-
-fn predicate_holds_subquery(expr: &BoundExpr) -> bool {
-    match &expr.kind {
-        BoundExprKind::Exists(_)
-        | BoundExprKind::ScalarSubquery(_)
-        | BoundExprKind::InSubquery { .. } => true,
-        BoundExprKind::Not(inner)
-        | BoundExprKind::Negate(inner)
-        | BoundExprKind::BitNot(inner)
-        | BoundExprKind::IsNull { expr: inner, .. }
-        | BoundExprKind::Convert { expr: inner, .. }
-        | BoundExprKind::Collate { expr: inner } => predicate_holds_subquery(inner),
-        BoundExprKind::Logical { left, right, .. }
-        | BoundExprKind::Compare { left, right, .. }
-        | BoundExprKind::Arith { left, right, .. } => {
-            predicate_holds_subquery(left) || predicate_holds_subquery(right)
-        }
-        BoundExprKind::Case {
-            operand,
-            arms,
-            else_,
-        } => {
-            operand
-                .as_ref()
-                .is_some_and(|item| predicate_holds_subquery(item))
-                || arms.iter().any(|arm| {
-                    predicate_holds_subquery(&arm.when) || predicate_holds_subquery(&arm.then)
-                })
-                || else_
-                    .as_ref()
-                    .is_some_and(|item| predicate_holds_subquery(item))
-        }
-        BoundExprKind::In {
-            expr: tested, list, ..
-        } => predicate_holds_subquery(tested) || list.iter().any(predicate_holds_subquery),
-        BoundExprKind::Like {
-            expr: tested,
-            pattern,
-            escape,
-            ..
-        } => {
-            predicate_holds_subquery(tested)
-                || predicate_holds_subquery(pattern)
-                || escape
-                    .as_ref()
-                    .is_some_and(|item| predicate_holds_subquery(item))
-        }
-        BoundExprKind::Function { args, .. } => args.iter().any(predicate_holds_subquery),
-        BoundExprKind::Literal(_)
-        | BoundExprKind::ColumnRef(_)
-        | BoundExprKind::Variable { .. } => false,
-    }
-}
 
 /// The rows of `input` for which `predicate` is true.
 struct Filter<'a> {
@@ -101,18 +48,7 @@ impl<'a> Operator<'a> for Filter<'a> {
         while let Some(row) = self.input.next(ctx)? {
             // `as_condition` answers `None` for the unknown of the three-valued logic;
             // `Some(true)` alone keeps the row (`tests/execute_select.rs`).
-            let inner_width = ctx.subquery_row_binding_count();
-            let passes = if ctx.subquery_locals_source()
-                == Some(SubqueryLocalsSource::JoinInnerScan)
-                && row.len() > inner_width
-                && !predicate_holds_subquery(&self.predicate)
-            {
-                ctx.eval_over_concatenated_row(|ctx| {
-                    as_condition(&eval_expr(&self.predicate, Some(&row), ctx)?)
-                })?
-            } else {
-                as_condition(&eval_expr(&self.predicate, Some(&row), ctx)?)?
-            };
+            let passes = as_condition(&eval_expr(&self.predicate, Some(&row), ctx)?)?;
             if passes == Some(true) {
                 return Ok(Some(row));
             }

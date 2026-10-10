@@ -9,35 +9,30 @@
 //! a reference with [`ColumnBinding::depth`] 1 reads that row, a reference with depth 2
 //! the row pushed by the evaluation that encloses this one, even when the inner plan
 //! scans the table of the enclosing query under another alias (`tests/subquery.rs`,
-//! `correlated_exists_two_levels_deep_over_the_same_table`).
+//! `correlated_exists_two_levels_deep_over_the_same_table`). Either reads the value at
+//! the index the reference carries.
 
-use std::collections::HashSet;
 use std::rc::Rc;
 
-use vauban_binder::{AggregateCall, BoundExpr, BoundExprKind, ColumnBinding, OutputSchema};
-use vauban_catalog::ColumnId;
-
-use crate::context::SLOT_COLUMN_ID;
+use vauban_binder::{BoundExpr, BoundExprKind, OutputSchema};
 use vauban_errors::{SqlError, SqlResult};
 use vauban_planner::{PhysicalPlan, SubPlan};
 use vauban_types::{Value, compare};
 
-use crate::context::{CANCEL_CHECK_ROWS, ExecContext, FoundSubplan, SubqueryLocalsSource};
+use crate::context::{CANCEL_CHECK_ROWS, ExecContext, FoundSubplan};
 use crate::errors::at;
 use crate::expr::{as_condition, eval_expr, from_condition};
 use crate::operator::{Operator, build_operator};
 use crate::row::Row;
 
-/// Pushes the outer row and subquery state for each row of `input`.
+/// Opens the plans of the subqueries its expressions hold for the rows of `input`.
 pub struct SubqueryEval<'a> {
     input: Box<dyn Operator<'a> + 'a>,
     /// Copied out of the plan once, when the operator is built, and shared with the frame
     /// each `open` pushes.
     subplans: Rc<[SubPlan]>,
     schema: OutputSchema,
-    input_bindings: Vec<ColumnBinding>,
     rows_since_cancel: u64,
-    outer_pushed: bool,
 }
 
 /// Builds the operator of a [`PhysicalPlan::SubqueryEval`].
@@ -58,9 +53,7 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         input: build_operator(input)?,
         subplans: Rc::from(subplans.as_slice()),
         schema: schema.clone(),
-        input_bindings: scan_column_bindings(input),
         rows_since_cancel: 0,
-        outer_pushed: false,
     }))
 }
 
@@ -68,16 +61,11 @@ impl<'a> Operator<'a> for SubqueryEval<'a> {
     fn open(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<()> {
         self.input.open(ctx)?;
         self.rows_since_cancel = 0;
-        self.outer_pushed = false;
         ctx.open_subquery_eval(Rc::clone(&self.subplans));
         Ok(())
     }
 
     fn next(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<Option<Row>> {
-        if self.outer_pushed {
-            let _ = ctx.pop_outer();
-            self.outer_pushed = false;
-        }
         if ctx.cancelled() {
             return Ok(None);
         }
@@ -90,8 +78,6 @@ impl<'a> Operator<'a> for SubqueryEval<'a> {
             ctx.clear_subquery_state();
             return Ok(None);
         }
-        ctx.push_outer(row.clone(), self.input_bindings.clone());
-        self.outer_pushed = true;
         Ok(Some(row))
     }
 
@@ -140,26 +126,19 @@ pub(crate) fn eval_scalar_plan(
     ctx: &mut ExecContext<'_>,
     line: Option<u32>,
 ) -> SqlResult<Value> {
-    with_enclosing_row(plan, row, ctx, |ctx| {
-        eval_scalar_plan_inner(plan, ctx, line)
-    })
+    with_enclosing_row(row, ctx, |ctx| eval_scalar_plan_inner(plan, ctx, line))
 }
 
-/// Runs `f` with `row` pushed as the row of the query that encloses `plan`, and the
-/// columns of `plan` pushed as the local ones. The correlation stacks are brought back
-/// to where they stood before, which also drops what a `SubqueryEval` of `plan` left
-/// when `f` closed it before its input was exhausted
-/// ([`ExecContext::unwind_to`]).
+/// Runs `f` with `row` pushed as the row of the query that encloses the subquery. The
+/// correlation stacks are brought back to where they stood before, which also drops what
+/// a `SubqueryEval` or a join of the subquery left when `f` closed it before its input
+/// was exhausted ([`ExecContext::unwind_to`]).
 fn with_enclosing_row(
-    plan: &PhysicalPlan,
     row: Option<&Row>,
     ctx: &mut ExecContext<'_>,
     f: impl FnOnce(&mut ExecContext<'_>) -> SqlResult<Value>,
 ) -> SqlResult<Value> {
     let mark = ctx.correlation_mark();
-    let locals = local_column_ids(plan);
-    let bindings = scan_column_bindings(plan);
-    ctx.push_subquery_locals(SubqueryLocalsSource::CorrelatedPlan, locals, bindings);
     ctx.push_query_row(row);
     let result = f(ctx);
     ctx.unwind_to(mark);
@@ -201,9 +180,7 @@ pub(crate) fn eval_exists_plan(
     ctx: &mut ExecContext<'_>,
     enclosing: Option<&Row>,
 ) -> SqlResult<Value> {
-    with_enclosing_row(plan, enclosing, ctx, |ctx| {
-        eval_exists_plan_inner(plan, ctx)
-    })
+    with_enclosing_row(enclosing, ctx, |ctx| eval_exists_plan_inner(plan, ctx))
 }
 
 fn eval_exists_plan_inner(plan: &PhysicalPlan, ctx: &mut ExecContext<'_>) -> SqlResult<Value> {
@@ -229,7 +206,7 @@ pub(crate) fn eval_in_subquery_plan(
         .collation
         .unwrap_or(vauban_types::Collation::DEFAULT);
     let tested = eval_expr(tested, row, ctx)?;
-    with_enclosing_row(plan, row, ctx, |ctx| {
+    with_enclosing_row(row, ctx, |ctx| {
         eval_in_subquery_plan_inner(plan, tested, ctx, line, collation)
     })
 }
@@ -303,180 +280,6 @@ pub(crate) fn eval_subquery_expr(
         }
         _ => Err(bug("eval_subquery_expr: not a subquery node")),
     }
-}
-
-/// Scan bindings describing how each position of a plan's row is laid out.
-///
-/// A `Project` is described by its own `schema` rather than by its input. A `Project`
-/// that expands a catalogue view numbers its output by position in that schema
-/// (`crates/vauban-binder/src/view.rs::source_columns`), and a `Project` that expands a
-/// derived table numbers its own output by position too, under a `column` scheme of its
-/// own (`crates/vauban-binder/src/join.rs::derived_source`, `query.rs`): either way, an
-/// identity that a later reference is bound against, not the identity its input exposes.
-/// Delegating to the input describes a column of the input's own row shape instead,
-/// which parts ways with the `Project`'s output once it reorders, drops or adds columns
-/// of its own. On a derived table that reorders its source, that shows up in a join key
-/// (`tests/subquery.rs`, `hash_join_key_on_a_derived_table_that_reorders_its_source`),
-/// under a correlated filter (`tests/subquery.rs`,
-/// `correlated_exists_over_a_derived_table_that_reorders_its_source`) and under a
-/// nested-loop join (`tests/nl_join.rs`,
-/// `nested_loop_join_over_a_derived_table_that_reorders_its_source`).
-pub(crate) fn scan_column_bindings(plan: &PhysicalPlan) -> Vec<ColumnBinding> {
-    match plan {
-        PhysicalPlan::TableScan { columns, .. } | PhysicalPlan::IndexSeek { columns, .. } => {
-            columns.clone()
-        }
-        PhysicalPlan::Project { schema, .. } => source_columns(schema),
-        PhysicalPlan::Filter { input, .. }
-        | PhysicalPlan::Top { input, .. }
-        | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::TopN { input, .. }
-        | PhysicalPlan::SubqueryEval { input, .. } => scan_column_bindings(input),
-        PhysicalPlan::HashAggregate {
-            input,
-            group_by,
-            aggregates,
-            schema,
-            ..
-        }
-        | PhysicalPlan::StreamAggregate {
-            input,
-            group_by,
-            aggregates,
-            schema,
-            ..
-        } => aggregate_row_bindings(input, group_by, aggregates, schema),
-        PhysicalPlan::Distinct(input) => scan_column_bindings(input),
-        PhysicalPlan::NestedLoopJoin { outer, inner, .. } => join_row_bindings(outer, inner),
-        // `HashJoin::concat` lays out the probe row before the build row (`hash_join.rs`):
-        // the bindings describing a hash join's output follow that order, not the
-        // `(build, probe)` order the plan carries.
-        PhysicalPlan::HashJoin { build, probe, .. } => join_row_bindings(probe, build),
-        PhysicalPlan::Union { inputs, .. }
-        | PhysicalPlan::Except { inputs, .. }
-        | PhysicalPlan::Intersect { inputs, .. } => {
-            inputs.first().map_or_else(Vec::new, scan_column_bindings)
-        }
-        PhysicalPlan::OneRow | PhysicalPlan::Values { .. } => Vec::new(),
-    }
-}
-
-/// The column identifiers a row produced anywhere in `plan` carries,
-/// [`scan_column_bindings`]'s counterpart for the `HashSet` that scopes an evaluation to
-/// the current row.
-pub(crate) fn local_column_ids(plan: &PhysicalPlan) -> HashSet<ColumnId> {
-    let mut ids = HashSet::new();
-    collect_local_column_ids(plan, &mut ids);
-    ids
-}
-
-fn collect_local_column_ids(plan: &PhysicalPlan, ids: &mut HashSet<ColumnId>) {
-    match plan {
-        PhysicalPlan::TableScan { columns, .. } => {
-            for binding in columns {
-                ids.insert(binding.column);
-            }
-        }
-        PhysicalPlan::IndexSeek { columns, .. } => {
-            for binding in columns {
-                ids.insert(binding.column);
-            }
-        }
-        // A `Project` carries the identifiers of its own output columns on top of those
-        // of its input: a predicate under the projection is evaluated on the input row,
-        // one above it on the projected row.
-        PhysicalPlan::Project { input, schema, .. } => {
-            collect_local_column_ids(input, ids);
-            for binding in source_columns(schema) {
-                ids.insert(binding.column);
-            }
-            ids.insert(SLOT_COLUMN_ID);
-        }
-        PhysicalPlan::NestedLoopJoin { outer, inner, .. } => {
-            collect_local_column_ids(outer, ids);
-            collect_local_column_ids(inner, ids);
-        }
-        PhysicalPlan::HashJoin { build, probe, .. } => {
-            collect_local_column_ids(build, ids);
-            collect_local_column_ids(probe, ids);
-        }
-        PhysicalPlan::Filter { input, .. }
-        | PhysicalPlan::Top { input, .. }
-        | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::TopN { input, .. }
-        | PhysicalPlan::SubqueryEval { input, .. }
-        | PhysicalPlan::HashAggregate { input, .. }
-        | PhysicalPlan::StreamAggregate { input, .. } => {
-            collect_local_column_ids(input, ids);
-            ids.insert(SLOT_COLUMN_ID);
-        }
-        PhysicalPlan::Distinct(input) => collect_local_column_ids(input, ids),
-        PhysicalPlan::Union { inputs, .. }
-        | PhysicalPlan::Except { inputs, .. }
-        | PhysicalPlan::Intersect { inputs, .. } => {
-            for input in inputs {
-                collect_local_column_ids(input, ids);
-            }
-        }
-        PhysicalPlan::OneRow | PhysicalPlan::Values { .. } => {}
-    }
-}
-
-/// One [`ColumnBinding`] per column of `schema`, numbered by position: the scheme
-/// `crates/vauban-binder/src/view.rs::source_columns` uses for a column that has no
-/// identifier of its own in the catalogue. A reference to a catalogue view's own column,
-/// bound that same way, resolves to the same `column` and `index` here. A derived table's
-/// own column is numbered differently by the binder
-/// (`crates/vauban-binder/src/join.rs::derived_source`, `query.rs`: `ColumnId(i)` from 0,
-/// not from 1 here) — only `index` then agrees, and `index` is what the executor reads
-/// off the row (`ExecContext::read_local_column`). The `column` of a binding serves to
-/// find a column of an enclosing row, not to place one in the row at hand
-/// (`tests/subquery.rs`, `hash_join_key_on_a_derived_table_that_reorders_its_source` and
-/// `correlated_exists_over_a_derived_table_that_reorders_its_source`).
-fn source_columns(schema: &OutputSchema) -> Vec<ColumnBinding> {
-    schema
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(position, column)| ColumnBinding {
-            column: ColumnId(i32::try_from(position.saturating_add(1)).unwrap_or(i32::MAX)),
-            index: position,
-            name: column.name.clone(),
-            ty: column.ty.clone(),
-            depth: 0,
-        })
-        .collect()
-}
-
-fn join_row_bindings(left: &PhysicalPlan, right: &PhysicalPlan) -> Vec<ColumnBinding> {
-    let mut bindings = scan_column_bindings(left);
-    let left_width = bindings.len();
-    for mut binding in scan_column_bindings(right) {
-        binding.index += left_width;
-        bindings.push(binding);
-    }
-    bindings
-}
-
-fn aggregate_row_bindings(
-    input: &PhysicalPlan,
-    group_by: &[BoundExpr],
-    aggregates: &[AggregateCall],
-    schema: &OutputSchema,
-) -> Vec<ColumnBinding> {
-    let _ = (group_by, aggregates);
-    let mut bindings = scan_column_bindings(input);
-    let group_len = schema.columns.len().saturating_sub(aggregates.len());
-    for index in group_len..schema.columns.len() {
-        bindings.push(ColumnBinding {
-            column: SLOT_COLUMN_ID,
-            index,
-            name: schema.columns[index].name.clone(),
-            ty: schema.columns[index].ty.clone(),
-            depth: 0,
-        });
-    }
-    bindings
 }
 
 fn bug(what: &str) -> SqlError {

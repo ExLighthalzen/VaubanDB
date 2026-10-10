@@ -3,19 +3,17 @@
 //!
 //! The hash table lives entirely in memory; spilling to disk is not implemented for V1.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use vauban_binder::{BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LogicalOp, OutputSchema};
-use vauban_catalog::ColumnId;
+use vauban_binder::{BoundExpr, BoundExprKind, CompareOp, LogicalOp, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{PhysicalJoinKind, PhysicalPlan};
 use vauban_types::Value;
 
-use crate::context::{ExecContext, SubqueryLocalsSource};
+use crate::context::ExecContext;
 use crate::expr::eval_expr;
 use crate::operator::{Operator, bucket_hash, build_operator, keys_equal};
 use crate::ops::not_implemented;
-use crate::ops::subquery::{local_column_ids, scan_column_bindings};
 use crate::row::Row;
 
 /// The hash join operator, built from a [`PhysicalPlan::HashJoin`].
@@ -28,15 +26,6 @@ pub(crate) struct HashJoin<'a> {
     schema: OutputSchema,
     left_width: usize,
     right_width: usize,
-    // The column identifiers and bindings of each side's own plan, in that side's own row
-    // layout: a key expression reads the row `build.next()` or `probe.next()` hands back
-    // before it is concatenated, at the position it has there, not the position it will
-    // have in the joined row (`tests/subquery.rs`,
-    // `hash_join_inside_a_correlated_scalar_filters_on_its_build_side`).
-    build_locals: HashSet<ColumnId>,
-    build_bindings: Vec<ColumnBinding>,
-    probe_locals: HashSet<ColumnId>,
-    probe_bindings: Vec<ColumnBinding>,
 
     // Built during open
     build_buckets: HashMap<u64, Vec<usize>>,
@@ -62,40 +51,25 @@ fn combined_hash(keys: &[Value]) -> u64 {
     h
 }
 
-/// Evaluates `keys` against `row`, scoped to `locals`/`bindings` so a reference reads
-/// `row` at the position it holds there — one side's own schema, before the join
-/// concatenates it — rather than the position it will have in the joined row. `None` on
-/// the first `NULL` key, as a hash join key does. The scope is popped whether evaluation
-/// succeeds, finds a `NULL`, or raises an error.
+/// Evaluates `keys` against `row`, the row of one side before the join concatenates it:
+/// each build key was moved to the positions of the build row when the operator was
+/// built ([`orient_hash_keys`]), each probe key reads the probe row, which starts the
+/// joined row (`tests/subquery.rs`,
+/// `hash_join_inside_a_correlated_scalar_filters_on_its_build_side`). `None` on the
+/// first `NULL` key, as a hash join key does.
 fn eval_side_keys<'a, 'k>(
     keys: impl Iterator<Item = &'k BoundExpr>,
     row: &Row,
-    locals: &HashSet<ColumnId>,
-    bindings: &[ColumnBinding],
     ctx: &mut ExecContext<'a>,
 ) -> SqlResult<Option<Vec<Value>>> {
-    ctx.push_subquery_locals(
-        SubqueryLocalsSource::JoinInnerScan,
-        locals.clone(),
-        bindings.to_vec(),
-    );
     let mut values = Vec::new();
-    let mut outcome = Ok(true);
     for key in keys {
-        match eval_expr(key, Some(row), ctx) {
-            Ok(Value::Null) => {
-                outcome = Ok(false);
-                break;
-            }
-            Ok(v) => values.push(v),
-            Err(e) => {
-                outcome = Err(e);
-                break;
-            }
+        match eval_expr(key, Some(row), ctx)? {
+            Value::Null => return Ok(None),
+            v => values.push(v),
         }
     }
-    ctx.pop_subquery_locals();
-    outcome.map(|matched| matched.then_some(values))
+    Ok(Some(values))
 }
 
 impl<'a> HashJoin<'a> {
@@ -112,8 +86,7 @@ impl<'a> HashJoin<'a> {
                 None => break,
                 Some(row) => {
                     let keys = self.keys.iter().map(|(build_key, _)| build_key);
-                    let key_values =
-                        eval_side_keys(keys, &row, &self.build_locals, &self.build_bindings, ctx)?;
+                    let key_values = eval_side_keys(keys, &row, ctx)?;
                     let Some(key_values) = key_values else {
                         continue;
                     };
@@ -182,8 +155,7 @@ impl<'a> Operator<'a> for HashJoin<'a> {
 
                 // Evaluate probe keys. A NULL probe key does not match.
                 let keys = self.keys.iter().map(|(_, probe_key)| probe_key);
-                let values =
-                    eval_side_keys(keys, row, &self.probe_locals, &self.probe_bindings, ctx)?;
+                let values = eval_side_keys(keys, row, ctx)?;
                 let Some(values) = values else {
                     // NULL key does not match. For LEFT, emit probe with NULL padding.
                     let row = self.probe_row.as_ref().unwrap();
@@ -296,6 +268,12 @@ impl KeySideRefs {
 /// Walks `expr` and records whether it reads probe columns, build columns, or neither.
 fn key_side_refs(expr: &BoundExpr, probe_width: usize) -> KeySideRefs {
     match &expr.kind {
+        // A column of an enclosing query is read from the outer-row stack, whichever
+        // side evaluates it: it belongs to neither input.
+        BoundExprKind::ColumnRef(binding) if binding.depth > 0 => KeySideRefs {
+            probe: false,
+            build: false,
+        },
         BoundExprKind::ColumnRef(binding) => {
             if binding.index < probe_width {
                 KeySideRefs {
@@ -460,7 +438,7 @@ fn remap_for_build_side(expr: &BoundExpr, left_width: usize) -> BoundExpr {
 fn remap_for_build_side_kind(kind: BoundExprKind, left_width: usize) -> BoundExprKind {
     match kind {
         BoundExprKind::ColumnRef(mut binding) => {
-            if binding.index >= left_width {
+            if binding.depth == 0 && binding.index >= left_width {
                 binding.index -= left_width;
             }
             BoundExprKind::ColumnRef(binding)
@@ -595,11 +573,6 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
     }
     let residual = merge_residual(residual.clone(), extra_residual, template);
 
-    let build_locals = local_column_ids(build);
-    let build_bindings = scan_column_bindings(build);
-    let probe_locals = local_column_ids(probe);
-    let probe_bindings = scan_column_bindings(probe);
-
     Ok(Box::new(HashJoin {
         build: build_operator(build)?,
         probe: build_operator(probe)?,
@@ -609,10 +582,6 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         schema: schema.clone(),
         left_width,
         right_width,
-        build_locals,
-        build_bindings,
-        probe_locals,
-        probe_bindings,
         build_buckets: HashMap::new(),
         build_rows: Vec::new(),
         probe_row: None,

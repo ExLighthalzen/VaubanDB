@@ -3,13 +3,13 @@
 //! the results go to is `sink.rs`.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use vauban_binder::{BatchVariables, ColumnBinding, SessionOptions, SubqueryId};
-use vauban_catalog::{Catalog, ColumnId};
+use vauban_catalog::Catalog;
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
 use vauban_planner::SubPlan;
 use vauban_storage::{SavepointId, Snapshot, Storage};
@@ -19,17 +19,6 @@ use vauban_types::{Decimal, TypeInfo, Value};
 
 use crate::interp::NameMap;
 use crate::row::Row;
-
-pub(crate) const SLOT_COLUMN_ID: ColumnId = ColumnId(0);
-
-/// Who pushed the current [`ExecContext::subquery_locals`] frame.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SubqueryLocalsSource {
-    /// EXISTS, IN or scalar evaluation over a correlated inner plan.
-    CorrelatedPlan,
-    /// Inner scan of a cross or semi join: row bindings are scan-local, not join-wide.
-    JoinInnerScan,
-}
 
 /// The subquery plans of one [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval)
 /// or of one statement expression, shared with the operator that opened the frame, and
@@ -59,36 +48,21 @@ impl FoundSubplan {
 /// One row of the outer-row stack.
 struct OuterFrame {
     row: Row,
-    /// Position `i` of `row` holds the value of `bindings[i]`. Empty when the layout of
-    /// the row is not described: a reference is then read at its own index.
-    bindings: Vec<ColumnBinding>,
     /// Whether the frame is the row of an enclosing query, which
-    /// [`ColumnBinding::depth`] counts, rather than a row pushed for the inner side of a
-    /// join or by [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval), which it
+    /// [`ColumnBinding::depth`] counts, rather than the outer row of a join, which it
     /// does not (`tests/subquery.rs`,
     /// `cross_self_join_inside_a_correlated_scalar_keeps_both_aliases`).
     query: bool,
 }
 
 impl OuterFrame {
-    /// The value of `binding` in this frame: at `binding.index` when the layout is not
-    /// described or agrees with the binding there, else at the position whose
-    /// binding carries the same column and name.
+    /// The value at `binding.index` of this frame's row.
     fn read(&self, binding: &ColumnBinding) -> SqlResult<Value> {
-        let at_index = self.bindings.get(binding.index);
-        let position =
-            if at_index.is_none_or(|b| b.column == binding.column && b.name == binding.name) {
-                binding.index
-            } else {
-                self.bindings
-                    .iter()
-                    .position(|b| b.column == binding.column && b.name == binding.name)
-                    .unwrap_or(binding.index)
-            };
-        self.row.get(position).cloned().ok_or_else(|| {
+        self.row.get(binding.index).cloned().ok_or_else(|| {
             bug(&format!(
-                "read_outer_column: column `{}` is at index {position} of a row of {} value(s)",
+                "read_outer_column: column `{}` is at index {} of a row of {} value(s)",
                 binding.name,
+                binding.index,
                 self.row.len()
             ))
         })
@@ -105,15 +79,6 @@ impl OuterFrame {
 pub(crate) struct CorrelationMark {
     outer: usize,
     frames: usize,
-    locals: usize,
-}
-
-/// The columns of the plan an expression is evaluated in, pushed by a correlated
-/// subquery evaluation or by the inner scan of a join.
-struct LocalsFrame {
-    source: SubqueryLocalsSource,
-    columns: HashSet<ColumnId>,
-    bindings: Vec<ColumnBinding>,
 }
 
 /// How many rows the driving loop of a query lets through between two reads of the
@@ -362,21 +327,17 @@ pub struct ExecContext<'a> {
     /// The informational messages queued by [`ExecContext::emit_info`], drained by the
     /// driving loop into the sink after the last row.
     infos: Vec<InfoMessage>,
-    /// The stack of outer rows. A correlated join pushes its outer row before opening
+    /// The stack of outer rows. A nested-loop join pushes its outer row before opening
     /// the inner input: an [`IndexSeek`](crate::ops::seek::IndexSeek) evaluates its
-    /// bounds with that row through [`eval_expr`](crate::expr::eval_expr), which consults
-    /// the top of this stack when the current row is `None`. A subquery evaluation
+    /// bounds with that row through [`eval_expr`](crate::expr::eval_expr), which reads
+    /// the innermost join row when the current row is `None`. A subquery evaluation
     /// pushes the row of the query that encloses it, and a reference whose
-    /// [`ColumnBinding::depth`] is `d` reads the `d`-th such row from the top
-    /// ([`ExecContext::read_outer_column`]).
+    /// [`ColumnBinding::depth`] is `d` reads the `d`-th such row from the top, at its
+    /// index ([`ExecContext::read_outer_column`]).
     outer_frames: Vec<OuterFrame>,
     /// One frame per active [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval)
     /// row, innermost last, so a nested `SubqueryEval` does not clobber its parent.
     subquery_frames: Vec<SubqueryFrame>,
-    /// The columns of the plans being evaluated, innermost last: a correlated subquery
-    /// evaluated under the inner scan of a join, or the reverse, sees its own frame and
-    /// gives the enclosing one back when it pops.
-    subquery_locals: Vec<LocalsFrame>,
     /// When set, each `open` of a subquery inner plan increments this counter.
     subquery_open_count: Option<Rc<Cell<usize>>>,
     /// When set, each `next` of a subquery inner plan increments this counter.
@@ -404,7 +365,6 @@ impl<'a> ExecContext<'a> {
             infos: Vec::new(),
             outer_frames: Vec::new(),
             subquery_frames: Vec::new(),
-            subquery_locals: Vec::new(),
             subquery_open_count: None,
             subquery_next_count: None,
         }
@@ -468,43 +428,24 @@ impl<'a> ExecContext<'a> {
         self.cancel.is_cancelled()
     }
 
-    /// Pushes a row onto the outer-row stack for a correlated join or a
-    /// [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval): the row is what
-    /// [`eval_expr`](crate::expr::eval_expr) reads when it is given no row. Position `i`
-    /// of `row` holds the value of `bindings[i]`.
+    /// Pushes the outer row of a nested-loop join onto the outer-row stack, before the
+    /// join opens its inner input: the row is what [`eval_expr`](crate::expr::eval_expr)
+    /// reads a column from when it is given no row, at the index of the reference.
     ///
     /// The row is not one of an enclosing query: a [`ColumnBinding::depth`] does not
     /// count it. Popped by [`ExecContext::pop_outer`].
-    pub fn push_outer(&mut self, row: Row, bindings: Vec<ColumnBinding>) {
-        self.outer_frames.push(OuterFrame {
-            row,
-            bindings,
-            query: false,
-        });
+    pub fn push_outer(&mut self, row: Row) {
+        self.outer_frames.push(OuterFrame { row, query: false });
     }
 
     /// Pushes the row of the query that encloses a subquery about to be evaluated: the
     /// row a reference with [`ColumnBinding::depth`] 1 reads inside that subquery, and
     /// with depth 2 inside a subquery of it. `None` pushes an empty row, so that the
-    /// depths stay aligned with the evaluations that enclose them.
-    ///
-    /// The layout of the row is the one of the top frame when that frame holds this
-    /// same row (the [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval) that
-    /// produced it pushed it with the bindings of its input); otherwise the layout is not
-    /// described and a reference is read at its own index. Popped by
+    /// depths stay aligned with the evaluations that enclose them. Popped by
     /// [`ExecContext::pop_outer`].
     pub(crate) fn push_query_row(&mut self, row: Option<&Row>) {
         let row = row.cloned().unwrap_or_default();
-        let bindings = self
-            .outer_frames
-            .last()
-            .filter(|top| top.row == row)
-            .map_or_else(Vec::new, |top| top.bindings.clone());
-        self.outer_frames.push(OuterFrame {
-            row,
-            bindings,
-            query: true,
-        });
+        self.outer_frames.push(OuterFrame { row, query: true });
     }
 
     /// Pops the row that [`ExecContext::push_outer`] or [`ExecContext::push_query_row`]
@@ -515,23 +456,24 @@ impl<'a> ExecContext<'a> {
         self.outer_frames.pop().map(|frame| frame.row)
     }
 
-    /// Reads one outer column from the stack.
+    /// Reads one outer column from the stack, at the index the reference carries.
     ///
     /// A `binding` with a [`ColumnBinding::depth`] of `d` (1 or more) is read from the
-    /// `d`-th enclosing-query row from the top, at its index when the layout of that row
-    /// agrees, else at the position that carries its column and name
-    /// ([`OuterFrame::read`]). Two aliases of one table, whose columns carry the same
-    /// identifier and name, are told apart by that depth alone (`tests/subquery.rs`,
-    /// `correlated_scalar_over_the_same_table_reads_the_enclosing_row`,
+    /// `d`-th enclosing-query row from the top. Two aliases of one table, whose columns
+    /// carry the same identifier and name, are told apart by that depth alone
+    /// (`tests/subquery.rs`, `correlated_scalar_over_the_same_table_reads_the_enclosing_row`,
     /// `correlated_exists_two_levels_deep_over_the_same_table`).
     ///
-    /// A `binding` at depth 0 is searched by column and name from the innermost frame
-    /// outward, the frames of joins included.
+    /// A `binding` at depth 0 is read from the row on top of the stack, which must be the
+    /// outer row of a join: the bound of an [`IndexSeek`](crate::ops::seek::IndexSeek) on
+    /// the inner side of that join reads it.
     ///
     /// # Errors
     ///
     /// The internal error 50000 when the stack holds fewer enclosing-query rows than
-    /// `depth`, or when no frame exposes a depth 0 column.
+    /// `depth`, when the top of the stack is not a join row for a depth 0 column, or when
+    /// the row is
+    /// narrower than the index.
     pub(crate) fn read_outer_column(&self, binding: &ColumnBinding) -> SqlResult<Value> {
         if binding.depth > 0 {
             let hops = usize::from(binding.depth);
@@ -550,31 +492,17 @@ impl<'a> ExecContext<'a> {
                 })?;
             return frame.read(binding);
         }
-        for frame in self.outer_frames.iter().rev() {
-            let by_column_and_name = frame
-                .bindings
-                .iter()
-                .position(|b| b.column == binding.column && b.name == binding.name);
-            let Some(pos) = by_column_and_name.or_else(|| {
-                frame
-                    .bindings
-                    .iter()
-                    .position(|b| b.column == binding.column)
-            }) else {
-                continue;
-            };
-            return frame.row.get(pos).cloned().ok_or_else(|| {
+        let frame = self
+            .outer_frames
+            .last()
+            .filter(|frame| !frame.query)
+            .ok_or_else(|| {
                 bug(&format!(
-                    "read_outer_column: column `{}` is at index {pos} of a row of {} value(s)",
-                    binding.name,
-                    frame.row.len()
+                    "read_outer_column: column `{}` is evaluated without an outer row",
+                    binding.name
                 ))
-            });
-        }
-        Err(bug(&format!(
-            "read_outer_column: column `{}` is evaluated without an outer row",
-            binding.name
-        )))
+            })?;
+        frame.read(binding)
     }
 
     /// Where the correlation stacks stand now; see [`CorrelationMark`].
@@ -583,7 +511,6 @@ impl<'a> ExecContext<'a> {
         CorrelationMark {
             outer: self.outer_frames.len(),
             frames: self.subquery_frames.len(),
-            locals: self.subquery_locals.len(),
         }
     }
 
@@ -591,14 +518,6 @@ impl<'a> ExecContext<'a> {
     pub(crate) fn unwind_to(&mut self, mark: CorrelationMark) {
         self.outer_frames.truncate(mark.outer);
         self.subquery_frames.truncate(mark.frames);
-        self.subquery_locals.truncate(mark.locals);
-    }
-
-    /// The innermost outer row, for [`eval_expr`](crate::expr::eval_expr) to resolve a
-    /// `ColumnRef` whose row is `None`.
-    #[must_use]
-    pub(crate) fn last_outer_row(&self) -> Option<&Row> {
-        self.outer_frames.last().map(|frame| &frame.row)
     }
 
     /// Opens one [`SubqueryEval`](vauban_planner::PhysicalPlan::SubqueryEval) operator over
@@ -680,125 +599,6 @@ impl<'a> ExecContext<'a> {
         {
             *entry = Some(value);
         }
-    }
-
-    /// Pushes the columns of the plan about to be evaluated: a correlated subquery, or
-    /// the inner scan of a join. Popped by [`ExecContext::pop_subquery_locals`], which
-    /// gives the enclosing frame back.
-    pub(crate) fn push_subquery_locals(
-        &mut self,
-        source: SubqueryLocalsSource,
-        locals: HashSet<ColumnId>,
-        bindings: Vec<ColumnBinding>,
-    ) {
-        self.subquery_locals.push(LocalsFrame {
-            source,
-            columns: locals,
-            bindings,
-        });
-    }
-
-    /// Pops the frame of [`ExecContext::push_subquery_locals`].
-    pub(crate) fn pop_subquery_locals(&mut self) {
-        self.subquery_locals.pop();
-    }
-
-    #[must_use]
-    pub(crate) fn subquery_locals_source(&self) -> Option<SubqueryLocalsSource> {
-        self.subquery_locals.last().map(|frame| frame.source)
-    }
-
-    #[must_use]
-    pub(crate) fn subquery_row_binding_count(&self) -> usize {
-        self.subquery_locals
-            .last()
-            .map_or(0, |frame| frame.bindings.len())
-    }
-
-    /// Evaluates a predicate over a concatenated join row.
-    ///
-    /// When the inner scan of a cross join pushed scan-local bindings, suspend them for
-    /// one evaluation so [`ColumnRef`](vauban_binder::BoundExprKind::ColumnRef)s use
-    /// join-wide indices on `row`.
-    pub(crate) fn eval_over_concatenated_row<R>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> SqlResult<R>,
-    ) -> SqlResult<R> {
-        if self.subquery_locals_source() != Some(SubqueryLocalsSource::JoinInnerScan) {
-            return f(self);
-        }
-        let suspended = self.subquery_locals.pop();
-        let result = f(self);
-        self.subquery_locals.extend(suspended);
-        result
-    }
-
-    /// The column identifiers of the innermost plan being evaluated, `None` outside a
-    /// correlated subquery and the inner scan of a join.
-    #[must_use]
-    pub(crate) fn subquery_locals(&self) -> Option<&HashSet<ColumnId>> {
-        self.subquery_locals.last().map(|frame| &frame.columns)
-    }
-
-    /// The value of `binding` in `row`, at the index the binder wrote on the reference.
-    ///
-    /// An expression is evaluated over the row of the plan level it belongs to, which is
-    /// not always the row the enclosing correlated plan hands back: a predicate written
-    /// between two derived tables reads the inner projection's row. The binder numbered
-    /// the reference against that level, and an operator describes its own output — a
-    /// `Project` by its schema
-    /// ([`scan_column_bindings`](crate::ops::subquery::scan_column_bindings)) — so the
-    /// index the reference carries is its position in the row at hand.
-    ///
-    /// Reconciling the reference against the innermost locals frame answers for the
-    /// level that frame describes instead. The two numberings then meet one position
-    /// apart: the frame numbers its own output `ColumnId(position + 1)`, while a derived
-    /// table's own column is `ColumnId(position)` from 0
-    /// (`crates/vauban-binder/src/join.rs::derived_source`), so a nested derived table
-    /// whose projection has the width of the frame is read one column to the left
-    /// (`tests/subquery.rs`, the correlated `EXISTS` over a nested derived table whose
-    /// projection has the width of the frame).
-    pub(crate) fn read_local_column(&self, row: &Row, binding: &ColumnBinding) -> SqlResult<Value> {
-        if binding.index < row.len() {
-            return row.get(binding.index).cloned().ok_or_else(|| {
-                bug(&format!(
-                    "read_local_column: column `{}` is at index {} of a row of {} value(s)",
-                    binding.name,
-                    binding.index,
-                    row.len()
-                ))
-            });
-        }
-        Err(bug(&format!(
-            "read_local_column: column `{}` is missing from the inner row",
-            binding.name
-        )))
-    }
-
-    /// Whether `binding` is read from the outer-row stack rather than from the current
-    /// row.
-    ///
-    /// A [`ColumnBinding::depth`] of 1 or more says so by itself: the binder wrote on the
-    /// reference how many queries up its column lives, and the column identifier and
-    /// name it carries may be those of a column of the inner plan too (two aliases of
-    /// one table). A depth of 0 with a column identifier that no scan of the inner plan
-    /// exposes is read from the stack as well; one the inner plan exposes is local even
-    /// under another name, since a second table of the plan may carry the identifier
-    /// under that other name (`tests/subquery.rs`,
-    /// `uncorrelated_cross_join_of_two_tables_inside_a_scalar_counts_its_pairs`).
-    pub(crate) fn column_is_outer(&self, binding: &ColumnBinding) -> bool {
-        if binding.column == SLOT_COLUMN_ID {
-            return false;
-        }
-        if binding.depth > 0 {
-            return true;
-        }
-        if self.outer_frames.is_empty() {
-            return false;
-        }
-        self.subquery_locals
-            .last()
-            .is_some_and(|frame| !frame.columns.contains(&binding.column))
     }
 
     /// Hooks used by integration tests to count inner-plan `open` calls.

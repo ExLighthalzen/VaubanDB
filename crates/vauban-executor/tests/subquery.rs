@@ -35,9 +35,11 @@ fn bit_ty() -> TypeInfo {
     TypeInfo::new(SqlType::Bit, true)
 }
 
-fn binding(table_offset: i32, index: usize) -> ColumnBinding {
+/// The column at `index` of a table, numbered as the catalogue numbers it: from 1, in
+/// each table, so that every table of these tests carries the identifiers of the others.
+fn binding(index: usize) -> ColumnBinding {
     ColumnBinding {
-        column: ColumnId(table_offset + i32::try_from(index).expect("small index")),
+        column: ColumnId(i32::try_from(index + 1).expect("small index")),
         index,
         name: format!("c{index}"),
         ty: int_ty(true),
@@ -45,32 +47,30 @@ fn binding(table_offset: i32, index: usize) -> ColumnBinding {
     }
 }
 
+/// The column at `index` of the row at hand.
 fn col(index: usize) -> BoundExpr {
-    outer_col(index)
-}
-
-fn outer_col(index: usize) -> BoundExpr {
     BoundExpr {
-        kind: BoundExprKind::ColumnRef(binding(1, index)),
+        kind: BoundExprKind::ColumnRef(binding(index)),
         ty: int_ty(true),
         line: 7,
     }
 }
 
-fn inner_col(index: usize) -> BoundExpr {
+/// The column at `index` of the row of the query that encloses the subquery.
+fn enclosing_col(index: usize) -> BoundExpr {
     BoundExpr {
-        kind: BoundExprKind::ColumnRef(binding(10, index)),
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            depth: 1,
+            ..binding(index)
+        }),
         ty: int_ty(true),
         line: 7,
     }
 }
 
+/// The column at `index` of the inner side of a join, in the concatenated row.
 fn join_inner_col(outer_width: usize, index: usize) -> BoundExpr {
-    BoundExpr {
-        kind: BoundExprKind::ColumnRef(binding(10, outer_width + index)),
-        ty: int_ty(true),
-        line: 7,
-    }
+    col(outer_width + index)
 }
 
 fn lit(n: i32) -> BoundExpr {
@@ -169,10 +169,10 @@ fn schema_of(names: &[&str], ty: TypeInfo) -> OutputSchema {
     }
 }
 
-fn scan(table: TableId, offset: i32) -> PhysicalPlan {
+fn scan(table: TableId) -> PhysicalPlan {
     PhysicalPlan::TableScan {
         table,
-        columns: vec![binding(offset, 0)],
+        columns: vec![binding(0)],
         alias: "t".to_owned(),
         schema: schema_of(&["c0"], int_ty(true)),
         hints: LockHints::default(),
@@ -323,9 +323,9 @@ fn scalar_subquery_returns_the_value() {
     let f = Fixture::new();
     f.insert(f.outer, &[1]);
     f.insert(f.inner, &[42]);
-    let inner = scan(f.inner, 10);
+    let inner = scan(f.inner);
     let sq = subquery_eval(
-        scan(f.outer, 1),
+        scan(f.outer),
         scalar(inner.clone()),
         vec![subplan(inner.clone(), false)],
     );
@@ -338,9 +338,9 @@ fn scalar_subquery_returns_the_value() {
 fn scalar_subquery_on_empty_input_is_null() {
     let f = Fixture::new();
     f.insert(f.outer, &[1]);
-    let inner = scan(f.inner, 10);
+    let inner = scan(f.inner);
     let sq = subquery_eval(
-        scan(f.outer, 1),
+        scan(f.outer),
         scalar(inner.clone()),
         vec![subplan(inner.clone(), false)],
     );
@@ -354,9 +354,9 @@ fn scalar_subquery_with_two_rows_is_512() {
     let f = Fixture::new();
     f.insert(f.outer, &[1]);
     f.insert(f.inner, &[1, 2]);
-    let inner = scan(f.inner, 10);
+    let inner = scan(f.inner);
     let sq = subquery_eval(
-        scan(f.outer, 1),
+        scan(f.outer),
         scalar(inner.clone()),
         vec![subplan(inner.clone(), false)],
     );
@@ -374,9 +374,9 @@ fn scalar_subquery_with_two_rows_is_512() {
 fn exists_on_empty_input_is_false() {
     let f = Fixture::new();
     f.insert(f.outer, &[1]);
-    let inner = scan(f.inner, 10);
+    let inner = scan(f.inner);
     let sq = subquery_eval(
-        scan(f.outer, 1),
+        scan(f.outer),
         exists(inner.clone()),
         vec![subplan(inner.clone(), false)],
     );
@@ -424,10 +424,10 @@ fn in_with_a_null_and_no_match_is_unknown() {
     f.insert(f.outer, &[1, 2]);
     f.insert(f.inner, &[5]);
     f.insert_null(f.inner);
-    let inner = scan(f.inner, 10);
+    let inner = scan(f.inner);
     let tested = col(0);
     let sq = subquery_eval(
-        scan(f.outer, 1),
+        scan(f.outer),
         in_subquery(tested.clone(), inner.clone(), false),
         vec![subplan(inner.clone(), false)],
     );
@@ -436,7 +436,7 @@ fn in_with_a_null_and_no_match_is_unknown() {
     assert!(rows.is_empty());
 
     let sq_not = subquery_eval(
-        scan(f.outer, 1),
+        scan(f.outer),
         in_subquery(col(0), inner.clone(), true),
         vec![subplan(inner.clone(), false)],
     );
@@ -447,9 +447,9 @@ fn in_with_a_null_and_no_match_is_unknown() {
     let g = Fixture::new();
     g.insert(g.outer, &[1, 2]);
     g.insert(g.inner, &[9]);
-    let inner2 = scan(g.inner, 10);
+    let inner2 = scan(g.inner);
     let sq2 = subquery_eval(
-        scan(g.outer, 1),
+        scan(g.outer),
         in_subquery(col(0), inner2.clone(), true),
         vec![subplan(inner2.clone(), false)],
     );
@@ -463,9 +463,9 @@ fn uncorrelated_subquery_is_evaluated_once() {
     let f = Fixture::new();
     f.insert(f.outer, &[1, 2, 3, 4, 5]);
     f.insert(f.inner, &[99]);
-    let inner = scan(f.inner, 10);
+    let inner = scan(f.inner);
     let sq = subquery_eval(
-        scan(f.outer, 1),
+        scan(f.outer),
         scalar(inner.clone()),
         vec![subplan(inner.clone(), false)],
     );
@@ -485,9 +485,9 @@ fn uncorrelated_subquery_is_evaluated_once() {
     assert_eq!(opens.get(), 1);
 
     f.insert(f.inner, &[1, 2, 3, 4, 5]);
-    let correlated_inner = filter(scan(f.inner, 10), eq(inner_col(0), outer_col(0)));
+    let correlated_inner = filter(scan(f.inner), eq(col(0), enclosing_col(0)));
     let sq_corr = subquery_eval(
-        scan(f.outer, 1),
+        scan(f.outer),
         exists(correlated_inner.clone()),
         vec![subplan(correlated_inner.clone(), true)],
     );
@@ -512,9 +512,9 @@ fn correlated_subquery_reads_the_outer_row() {
     f.insert(f.outer, &[10, 20]);
     f.insert(f.inner, &[10]);
     f.insert(f.inner, &[20]);
-    let inner = filter(scan(f.inner, 10), eq(inner_col(0), outer_col(0)));
+    let inner = filter(scan(f.inner), eq(col(0), enclosing_col(0)));
     let sq = subquery_eval(
-        scan(f.outer, 1),
+        scan(f.outer),
         scalar(inner.clone()),
         vec![subplan(inner.clone(), true)],
     );
@@ -531,10 +531,10 @@ fn semi_join_emits_the_outer_row_once() {
     f.insert(f.inner, &[1, 1]);
     let outer_width = 1;
     let join = PhysicalPlan::NestedLoopJoin {
-        outer: Box::new(scan(f.outer, 1)),
-        inner: Box::new(scan(f.inner, 10)),
+        outer: Box::new(scan(f.outer)),
+        inner: Box::new(scan(f.inner)),
         kind: PhysicalJoinKind::Semi,
-        on: Some(eq(outer_col(0), join_inner_col(outer_width, 0))),
+        on: Some(eq(col(0), join_inner_col(outer_width, 0))),
         schema: schema_of(&["c0"], int_ty(true)),
     };
     let (_outcome, rows) = f.run(join).expect("semi join");
@@ -542,10 +542,10 @@ fn semi_join_emits_the_outer_row_once() {
     assert_eq!(rows[0], vec![Value::I32(1)]);
 
     let anti = PhysicalPlan::NestedLoopJoin {
-        outer: Box::new(scan(f.outer, 1)),
-        inner: Box::new(scan(f.inner, 10)),
+        outer: Box::new(scan(f.outer)),
+        inner: Box::new(scan(f.inner)),
         kind: PhysicalJoinKind::AntiSemi,
-        on: Some(eq(outer_col(0), lit(99))),
+        on: Some(eq(col(0), lit(99))),
         schema: schema_of(&["c0"], int_ty(true)),
     };
     let (_outcome, anti_rows) = f.run(anti).expect("anti semi join");
@@ -584,18 +584,13 @@ fn correlated_exists_over_a_cross_join_keeps_both_sides() {
     insert(third_table, 20);
 
     let cross = PhysicalPlan::NestedLoopJoin {
-        outer: Box::new(scan(outer_table, 1)),
-        inner: Box::new(scan(inner_table, 10)),
+        outer: Box::new(scan(outer_table)),
+        inner: Box::new(scan(inner_table)),
         kind: PhysicalJoinKind::Cross,
         on: None,
         schema: schema_of(&["c0", "c0"], int_ty(true)),
     };
-    let third = BoundExpr {
-        kind: BoundExprKind::ColumnRef(binding(30, 0)),
-        ty: int_ty(true),
-        line: 7,
-    };
-    let subquery = filter(scan(third_table, 30), eq(third, outer_col(0)));
+    let subquery = filter(scan(third_table), eq(col(0), enclosing_col(0)));
     let plan = filter(
         subquery_eval(
             cross,
@@ -934,8 +929,7 @@ fn hash_join_inside_a_correlated_scalar_projects_its_build_side() {
 }
 
 /// A derived table's own column, read by a scalar subquery that encloses it: the
-/// reference is at depth 1 but still carries `SLOT_COLUMN_ID`, and must be read from the
-/// enclosing row, not the local one.
+/// reference is at depth 1 and must be read from the enclosing row, not the local one.
 #[test]
 fn derived_table_column_read_from_an_enclosing_scalar() {
     let f = seeded();
@@ -965,8 +959,8 @@ fn derived_table_column_read_two_levels_down() {
     assert_eq!(rows, i32s(&[&[1], &[2]]));
 }
 
-/// The derived table sits under a join: its `SLOT_COLUMN_ID` column keeps the position
-/// the join gave it, and a correlated scalar still reads the enclosing row through it.
+/// The derived table sits under a join: its column keeps the position the join gave it,
+/// and a correlated scalar still reads the enclosing row through it.
 #[test]
 fn derived_table_under_a_join_column_read_from_an_enclosing_scalar() {
     let f = seeded();
@@ -1046,8 +1040,7 @@ fn correlated_scalar_over_a_derived_table_that_renames_as_it_reorders_is_a_witne
 }
 
 /// Witness, not an axis: a derived table narrower than its source keeps the order of the
-/// columns it does keep, and its only column carries `SLOT_COLUMN_ID`, which
-/// `expr.rs` reads by index without reconciling names.
+/// columns it does keep, and `expr.rs` reads its only column by index.
 #[test]
 fn correlated_exists_over_a_derived_table_narrower_than_its_source_is_a_witness() {
     let f = seeded();
@@ -1198,6 +1191,173 @@ fn in_subquery_over_an_uncorrelated_derived_table_that_reorders_is_a_witness() {
         "SELECT x.a FROM t1 x WHERE x.a IN (SELECT d.k FROM (SELECT q.v, q.k FROM t3 q) d WHERE d.v > 10) ORDER BY x.a;",
     );
     assert_eq!(rows, i32s(&[&[2], &[3]]));
+}
+
+// ---------------------------------------------------------------------------------------
+// Two tables numbered alike: every reference is a position
+// ---------------------------------------------------------------------------------------
+
+/// The variables a session declared, as the binder looks them up.
+struct DeclaredIn<'s>(&'s ExecSession);
+
+impl vauban_binder::VariableScope for DeclaredIn<'_> {
+    fn type_of(&self, name: &str) -> Option<TypeInfo> {
+        self.0.variable_types.get(name).cloned()
+    }
+}
+
+impl SqlFixture {
+    /// Runs each statement of `text` in one session, as a batch does, and hands back the
+    /// value the session holds for `variable` at the end.
+    fn run_in_session(&self, text: &str, variable: &str) -> Value {
+        let batch = vauban_parser::parse_batch(text, &vauban_parser::ParseOptions::default())
+            .expect("the text parses");
+        let mut session = ExecSession::default();
+        for statement in &batch.statements {
+            let handle = self.txn.begin(IsolationLevel::ReadCommitted);
+            let snapshot = self.catalog.snapshot(&handle);
+            let declared = DeclaredIn(&session);
+            let mut bind_ctx = vauban_binder::BindContext::scalar(text, SessionOptions::default());
+            bind_ctx.catalog = Some(&snapshot);
+            bind_ctx.variables = &declared;
+            let bound = vauban_binder::bind(statement, &bind_ctx).expect("the statement binds");
+            let planned = vauban_planner::plan(
+                bound,
+                &vauban_planner::PlanContext {
+                    catalog: &vauban_planner::NoIndexes,
+                },
+            )
+            .expect("the statement plans");
+            let snap = self.txn.statement_snapshot(&handle);
+            let eval = StaticContext::default();
+            let mut ctx = ExecContext::scalar(&eval, SessionOptions::default())
+                .with_engine(self.storage.as_ref(), &self.txn, &snap)
+                .with_catalog(&self.catalog)
+                .with_handle(&handle)
+                .with_session(&mut session);
+            execute_collect(&planned, &mut ctx).expect("the statement runs");
+            self.txn.commit(handle).expect("the transaction commits");
+        }
+        session
+            .variables
+            .get(variable)
+            .cloned()
+            .expect("the variable was declared")
+    }
+}
+
+/// `p` and `q` both declare `(a, b, c)`, so their columns carry the identifiers 1, 2 and 3
+/// alike; `k` and `s` are the shapes of an accumulating assignment.
+fn alike() -> SqlFixture {
+    let f = SqlFixture::new();
+    for ddl in [
+        "CREATE TABLE p (a int, b int, c int);",
+        "CREATE TABLE q (a int, b int, c int);",
+        "CREATE TABLE k (a int NOT NULL PRIMARY KEY, b int NOT NULL, t varchar(10) NOT NULL);",
+        "CREATE TABLE s (c int NULL, x int NULL);",
+        "INSERT INTO p VALUES (1, 2, 7), (2, 3, 8), (3, 1, 7), (4, 9, 8);",
+        "INSERT INTO q VALUES (1, 4, 7), (2, 2, 8), (3, 1, 9);",
+        "INSERT INTO k VALUES (5, 1, 'e'), (1, 3, 'a'), (3, 2, 'c'), (2, 2, 'b'), (4, 1, 'd');",
+        "INSERT INTO s VALUES (3, 1), (3, 2), (3, NULL), (1, 5), (1, 4), (2, 9), (NULL, 7), (NULL, 8);",
+    ] {
+        f.run(ddl);
+    }
+    f
+}
+
+fn text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.text.clone(),
+        other => panic!("expected a string, got {other:?}"),
+    }
+}
+
+/// A correlated scalar over a cross join of `p` and `q`: `q.c` is the third column of the
+/// second table, and the subquery scans `p` again, whose `c` carries the same identifier.
+#[test]
+fn correlated_scalar_between_two_tables_numbered_alike_reads_the_second_one() {
+    let f = alike();
+    let rows = f.run(
+        "SELECT p.a, q.a, (SELECT COUNT(*) FROM p p2 WHERE p2.c = q.c AND p2.a > p.a) \
+         FROM p CROSS JOIN q ORDER BY p.a, q.a;",
+    );
+    assert_eq!(
+        rows,
+        i32s(&[
+            &[1, 1, 1],
+            &[1, 2, 2],
+            &[1, 3, 0],
+            &[2, 1, 1],
+            &[2, 2, 1],
+            &[2, 3, 0],
+            &[3, 1, 0],
+            &[3, 2, 1],
+            &[3, 3, 0],
+            &[4, 1, 0],
+            &[4, 2, 0],
+            &[4, 3, 0]
+        ])
+    );
+}
+
+/// `EXISTS` in `EXISTS`: the innermost query reads `q.c` one query up and `p.a` two queries
+/// up, both third or first columns of tables numbered alike.
+#[test]
+fn exists_in_exists_reads_each_level_it_names() {
+    let f = alike();
+    let rows = f.run(
+        "SELECT p.a FROM p WHERE EXISTS (SELECT 1 FROM q WHERE q.a = p.b AND EXISTS \
+         (SELECT 1 FROM p p2 WHERE p2.c = q.c AND p2.a <> p.a)) ORDER BY p.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1], &[3]]));
+}
+
+/// The same two levels over a cross join: the innermost query reads `p.b` two queries up,
+/// the middle one `q.c`, the second table of the enclosing join.
+#[test]
+fn exists_in_exists_over_a_cross_join_reads_each_level_it_names() {
+    let f = alike();
+    let rows = f.run(
+        "SELECT p.a, q.a FROM p CROSS JOIN q WHERE EXISTS (SELECT 1 FROM p p2 WHERE p2.c = q.c \
+         AND EXISTS (SELECT 1 FROM q q2 WHERE q2.a = p2.a AND q2.b > p.b)) ORDER BY p.a, q.a;",
+    );
+    assert_eq!(rows, i32s(&[&[1, 1], &[2, 1], &[3, 1], &[3, 2]]));
+}
+
+/// An accumulating assignment ordered by columns of both sides of a join, whose value holds
+/// a subquery correlated on the second side: the value is computed above the sort, over
+/// the row the sort hands back, and the subquery reads that side there.
+#[test]
+fn an_accumulating_assignment_reads_the_second_side_of_a_join_in_its_subquery() {
+    let f = alike();
+    let cross = f.run_in_session(
+        "DECLARE @s varchar(80) = ''; SELECT @s = @s + k1.t + CAST((SELECT COUNT(*) FROM s \
+         WHERE s.c = k2.a) AS varchar(3)) FROM k k1 CROSS JOIN k k2 WHERE k2.a < 3 \
+         ORDER BY k1.a, k2.a;",
+        "@s",
+    );
+    assert_eq!(text(&cross), "a2a1b2b1c2c1d2d1e2e1");
+    let joined = f.run_in_session(
+        "DECLARE @s varchar(80) = ''; SELECT @s = @s + k1.t + CAST((SELECT COUNT(*) FROM s \
+         WHERE s.c = k2.a) AS varchar(3)) FROM k k1 JOIN k k2 ON k1.a = k2.b \
+         ORDER BY k1.a, k2.a;",
+        "@s",
+    );
+    assert_eq!(text(&joined), "a0a0b1b3c2");
+    let numbered_alike = f.run_in_session(
+        "DECLARE @s varchar(80) = ''; SELECT @s = @s + CAST(p.a AS varchar(3)) + \
+         CAST((SELECT COUNT(*) FROM p p3 WHERE p3.b > p2.b) AS varchar(3)) + ';' \
+         FROM p CROSS JOIN p p2 WHERE p2.a < 3 ORDER BY p.a, p2.a;",
+        "@s",
+    );
+    assert_eq!(text(&numbered_alike), "12;11;22;21;32;31;42;41;");
+    let two_tables = f.run_in_session(
+        "DECLARE @s varchar(80) = ''; SELECT @s = @s + CAST(p.a AS varchar(3)) + \
+         CAST((SELECT COUNT(*) FROM q WHERE q.b > p2.c - 6) AS varchar(3)) + ';' \
+         FROM p JOIN q p2 ON p.a = p2.b ORDER BY p.a, p2.a;",
+        "@s",
+    );
+    assert_eq!(text(&two_tables), "11;21;42;");
 }
 
 // ---------------------------------------------------------------------------------------

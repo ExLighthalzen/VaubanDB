@@ -40,12 +40,11 @@ impl<'a> UnionAll<'a> {
     }
 }
 
-/// Drops outer-row and inner-scan correlation state an operand may have left on the context.
+/// Drops the outer rows an operand may have left on the context.
 ///
 /// Each operand owns its own operator tree; when one is exhausted the next one must not
 /// inherit stale frames from a nested-loop join that closed mid-scan.
 fn clear_operand_correlation(ctx: &mut ExecContext<'_>) {
-    ctx.pop_subquery_locals();
     while ctx.pop_outer().is_some() {}
 }
 

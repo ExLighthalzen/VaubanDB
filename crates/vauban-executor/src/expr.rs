@@ -73,7 +73,7 @@ use vauban_types::{
     eval_binary,
 };
 
-use crate::context::{ExecContext, SLOT_COLUMN_ID};
+use crate::context::ExecContext;
 use crate::errors::at;
 use crate::row::Row;
 
@@ -189,43 +189,24 @@ pub fn eval_expr(
                 "eval_expr: the variable `{name}` was not declared"
             ))
         }),
-        // A column is read by position and consults nothing: `index` is where the value
-        // sits in the row the node below produced, and the binder put the name and the
-        // type in the binding while it resolved the column. A `row` of `None` means the
-        // binder let a column reference through where there is no source to read — 50000
-        // (`column_ref_without_row_is_a_bug`), no client input causing it — unless the
-        // reference is to an outer row pushed by a correlated join, in which case the
-        // outer rows of the context are consulted instead.
+        // A column is read by position and consults nothing else: each reference carries
+        // the number of enclosing queries up its row lives (`depth`) and where the value
+        // sits in that row (`index`), as the plan leaves them. Depth 0 is the row at hand, or,
+        // without a row, the outer row of the join whose inner side is being opened
+        // (the bound of an index seek). A `row` of `None` with no such join row means a
+        // column reference was let through where there is no source to read: 50000
+        // (`column_ref_without_row_is_a_bug`), no client input causing it.
         BoundExprKind::ColumnRef(binding) => {
-            // A column of an enclosing query is read from the outer-row stack before the
-            // current row is looked at: the row of the subquery may carry a column of the
-            // same identifier and name (`tests/subquery.rs`,
-            // `correlated_scalar_over_the_same_table_reads_the_enclosing_row`). This holds
-            // for a derived table's own column too, which carries `SLOT_COLUMN_ID`: a
-            // depth of 1 or more still means the enclosing row, not the local one
-            // (`tests/subquery.rs`, `derived_table_column_read_from_an_enclosing_scalar`).
+            // A column of an enclosing query is read from the outer-row stack, never from
+            // the row at hand: the row of the subquery may carry a column of the same
+            // identifier and name (`tests/subquery.rs`,
+            // `correlated_scalar_over_the_same_table_reads_the_enclosing_row`).
             if binding.depth > 0 {
                 return ctx.read_outer_column(binding);
             }
-            let row = if let Some(row) = row {
-                row
-            } else {
-                ctx.last_outer_row().ok_or_else(|| {
-                    bug(&format!(
-                        "eval_expr: column `{}` is evaluated without a row",
-                        binding.name
-                    ))
-                })?
+            let Some(row) = row else {
+                return ctx.read_outer_column(binding);
             };
-            if binding.column == SLOT_COLUMN_ID {
-                return ctx.read_local_column(row, binding);
-            }
-            if ctx.subquery_locals().is_some() {
-                if ctx.column_is_outer(binding) {
-                    return ctx.read_outer_column(binding);
-                }
-                return ctx.read_local_column(row, binding);
-            }
             if let Some(value) = row.get(binding.index) {
                 return Ok(value.clone());
             }

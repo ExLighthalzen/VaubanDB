@@ -366,6 +366,40 @@ fn uncorrelated_in_carries_the_equality() {
     assert!(matches!(right.kind, BoundExprKind::ColumnRef(_)));
 }
 
+/// `a.k IN (SELECT b.c FROM b)`: `b.c` is the second column of `b`, but the inner plan
+/// produces it as its only column, so the equality reads it right after the two columns of
+/// `a`, at index 2, and not at the index `b.c` has in the row of `b` shifted past `a`.
+#[test]
+fn in_subquery_compares_the_column_the_inner_plan_produces() {
+    let inner = project_one(scan_b(), binding_b("c", 12, 1), "c");
+    let filtered = LogicalPlan::Filter {
+        input: Box::new(scan_a()),
+        predicate: in_subquery(column(binding_a("k", 1, 0)), inner, false),
+    };
+    let planned = plan_with(&FakeCatalog::new(), filtered);
+    let PhysicalPlan::NestedLoopJoin {
+        kind,
+        on: Some(on),
+        inner,
+        ..
+    } = &planned
+    else {
+        panic!("expected a semi-join with an ON, got {planned:?}");
+    };
+    assert_eq!(*kind, PhysicalJoinKind::Semi);
+    assert_eq!(inner.schema().columns.len(), 1);
+    let BoundExprKind::Compare { left, right, .. } = &on.kind else {
+        panic!("expected equality ON, got {on:?}");
+    };
+    let (BoundExprKind::ColumnRef(tested), BoundExprKind::ColumnRef(produced)) =
+        (&left.kind, &right.kind)
+    else {
+        panic!("expected two column references, got {on:?}");
+    };
+    assert_eq!((tested.index, tested.depth), (0, 0));
+    assert_eq!((produced.index, produced.depth), (2, 0));
+}
+
 #[test]
 fn not_in_stays_a_subquery_eval() {
     let inner = project_one(scan_b(), binding_b("k", 11, 0), "k");

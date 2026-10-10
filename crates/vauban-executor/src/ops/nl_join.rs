@@ -11,25 +11,22 @@
 //! reference the outer row, the join pushes the outer row into the context before opening
 //! the inner, so that `eval_expr` resolves the column references against it.
 //!
-//! # Inner scan bindings
+//! # Positions
 //!
-//! A cross or semi join without `on` drives its inner input with scan-local bindings
-//! pushed on the context (`SubqueryLocalsSource::JoinInnerScan`), so that an expression
-//! inside the inner tree reads the inner row by scan-local position. Those bindings are
-//! pushed around each `open` and `next` of the inner operator and popped before the join
-//! hands a row upward: the `on`, and the operators above the join, read the concatenated
-//! row by index, which is what tells two aliases of one table apart
-//! (`tests/nl_join.rs`, `self_cross_join_projects_both_aliases`).
+//! The `on` and the operators above the join read the concatenated row by index, which
+//! is what tells two aliases of one table apart (`tests/nl_join.rs`,
+//! `self_cross_join_projects_both_aliases`). An expression of the inner tree reads the
+//! inner row by its own index, and an index-seek bound the outer row pushed on the
+//! context.
 
-use vauban_binder::{BoundExpr, BoundExprKind, ColumnBinding, OutputSchema};
+use vauban_binder::{BoundExpr, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{PhysicalJoinKind, PhysicalPlan};
 use vauban_types::Value;
 
-use crate::context::{CANCEL_CHECK_ROWS, ExecContext, SubqueryLocalsSource};
+use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
 use crate::expr::{as_condition, eval_expr};
 use crate::operator::{Operator, build_operator};
-use crate::ops::subquery::{local_column_ids, scan_column_bindings};
 use crate::row::Row;
 
 /// Where the join stands between two `next()` calls.
@@ -96,8 +93,6 @@ pub struct NestedLoopJoin<'a> {
     pub unmatched_outer: Vec<Row>,
     /// How many outer rows were pulled since the last cancellation check.
     pub rows_since_cancel: u64,
-    /// Scan bindings of the outer side, passed to [`ExecContext::push_outer`].
-    pub outer_bindings: Vec<ColumnBinding>,
 }
 
 /// Builds the operator of a [`PhysicalPlan::NestedLoopJoin`].
@@ -133,65 +128,19 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         matched: Vec::new(),
         unmatched_outer: Vec::new(),
         rows_since_cancel: 0,
-        outer_bindings: scan_column_bindings(outer),
     }))
 }
 
 impl<'a> NestedLoopJoin<'a> {
-    /// Whether the inner input is driven with scan-local bindings: `on` is absent for a
-    /// cross join and when the planner folds the predicate into an inner
-    /// [`IndexSeek`](crate::ops::seek::IndexSeek). Cross and semi joins push inner scan
-    /// bindings; inner and left joins read the concatenated row by index.
-    fn drives_inner_with_scan_bindings(&self) -> bool {
-        self.on.is_none()
-            && matches!(
-                self.kind,
-                PhysicalJoinKind::Cross | PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi
-            )
-    }
-
-    /// Runs one call on the inner operator with the scan-local bindings of the inner plan
-    /// pushed on the context, and pops them before returning, so that the bindings are
-    /// visible to the inner tree alone and not to the `on` nor to the operators above the
-    /// join. The frame goes on top of the one a correlated subquery evaluating this join
-    /// pushed, which gets back its place once the call returns; nothing is pushed when
-    /// the join reads its inner by index.
-    fn with_inner_scan_bindings<R>(
-        ctx: &mut ExecContext<'a>,
-        inner_plan: &PhysicalPlan,
-        push: bool,
-        f: impl FnOnce(&mut ExecContext<'a>) -> SqlResult<R>,
-    ) -> SqlResult<R> {
-        if !push {
-            return f(ctx);
-        }
-        ctx.push_subquery_locals(
-            SubqueryLocalsSource::JoinInnerScan,
-            local_column_ids(inner_plan),
-            scan_column_bindings(inner_plan),
-        );
-        let result = f(ctx);
-        ctx.pop_subquery_locals();
-        result
-    }
-
     /// Evaluates `on` on the combined row, or answers `Some(true)` for a cross join.
     fn check_on(
         on: &Option<BoundExpr>,
         combined: &Row,
         ctx: &mut ExecContext<'a>,
-        outer_width: usize,
-        inner_width: usize,
-        semi: bool,
     ) -> SqlResult<Option<bool>> {
         match on {
             Some(predicate) => {
-                let predicate = if semi {
-                    remap_semi_on(predicate, outer_width, inner_width)
-                } else {
-                    predicate.clone()
-                };
-                let value = eval_expr(&predicate, Some(combined), ctx)?;
+                let value = eval_expr(predicate, Some(combined), ctx)?;
                 as_condition(&value)
             }
             None => Ok(Some(true)),
@@ -204,14 +153,11 @@ impl<'a> NestedLoopJoin<'a> {
         outer: &Row,
         inner: &Row,
         ctx: &mut ExecContext<'a>,
-        _outer_width: usize,
-        _inner_width: usize,
-        semi: bool,
     ) -> SqlResult<Option<Row>> {
         let mut combined = Row::with_capacity(outer.len() + inner.len());
         combined.extend_from_slice(outer);
         combined.extend_from_slice(inner);
-        match Self::check_on(on, &combined, ctx, outer.len(), inner.len(), semi)? {
+        match Self::check_on(on, &combined, ctx)? {
             None | Some(false) => Ok(None),
             Some(true) => Ok(Some(combined)),
         }
@@ -303,7 +249,6 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
     }
 
     fn next(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<Option<Row>> {
-        let scan_bindings = self.drives_inner_with_scan_bindings();
         loop {
             match &mut self.phase {
                 Phase::Done => return Ok(None),
@@ -347,32 +292,11 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                     outer_row,
                     had_match,
                 } => {
-                    let outer_width = self.outer_width;
-                    let inner_width = self.inner_width;
-                    let semi = matches!(
-                        self.kind,
-                        PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi
-                    );
-                    let next = Self::with_inner_scan_bindings(
-                        ctx,
-                        &self.inner_plan,
-                        scan_bindings,
-                        |ctx| inner.next(ctx),
-                    )?;
-                    match next {
+                    match inner.next(ctx)? {
                         Some(inner_row) => {
                             let holds = match self.kind {
                                 PhysicalJoinKind::Cross => true,
-                                _ => Self::pair(
-                                    &self.on,
-                                    outer_row,
-                                    &inner_row,
-                                    ctx,
-                                    outer_width,
-                                    inner_width,
-                                    semi,
-                                )?
-                                .is_some(),
+                                _ => Self::pair(&self.on, outer_row, &inner_row, ctx)?.is_some(),
                             };
                             if holds {
                                 *had_match = true;
@@ -389,15 +313,9 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                     self.phase = Phase::NeedOuter;
                                     continue;
                                 }
-                                if let Some(combined) = Self::pair(
-                                    &self.on,
-                                    outer_row,
-                                    &inner_row,
-                                    ctx,
-                                    outer_width,
-                                    inner_width,
-                                    semi,
-                                )? {
+                                if let Some(combined) =
+                                    Self::pair(&self.on, outer_row, &inner_row, ctx)?
+                                {
                                     return Ok(Some(combined));
                                 }
                             }
@@ -440,24 +358,12 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                     pos,
                     had_match,
                 } => {
-                    let outer_width = self.outer_width;
-                    let inner_width = self.inner_width;
-                    let semi = matches!(
-                        self.kind,
-                        PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi
-                    );
                     while *pos < self.inner_rows.len() {
                         let p = *pos;
                         *pos += 1;
-                        if let Some(combined) = Self::pair(
-                            &self.on,
-                            outer_row,
-                            &self.inner_rows[p],
-                            ctx,
-                            outer_width,
-                            inner_width,
-                            semi,
-                        )? {
+                        if let Some(combined) =
+                            Self::pair(&self.on, outer_row, &self.inner_rows[p], ctx)?
+                        {
                             self.matched[p] = true;
                             *had_match = true;
                             return Ok(Some(combined));
@@ -486,14 +392,9 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 | PhysicalJoinKind::Cross
                                 | PhysicalJoinKind::Inner
                                 | PhysicalJoinKind::Left => {
-                                    ctx.push_outer(row.clone(), self.outer_bindings.clone());
+                                    ctx.push_outer(row.clone());
                                     let mut inner = build_operator(&self.inner_plan)?;
-                                    Self::with_inner_scan_bindings(
-                                        ctx,
-                                        &self.inner_plan,
-                                        scan_bindings,
-                                        |ctx| inner.open(ctx),
-                                    )?;
+                                    inner.open(ctx)?;
                                     self.phase = Phase::Scanning {
                                         inner,
                                         outer_row: row,
@@ -536,110 +437,5 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
 
     fn schema(&self) -> &OutputSchema {
         &self.schema
-    }
-}
-
-fn remap_semi_on(expr: &BoundExpr, outer_width: usize, inner_width: usize) -> BoundExpr {
-    BoundExpr {
-        kind: remap_semi_on_kind(expr.kind.clone(), outer_width, inner_width),
-        ty: expr.ty.clone(),
-        line: expr.line,
-    }
-}
-
-fn remap_semi_on_kind(
-    kind: BoundExprKind,
-    outer_width: usize,
-    inner_width: usize,
-) -> BoundExprKind {
-    match kind {
-        BoundExprKind::ColumnRef(mut binding) => {
-            if binding.index >= outer_width && inner_width > 0 {
-                binding.index = outer_width + (binding.index - outer_width) % inner_width;
-            }
-            BoundExprKind::ColumnRef(binding)
-        }
-        BoundExprKind::Negate(inner) => {
-            BoundExprKind::Negate(Box::new(remap_semi_on(&inner, outer_width, inner_width)))
-        }
-        BoundExprKind::BitNot(inner) => {
-            BoundExprKind::BitNot(Box::new(remap_semi_on(&inner, outer_width, inner_width)))
-        }
-        BoundExprKind::Not(inner) => {
-            BoundExprKind::Not(Box::new(remap_semi_on(&inner, outer_width, inner_width)))
-        }
-        BoundExprKind::IsNull { expr, negated } => BoundExprKind::IsNull {
-            expr: Box::new(remap_semi_on(&expr, outer_width, inner_width)),
-            negated,
-        },
-        BoundExprKind::Convert { expr, style, try_ } => BoundExprKind::Convert {
-            expr: Box::new(remap_semi_on(&expr, outer_width, inner_width)),
-            style,
-            try_,
-        },
-        BoundExprKind::Collate { expr } => BoundExprKind::Collate {
-            expr: Box::new(remap_semi_on(&expr, outer_width, inner_width)),
-        },
-        BoundExprKind::Arith { op, left, right } => BoundExprKind::Arith {
-            op,
-            left: Box::new(remap_semi_on(&left, outer_width, inner_width)),
-            right: Box::new(remap_semi_on(&right, outer_width, inner_width)),
-        },
-        BoundExprKind::Compare { op, left, right } => BoundExprKind::Compare {
-            op,
-            left: Box::new(remap_semi_on(&left, outer_width, inner_width)),
-            right: Box::new(remap_semi_on(&right, outer_width, inner_width)),
-        },
-        BoundExprKind::Logical { op, left, right } => BoundExprKind::Logical {
-            op,
-            left: Box::new(remap_semi_on(&left, outer_width, inner_width)),
-            right: Box::new(remap_semi_on(&right, outer_width, inner_width)),
-        },
-        BoundExprKind::In {
-            expr,
-            list,
-            negated,
-        } => BoundExprKind::In {
-            expr: Box::new(remap_semi_on(&expr, outer_width, inner_width)),
-            list: list
-                .into_iter()
-                .map(|item| remap_semi_on(&item, outer_width, inner_width))
-                .collect(),
-            negated,
-        },
-        BoundExprKind::Like {
-            expr,
-            pattern,
-            escape,
-            negated,
-        } => BoundExprKind::Like {
-            expr: Box::new(remap_semi_on(&expr, outer_width, inner_width)),
-            pattern: Box::new(remap_semi_on(&pattern, outer_width, inner_width)),
-            escape: escape.map(|item| Box::new(remap_semi_on(&item, outer_width, inner_width))),
-            negated,
-        },
-        BoundExprKind::Case {
-            operand,
-            arms,
-            else_,
-        } => BoundExprKind::Case {
-            operand: operand.map(|item| Box::new(remap_semi_on(&item, outer_width, inner_width))),
-            arms: arms
-                .into_iter()
-                .map(|arm| vauban_binder::BoundCaseArm {
-                    when: remap_semi_on(&arm.when, outer_width, inner_width),
-                    then: remap_semi_on(&arm.then, outer_width, inner_width),
-                })
-                .collect(),
-            else_: else_.map(|item| Box::new(remap_semi_on(&item, outer_width, inner_width))),
-        },
-        BoundExprKind::Function { def, args } => BoundExprKind::Function {
-            def,
-            args: args
-                .into_iter()
-                .map(|arg| remap_semi_on(&arg, outer_width, inner_width))
-                .collect(),
-        },
-        other => other,
     }
 }

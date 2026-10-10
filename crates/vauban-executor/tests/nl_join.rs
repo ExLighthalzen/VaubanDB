@@ -585,9 +585,13 @@ fn column_binding(column: i32, index: usize) -> ColumnBinding {
     }
 }
 
-fn column_ref(column: i32, index: usize) -> BoundExpr {
+/// A reference to the column at `index` of the row of the enclosing query.
+fn enclosing_column_ref(column: i32, index: usize) -> BoundExpr {
     BoundExpr {
-        kind: BoundExprKind::ColumnRef(column_binding(column, index)),
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            depth: 1,
+            ..column_binding(column, index)
+        }),
         ty: int_ty(),
         line: 1,
     }
@@ -706,6 +710,8 @@ fn subquery_eval(input: PhysicalPlan, subplans: Vec<SubPlan>) -> PhysicalPlan {
 }
 
 /// A cross product filtered inside a correlated `EXISTS` keeps both correlation paths.
+/// The three tables number their single column 1, as the catalogue does: the reference
+/// to the enclosing row is told apart by its depth alone.
 #[test]
 fn correlated_exists_with_a_cross_join_filter_inside() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
@@ -747,8 +753,8 @@ fn correlated_exists_with_a_cross_join_filter_inside() {
     };
 
     let cross = PhysicalPlan::NestedLoopJoin {
-        outer: Box::new(scan_side(side_a, 10)),
-        inner: Box::new(scan_side(side_b, 11)),
+        outer: Box::new(scan_side(side_a, 1)),
+        inner: Box::new(scan_side(side_b, 1)),
         kind: PhysicalJoinKind::Cross,
         on: None,
         schema: schema_of(&["a", "b"]),
@@ -756,8 +762,8 @@ fn correlated_exists_with_a_cross_join_filter_inside() {
     let inner = PhysicalPlan::Filter {
         input: Box::new(cross),
         predicate: and(
-            eq(join_column_ref(10, 0), join_column_ref(11, 1)),
-            eq(join_column_ref(10, 0), column_ref(1, 0)),
+            eq(join_column_ref(1, 0), join_column_ref(1, 1)),
+            eq(join_column_ref(1, 0), enclosing_column_ref(1, 0)),
         ),
     };
     let outer_scan = PhysicalPlan::TableScan {
@@ -1097,12 +1103,12 @@ impl DerivedInnerFixture {
         }
     }
 
-    /// `other` scanned as `(ok, ow)`, column ids 11 and 12, which `small_scan` leaves
-    /// unused: a reference to one of them is read from the outer row.
+    /// `other` scanned as `(ok, ow)`, column ids 1 and 2, the identifiers `small_scan`
+    /// carries too.
     fn other_scan(&self) -> PhysicalPlan {
         PhysicalPlan::TableScan {
             table: self.other,
-            columns: vec![Self::column(11, 0, "ok"), Self::column(12, 1, "ow")],
+            columns: vec![Self::column(1, 0, "ok"), Self::column(2, 1, "ow")],
             alias: "o".to_owned(),
             schema: schema_of(&["ok", "ow"]),
             hints: LockHints::default(),
@@ -1145,28 +1151,28 @@ impl DerivedInnerFixture {
 }
 
 /// The join drives a derived table that swaps its source's columns, and the predicate
-/// inside it compares the derived table's own `k` with the outer row's `ok`: the pairs
-/// kept are those whose keys are equal.
+/// above it compares the derived table's own `k` with the outer row's `ok`, two columns
+/// whose identifiers are the same: the pairs kept are those whose keys are equal.
 #[test]
 fn nested_loop_join_over_a_derived_table_that_reorders_its_source() {
     let f = DerivedInnerFixture::new();
-    let inner = PhysicalPlan::Filter {
-        input: Box::new(f.derived_swapping_small()),
-        predicate: eq(
-            DerivedInnerFixture::column_ref(1, 1, "k"),
-            DerivedInnerFixture::column_ref(11, 0, "ok"),
-        ),
-    };
-    let plan = PhysicalPlan::NestedLoopJoin {
+    let join = PhysicalPlan::NestedLoopJoin {
         outer: Box::new(f.other_scan()),
-        inner: Box::new(inner),
+        inner: Box::new(f.derived_swapping_small()),
         kind: PhysicalJoinKind::Cross,
         on: None,
         schema: schema_of(&["ok", "ow", "v", "k"]),
     };
+    let plan = PhysicalPlan::Filter {
+        input: Box::new(join),
+        predicate: eq(
+            DerivedInnerFixture::column_ref(1, 3, "k"),
+            DerivedInnerFixture::column_ref(1, 0, "ok"),
+        ),
+    };
     assert_eq!(
         f.run(plan),
         vec![ints(&[1, 100, 10, 1]), ints(&[3, 300, 30, 3])],
-        "the derived table's `k` is read at index 1, where its own projection puts it"
+        "the derived table's `k` is read at index 3 of the joined row, where its own projection puts it"
     );
 }

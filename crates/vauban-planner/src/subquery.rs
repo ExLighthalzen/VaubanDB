@@ -29,9 +29,10 @@
 //! (`tests/subquery.rs`, `subplans_follow_the_expression_order`).
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundProjection, BoundSubquery, CompareOp, LogicalOp, LogicalPlan,
-    OutputColumn, OutputSchema,
+    BoundExpr, BoundExprKind, BoundProjection, BoundSubquery, ColumnBinding, CompareOp, LogicalOp,
+    LogicalPlan, OutputColumn, OutputSchema,
 };
+use vauban_catalog::ColumnId;
 use vauban_errors::SqlResult;
 use vauban_types::{SqlType, TypeInfo};
 
@@ -275,126 +276,44 @@ fn semi_join(
     }
 }
 
-/// The equality `on` for `e IN (SELECT x …)` when the subquery select list is a bare
-/// column reference.
+/// The equality `on` for `e IN (SELECT x …)`: `e`, read on the outer side of the
+/// concatenated row, against the single column the inner plan produces, which sits right
+/// after the outer columns. `x` itself is computed by the inner plan, over the rows of
+/// the subquery, and is not read again here (`tests/subquery.rs`,
+/// `in_subquery_compares_the_column_the_inner_plan_produces`).
 fn in_subquery_equality(
     tested: &BoundExpr,
     plan: &LogicalPlan,
     outer: &PhysicalPlan,
 ) -> SqlResult<BoundExpr> {
     let outer_width = outer.schema().columns.len();
-    let inner_expr = shift_column_indices(subquery_select_expr(plan)?, outer_width);
+    let selected = subquery_select_expr(plan)?;
+    let name = plan
+        .schema()
+        .columns
+        .first()
+        .map_or_else(String::new, |column| column.name.clone());
+    let inner_column = BoundExpr {
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            column: ColumnId(1),
+            index: outer_width,
+            name,
+            ty: selected.ty.clone(),
+            depth: 0,
+        }),
+        ty: selected.ty,
+        line: selected.line,
+    };
     let ty = tested.ty.clone();
     Ok(BoundExpr {
         kind: BoundExprKind::Compare {
             op: CompareOp::Eq,
             left: Box::new(tested.clone()),
-            right: Box::new(inner_expr),
+            right: Box::new(inner_column),
         },
         ty,
         line: tested.line,
     })
-}
-
-/// Shifts [`ColumnRef`](vauban_binder::BoundExprKind::ColumnRef) indices by `offset`
-/// so a semi-join predicate reads the concatenated row.
-fn shift_column_indices(expr: BoundExpr, offset: usize) -> BoundExpr {
-    BoundExpr {
-        kind: shift_column_indices_kind(expr.kind, offset),
-        ty: expr.ty,
-        line: expr.line,
-    }
-}
-
-fn shift_column_indices_kind(kind: BoundExprKind, offset: usize) -> BoundExprKind {
-    match kind {
-        BoundExprKind::ColumnRef(mut binding) => {
-            binding.index += offset;
-            BoundExprKind::ColumnRef(binding)
-        }
-        BoundExprKind::Negate(inner) => {
-            BoundExprKind::Negate(Box::new(shift_column_indices(*inner, offset)))
-        }
-        BoundExprKind::BitNot(inner) => {
-            BoundExprKind::BitNot(Box::new(shift_column_indices(*inner, offset)))
-        }
-        BoundExprKind::Not(inner) => {
-            BoundExprKind::Not(Box::new(shift_column_indices(*inner, offset)))
-        }
-        BoundExprKind::IsNull { expr, negated } => BoundExprKind::IsNull {
-            expr: Box::new(shift_column_indices(*expr, offset)),
-            negated,
-        },
-        BoundExprKind::Convert { expr, style, try_ } => BoundExprKind::Convert {
-            expr: Box::new(shift_column_indices(*expr, offset)),
-            style,
-            try_,
-        },
-        BoundExprKind::Collate { expr } => BoundExprKind::Collate {
-            expr: Box::new(shift_column_indices(*expr, offset)),
-        },
-        BoundExprKind::Arith { op, left, right } => BoundExprKind::Arith {
-            op,
-            left: Box::new(shift_column_indices(*left, offset)),
-            right: Box::new(shift_column_indices(*right, offset)),
-        },
-        BoundExprKind::Compare { op, left, right } => BoundExprKind::Compare {
-            op,
-            left: Box::new(shift_column_indices(*left, offset)),
-            right: Box::new(shift_column_indices(*right, offset)),
-        },
-        BoundExprKind::Logical { op, left, right } => BoundExprKind::Logical {
-            op,
-            left: Box::new(shift_column_indices(*left, offset)),
-            right: Box::new(shift_column_indices(*right, offset)),
-        },
-        BoundExprKind::In {
-            expr,
-            list,
-            negated,
-        } => BoundExprKind::In {
-            expr: Box::new(shift_column_indices(*expr, offset)),
-            list: list
-                .into_iter()
-                .map(|item| shift_column_indices(item, offset))
-                .collect(),
-            negated,
-        },
-        BoundExprKind::Like {
-            expr,
-            pattern,
-            escape,
-            negated,
-        } => BoundExprKind::Like {
-            expr: Box::new(shift_column_indices(*expr, offset)),
-            pattern: Box::new(shift_column_indices(*pattern, offset)),
-            escape: escape.map(|item| Box::new(shift_column_indices(*item, offset))),
-            negated,
-        },
-        BoundExprKind::Case {
-            operand,
-            arms,
-            else_,
-        } => BoundExprKind::Case {
-            operand: operand.map(|item| Box::new(shift_column_indices(*item, offset))),
-            arms: arms
-                .into_iter()
-                .map(|arm| vauban_binder::BoundCaseArm {
-                    when: shift_column_indices(arm.when, offset),
-                    then: shift_column_indices(arm.then, offset),
-                })
-                .collect(),
-            else_: else_.map(|item| Box::new(shift_column_indices(*item, offset))),
-        },
-        BoundExprKind::Function { def, args } => BoundExprKind::Function {
-            def,
-            args: args
-                .into_iter()
-                .map(|arg| shift_column_indices(arg, offset))
-                .collect(),
-        },
-        other => other,
-    }
 }
 
 /// The single expression of a one-column subquery select list.
