@@ -223,7 +223,10 @@ fn detach_head(storage: &DiskStorage, head: PageId) -> Result<Option<PageId>, In
 /// sealed page written here is what a later `pin` reads back. It goes through the file layer
 /// rather than through the pool, because a frame of the pool is filled by a `pin` and a `pin`
 /// of a page past the end of `data` is refused by [`super::file::DataFile::read_page`]: the
-/// page this function writes is therefore one the pool has yet to cache. The page a recycled
+/// page this function writes is therefore one the pool has yet to cache. It is written under
+/// the lock of the control block and not under the lock of the pool, beside the reads and
+/// writes the pool issues at the same time; the file layer gives each of them its own offset.
+/// The page a recycled
 /// identifier names goes through the pool instead, which may hold the version [`free`]
 /// dirtied.
 fn grow_by_one_page(storage: &DiskStorage, id: PageId) -> Result<(), InternalError> {

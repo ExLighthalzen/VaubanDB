@@ -6,6 +6,8 @@
 //! after a checkpoint and a reopen.
 //! The structure of the trees themselves is checked from inside the crate
 //! (`disk::btree::concurrency::eight_writers_leave_valid_trees`).
+//! Twenty-four threads on a small pool grow the data file while others read pages back from
+//! it: each page is read and written at its own position.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -214,4 +216,132 @@ fn concurrent_inserts_of_one_key_let_one_through() {
 #[test]
 fn concurrent_inserts_of_one_clustered_key_let_one_through() {
     one_insert_per_key("clustered", true);
+}
+
+/// Threads that write rows while the file of [`many_threads_grow_the_file_beside_a_small_pool`]
+/// grows under them.
+const GROWING_WRITERS: u64 = 16;
+/// Threads that scan the tables while the writers grow the file.
+const GROWING_READERS: u64 = 8;
+/// Frames of the pool: far fewer than the pages the writers fill, so that the readers keep
+/// reading pages back from the file while the allocator writes new ones.
+const SMALL_POOL: usize = 64;
+/// Rows each writer inserts, in transactions of [`GROWING_PER_TXN`].
+const GROWING_ROWS: i32 = 1_200;
+/// Rows per transaction of a growing writer.
+const GROWING_PER_TXN: i32 = 20;
+/// Columns of a row: wide enough that the writers fill a few hundred pages.
+const WIDE_COLUMNS: usize = 24;
+
+/// A heap table of [`WIDE_COLUMNS`] nullable `int`.
+fn wide_heap() -> TableShape {
+    TableShape {
+        columns: vec![TypeInfo::new(SqlType::Int, true); WIDE_COLUMNS],
+        clustered_key: None,
+    }
+}
+
+/// The row `key` of writer `writer`: its first two columns name it, the others repeat the key.
+fn wide_row(writer: u64, key: i32) -> Row {
+    let mut values = vec![
+        Value::I32(i32::try_from(writer).expect("a writer")),
+        Value::I32(key),
+    ];
+    values.resize(WIDE_COLUMNS, Value::I32(key));
+    Row(values)
+}
+
+/// The rows a scan of `table` reads, as `(writer, key)` pairs, after checking each of them is
+/// whole.
+fn wide_rows(storage: &DiskStorage, table: TableId) -> Vec<(i32, i32)> {
+    storage
+        .scan(&settled(), table)
+        .expect("scan")
+        .map(|row| {
+            let row = row.expect("a row").1;
+            let int = |value: &Value| match value {
+                Value::I32(int) => *int,
+                other => panic!("a column of another type: {other:?}"),
+            };
+            let key = int(&row.0[1]);
+            assert!(
+                row.0[2..].iter().all(|value| int(value) == key),
+                "row {row:?}"
+            );
+            (int(&row.0[0]), key)
+        })
+        .collect()
+}
+
+/// Twenty-four threads on a pool of sixty-four frames: sixteen writers fill their own heap
+/// tables, which makes the allocator grow the data file page after page, while eight readers
+/// scan those tables and keep reading evicted pages back. A page read or written at the
+/// position of another one is reported by its header, as a corruption naming the two
+/// identifiers; none may show, and every row reads back whole, before and after a reopen.
+#[test]
+fn many_threads_grow_the_file_beside_a_small_pool() {
+    let dir = fresh_dir("growth");
+    let options = DiskOptions {
+        buffer_pages: SMALL_POOL,
+    };
+    let tables = {
+        let storage = DiskStorage::open(&dir, options).expect("open");
+        let db = storage.create_database("d").expect("create the database");
+        let tables: Vec<TableId> = (0..GROWING_WRITERS)
+            .map(|_| storage.create_table(db, &wide_heap()).expect("a table"))
+            .collect();
+        let writing = AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..GROWING_READERS)
+                .map(|reader| {
+                    let (storage, tables, writing) = (&storage, &tables, &writing);
+                    scope.spawn(move || {
+                        let mut scans = 0u64;
+                        while writing.load(Ordering::SeqCst) {
+                            let at = usize::try_from(reader + scans).expect("an index");
+                            wide_rows(storage, tables[at % tables.len()]);
+                            scans += 1;
+                        }
+                        scans
+                    })
+                })
+                .collect();
+            let writers: Vec<_> = (0..GROWING_WRITERS)
+                .map(|writer| {
+                    let (storage, table) = (&storage, tables[usize::try_from(writer).expect("n")]);
+                    scope.spawn(move || {
+                        for batch in 0..GROWING_ROWS / GROWING_PER_TXN {
+                            let txn = TxnId(1 + writer * 1_000 + u64::try_from(batch).expect("n"));
+                            for step in 0..GROWING_PER_TXN {
+                                let row = wide_row(writer, batch * GROWING_PER_TXN + step);
+                                storage.insert(txn, table, &row).expect("insert");
+                            }
+                            storage.commit(txn).expect("commit");
+                        }
+                    })
+                })
+                .collect();
+            let joined: Vec<_> = writers.into_iter().map(|writer| writer.join()).collect();
+            writing.store(false, Ordering::SeqCst);
+            let scans: Vec<_> = readers.into_iter().map(|reader| reader.join()).collect();
+            for writer in joined {
+                writer.expect("a writer");
+            }
+            for reader in scans {
+                assert!(reader.expect("a reader") > 0, "the reader ran");
+            }
+        });
+        storage.checkpoint().expect("checkpoint");
+        tables
+    };
+    let storage = DiskStorage::open(&dir, options).expect("reopen");
+    for (writer, table) in (0..GROWING_WRITERS).zip(&tables) {
+        let mut rows = wide_rows(&storage, *table);
+        rows.sort_unstable();
+        let owner = i32::try_from(writer).expect("a writer");
+        let expected: Vec<(i32, i32)> = (0..GROWING_ROWS).map(|key| (owner, key)).collect();
+        assert_eq!(rows, expected, "the rows of writer {writer} after a reopen");
+    }
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
 }

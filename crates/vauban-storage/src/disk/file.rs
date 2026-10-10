@@ -1,16 +1,16 @@
 //! The data file of an on-disk instance: an array of pages of [`PAGE_SIZE`] bytes, addressed
 //! by [`PageId`].
 //!
-//! Reads and writes go through [`std::fs::File`], `seek` and `read_exact` / `write_all`; the
-//! file is not mapped into memory, so that the decision of when a page sits in memory and
+//! Reads and writes go through [`std::fs::File`] by positioned accesses (`read_exact_at` /
+//! `write_all_at` on Unix, `seek_read` / `seek_write` on Windows), which name their offset
+//! themselves rather than moving a cursor the handle shares; the file is not mapped into memory, so that the decision of when a page sits in memory and
 //! when it is written back belongs to the buffer pool rather than to the kernel.
 //!
 //! This layer moves 8 192-byte pages and checks their checksum; it does not grow the file by
 //! itself and does not cache anything. The allocator ([`super::alloc`]) owns the growth, the
 //! buffer pool ([`super::buffer`]) owns the caching.
 
-use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use vauban_errors::InternalError;
@@ -23,9 +23,11 @@ use super::page::{PAGE_SIZE, Page, PageId};
 /// by [`PAGE_SIZE`], which is 0 on a fresh instance. A size that is not a multiple is
 /// [`InternalError::Corruption`] at open time.
 ///
-/// The handle is shared behind `&self`, and a read is a `seek` followed by a `read_exact` on
-/// that handle: the caller is responsible for not issuing two such pairs at once on the same
-/// `DataFile`. That caller is the buffer pool ([`super::buffer`]), which serialises page I/O.
+/// The handle is shared behind `&self`, by the buffer pool ([`super::buffer`]) and by the
+/// allocator ([`super::alloc`]), which grows the file without holding the lock of the pool.
+/// Each read and each write carries its own offset, so two threads that move pages at once
+/// each reach the page they name (`many_threads_grow_the_file_beside_a_small_pool`, in
+/// `tests/disk_concurrency.rs`).
 #[derive(Debug)]
 pub(crate) struct DataFile {
     /// Path of the file, kept for the error messages.
@@ -115,11 +117,9 @@ impl DataFile {
             )));
         }
         let mut buffer = [0u8; PAGE_SIZE];
-        let mut handle = &self.file;
         // `id.0 < pages`, and `pages` is the size of the file divided by `PAGE_SIZE`, so the
         // product is at most that size and fits in a `u64`.
-        handle.seek(SeekFrom::Start(id.0 * PAGE_SIZE as u64))?;
-        handle.read_exact(&mut buffer)?;
+        read_exact_at(&self.file, &mut buffer, id.0 * PAGE_SIZE as u64)?;
         Page::from_bytes(buffer)
     }
 
@@ -141,12 +141,74 @@ impl DataFile {
                 self.path.display()
             )));
         }
-        let mut handle = &self.file;
         // Bounded as in `read_page`.
-        handle.seek(SeekFrom::Start(id.0 * PAGE_SIZE as u64))?;
-        handle.write_all(&page.0)?;
+        write_all_at(&self.file, &page.0, id.0 * PAGE_SIZE as u64)?;
         Ok(())
     }
+}
+
+/// Fills `buffer` from the bytes of `file` that start at `offset`, without moving a cursor
+/// shared with another thread.
+#[cfg(unix)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buffer, offset)
+}
+
+/// Writes `bytes` into `file` from `offset` on, without moving a cursor shared with another
+/// thread.
+#[cfg(unix)]
+fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, bytes, offset)
+}
+
+/// Fills `buffer` from the bytes of `file` that start at `offset`.
+///
+/// `seek_read` names its offset in the call itself; it moves the cursor of the handle as a side
+/// effect, which nothing in this layer reads. A short read is continued from where it stopped,
+/// and an end of file before `buffer` is full is [`std::io::ErrorKind::UnexpectedEof`].
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        match file.seek_read(buffer, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the data file ends inside a page",
+                ));
+            }
+            Ok(read) => {
+                buffer = &mut buffer[read..];
+                offset += read as u64;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// Writes `bytes` into `file` from `offset` on, continuing a short write from where it stopped.
+#[cfg(windows)]
+fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !bytes.is_empty() {
+        match file.seek_write(bytes, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "the data file took no byte of a page",
+                ));
+            }
+            Ok(written) => {
+                bytes = &bytes[written..];
+                offset += written as u64;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

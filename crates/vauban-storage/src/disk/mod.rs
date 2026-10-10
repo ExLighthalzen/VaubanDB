@@ -135,19 +135,19 @@ impl Default for DiskOptions {
 /// The structure holds the directory, the open files, the control block read from
 /// `vauban.ctl` and the buffer pool over the data file. On the path of the engine, pages of
 /// `data` are read and written through the pool: a caller `pin`s a page rather than reading
-/// it, and the `seek` and the `read_exact` / `write_all` of the file layer are issued from
-/// there. [`DiskStorage::data`] is a second `pub(crate)` handle on the same file, which the
-/// tests of this module use to write a page behind the pool, and which the allocator
-/// ([`alloc`]) grows. The `impl Storage` is in `storage_impl`.
+/// it, and the reads and writes of the file layer are issued from there.
+/// [`DiskStorage::data`] is a second `pub(crate)` handle on the same file, which the tests of
+/// this module use to write a page behind the pool, and which the allocator ([`alloc`]) grows;
+/// each access of the file layer names its own offset, so the two may move pages at once. The `impl Storage` is in `storage_impl`.
 // `options` is read by the tests of this module and by nothing else in the engine.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct DiskStorage {
     /// Directory of the instance, the `dir` given to [`DiskStorage::open`].
     pub(crate) dir: PathBuf,
-    /// The data file, `<dir>/data`. [`DiskStorage::pool`] holds the same handle and
-    /// serialises the page reads and writes it issues itself; a call made through this field
-    /// goes to the file without passing that lock.
+    /// The data file, `<dir>/data`. [`DiskStorage::pool`] holds the same handle; a call made
+    /// through this field goes to the file without passing the lock of the pool, which the
+    /// positioned accesses of [`file::DataFile`] make safe for the bytes of other pages.
     pub(crate) data: Arc<DataFile>,
     /// Cache of the pages of `data`, of `options.buffer_pages` frames.
     pub(crate) pool: BufferPool,

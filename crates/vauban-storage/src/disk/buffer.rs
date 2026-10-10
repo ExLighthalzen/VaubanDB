@@ -5,10 +5,11 @@
 //! The engine reads and writes the pages of `data` through the pool: the callers
 //! `pin` a page instead of reading it. The tests of the [`super`] module reach
 //! [`super::file::DataFile`] directly — [`super::DiskStorage::data`] is `pub(crate)` and holds
-//! the same handle as the pool — so what the pool serialises is the engine's own `seek` +
-//! `read_exact` pairs, by holding its lock across the read and across the write. A
-//! [`PinGuard`] does *not* hold that lock, so a caller may hold two pins at once (the heap
-//! pins two pages).
+//! the same handle as the pool — and so does the allocator, which grows the file outside the
+//! lock of the pool; each access of the file layer names its own offset, so those accesses do
+//! not need that lock to land on their page. The pool holds its lock across its own read and
+//! write. A [`PinGuard`] does *not* hold that lock, so a caller may hold two pins at once (the
+//! heap pins two pages).
 //!
 //! # Latches
 //!
