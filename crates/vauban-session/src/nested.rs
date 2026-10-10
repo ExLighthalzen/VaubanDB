@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use vauban_binder::{BatchVariables, BindContext, BoundExpr, BoundStatement};
 use vauban_catalog::CatalogSnapshot;
-use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
+use vauban_errors::{ErrorScope, InternalError, SqlError, SqlResult, error_behavior};
 use vauban_executor::{
     Call, EnvironmentChange, EvaluatedExecArg, ExecContext, ExecOutcome, ExecSession, Host,
     Program, ProgramEnd, Ran, Site, StatementSink, eval_expr,
@@ -776,7 +776,7 @@ impl Session {
                 nested_state.rowcount = 0;
                 let continues = more
                     && !nested_state.options.xact_abort
-                    && err.batch_scope() == BatchErrorScope::Statement;
+                    && error_behavior(err.number).scope == ErrorScope::Statement;
                 if continues {
                     // The rest of the text still runs: a `RETURN` or a later error, not this
                     // one, decides the status this call leaves
@@ -1148,8 +1148,9 @@ fn nested_failure(
     nested_state.last_error = err.number;
     sink.error(err)?;
     outcome.failed = true;
-    let continues =
-        more && !nested_state.options.xact_abort && err.batch_scope() == BatchErrorScope::Statement;
+    let continues = more
+        && !nested_state.options.xact_abort
+        && error_behavior(err.number).scope == ErrorScope::Statement;
     if continues {
         sink.done_in_proc(None, true)?;
         Ok(Flow::Continue)
@@ -1388,7 +1389,7 @@ impl Host for NestedHost<'_> {
         self.nested_state.rowcount = 0;
         let continues = !self.nested_state.options.xact_abort
             && err.number != 0
-            && err.batch_scope() == BatchErrorScope::Statement;
+            && error_behavior(err.number).scope == ErrorScope::Statement;
         nested_failure(&err, continues, self.nested_state, self.sink, self.outcome)?;
         Ok(())
     }
@@ -1473,7 +1474,7 @@ fn nested_procedure_continues(
     }
     more && !nested_state.options.xact_abort
         && error_number != 0
-        && SqlError::new(error_number, 16, 1, "x").batch_scope() == BatchErrorScope::Statement
+        && error_behavior(error_number).scope == ErrorScope::Statement
 }
 
 fn at_procedure_line(err: SqlError, line: u32) -> SqlError {

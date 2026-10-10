@@ -20,7 +20,10 @@ mod info;
 mod internal;
 mod sql_error;
 
-pub use catalog::{BatchErrorScope, ErrorDef, message_template};
+pub use catalog::{
+    BatchErrorScope, ErrorBehavior, ErrorDef, ErrorPhase, ErrorScope, error_behavior,
+    message_template,
+};
 pub use info::InfoMessage;
 pub use internal::InternalError;
 pub use sql_error::{SqlError, SqlResult};

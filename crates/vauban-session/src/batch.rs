@@ -84,7 +84,7 @@
 //!   `an_alter_table_on_a_table_still_missing_is_4902_at_run_time`). A deferred statement
 //!   whose table exists by then is checked like the rest, so a 207 it raises is a run-time
 //!   error too (`a_deferred_statement_raises_207_when_it_runs`);
-//! - a **run-time** error stops its statement. Its catalogued [`BatchErrorScope`] then
+//! - a **run-time** error stops its statement. Its catalogued [`vauban_errors::ErrorScope`] then
 //!   decides whether the following statement runs. This is not a severity/state rule: 8134
 //!   and 245 are both severity 16, state 1, but 8134 alone lets the batch continue
 //!   (`a_statement_scoped_runtime_error_lets_the_batch_continue`,
@@ -1298,7 +1298,8 @@ impl BatchHost<'_> {
     ///
     /// A binding that fails now is a run-time error of the statement: what came before it
     /// has produced its results, and the catalogued scope of the number decides whether
-    /// the batch goes on. 208, 207, 1088 and 4902 are batch-scoped, so
+    /// the batch goes on. 1088 stops the batch, and 208, 207 and 4902 stop their level,
+    /// which is the batch here, so
     /// `SELECT 1; SELECT * FROM dbo.t; CREATE TABLE dbo.t (a int); SELECT 2;` answers the
     /// row of the first `SELECT`, then 208 on the line of the second, and no `2`
     /// (`tests/run_batch_pipeline.rs`, `a_select_before_the_create_is_208_at_run_time`).
@@ -1952,7 +1953,7 @@ mod tests {
     /// Same place as SQL Server:
     /// `SELECT 1; CREATE TABLE dbo.s16d (a int); CREATE TABLE dbo.s16d (a int); SELECT 2;`
     /// answers the result set of the `SELECT 1`, then 2714 severity 16 state 6, and no
-    /// result set for the `SELECT 2`, 2714 being batch-scoped ([`BatchErrorScope`]). The
+    /// result set for the `SELECT 2`, 2714 being batch-scoped ([`vauban_errors::ErrorScope`]). The
     /// first table stays: its own transaction was committed before the second statement
     /// ran.
     #[test]

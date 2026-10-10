@@ -1,7 +1,7 @@
 //! Execute a resolved system-procedure [`ProcAction`] through the session.
 
 use crate::rpc::{DescribeKind, ProcAction, ProcArg, ProcParam, StaticResultColumn};
-use vauban_errors::{BatchErrorScope, SqlError, SqlResult};
+use vauban_errors::{ErrorScope, SqlError, SqlResult, error_behavior};
 use vauban_executor::EvaluatedExecArg;
 use vauban_tds::{ColumnFlags, ColumnMeta, RpcParam};
 use vauban_txn::IsolationLevel;
@@ -393,31 +393,24 @@ fn batch_continues(session: &Session, more: bool, failed: bool, error_number: u3
     }
     more && !session.state().options.xact_abort
         && error_number != 0
-        && SqlError::new(error_number, 16, 1, "x").batch_scope() == BatchErrorScope::Statement
+        && error_behavior(error_number).scope == ErrorScope::Statement
 }
-
-/// A statement of a nested text that fails to compile stops the whole text before any of it
-/// runs, and the caller goes on. The numbers pinned by `tests/nested.rs` are 208
-/// (`a_208_in_an_exec_lets_the_caller_continue` and its siblings for 206, 207 and 2812), 156
-/// (`a_156_syntax_error_in_a_nested_text_lets_the_caller_continue`) and 178
-/// (`a_178_return_with_a_value_in_a_nested_text_lets_the_caller_continue`); 102, 103, 132,
-/// 133, 137, 1038 and 4104 are listed on the same rule without a test of their own.
-const NESTED_TEXT_COMPILATION_ERRORS: [u32; 13] = [
-    102, 103, 132, 133, 137, 156, 178, 206, 207, 208, 1038, 2812, 4104,
-];
 
 /// Whether the batch that issued `EXEC('…')` or `sp_executesql` runs its next statement once
 /// the nested text this call ran is done.
 ///
-/// `XACT_ABORT ON` on the caller stops it after any failure. Otherwise, an error the nested
-/// text fails to *compile* on (`NESTED_TEXT_COMPILATION_ERRORS`) does not stop the caller: no
-/// statement of the text ran, so nothing there needed the caller to stop either. An error
-/// raised while a statement of the nested text *runs* stops the caller exactly when its
-/// catalogued scope (`vauban_errors::SqlError::batch_scope`) already stops the batch that
-/// raised it — `BatchErrorScope::Batch` — and lets the caller go on when it is
-/// `BatchErrorScope::Statement` (`tests/nested.rs`,
+/// `XACT_ABORT ON` on the caller stops it after a failure. Otherwise the catalogued scope of
+/// the last error of the text decides ([`vauban_errors::error_behavior`]): an error that
+/// stops its statement or its level ([`ErrorScope::Statement`], [`ErrorScope::Level`]) lets
+/// the caller go on, a wider one stops it ([`ErrorScope::stops_the_caller`]). A text that
+/// fails to compile raises an error of its level: 208
+/// (`a_208_in_an_exec_lets_the_caller_continue` and its siblings for 206, 207 and 2812), 156
+/// (`a_156_syntax_error_in_a_nested_text_lets_the_caller_continue`) and 178
+/// (`a_178_return_with_a_value_in_a_nested_text_lets_the_caller_continue`). Errors raised
+/// while a statement of the text runs are covered by
 /// `nested_batch_scope_family_decides_caller_continuation`,
-/// `a_515_in_an_exec_lets_the_caller_continue` and its siblings for 547, 2627 and 3701).
+/// `a_515_in_an_exec_lets_the_caller_continue` and its siblings for 547, 2627 and 3701
+/// (`tests/nested.rs`).
 pub(crate) fn continues_after_nested(more: bool, xact_abort: bool, error_number: u32) -> bool {
     if error_number == 0 {
         return more;
@@ -425,10 +418,7 @@ pub(crate) fn continues_after_nested(more: bool, xact_abort: bool, error_number:
     if xact_abort {
         return false;
     }
-    if NESTED_TEXT_COMPILATION_ERRORS.contains(&error_number) {
-        return more;
-    }
-    more && SqlError::new(error_number, 16, 1, "x").batch_scope() == BatchErrorScope::Statement
+    more && !error_behavior(error_number).scope.stops_the_caller()
 }
 
 fn apply_batch_outputs(

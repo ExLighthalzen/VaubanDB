@@ -405,3 +405,156 @@ fn batch_scope_of_a_subquery_of_several_values_is_statement() {
     let def = message_template(512).expect("error 512 is in the catalog");
     assert_eq!(def.batch_scope(), BatchErrorScope::Statement);
 }
+
+/// One severity of each band of [`ErrorBehavior::of_severity`].
+#[test]
+fn default_behaviour_follows_the_severity() {
+    let info = ErrorBehavior::of_severity(10);
+    assert_eq!(info.scope, ErrorScope::Statement);
+    assert!(!info.dooms_transaction && !info.xact_abort_widens);
+
+    let syntax = ErrorBehavior::of_severity(15);
+    assert_eq!(syntax.scope, ErrorScope::Level);
+    assert_eq!(syntax.phase, ErrorPhase::Compilation);
+    assert!(!syntax.dooms_transaction && !syntax.xact_abort_widens);
+
+    for severity in [11, 14, 16, 19] {
+        let run_time = ErrorBehavior::of_severity(severity);
+        assert_eq!(run_time.scope, ErrorScope::Batch, "severity {severity}");
+        assert_eq!(run_time.phase, ErrorPhase::Execution, "severity {severity}");
+        assert!(run_time.dooms_transaction && run_time.xact_abort_widens);
+    }
+
+    for severity in [20, 25] {
+        assert_eq!(
+            ErrorBehavior::of_severity(severity).scope,
+            ErrorScope::Connection,
+            "severity {severity}"
+        );
+    }
+}
+
+/// 8134 and 245 share severity 16 and state 1; the first stops its statement, the second
+/// the batch.
+#[test]
+fn run_time_errors_of_one_severity_differ_in_scope() {
+    assert_eq!(
+        message_template(8134).map(|d| d.severity),
+        message_template(245).map(|d| d.severity)
+    );
+    assert_eq!(error_behavior(8134).scope, ErrorScope::Statement);
+    assert_eq!(error_behavior(245).scope, ErrorScope::Batch);
+}
+
+#[test]
+fn the_caller_goes_on_after_a_statement_or_a_level() {
+    assert!(!ErrorScope::Statement.stops_the_caller());
+    assert!(!ErrorScope::Level.stops_the_caller());
+    assert!(ErrorScope::Batch.stops_the_caller());
+    assert!(ErrorScope::Connection.stops_the_caller());
+}
+
+#[test]
+fn an_uncatalogued_number_stops_the_batch() {
+    for number in [0, 50_000, 999_999] {
+        assert!(message_template(number).is_none());
+        let behavior = error_behavior(number);
+        assert_eq!(behavior.scope, ErrorScope::Batch, "error {number}");
+        assert_eq!(behavior.phase, ErrorPhase::Execution, "error {number}");
+    }
+}
+
+/// Scope, phase, transaction doomed under `TRY…CATCH`, widened by `XACT_ABORT ON`, for the
+/// errors whose behaviour applications rely on.
+#[test]
+fn known_errors_carry_their_behaviour() {
+    use ErrorPhase::{Compilation, Execution};
+    use ErrorScope::{Batch, Level, Statement};
+    let expected: &[(u32, ErrorScope, ErrorPhase, bool, bool)] = &[
+        // Names resolved at compilation, or when the batch reaches the statement.
+        (206, Level, Compilation, false, true),
+        (207, Level, Compilation, false, true),
+        (208, Level, Compilation, false, true),
+        (4104, Level, Compilation, false, true),
+        (4902, Level, Compilation, false, true),
+        (209, Level, Compilation, false, true),
+        (1011, Level, Compilation, false, true),
+        (1012, Level, Compilation, false, true),
+        (2715, Level, Compilation, false, true),
+        (8120, Level, Compilation, false, true),
+        // Syntax and other compilation checks of severity 15.
+        (102, Level, Compilation, false, false),
+        (105, Level, Compilation, false, false),
+        (133, Level, Compilation, false, false),
+        (137, Level, Compilation, false, false),
+        (155, Level, Compilation, false, false),
+        (156, Level, Compilation, false, false),
+        (178, Level, Compilation, false, false),
+        (1038, Level, Compilation, false, false),
+        // The failing statement stops.
+        (220, Statement, Execution, false, true),
+        (512, Statement, Execution, false, true),
+        (515, Statement, Execution, false, true),
+        (547, Statement, Execution, false, true),
+        (2627, Statement, Execution, false, true),
+        (2812, Statement, Execution, false, true),
+        (8134, Statement, Execution, false, true),
+        (3701, Statement, Execution, false, false),
+        (266, Statement, Execution, true, false),
+        // The batch stops.
+        (127, Batch, Execution, false, true),
+        (241, Batch, Execution, true, true),
+        (245, Batch, Execution, true, true),
+        (1014, Batch, Execution, true, true),
+        (1031, Batch, Execution, true, true),
+        (1088, Batch, Execution, true, true),
+        (1205, Batch, Execution, true, true),
+        (1750, Batch, Execution, true, true),
+        (2714, Batch, Execution, true, true),
+    ];
+    for &(number, scope, phase, dooms, widens) in expected {
+        assert!(message_template(number).is_some(), "error {number}");
+        assert_eq!(
+            error_behavior(number),
+            ErrorBehavior {
+                scope,
+                phase,
+                dooms_transaction: dooms,
+                xact_abort_widens: widens,
+            },
+            "error {number}"
+        );
+    }
+}
+
+/// The entries that stop their statement and nothing more, with `XACT_ABORT OFF`.
+#[test]
+fn statement_scoped_entries() {
+    let statement: Vec<u32> = CATALOG
+        .iter()
+        .filter(|def| def.severity > 10 && def.behavior().scope == ErrorScope::Statement)
+        .map(|def| def.number)
+        .collect();
+    assert_eq!(
+        statement,
+        [
+            220, 232, 237, 242, 244, 248, 266, 506, 512, 515, 517, 535, 536, 537, 544, 547, 2601,
+            2627, 2628, 2812, 3623, 3701, 8115, 8134, 8152, 9806, 9807, 9809, 9810,
+        ]
+    );
+}
+
+/// An exception that equals the default of its severity says nothing: the entry drops it.
+#[test]
+fn an_exception_differs_from_the_default_of_its_severity() {
+    for def in CATALOG {
+        if let Some(behavior) = def.exception {
+            assert_ne!(
+                behavior,
+                ErrorBehavior::of_severity(def.severity),
+                "error {}",
+                def.number
+            );
+        }
+    }
+}

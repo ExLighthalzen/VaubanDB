@@ -745,6 +745,73 @@ fn a_2812_in_an_exec_lets_the_caller_continue() {
     assert!(has_int_row(&events.0, 3), "{:?}", events.0);
 }
 
+/// 2812 stops the `EXEC` that names the missing procedure, and nothing more: the next
+/// statement of the batch runs.
+#[test]
+fn a_2812_lets_the_batch_go_on() {
+    let events = run_batch(
+        &mut session(),
+        "SELECT 1; EXEC dbo.nested_no_such_proc; SELECT 2;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2812]);
+    assert!(has_int_row(&events.0, 2), "{:?}", events.0);
+}
+
+/// Inside a nested text too, 2812 stops its own statement: the text goes on, then the
+/// caller.
+#[test]
+fn a_2812_inside_an_exec_lets_the_text_go_on() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('EXEC dbo.nested_no_such_proc; SELECT 2;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2812]);
+    assert!(has_int_row(&events.0, 2), "{:?}", events.0);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// A syntax error stops the nested text it was found in, and the caller goes on: 105 is
+/// severity 15, whose errors stop their level.
+#[test]
+fn a_105_in_an_exec_lets_the_caller_continue() {
+    let events = run_batch(&mut session(), "EXEC('SELECT ''abc'); SELECT 3;");
+    assert_eq!(error_numbers(&events.0), vec![105]);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// `ALTER TABLE` on a table that does not exist stops its nested text, like 208, and the
+/// caller goes on.
+#[test]
+fn a_4902_in_an_exec_lets_the_caller_continue() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('ALTER TABLE dbo.nested_missing ADD b int;'); SELECT 3;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![4902]);
+    assert!(has_int_row(&events.0, 3), "{:?}", events.0);
+}
+
+/// The other side of the two tests above: a negative row count read at run time (127) and
+/// an index on a table that does not exist (1088) stop the caller as well, although their
+/// severity is that of the syntax errors.
+#[test]
+fn a_127_or_a_1088_in_an_exec_stops_the_caller() {
+    for (text, number) in [
+        (
+            "EXEC('DECLARE @n int = -1; SELECT TOP (@n) 1;'); SELECT 3;",
+            127,
+        ),
+        (
+            "EXEC('CREATE INDEX ix ON dbo.nested_missing (a);'); SELECT 3;",
+            1088,
+        ),
+    ] {
+        let events = run_batch(&mut session(), text);
+        assert_eq!(error_numbers(&events.0), vec![number], "{text}");
+        assert!(!has_int_row(&events.0, 3), "{text}: {:?}", events.0);
+    }
+}
+
 /// `8134` only stops the statement that raised it: the nested text goes on to its own next
 /// statement, which succeeds, so the caller sees the call as a whole succeed, and `@@ERROR`
 /// right after the call is `0`, not the division by zero in the middle of the text.
@@ -1069,8 +1136,8 @@ async fn tiberius_reads_run_nested_doneinproc_and_doneproc() {
 
 /// The rule this project applies to decide whether the caller of an `EXEC('…')` goes on: an
 /// error raised while a statement of the nested text *runs* stops the caller exactly when
-/// its catalogued scope (`vauban_errors::SqlError::batch_scope`) already stops the batch
-/// that raised it. Parameterized over the numbers this project checks that scope on.
+/// its catalogued scope (`vauban_errors::error_behavior`) stops the batch that raised it.
+/// Parameterized over the numbers this project checks that scope on.
 #[test]
 fn nested_batch_scope_family_decides_caller_continuation() {
     let stops: &[(&str, u32)] = &[
