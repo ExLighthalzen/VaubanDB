@@ -78,7 +78,7 @@ pub(crate) fn alter_table(
         return alter_table_constraint(catalog, txn, table, change);
     }
     lock_current_storage(catalog, txn, table)?;
-    let (old, plan, old_storage) = {
+    let (old, plan, old_storage, old_indexes) = {
         let mut store = table::store(catalog);
         table::refresh(catalog, &mut store)?;
         index::refresh(catalog, &mut store)?;
@@ -93,7 +93,13 @@ pub(crate) fn alter_table(
         let old = entry.meta.clone();
         let plan = plan_change(catalog, txn, &store, &old, change)?;
         let old_storage = old.storage_id;
-        (old, plan, old_storage)
+        let old_indexes: Vec<(IndexId, String)> = store
+            .indexes
+            .of_table(old.id)
+            .into_iter()
+            .map(|index| (index.id, index.name.clone()))
+            .collect();
+        (old, plan, old_storage, old_indexes)
     };
     let (meta, index_defs) = copy_table(catalog, txn, &old, &plan)?;
     // Granted at once: no other transaction knows the new storage table yet.
@@ -103,7 +109,6 @@ pub(crate) fn alter_table(
         .register_on_commit(txn, CommitAction::DropTable(old_storage))?;
     {
         let mut store = table::store(catalog);
-        remove_storage_indexes(&mut store, old.id, old_storage);
         if let Some(entry) = store.entries.get_mut(&table) {
             entry.previous_metas.push(old.clone());
             entry.meta = meta.clone();
@@ -115,11 +120,76 @@ pub(crate) fn alter_table(
     for def in index_defs {
         catalog.create_index(txn, &def)?;
     }
-    let store = table::store(catalog);
+    let mut store = table::store(catalog);
+    repoint_foreign_keys(catalog, txn, &mut store, table, &old_indexes)?;
     Ok(store
         .get(table)
         .cloned()
         .expect("alter_table stored the table"))
+}
+
+/// Points the `FOREIGN KEY` constraints that read an index of `table` at the index of the
+/// same name the rebuild made, and writes the rows of each table whose constraint moved.
+///
+/// The rebuild gives each index of `table` a new [`IndexId`], and a `FOREIGN KEY` of another
+/// table, or of `table` itself, holds the identifier of the key it reads: left alone, it
+/// would read an index dropped at the `COMMIT` (`tests/alter.rs`,
+/// `a_foreign_key_keeps_its_unique_index_across_a_dropped_constraint`).
+/// `old_indexes` holds the identifier and the name of each index of `table` before the
+/// rebuild.
+///
+/// # Errors
+///
+/// Those of [`crate::sys_rows::rewrite`].
+fn repoint_foreign_keys(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    store: &mut TableStore,
+    table: ObjectId,
+    old_indexes: &[(IndexId, String)],
+) -> SqlResult<()> {
+    let current = store.indexes.of_table(table);
+    let moved: Vec<(IndexId, IndexId)> = old_indexes
+        .iter()
+        .filter_map(|(id, name)| {
+            current
+                .iter()
+                .find(|index| index.name.eq_ignore_ascii_case(name))
+                .filter(|index| index.id != *id)
+                .map(|index| (*id, index.id))
+        })
+        .collect();
+    if moved.is_empty() {
+        return Ok(());
+    }
+    let mut rewritten = Vec::new();
+    for entry in store
+        .entries
+        .values_mut()
+        .filter(|entry| entry.dropped_by.is_none())
+    {
+        let mut changed = false;
+        for constraint in &mut entry.meta.constraints {
+            if let ConstraintMeta::ForeignKey {
+                referenced_table,
+                referenced_index,
+                ..
+            } = constraint
+                && *referenced_table == table
+                && let Some((_, new)) = moved.iter().find(|(old, _)| old == referenced_index)
+            {
+                *referenced_index = *new;
+                changed = true;
+            }
+        }
+        if changed {
+            rewritten.push(entry.meta.clone());
+        }
+    }
+    for meta in &rewritten {
+        crate::sys_rows::rewrite(catalog, txn, meta, &store.indexes)?;
+    }
+    Ok(())
 }
 
 /// Takes the `Sch-M` of the storage table `table` stands on, the store let go during the
@@ -201,6 +271,68 @@ fn is_named_key_constraint(store: &TableStore, table: ObjectId, name: &str) -> S
         }
     }
     Ok(false)
+}
+
+/// Error 3725: the key constraint a `DROP CONSTRAINT` names is read by a `FOREIGN KEY`.
+const KEY_REFERENCED_3725: u32 = 3725;
+
+/// Refuses the `DROP CONSTRAINT` of the `PRIMARY KEY` or `UNIQUE` constraint `name` of
+/// `table` when a `FOREIGN KEY` of a live table, `table` included, reads its index.
+///
+/// # Errors
+///
+/// 3725 severity 16 state 0, naming the key, the referencing table without its schema and
+/// the `FOREIGN KEY` (`tests/alter.rs`,
+/// `dropping_a_unique_constraint_a_foreign_key_reads_is_3725`). `vauban-errors` does not
+/// catalogue the number, so the error is built here.
+fn refuse_drop_of_a_referenced_key(
+    store: &TableStore,
+    table: &TableMeta,
+    name: &str,
+) -> SqlResult<()> {
+    let Some(key) = table
+        .constraints
+        .iter()
+        .find_map(|constraint| match constraint {
+            ConstraintMeta::PrimaryKey(index) | ConstraintMeta::Unique(index)
+                if store
+                    .indexes
+                    .get(*index)
+                    .is_some_and(|meta| meta.name.eq_ignore_ascii_case(name)) =>
+            {
+                Some(*index)
+            }
+            _ => None,
+        })
+    else {
+        return Ok(());
+    };
+    for referencing in store.live() {
+        for constraint in &referencing.constraints {
+            if let ConstraintMeta::ForeignKey {
+                constraint,
+                referenced_table,
+                referenced_index,
+                ..
+            } = constraint
+                && *referenced_table == table.id
+                && *referenced_index == key
+            {
+                let foreign_key = constraint_object_name(store, *constraint)?;
+                return Err(SqlError::new(
+                    KEY_REFERENCED_3725,
+                    16,
+                    0,
+                    format!(
+                        "The constraint '{name}' cannot go: the foreign key constraint \
+                         '{foreign_key}' of table '{}' reads it.",
+                        referencing.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn alter_table_constraint(
@@ -450,6 +582,7 @@ fn plan_change(
         }
         AlterTable::DropConstraint { name } => {
             if is_named_key_constraint(store, old.id, name)? {
+                refuse_drop_of_a_referenced_key(store, old, name)?;
                 let before = keys.len();
                 keys.retain(|key| {
                     constraint_def_name(key)
@@ -553,7 +686,35 @@ fn copy_table(
     };
     {
         let mut store = table::store(catalog);
-        index::apply_table_keys(catalog, txn, &mut store, &keys, &mut meta)?;
+        // The indexes of the old storage table still carry the names the keys are rebuilt
+        // under: they are marked superseded while the new ones are made, and stay in the
+        // store for a `ROLLBACK` to find again (`tests/alter.rs`,
+        // `adding_a_column_keeps_a_named_primary_key`,
+        // `a_rolled_back_rebuild_leaves_the_indexes_and_the_foreign_keys_as_they_were`).
+        store.indexes.supersede(old.id, old.storage_id, true);
+        let built =
+            rebuild_keys_and_constraints(catalog, txn, &mut store, old, plan, &keys, &mut meta);
+        if built.is_err() {
+            store.indexes.supersede(old.id, old.storage_id, false);
+        }
+        built?;
+    }
+    Ok((meta, plan.statement_indexes.clone()))
+}
+
+/// The second half of [`copy_table`]: the key indexes over the new storage table, the
+/// constraints the change keeps or adds, and the rows of the internal tables.
+fn rebuild_keys_and_constraints(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    store: &mut TableStore,
+    old: &TableMeta,
+    plan: &AlterPlan,
+    keys: &index::TableKeys,
+    meta: &mut TableMeta,
+) -> SqlResult<()> {
+    {
+        index::apply_table_keys(catalog, txn, store, keys, meta)?;
         meta.constraints.extend(plan.preserved.clone());
         // `plan.add` carries the `DEFAULT` of a column `ADD COLUMN` just appended, named or
         // not (`plan_change`): one call, so its named loop marks the column before the bare
@@ -563,13 +724,13 @@ fn copy_table(
         // `add_column_with_default_fills_existing_rows`, which needs `ColumnMeta::default`
         // already set on `plan.columns` for the backfill `copy_visible_rows` did above).
         crate::constraints::apply_table_constraints(
-            &mut store,
+            store,
             &build_table_def(old, &plan.columns, &[], &plan.add),
-            &mut meta,
+            meta,
         )?;
-        crate::sys_rows::rewrite(catalog, txn, &meta, &store.indexes)?;
+        crate::sys_rows::rewrite(catalog, txn, meta, &store.indexes)?;
     }
-    Ok((meta, plan.statement_indexes.clone()))
+    Ok(())
 }
 
 fn copy_visible_rows(
@@ -620,13 +781,6 @@ fn prune_constraint_objects(store: &mut TableStore, table: &TableMeta) {
         .constraints
         .entries
         .retain(|id, object| object.parent != Some(table.id) || kept.contains(id));
-}
-
-fn remove_storage_indexes(store: &mut TableStore, table: ObjectId, storage_table: TableId) {
-    store
-        .indexes
-        .entries
-        .retain(|_, entry| !(entry.table == table && entry.storage_table == storage_table));
 }
 
 fn table_is_empty(catalog: &Catalog, txn: &TxnHandle, table: &TableMeta) -> SqlResult<bool> {

@@ -98,6 +98,12 @@ const INDEX_OF_A_DROPPED_TABLE_3701_STATE: u8 = 6;
 pub(crate) struct IndexStore {
     /// One entry per index created through this catalogue and still in `storage`.
     pub(crate) entries: BTreeMap<IndexId, IndexEntry>,
+    /// The table and the name of each index [`refresh`] has seen, kept after the entry has
+    /// gone while a `FOREIGN KEY` still reads it: a `ROLLBACK` of an `ALTER TABLE` drops the
+    /// indexes the rebuild made, and the key that read one of them goes back to the index of
+    /// the same name over the storage table the `ROLLBACK` restored (`tests/alter.rs`,
+    /// `a_rolled_back_rebuild_leaves_the_indexes_and_the_foreign_keys_as_they_were`).
+    names: BTreeMap<IndexId, (ObjectId, String)>,
 }
 
 /// One index of an [`IndexStore`].
@@ -115,6 +121,11 @@ pub(crate) struct IndexEntry {
     /// closed without the drop taking effect (`tests/index.rs`,
     /// `a_rolled_back_drop_index_leaves_the_index`).
     dropped_by: Option<TxnId>,
+    /// `true` while the index stands on a storage table its table no longer stands on: the
+    /// old storage table of an `ALTER TABLE` not yet committed. Such an entry is kept, so a
+    /// `ROLLBACK` finds it again, and it is left out of [`IndexStore::of_table`] and of the
+    /// name checks. Set by [`IndexStore::supersede`] and recomputed by [`refresh`].
+    superseded: bool,
 }
 
 impl IndexEntry {
@@ -126,6 +137,7 @@ impl IndexEntry {
             storage_table,
             meta,
             dropped_by: None,
+            superseded: false,
         }
     }
 }
@@ -143,9 +155,21 @@ impl IndexStore {
     pub(crate) fn of_table(&self, table: ObjectId) -> Vec<&IndexMeta> {
         self.entries
             .values()
-            .filter(|entry| entry.table == table && entry.dropped_by.is_none())
+            .filter(|entry| entry.table == table && entry.dropped_by.is_none() && !entry.superseded)
             .map(|entry| &entry.meta)
             .collect()
+    }
+
+    /// Marks the indexes of `table` built over `storage_table` as superseded (`on`) or not.
+    ///
+    /// `alter.rs` marks the indexes of the old storage table before it builds the new ones
+    /// under the same names, and clears the mark when the rebuild fails.
+    pub(crate) fn supersede(&mut self, table: ObjectId, storage_table: TableId, on: bool) {
+        for entry in self.entries.values_mut() {
+            if entry.table == table && entry.storage_table == storage_table {
+                entry.superseded = on;
+            }
+        }
     }
 
     /// The index of identifier `id`, `None` when this catalogue created no such index or
@@ -162,9 +186,9 @@ impl IndexStore {
     /// A pending `DROP` does not free the name: the index is in `storage` until the
     /// `COMMIT` (`tests/index.rs`, `a_duplicate_index_name_on_a_table_is_refused`).
     fn named(&self, table: ObjectId, name: &str) -> Option<&IndexEntry> {
-        self.entries
-            .values()
-            .find(|entry| entry.table == table && entry.meta.name.eq_ignore_ascii_case(name))
+        self.entries.values().find(|entry| {
+            entry.table == table && !entry.superseded && entry.meta.name.eq_ignore_ascii_case(name)
+        })
     }
 }
 
@@ -577,10 +601,22 @@ fn drop_index_with(
 ///
 /// The error of the `storage` calls.
 pub(crate) fn refresh(catalog: &Catalog, store: &mut TableStore) -> SqlResult<()> {
+    let tables = crate::constraints::live_storage_tables(catalog)?;
     let mut live: BTreeSet<IndexId> = BTreeSet::new();
     let mut asked: BTreeSet<TableId> = BTreeSet::new();
+    for (id, entry) in &store.indexes.entries {
+        store
+            .indexes
+            .names
+            .insert(*id, (entry.table, entry.meta.name.clone()));
+    }
     for entry in store.indexes.entries.values() {
-        if store.get(entry.table).is_some() && asked.insert(entry.storage_table) {
+        // The storage table of an `ALTER TABLE` undone by a `ROLLBACK` is gone with its
+        // indexes: storage is not asked about it.
+        if store.get(entry.table).is_some()
+            && tables.contains(&entry.storage_table)
+            && asked.insert(entry.storage_table)
+        {
             for (id, _) in catalog.storage.indexes(entry.storage_table)? {
                 live.insert(id);
             }
@@ -600,7 +636,72 @@ pub(crate) fn refresh(catalog: &Catalog, store: &mut TableStore) -> SqlResult<()
             entry.dropped_by = None;
         }
     }
+    let current: BTreeMap<ObjectId, TableId> = store
+        .entries
+        .iter()
+        .map(|(id, table)| (*id, table.meta.storage_id))
+        .collect();
+    for entry in store.indexes.entries.values_mut() {
+        if let Some(storage_table) = current.get(&entry.table) {
+            entry.superseded = *storage_table != entry.storage_table;
+        }
+    }
+    repoint_foreign_keys_at_gone_indexes(store);
     Ok(())
+}
+
+/// Points each `FOREIGN KEY` whose index is gone or superseded at the index of the same
+/// name its referenced table stands on now, then forgets the names no key reads any more.
+///
+/// The shape is the `ROLLBACK` of an `ALTER TABLE` of the referenced table: the rebuild
+/// pointed the key at the index it made, which the `ROLLBACK` dropped
+/// (`tests/alter.rs`,
+/// `a_rolled_back_rebuild_leaves_the_indexes_and_the_foreign_keys_as_they_were`).
+fn repoint_foreign_keys_at_gone_indexes(store: &mut TableStore) {
+    let TableStore {
+        entries, indexes, ..
+    } = store;
+    for table in entries.values_mut() {
+        for constraint in &mut table.meta.constraints {
+            let ConstraintMeta::ForeignKey {
+                referenced_table,
+                referenced_index,
+                ..
+            } = constraint
+            else {
+                continue;
+            };
+            if indexes
+                .entries
+                .get(referenced_index)
+                .is_some_and(|entry| !entry.superseded)
+            {
+                continue;
+            }
+            let Some((_, name)) = indexes.names.get(referenced_index) else {
+                continue;
+            };
+            if let Some((id, _)) = indexes.entries.iter().find(|(_, entry)| {
+                entry.table == *referenced_table
+                    && !entry.superseded
+                    && entry.meta.name.eq_ignore_ascii_case(name)
+            }) {
+                *referenced_index = *id;
+            }
+        }
+    }
+    let read: BTreeSet<IndexId> = entries
+        .values()
+        .flat_map(|table| table.meta.constraints.iter())
+        .filter_map(|constraint| match constraint {
+            ConstraintMeta::ForeignKey {
+                referenced_index, ..
+            } => Some(*referenced_index),
+            _ => None,
+        })
+        .collect();
+    let IndexStore { entries, names } = indexes;
+    names.retain(|id, _| entries.contains_key(id) || read.contains(id));
 }
 
 /// Creates one index in `storage`, registers its compensation and stores `meta` under the
@@ -641,6 +742,10 @@ fn create_one_index(
         catalog.storage.drop_index(id)?;
         return Err(err);
     }
+    store
+        .indexes
+        .names
+        .insert(id, (table.id, meta.name.clone()));
     store.indexes.entries.insert(
         id,
         IndexEntry {
@@ -648,6 +753,7 @@ fn create_one_index(
             storage_table: table.storage_id,
             meta: IndexMeta { id, ..meta },
             dropped_by: None,
+            superseded: false,
         },
     );
     Ok(id)

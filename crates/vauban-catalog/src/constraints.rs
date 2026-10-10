@@ -733,7 +733,7 @@ fn marker_table_shape() -> vauban_storage::TableShape {
     }
 }
 
-fn live_storage_tables(catalog: &Catalog) -> SqlResult<BTreeSet<TableId>> {
+pub(crate) fn live_storage_tables(catalog: &Catalog) -> SqlResult<BTreeSet<TableId>> {
     let mut live = BTreeSet::new();
     for (db, _) in catalog.storage.databases()? {
         for (table, _) in catalog.storage.tables(db)? {
@@ -845,6 +845,34 @@ fn name_for(kind: &str, written: Option<&str>, column: Option<&str>, meta: &Tabl
     }
 }
 
+/// Whether a `PRIMARY KEY` or `UNIQUE` constraint of a live table of the schema of `meta`
+/// is called `name`.
+///
+/// The key constraints are named by their index ([`IndexMeta`]) and not by an object of
+/// [`ConstraintStore`], so [`ConstraintStore::named`] does not see them; their names share
+/// the schema with the other constraints all the same, and
+/// `ALTER TABLE t ADD CONSTRAINT pk_t CHECK (a > 0);` over the `PRIMARY KEY` `pk_t` answers
+/// 2714 state 5 (`tests/alter.rs`,
+/// `adding_a_check_under_the_name_of_a_key_is_2714_state_5`).
+fn taken_by_a_key(store: &TableStore, meta: &TableMeta, name: &str) -> bool {
+    store
+        .live()
+        .filter(|table| {
+            table.database == meta.database && table.schema.eq_ignore_ascii_case(&meta.schema)
+        })
+        .flat_map(|table| table.constraints.iter())
+        .filter_map(|constraint| match constraint {
+            ConstraintMeta::PrimaryKey(index) | ConstraintMeta::Unique(index) => Some(*index),
+            _ => None,
+        })
+        .any(|index| {
+            store
+                .indexes
+                .get(index)
+                .is_some_and(|index| index.name.eq_ignore_ascii_case(name))
+        })
+}
+
 /// Stores the object of a constraint called `name` on the table `meta` and answers its
 /// identifier.
 ///
@@ -854,8 +882,9 @@ fn name_for(kind: &str, written: Option<&str>, column: Option<&str>, meta: &Tabl
 /// # Errors
 ///
 /// - [`InternalError::Bug`] naming 8168 when `made` already holds the name;
-/// - 2714 at [`CONSTRAINT_EXISTS_2714_STATE`] when a constraint or a table of the same
-///   database and schema carries it, the table being created included. The name printed is
+/// - 2714 at [`CONSTRAINT_EXISTS_2714_STATE`] when a constraint, a key constraint
+///   ([`taken_by_a_key`]) or a table of the same database and schema carries it, the table
+///   being created included. The name printed is
 ///   the one written, without its schema (module documentation);
 /// - [`InternalError::Bug`] when the identifier counter is exhausted
 ///   ([`TableStore::take_object_id`]).
@@ -885,6 +914,7 @@ fn register(
     });
     if taken_by_the_table_being_created
         || taken_by_a_table
+        || taken_by_a_key(store, meta, name)
         || store
             .constraints
             .named(meta.database, &meta.schema, name)

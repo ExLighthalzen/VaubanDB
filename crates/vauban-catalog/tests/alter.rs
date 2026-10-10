@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use vauban_catalog::{
-    AlterTable, Catalog, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, TableDef,
+    AlterTable, Catalog, ColumnDef, ConstraintDef, IdentitySpec, ObjectId, QualifiedName, TableDef,
 };
 use vauban_parser::{Expr, Literal, Span};
 use vauban_storage::{DbId, MemoryStorage, Row, Storage, TableId};
@@ -1401,4 +1401,512 @@ fn drop_constraint_rollback_restores_a_create_table_foreign_key() {
         1
     );
     txn.commit(reader).expect("commit reader");
+}
+
+/// One key column `name`, ascending.
+fn key_on(name: &str) -> Vec<vauban_catalog::SortedColumn> {
+    vec![vauban_catalog::SortedColumn {
+        column: name.to_owned(),
+        descending: false,
+    }]
+}
+
+fn primary_key(name: Option<&str>, column: &str, clustered: bool) -> ConstraintDef {
+    ConstraintDef::PrimaryKey {
+        name: name.map(str::to_owned),
+        columns: key_on(column),
+        clustered,
+    }
+}
+
+fn unique(name: Option<&str>, column: &str) -> ConstraintDef {
+    ConstraintDef::Unique {
+        name: name.map(str::to_owned),
+        columns: key_on(column),
+        clustered: false,
+    }
+}
+
+fn drop_constraint(name: &str) -> AlterTable {
+    AlterTable::DropConstraint {
+        name: name.to_owned(),
+    }
+}
+
+/// The names of the indexes `catalog` holds on `table`, and how many are unique.
+fn index_names(catalog: &Catalog, txn: &Arc<TransactionManager>, table: ObjectId) -> Vec<String> {
+    let reader = begin(txn);
+    let mut names: Vec<String> = catalog
+        .snapshot(&reader)
+        .indexes_of(table)
+        .iter()
+        .map(|index| index.name.clone())
+        .collect();
+    txn.commit(reader).expect("commit reader");
+    names.sort();
+    names
+}
+
+/// `CREATE TABLE t (a int PRIMARY KEY, b int CONSTRAINT uq UNIQUE);`, the key clustered or
+/// not, then `ALTER TABLE t DROP CONSTRAINT uq;`: the `UNIQUE` goes with its index, the key
+/// stays, two equal `b` go in, and a reopened catalogue holds the same.
+fn drop_the_unique_beside_a_primary_key(clustered: bool) {
+    let (catalog, storage, txn) = instance();
+    let setup = begin(&txn);
+    let mut def = two_int_columns("t");
+    def.constraints.push(primary_key(None, "a", clustered));
+    def.constraints.push(unique(Some("uq"), "b"));
+    let created = catalog.create_table(&setup, &def).expect("create t");
+    txn.commit(setup).expect("commit create");
+    let pk_name = index_names(&catalog, &txn, created.id)
+        .into_iter()
+        .find(|name| name.starts_with("PK__"))
+        .expect("the primary key");
+
+    let handle = begin(&txn);
+    let altered = catalog
+        .alter_table(&handle, created.id, &drop_constraint("uq"))
+        .expect("ALTER TABLE t DROP CONSTRAINT uq;");
+    assert_eq!(altered.constraints.len(), 1, "the primary key alone");
+    insert_rows(&storage, &handle, altered.storage_id, &[(1, 5), (2, 5)]);
+    txn.commit(handle).expect("commit");
+    assert_eq!(
+        index_names(&catalog, &txn, created.id),
+        vec![pk_name.clone()]
+    );
+
+    let reopened = Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn)).expect("reopen");
+    assert_eq!(index_names(&reopened, &txn, created.id), vec![pk_name]);
+    let reader = begin(&txn);
+    let meta = reopened
+        .snapshot(&reader)
+        .table(created.id)
+        .cloned()
+        .expect("t after the reopen");
+    txn.commit(reader).expect("commit reader");
+    let writer = begin(&txn);
+    insert_rows(&storage, &writer, meta.storage_id, &[(3, 5)]);
+    txn.commit(writer)
+        .expect("a third equal b after the reopen");
+    let reader = begin(&txn);
+    assert_eq!(
+        scan_values(&storage, &reader, &txn, meta.storage_id, 2).len(),
+        3
+    );
+    txn.commit(reader).expect("commit reader");
+}
+
+#[test]
+fn dropping_a_unique_beside_a_clustered_primary_key_frees_its_values() {
+    drop_the_unique_beside_a_primary_key(true);
+}
+
+#[test]
+fn dropping_a_unique_on_a_heap_beside_a_primary_key_frees_its_values() {
+    drop_the_unique_beside_a_primary_key(false);
+}
+
+#[test]
+fn adding_a_column_keeps_a_named_primary_key() {
+    let (catalog, storage, txn) = instance();
+    let handle = begin(&txn);
+    let mut def = two_int_columns("t");
+    def.constraints.push(primary_key(Some("pk_t"), "a", true));
+    def.constraints.push(unique(None, "b"));
+    let created = catalog.create_table(&handle, &def).expect("create t");
+    txn.commit(handle).expect("commit create");
+    let before = index_names(&catalog, &txn, created.id);
+
+    let handle = begin(&txn);
+    let altered = catalog
+        .alter_table(
+            &handle,
+            created.id,
+            &AlterTable::AddColumn {
+                column: Box::new(column("c", SqlType::Int, true)),
+                default_name: None,
+            },
+        )
+        .expect("ALTER TABLE t ADD c int;");
+    assert_eq!(altered.columns.len(), 3);
+    txn.commit(handle).expect("commit");
+    assert_eq!(index_names(&catalog, &txn, created.id), before);
+
+    let reopened = Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn)).expect("reopen");
+    assert_eq!(index_names(&reopened, &txn, created.id), before);
+    let reader = begin(&txn);
+    assert_eq!(
+        reopened
+            .snapshot(&reader)
+            .table(created.id)
+            .expect("t after the reopen")
+            .columns
+            .len(),
+        3
+    );
+    txn.commit(reader).expect("commit reader");
+}
+
+#[test]
+fn adding_a_check_under_the_name_of_a_key_is_2714_state_5() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let mut def = two_int_columns("c1");
+    def.constraints.push(primary_key(Some("pk_c1"), "a", true));
+    def.constraints.push(unique(Some("uq_c1"), "b"));
+    let c1 = catalog.create_table(&handle, &def).expect("create c1");
+    let other = catalog
+        .create_table(&handle, &two_int_columns("c2"))
+        .expect("create c2");
+    txn.commit(handle).expect("commit create");
+
+    let check = |name: &str| AlterTable::AddConstraint {
+        constraint: Box::new(ConstraintDef::Check {
+            name: Some(name.to_owned()),
+            expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+        }),
+    };
+    for (table, name) in [(c1.id, "pk_c1"), (c1.id, "UQ_C1"), (other.id, "pk_c1")] {
+        let handle = begin(&txn);
+        let err = catalog
+            .alter_table(&handle, table, &check(name))
+            .expect_err("a name a key of the schema carries");
+        assert_eq!((err.number, err.state), (2714, 5), "{name}");
+        txn.rollback(handle).expect("rollback");
+    }
+    // The refused name left nothing behind: dropping the key still finds one constraint.
+    let handle = begin(&txn);
+    let altered = catalog
+        .alter_table(&handle, c1.id, &drop_constraint("uq_c1"))
+        .expect("ALTER TABLE c1 DROP CONSTRAINT uq_c1;");
+    assert_eq!(altered.constraints.len(), 1);
+    txn.commit(handle).expect("commit");
+}
+
+/// `r (id PRIMARY KEY pk_r, k UNIQUE uq_r, m)` with `CREATE UNIQUE INDEX ux_r ON r (m)`, and
+/// `f (x REFERENCES r (m), y REFERENCES r (id))`.
+fn referenced_table(catalog: &Catalog, txn: &Arc<TransactionManager>) -> (ObjectId, ObjectId) {
+    let handle = begin(txn);
+    let mut r = table(
+        "r",
+        vec![
+            column("id", SqlType::Int, false),
+            column("k", SqlType::Int, true),
+            column("m", SqlType::Int, false),
+        ],
+    );
+    r.constraints.push(primary_key(Some("pk_r"), "id", true));
+    r.constraints.push(unique(Some("uq_r"), "k"));
+    let r_meta = catalog.create_table(&handle, &r).expect("create r");
+    catalog
+        .create_index(
+            &handle,
+            &vauban_catalog::IndexDef {
+                table: r_meta.id,
+                name: "ux_r".to_owned(),
+                columns: key_on("m"),
+                unique: true,
+                clustered: false,
+            },
+        )
+        .expect("create ux_r");
+    let mut f = table(
+        "f",
+        vec![
+            column("x", SqlType::Int, true),
+            column("y", SqlType::Int, true),
+        ],
+    );
+    for (name, from, to) in [("fk_f", "x", "m"), ("fk_g", "y", "id")] {
+        f.constraints.push(ConstraintDef::ForeignKey {
+            name: Some(name.to_owned()),
+            columns: vec![from.to_owned()],
+            referenced: QualifiedName {
+                database: "master".to_owned(),
+                schema: "dbo".to_owned(),
+                name: "r".to_owned(),
+            },
+            referenced_columns: vec![to.to_owned()],
+            on_delete: vauban_parser::RefAction::NoAction,
+            on_update: vauban_parser::RefAction::NoAction,
+        });
+    }
+    let f_meta = catalog.create_table(&handle, &f).expect("create f");
+    txn.commit(handle).expect("commit create");
+    (r_meta.id, f_meta.id)
+}
+
+/// The name of the index each `FOREIGN KEY` of `table` reads, in declaration order.
+fn foreign_key_targets(
+    catalog: &Catalog,
+    txn: &Arc<TransactionManager>,
+    table: ObjectId,
+) -> Vec<String> {
+    let reader = begin(txn);
+    let snapshot = catalog.snapshot(&reader);
+    let meta = snapshot.table(table).expect("the table");
+    let targets = meta
+        .constraints
+        .iter()
+        .filter_map(|constraint| match constraint {
+            vauban_catalog::ConstraintMeta::ForeignKey {
+                referenced_table,
+                referenced_index,
+                ..
+            } => snapshot
+                .indexes_of(*referenced_table)
+                .iter()
+                .find(|index| index.id == *referenced_index)
+                .map(|index| index.name.clone())
+                .or(Some("<gone>".to_owned())),
+            _ => None,
+        })
+        .collect();
+    txn.commit(reader).expect("commit reader");
+    targets
+}
+
+#[test]
+fn a_foreign_key_keeps_its_unique_index_across_a_dropped_constraint() {
+    let (catalog, storage, txn) = instance();
+    let (r, f) = referenced_table(&catalog, &txn);
+    assert_eq!(foreign_key_targets(&catalog, &txn, f), vec!["ux_r", "pk_r"]);
+
+    let handle = begin(&txn);
+    catalog
+        .alter_table(&handle, r, &drop_constraint("uq_r"))
+        .expect("ALTER TABLE r DROP CONSTRAINT uq_r;");
+    txn.commit(handle).expect("commit");
+    assert_eq!(index_names(&catalog, &txn, r), vec!["pk_r", "ux_r"]);
+    assert_eq!(foreign_key_targets(&catalog, &txn, f), vec!["ux_r", "pk_r"]);
+
+    let reopened = Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn)).expect("reopen");
+    assert_eq!(index_names(&reopened, &txn, r), vec!["pk_r", "ux_r"]);
+    assert_eq!(
+        foreign_key_targets(&reopened, &txn, f),
+        vec!["ux_r", "pk_r"]
+    );
+}
+
+#[test]
+fn dropping_a_unique_constraint_a_foreign_key_reads_is_3725() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let mut r2 = two_int_columns("r2");
+    r2.constraints.push(primary_key(None, "a", true));
+    r2.constraints.push(unique(Some("uq_r2"), "b"));
+    catalog.create_table(&handle, &r2).expect("create r2");
+    let mut f2 = table("f2", vec![column("x", SqlType::Int, true)]);
+    f2.constraints.push(ConstraintDef::ForeignKey {
+        name: Some("fk_f2".to_owned()),
+        columns: vec!["x".to_owned()],
+        referenced: QualifiedName {
+            database: "master".to_owned(),
+            schema: "dbo".to_owned(),
+            name: "r2".to_owned(),
+        },
+        referenced_columns: vec!["b".to_owned()],
+        on_delete: vauban_parser::RefAction::NoAction,
+        on_update: vauban_parser::RefAction::NoAction,
+    });
+    catalog.create_table(&handle, &f2).expect("create f2");
+    txn.commit(handle).expect("commit create");
+    let r2_id = {
+        let reader = begin(&txn);
+        let id = catalog
+            .snapshot(&reader)
+            .resolve_object("master", Some("dbo"), "r2", "dbo")
+            .expect("r2")
+            .id;
+        txn.commit(reader).expect("commit reader");
+        id
+    };
+
+    let handle = begin(&txn);
+    let err = catalog
+        .alter_table(&handle, r2_id, &drop_constraint("uq_r2"))
+        .expect_err("fk_f2 reads uq_r2");
+    assert_eq!((err.number, err.severity, err.state), (3725, 16, 0));
+    assert!(err.message.contains("'uq_r2'") && err.message.contains("'fk_f2'"));
+    txn.rollback(handle).expect("rollback");
+    assert_eq!(index_names(&catalog, &txn, r2_id).len(), 2);
+}
+
+#[test]
+fn dropping_a_primary_key_a_foreign_key_reads_is_3725() {
+    let (catalog, _storage, txn) = instance();
+    let (r, _f) = referenced_table(&catalog, &txn);
+    let handle = begin(&txn);
+    let err = catalog
+        .alter_table(&handle, r, &drop_constraint("pk_r"))
+        .expect_err("fk_g reads pk_r");
+    assert_eq!((err.number, err.state), (3725, 0));
+    assert!(err.message.contains("'fk_g'"));
+    txn.rollback(handle).expect("rollback");
+}
+
+/// `x (a PRIMARY KEY pk_x, b UNIQUE uq_x, c, d UNIQUE uq_d, e)` with
+/// `CREATE INDEX ix_x ON x (c)`, and `y (p REFERENCES x (b), q REFERENCES x (a))`.
+fn table_with_every_index(
+    catalog: &Catalog,
+    txn: &Arc<TransactionManager>,
+) -> (ObjectId, ObjectId) {
+    let handle = begin(txn);
+    let mut x = table(
+        "x",
+        ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|name| column(name, SqlType::Int, *name != "a"))
+            .collect(),
+    );
+    x.constraints.push(primary_key(Some("pk_x"), "a", true));
+    x.constraints.push(unique(Some("uq_x"), "b"));
+    x.constraints.push(unique(Some("uq_d"), "d"));
+    let x_meta = catalog.create_table(&handle, &x).expect("create x");
+    catalog
+        .create_index(
+            &handle,
+            &vauban_catalog::IndexDef {
+                table: x_meta.id,
+                name: "ix_x".to_owned(),
+                columns: key_on("c"),
+                unique: false,
+                clustered: false,
+            },
+        )
+        .expect("create ix_x");
+    let mut y = table(
+        "y",
+        vec![
+            column("p", SqlType::Int, true),
+            column("q", SqlType::Int, true),
+        ],
+    );
+    for (name, from, to) in [("fk_yb", "p", "b"), ("fk_ya", "q", "a")] {
+        y.constraints.push(ConstraintDef::ForeignKey {
+            name: Some(name.to_owned()),
+            columns: vec![from.to_owned()],
+            referenced: QualifiedName {
+                database: "master".to_owned(),
+                schema: "dbo".to_owned(),
+                name: "x".to_owned(),
+            },
+            referenced_columns: vec![to.to_owned()],
+            on_delete: vauban_parser::RefAction::NoAction,
+            on_update: vauban_parser::RefAction::NoAction,
+        });
+    }
+    let y_meta = catalog.create_table(&handle, &y).expect("create y");
+    txn.commit(handle).expect("commit create");
+    (x_meta.id, y_meta.id)
+}
+
+/// What a reader sees of `x` and `y`: the column count of `x`, the indexes of `x`, the
+/// index each foreign key of `y` reads, and whether `x` still refuses a second `a` and a
+/// second `b` through its storage.
+fn state_of(
+    catalog: &Catalog,
+    storage: &Arc<dyn Storage>,
+    txn: &Arc<TransactionManager>,
+    x: ObjectId,
+    y: ObjectId,
+) -> (usize, Vec<String>, Vec<String>, [bool; 2]) {
+    let reader = begin(txn);
+    let meta = catalog
+        .snapshot(&reader)
+        .table(x)
+        .cloned()
+        .expect("x is still there");
+    txn.commit(reader).expect("commit reader");
+    let width = meta.columns.len();
+    let row = |a: i32, b: i32| {
+        let mut values = vec![Value::Null; width];
+        values[0] = Value::I32(a);
+        values[1] = Value::I32(b);
+        Row(values)
+    };
+    let mut refused = [false; 2];
+    for (slot, (first, second)) in [(row(1, 1), row(1, 2)), (row(2, 3), row(3, 3))]
+        .into_iter()
+        .enumerate()
+    {
+        let writer = begin(txn);
+        storage
+            .insert(writer.id, meta.storage_id, &first)
+            .expect("first row");
+        refused[slot] = storage.insert(writer.id, meta.storage_id, &second).is_err();
+        txn.rollback(writer).expect("rollback the probe");
+    }
+    (
+        width,
+        index_names(catalog, txn, x),
+        foreign_key_targets(catalog, txn, y),
+        refused,
+    )
+}
+
+/// Each change the rebuild serves, undone by `ROLLBACK` and by `ROLLBACK TRANSACTION` to a
+/// savepoint, leaves `x` and `y` as they were, before and after a reopen.
+#[test]
+fn a_rolled_back_rebuild_leaves_the_indexes_and_the_foreign_keys_as_they_were() {
+    let changes = [
+        AlterTable::AddColumn {
+            column: Box::new(column("z", SqlType::Int, true)),
+            default_name: None,
+        },
+        drop_constraint("uq_d"),
+        AlterTable::DropColumn {
+            name: "e".to_owned(),
+        },
+    ];
+    for change in &changes {
+        for savepoint in [false, true] {
+            let (catalog, storage, txn) = instance();
+            let (x, y) = table_with_every_index(&catalog, &txn);
+            let before = state_of(&catalog, &storage, &txn, x, y);
+            assert_eq!(before.1, vec!["ix_x", "pk_x", "uq_d", "uq_x"]);
+            assert_eq!(before.2, vec!["uq_x", "pk_x"]);
+            assert_eq!(before.3, [true, true]);
+
+            let handle = begin(&txn);
+            if savepoint {
+                let mark = txn.savepoint(&handle).expect("SAVE TRANSACTION s");
+                catalog
+                    .alter_table(&handle, x, change)
+                    .unwrap_or_else(|err| panic!("{change:?}: {err:?}"));
+                txn.rollback_to(&handle, mark)
+                    .expect("ROLLBACK TRANSACTION s");
+                assert_eq!(
+                    state_of(&catalog, &storage, &txn, x, y),
+                    before,
+                    "{change:?} inside the transaction, after the savepoint"
+                );
+                txn.commit(handle).expect("commit");
+            } else {
+                catalog
+                    .alter_table(&handle, x, change)
+                    .unwrap_or_else(|err| panic!("{change:?}: {err:?}"));
+                txn.rollback(handle).expect("rollback");
+            }
+            assert_eq!(
+                state_of(&catalog, &storage, &txn, x, y),
+                before,
+                "{change:?}, savepoint {savepoint}"
+            );
+            let reopened =
+                Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn)).expect("reopen");
+            assert_eq!(
+                state_of(&reopened, &storage, &txn, x, y),
+                before,
+                "{change:?}, savepoint {savepoint}, reopened"
+            );
+            // The table still takes a change once the first one is undone.
+            let handle = begin(&txn);
+            catalog
+                .alter_table(&handle, x, change)
+                .unwrap_or_else(|err| panic!("{change:?} again: {err:?}"));
+            txn.commit(handle).expect("commit the change");
+            assert_eq!(foreign_key_targets(&catalog, &txn, y), vec!["uq_x", "pk_x"]);
+        }
+    }
 }
