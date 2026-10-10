@@ -229,17 +229,11 @@ fn a_transaction_named_by_a_variable_is_refused_by_the_parser() {
     assert!(matches!(txn("BEGIN TRAN n"), TxnStatement::Begin { .. }));
 }
 
-/// The `SET` options reach `session`, not the binder: there is no `BoundStatement`
-/// variant for them, and `bind` answers the internal 50000.
-///
-/// The five isolation levels are in the list, `SNAPSHOT` included: each
-/// parses, so a `BoundStatement::SetOption` would have something to hold; the refusal
-/// below is the entry point that is missing. `session::batch::bind_batch` applies these
-/// statements to its own state before calling `bind`, which is why a client does not see
-/// this 50000. The counter-proof is the last assertion: a transaction statement of the
-/// same batch binds.
+/// A `SET <option>` binds to `BoundStatement::SetOption`, the statement the parser built
+/// unchanged: the session applies it when it runs, so the binder checks nothing, an option
+/// it does not know included. Written in a block or a branch, it binds there too.
 #[test]
-fn set_options_do_not_reach_the_binder() {
+fn set_options_bind_as_they_were_parsed() {
     let texts = [
         "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
         "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
@@ -252,15 +246,32 @@ fn set_options_do_not_reach_the_binder() {
         "SET XACT_ABORT OFF",
         "SET IMPLICIT_TRANSACTIONS ON",
         "SET DEADLOCK_PRIORITY LOW",
+        "SET NO_SUCH_OPTION ON",
     ];
     for text in texts {
-        let error = refusal(text);
-        assert_eq!(error.number, 50000, "{text}: {}", error.message);
-        assert!(
-            error.message.contains("SET <option>"),
-            "{text} names the option: {}",
-            error.message
-        );
+        let parsed = match parse_batch(text, &ParseOptions::default()) {
+            Ok(batch) => batch.statements,
+            Err(error) => panic!("{text} parses: {}", error.message),
+        };
+        let [vauban_parser::Statement::SetOption(written)] = parsed.as_slice() else {
+            panic!("{text} is one SET of an option");
+        };
+        match bound(text).as_slice() {
+            [BoundStatement::SetOption(set)] => assert_eq!(set, written, "{text}"),
+            other => panic!("{text} binds to one SET of an option, got {other:?}"),
+        }
+    }
+    match bound("BEGIN SET XACT_ABORT ON END").as_slice() {
+        [BoundStatement::Block(held)] => {
+            assert!(matches!(held.as_slice(), [BoundStatement::SetOption(_)]));
+        }
+        other => panic!("a block that holds a SET binds to a block, got {other:?}"),
+    }
+    match bound("IF 1 = 1 SET NOCOUNT ON").as_slice() {
+        [BoundStatement::If { then_, .. }] => {
+            assert!(matches!(then_.as_ref(), BoundStatement::SetOption(_)));
+        }
+        other => panic!("an IF that holds a SET binds to an IF, got {other:?}"),
     }
     assert!(matches!(txn("BEGIN TRAN"), TxnStatement::Begin { .. }));
 }

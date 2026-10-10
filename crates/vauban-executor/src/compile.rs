@@ -243,6 +243,8 @@ pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult
         // not built. Whoever binds it runs these checks on what comes out (`control.rs`,
         // `run_deferred`).
         PhysicalStatement::Deferred(_) => Ok(()),
+        // Nothing to check: the session reads the option and its value when it applies them.
+        PhysicalStatement::SetOption(_) => Ok(()),
         PhysicalStatement::Insert(insert) => compile_plan(&insert.source, ctx),
         PhysicalStatement::SelectInto(select_into) => compile_plan(&select_into.source, ctx),
         PhysicalStatement::Update(update) => {

@@ -107,6 +107,7 @@ pub fn plan(stmt: BoundStatement, ctx: &PlanContext<'_>) -> SqlResult<PhysicalSt
         BoundStatement::Label { name } => Ok(PhysicalStatement::Label { name }),
         BoundStatement::Print(expr) => Ok(PhysicalStatement::Print(expr)),
         BoundStatement::Transaction(txn) => Ok(PhysicalStatement::Transaction(txn)),
+        BoundStatement::SetOption(set) => Ok(PhysicalStatement::SetOption(set)),
         // Nothing to plan: the statement is not bound yet, and whoever runs it plans it
         // once it is (`vauban_executor`, `control.rs`).
         BoundStatement::Deferred(deferred) => Ok(PhysicalStatement::Deferred(deferred)),

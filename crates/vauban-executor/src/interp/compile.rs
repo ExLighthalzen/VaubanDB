@@ -288,6 +288,7 @@ impl<'s> Compiler<'s> {
             | PhysicalStatement::Print(_)
             | PhysicalStatement::Transaction(_)
             | PhysicalStatement::Execute(_)
+            | PhysicalStatement::SetOption(_)
             | PhysicalStatement::Deferred(_) => {
                 let enclosing = self.open.last().copied();
                 self.emit(Instr::Run {

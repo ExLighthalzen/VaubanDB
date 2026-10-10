@@ -467,6 +467,10 @@ pub struct SetOptionStatement {
     /// One statement can carry several names: `SET ANSI_NULLS, ANSI_PADDING ON` yields two
     /// entries sharing the same value.
     pub options: Vec<(String, SetOptionValue)>,
+    /// The table of `SET IDENTITY_INSERT <table> {ON|OFF}`, as parsed, its delimiters
+    /// removed; `None` for the other options. The option name of that form still carries the
+    /// table as written, for `Display`.
+    pub table: Option<ObjectName>,
     /// Position of the whole statement.
     pub span: Span,
 }

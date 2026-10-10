@@ -40,11 +40,9 @@
 //!   Server. This file binds no expression
 //!   (`a_transaction_named_by_a_variable_is_refused_by_the_parser`).
 //! - `SET TRANSACTION ISOLATION LEVEL …`, `SET LOCK_TIMEOUT n` and `SET XACT_ABORT ON`
-//!   parse as `Statement::SetOption`, which `session` applies to its own state before the
-//!   binder is called (`session::batch::bind_batch`) and which `statement.rs` reports as
-//!   an internal 50000 on the path where it does reach `bind`
-//!   (`set_options_do_not_reach_the_binder`). The bound statement has no `SetOption`
-//!   variant to hold them.
+//!   parse as `Statement::SetOption`, which `statement.rs` binds to
+//!   [`BoundStatement::SetOption`] unchanged: the session applies it to its own state when
+//!   it runs (`set_options_bind_as_they_were_parsed`).
 
 use vauban_errors::SqlResult;
 use vauban_parser::Ident;

@@ -967,3 +967,114 @@ fn identity_insert_survives_the_next_batch_and_is_not_shared() {
     let events = run_on(&mut a, "SELECT id FROM dbo.t1 WHERE id = 7");
     assert_eq!(rows(&events), vec![vec![Value::I32(7)]], "{events:#?}");
 }
+
+// ---------------------------------------------------------------------------------------
+// A SET held by a branch, a loop or a block
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_set_held_by_a_block_or_a_branch_changes_the_options() {
+    // The test of the `IF`, the `SET` it holds, then a `SELECT` whose DONE carries no
+    // count: the option holds from the statement after the `SET`.
+    let events = run("IF 1=1 SET NOCOUNT ON; SELECT 1;");
+    assert_eq!(
+        dones(&events),
+        vec![(None, true), (None, true), (None, false)],
+        "{events:#?}"
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]]);
+    // A branch that is not taken changes nothing: the `SELECT` keeps its count.
+    let events = run("IF 1=0 SET NOCOUNT ON; SELECT 1;");
+    assert_eq!(
+        dones(&events),
+        vec![(None, true), (Some(1), false)],
+        "{events:#?}"
+    );
+    // In a block, the `SET` reaches the statement after it in the same block, and the
+    // option outlives the block and the batch.
+    let mut session = session();
+    let events = run_on(
+        &mut session,
+        "BEGIN SELECT 1; SET NOCOUNT ON; SELECT 2; END",
+    );
+    assert_eq!(
+        dones(&events),
+        vec![(Some(1), true), (None, true), (None, false)],
+        "{events:#?}"
+    );
+    assert!(session.state().options.nocount);
+    let events = run_on(&mut session, "WHILE 1=1 BEGIN SET NOCOUNT OFF; BREAK; END");
+    assert!(!session.state().options.nocount, "{events:#?}");
+}
+
+#[test]
+fn xact_abort_set_in_a_block_stops_the_batch_on_the_next_error() {
+    let events = run("BEGIN SET XACT_ABORT ON END");
+    assert_eq!(dones(&events), vec![(None, false)], "{events:#?}");
+    no_error(&events, "BEGIN SET XACT_ABORT ON END");
+    // 8134 lets a batch go on unless `XACT_ABORT` is on: the `SET` of the block decides.
+    let events = run("BEGIN SET XACT_ABORT ON END; SELECT 1 / 0; SELECT 2;");
+    assert_eq!(only_error(&events).number, 8134);
+    assert!(rows(&events).is_empty(), "{events:#?}");
+    let events = run("BEGIN SET XACT_ABORT OFF END; SELECT 1 / 0; SELECT 2;");
+    assert_eq!(only_error(&events).number, 8134);
+    assert_eq!(rows(&events), vec![vec![Value::I32(2)]], "{events:#?}");
+}
+
+#[test]
+fn the_options_of_the_other_kinds_are_set_from_a_branch() {
+    let mut session = session();
+    let events = run_on(
+        &mut session,
+        "IF 1=1 BEGIN SET DATEFIRST 1; SET LOCK_TIMEOUT -1; SET DEADLOCK_PRIORITY HIGH; \
+         SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SET CONCAT_NULL_YIELDS_NULL OFF; END",
+    );
+    no_error(&events, "the options set from a branch");
+    let options = &session.state().options;
+    assert_eq!(options.datefirst, 1);
+    assert_eq!(options.lock_timeout, -1);
+    assert_eq!(options.deadlock_priority, 5);
+    assert!(!options.concat_null_yields_null);
+    assert_eq!(
+        session.state().isolation,
+        vauban_txn::IsolationLevel::Serializable
+    );
+    let events = run_on(
+        &mut session,
+        "SELECT DATEPART(weekday, CAST('2000-01-02' AS date)), 'a' + CAST(NULL AS varchar(1));",
+    );
+    assert_eq!(rows(&events), vec![vec![Value::I32(7), text("a")]]);
+}
+
+#[test]
+fn a_refused_set_in_a_block_carries_its_own_line_and_stops_the_batch() {
+    let mut session = session();
+    create_identity_table(&mut session, "ra");
+    create_identity_table(&mut session, "rb");
+    let events = run_on(
+        &mut session,
+        "SET IDENTITY_INSERT dbo.ra ON;\nIF 1=1\n  BEGIN\n    SELECT 1;\n    \
+         SET IDENTITY_INSERT dbo.rb ON;\n  END\nSELECT 2;",
+    );
+    let err = only_error(&events);
+    assert_eq!(err.number, 8107);
+    assert_eq!(err.line, 5, "{events:#?}");
+    assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
+    // The table the branch named is checked when the branch runs: 1088 for a name the
+    // catalogue does not hold.
+    let events = run_on(&mut session, "IF 1=1 SET IDENTITY_INSERT dbo.nosuch OFF;");
+    assert_eq!(only_error(&events).number, 1088);
+}
+
+#[test]
+fn a_set_held_by_a_branch_of_a_dynamic_text_ends_with_its_level() {
+    let mut session = session();
+    let events = run_on(&mut session, "EXEC('IF 1=1 SET NOCOUNT ON'); SELECT 2;");
+    no_error(&events, "EXEC");
+    assert_eq!(
+        dones(&events).last(),
+        Some(&(Some(1), false)),
+        "{events:#?}"
+    );
+    assert!(!session.state().options.nocount);
+}

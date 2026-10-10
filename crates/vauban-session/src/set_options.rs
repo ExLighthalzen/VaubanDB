@@ -1,10 +1,11 @@
-//! `SetOptions`, `DateFormat`, `IsolationLevel` and the minimal recognition of the `SET`
-//! statements drivers send when a connection opens.
+//! `SetOptions`, `DateFormat`, `IsolationLevel`, and how a `SET <option>` statement changes
+//! them.
 //!
-//! `split_statements` cuts a batch into statements and `apply_set_statement` recognises a
-//! `SET` statement word by word and updates the session state, without any other effect
-//! and without failing: an unknown or malformed `SET` is `Ignored` and logged at `debug`.
-//! Both predate the T-SQL parser, which `batch.rs` uses instead.
+//! [`apply_set_option`] reads a `SET` statement as the parser built it and updates the
+//! session state, without any other effect: an unknown or malformed `SET` is `Ignored` and
+//! logged at `debug`. The session applies it where its program reaches it, written at the
+//! top level of a batch or held by an `IF`, a `WHILE` or a `BEGIN … END`
+//! (`tests/set_options_effects.rs`, `a_set_held_by_a_block_or_a_branch_changes_the_options`).
 
 use std::sync::Arc;
 use tracing::debug;
@@ -13,7 +14,9 @@ use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{SqlError, SqlResult};
 
 use vauban_executor::ExecSession;
-use vauban_parser::ParseOptions;
+use vauban_parser::{
+    Expr, Literal, ObjectName, ParseOptions, SetOptionStatement, SetOptionValue, UnaryOp,
+};
 use vauban_planner::{PhysicalPlan, PhysicalStatement};
 use vauban_storage::{DbId, Storage};
 use vauban_txn::{LockTimeout, TransactionManager, TxnHandle};
@@ -389,7 +392,8 @@ fn statement_reads_user_table(bound: &PhysicalStatement) -> bool {
         | PhysicalStatement::Return(_)
         | PhysicalStatement::Print(_)
         | PhysicalStatement::Transaction(_)
-        | PhysicalStatement::Execute(_) => false,
+        | PhysicalStatement::Execute(_)
+        | PhysicalStatement::SetOption(_) => false,
         // A statement that is not bound yet gets its plan when the control of flow
         // reaches it (`vauban_executor`, `control.rs`), and the tables it names are
         // resolved there.
@@ -464,126 +468,52 @@ impl DateFormat {
     }
 }
 
-/// Result of `apply_set_statement`.
+/// Result of [`apply_set_option`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetOutcome {
     /// The statement was recognised and the state updated.
     Applied,
-    /// The statement is not a recognised `SET`; the state is unchanged. The payload is the
-    /// statement as received, for the log.
-    Ignored(String),
+    /// The statement is not a recognised `SET`; the state is unchanged.
+    Ignored,
     /// The statement was recognised and refused; the state is unchanged.
     Failed(SqlError),
 }
 
-/// Keywords that start a statement: a line beginning with one of them starts a new
-/// statement even without `;` (drivers separate their `SET`s with `;` or with new lines).
-const STATEMENT_KEYWORDS: [&str; 4] = ["SET", "SELECT", "USE", "WAITFOR"];
-
-/// Cuts a batch into statements, on `;` and on the lines that begin with a statement
-/// keyword (case-insensitive), ignoring `--` and `/* */` comments and `'...'` strings.
-/// Each statement is trimmed; empty ones and comment-only ones are dropped.
-///
-/// Enough for the batches of the drivers; the parser replaces it on the query path.
-// Dead on the query path: `run_batch` does not cut a batch itself, and the callers left
-// are the unit tests of this file, which rustc does not count. The function goes away
-// with `apply_set_statement`.
-#[allow(dead_code)]
-pub(crate) fn split_statements(batch: &str) -> Vec<&str> {
-    let mut statements = Vec::new();
-    // Byte offset where the current statement starts and whether it has a token yet.
-    let mut start = 0;
-    let mut has_token = false;
-    let mut push = |from: usize, to: usize, has_token: bool| {
-        let text = batch[from..to].trim();
-        if has_token && !text.is_empty() {
-            statements.push(text);
-        }
-    };
-
-    for spanned in tokenize(batch) {
-        match spanned.token {
-            Token::Semicolon => {
-                push(start, spanned.start, has_token);
-                start = spanned.end;
-                has_token = false;
-            }
-            Token::Word(word) if spanned.line_start && has_token && is_keyword(word) => {
-                push(start, spanned.start, has_token);
-                start = spanned.start;
-                has_token = true;
-            }
-            _ => has_token = true,
-        }
-    }
-    push(start, batch.len(), has_token);
-    statements
-}
-
-fn is_keyword(word: &str) -> bool {
-    STATEMENT_KEYWORDS
-        .iter()
-        .any(|keyword| keyword.eq_ignore_ascii_case(word))
-}
-
-/// Recognises a `SET` statement (case-insensitive, any spacing) and updates `state`.
+/// Applies a `SET <option>` statement, as the parser built it, to `state`.
 ///
 /// Recognised: `SET <opt> [, <opt>...] ON|OFF` for the boolean options of `SetOptions`,
 /// `SET ANSI_DEFAULTS ON|OFF`, `SET TEXTSIZE n`, `SET LOCK_TIMEOUT n`, `SET DATEFORMAT f`,
 /// `SET DATEFIRST n`, `SET LANGUAGE name`, `SET DEADLOCK_PRIORITY LOW|NORMAL|HIGH|n`,
-/// `SET TRANSACTION ISOLATION LEVEL ...` and `SET IDENTITY_INSERT <table> ON|OFF`.
-/// Anything else (`SET NOEXEC`, `SET ROWCOUNT`, `SET SHOWPLAN_*`, unknown option,
-/// malformed value) is `Ignored` with a `debug` log and leaves the state untouched: no
-/// error here. A second `IDENTITY_INSERT ON` while another table is open is `Failed`
-/// with 8107 (`tests/set_options_effects.rs`).
-pub(crate) fn apply_set_statement(
+/// `SET TRANSACTION ISOLATION LEVEL ...` and `SET IDENTITY_INSERT <table> ON|OFF`, a number
+/// or a name being written as a literal. Anything else (`SET NOEXEC`, `SET ROWCOUNT`,
+/// `SET SHOWPLAN_*`, an unknown option, a value out of range, a variable) is `Ignored` with
+/// a `debug` log and leaves the state untouched: no error here. A second
+/// `IDENTITY_INSERT ON` while another table is open is `Failed` with 8107
+/// (`tests/set_options_effects.rs`).
+pub(crate) fn apply_set_option(
     state: &mut SessionState,
-    stmt: &str,
+    set: &SetOptionStatement,
     catalog: Option<&CatalogSnapshot>,
 ) -> SetOutcome {
-    let tokens: Vec<Token<'_>> = tokenize(stmt).into_iter().map(|s| s.token).collect();
-    match apply_tokens(state, &tokens, catalog) {
+    let applied = match (&set.table, set.options.as_slice()) {
+        (Some(table), [(_, value)]) => apply_identity_insert(state, table, value, catalog),
+        (None, [(name, value)]) => Ok(apply_known_option(state, name, value)),
+        (None, entries) => Ok(apply_boolean_list(&mut state.options, entries)),
+        (Some(_), _) => Ok(None),
+    };
+    match applied {
         Ok(Some(())) => SetOutcome::Applied,
         Ok(None) => {
-            debug!(statement = stmt, "SET statement ignored");
-            SetOutcome::Ignored(stmt.to_owned())
+            debug!(statement = %set, "SET statement ignored");
+            SetOutcome::Ignored
         }
         Err(err) => SetOutcome::Failed(err),
     }
 }
 
-/// `Ok(Some(()))` once the state is updated; `Ok(None)` leaves it untouched; `Err` is a
-/// recognised `SET` that was refused (8107).
-fn apply_tokens(
-    state: &mut SessionState,
-    tokens: &[Token<'_>],
-    catalog: Option<&CatalogSnapshot>,
-) -> Result<Option<()>, SqlError> {
-    let (first, rest) = match tokens.split_first() {
-        Some(pair) => pair,
-        None => return Ok(None),
-    };
-    if !first.is_word("SET") {
-        return Ok(None);
-    }
-    let (option, args) = match rest.split_first() {
-        Some(pair) => pair,
-        None => return Ok(None),
-    };
-    let Token::Word(option) = option else {
-        return Ok(None);
-    };
-    if option.eq_ignore_ascii_case("IDENTITY_INSERT") {
-        return apply_identity_insert(state, args, catalog);
-    }
-    Ok(apply_known_option(state, option, args))
-}
-
 /// Default schema of a login, `dbo` until the catalogue knows better.
 const DEFAULT_SCHEMA: &str = "dbo";
 
-/// `SET IDENTITY_INSERT <table> {ON|OFF}`. A second `ON` while another table is open
-/// answers 8107 and leaves the first table open.
 /// Refuses `SET IDENTITY_INSERT … ON` or `… OFF` when the name resolves to nothing or to
 /// a table without an identity column. An unknown table is checked before a missing identity.
 fn validate_identity_insert_target(
@@ -605,23 +535,21 @@ fn validate_identity_insert_target(
     Ok(())
 }
 
+/// `SET IDENTITY_INSERT <table> {ON|OFF}`. A second `ON` while another table is open
+/// answers 8107 and leaves the first table open.
 fn apply_identity_insert(
     state: &mut SessionState,
-    args: &[Token<'_>],
+    table: &ObjectName,
+    value: &SetOptionValue,
     catalog: Option<&CatalogSnapshot>,
 ) -> Result<Option<()>, SqlError> {
-    let [Token::Word(table), Token::Word(on_off)] = args else {
+    let on = match value {
+        SetOptionValue::On => true,
+        SetOptionValue::Off => false,
+        SetOptionValue::Value(_) | SetOptionValue::Word(_) => return Ok(None),
+    };
+    let Some(target) = identity_target(table, &state.database) else {
         return Ok(None);
-    };
-    let on = match on_off {
-        word if word.eq_ignore_ascii_case("ON") => true,
-        word if word.eq_ignore_ascii_case("OFF") => false,
-        _ => return Ok(None),
-    };
-    let target = match parse_identity_table(table, &state.database, state.options.quoted_identifier)
-    {
-        Some(target) => target,
-        None => return Ok(None),
     };
     if let Some(catalog) = catalog {
         validate_identity_insert_target(
@@ -664,120 +592,63 @@ struct IdentityTarget {
     written: String,
 }
 
-/// One, two or three dotted parts: `t`, `dbo.t`, `db.dbo.t`. Missing schema is `dbo`;
-/// missing database is `current_db`.
+/// The table `name` designates: a missing schema is `dbo`, a missing database is
+/// `current_db`. `None` for a name that carries a linked server part.
 ///
 /// What the state keeps is the name without its delimiters, so that a later `OFF` written
 /// another way closes the option that `[dbo].[t] ON` opened
 /// (`tests/set_options_effects.rs`, `identity_insert_opened_on_a_delimited_name_is_closed_by_a_canonical_off`).
-/// `"..."` is a name while `QUOTED_IDENTIFIER` is on; off, this answers `None` and
-/// nothing is opened (`a_dot_or_a_bracket_inside_a_delimited_part_does_not_split_it`).
-fn parse_identity_table(
-    written: &str,
-    current_db: &str,
-    quoted_identifier: bool,
-) -> Option<IdentityTarget> {
-    let parts = split_identifier(written, quoted_identifier)?;
-    let (database, schema, name) = match parts.as_slice() {
-        [name] => (
-            current_db.to_owned(),
-            DEFAULT_SCHEMA.to_owned(),
-            name.clone(),
-        ),
-        [schema, name] => (current_db.to_owned(), schema.clone(), name.clone()),
-        [database, schema, name] => (database.clone(), schema.clone(), name.clone()),
-        _ => return None,
-    };
+fn identity_target(name: &ObjectName, current_db: &str) -> Option<IdentityTarget> {
+    if name.server.is_some() {
+        return None;
+    }
+    let written: Vec<&str> = [name.database.as_ref(), name.schema.as_ref()]
+        .into_iter()
+        .map(|part| part.map(|part| part.value.as_str()))
+        .skip_while(Option::is_none)
+        .map(|part| part.unwrap_or(""))
+        .chain(std::iter::once(name.name.value.as_str()))
+        .collect();
     Some(IdentityTarget {
         table: IdentityInsertTable {
-            database,
-            schema,
-            name,
+            database: name
+                .database
+                .as_ref()
+                .map_or_else(|| current_db.to_owned(), |part| part.value.clone()),
+            schema: name
+                .schema
+                .as_ref()
+                .map_or_else(|| DEFAULT_SCHEMA.to_owned(), |part| part.value.clone()),
+            name: name.name.value.clone(),
         },
-        written: parts.join("."),
+        written: written.join("."),
     })
 }
 
-/// Splits a table name into its parts on the dots that separate them, delimiters honoured
-/// before anything is stripped.
-///
-/// A delimited part keeps what it holds: `[dbo.x]` is one part named `dbo.x`, and `[a]]b]`
-/// one part named `a]b`, a doubled closing delimiter standing for itself. Splitting on the
-/// dots first would read those two as two parts and as `a]]b`
-/// (`a_dot_or_a_bracket_inside_a_delimited_part_does_not_split_it`).
-///
-/// `None` when the name is not one, two or three non-empty parts, when a delimiter is left
-/// open, or when anything follows a closing delimiter other than a dot.
-fn split_identifier(written: &str, quoted_identifier: bool) -> Option<Vec<String>> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut rest = written;
-    loop {
-        let (part, tail) = match rest.chars().next()? {
-            '[' => delimited(rest, ']')?,
-            '"' if quoted_identifier => delimited(rest, '"')?,
-            _ => {
-                let end = rest.find(['.', '[', ']', '"']).unwrap_or(rest.len());
-                (rest[..end].to_owned(), &rest[end..])
-            }
-        };
-        if part.is_empty() {
-            return None;
-        }
-        parts.push(part);
-        match tail.strip_prefix('.') {
-            Some(next) => rest = next,
-            None if tail.is_empty() => break,
-            None => return None,
-        }
-    }
-    (1..=3).contains(&parts.len()).then_some(parts)
-}
-
-/// What a `[...]` or `"..."` part holds, and the text that follows it. The closing
-/// delimiter written twice stands for itself. `None` for a part left unclosed
-/// (`a_dot_or_a_bracket_inside_a_delimited_part_does_not_split_it`).
-fn delimited(src: &str, close: char) -> Option<(String, &str)> {
-    let mut value = String::new();
-    // Past the opening delimiter, which is one byte (`[` or `"`).
-    let mut rest = &src[1..];
-    loop {
-        let end = rest.find(close)?;
-        value.push_str(&rest[..end]);
-        let after = &rest[end + close.len_utf8()..];
-        match after.strip_prefix(close) {
-            Some(tail) => {
-                value.push(close);
-                rest = tail;
-            }
-            None => return Some((value, after)),
-        }
-    }
-}
-
-/// `Some(())` once the state is updated; `None` leaves it untouched (nothing is applied
-/// before the whole statement is validated).
-fn apply_known_option(state: &mut SessionState, option: &str, args: &[Token<'_>]) -> Option<()> {
+/// `Some(())` once the state is updated by the option `name` set to `value`; `None` leaves
+/// it untouched.
+fn apply_known_option(state: &mut SessionState, name: &str, value: &SetOptionValue) -> Option<()> {
     let options = &mut state.options;
-    match option.to_ascii_uppercase().as_str() {
-        "TRANSACTION" => state.isolation = parse_isolation(args)?,
+    match normalised(name).as_str() {
+        "TRANSACTION ISOLATION LEVEL" => state.isolation = isolation_level(value)?,
         "TEXTSIZE" => {
-            let size: i32 = single_word(args)?.parse().ok()?;
+            let size = i32::try_from(integer(value)?).ok()?;
             // 0 resets the default of 4096 bytes.
             options.textsize = if size == 0 { 4096 } else { size };
         }
-        "LOCK_TIMEOUT" => options.lock_timeout = single_word(args)?.parse().ok()?,
-        "DATEFORMAT" => options.dateformat = DateFormat::parse(&single_value(args)?)?,
+        "LOCK_TIMEOUT" => options.lock_timeout = i32::try_from(integer(value)?).ok()?,
+        "DATEFORMAT" => options.dateformat = DateFormat::parse(&name_value(value)?)?,
         "DATEFIRST" => {
-            let day: u8 = single_word(args)?.parse().ok()?;
+            let day = u8::try_from(integer(value)?).ok()?;
             if !(1..=7).contains(&day) {
                 return None;
             }
             options.datefirst = day;
         }
-        "LANGUAGE" => options.language = single_value(args)?,
-        "DEADLOCK_PRIORITY" => options.deadlock_priority = parse_deadlock_priority(args)?,
+        "LANGUAGE" => options.language = name_value(value)?,
+        "DEADLOCK_PRIORITY" => options.deadlock_priority = deadlock_priority(value)?,
         "ANSI_DEFAULTS" => {
-            let on = parse_on_off(args)?;
+            let on = on_off(value)?;
             // The seven options `ANSI_DEFAULTS` controls.
             options.ansi_nulls = on;
             options.ansi_null_dflt_on = on;
@@ -787,45 +658,41 @@ fn apply_known_option(state: &mut SessionState, option: &str, args: &[Token<'_>]
             options.implicit_transactions = on;
             options.quoted_identifier = on;
         }
-        _ => {
-            let (names, on) = parse_option_list(option, args)?;
-            // Validate every name before applying any: partial application would leave
-            // an inconsistent state on `Ignored`.
-            if names
-                .iter()
-                .any(|name| bool_option(options, name).is_none())
-            {
-                return None;
-            }
-            for name in names {
-                if let Some(field) = bool_option(options, name) {
-                    *field = on;
-                }
-            }
+        _ => return apply_boolean_list(options, &[(name.to_owned(), value.clone())]),
+    }
+    Some(())
+}
+
+/// `<opt> [, <opt>...] ON|OFF` over the boolean options. The names are validated before one
+/// is applied: a partial application would leave an inconsistent state on `None`
+/// (`unknown_or_malformed_statements_are_ignored_without_change`, `SET ANSI_NULLS, FOO ON`).
+fn apply_boolean_list(
+    options: &mut SetOptions,
+    entries: &[(String, SetOptionValue)],
+) -> Option<()> {
+    let (_, value) = entries.first()?;
+    let on = on_off(value)?;
+    if entries
+        .iter()
+        .any(|(name, value)| value != &entries[0].1 || bool_option(options, name).is_none())
+    {
+        return None;
+    }
+    for (name, _) in entries {
+        if let Some(field) = bool_option(options, name) {
+            *field = on;
         }
     }
     Some(())
 }
 
-/// `<opt> [, <opt>...] ON|OFF`: the option names and the value.
-fn parse_option_list<'a>(first: &'a str, args: &[Token<'a>]) -> Option<(Vec<&'a str>, bool)> {
-    let mut names = vec![first];
-    let mut expect_name = false;
-    let mut args = args.iter();
-    loop {
-        match args.next()? {
-            Token::Comma if !expect_name => expect_name = true,
-            Token::Word(word) if expect_name => {
-                names.push(word);
-                expect_name = false;
-            }
-            Token::Word(word) if !expect_name => {
-                let on = on_off(word)?;
-                return args.next().is_none().then_some((names, on));
-            }
-            _ => return None,
-        }
-    }
+/// An option name or a value upper-cased, its words separated by one space:
+/// `transaction  isolation level` reads `TRANSACTION ISOLATION LEVEL`.
+fn normalised(text: &str) -> String {
+    text.split_whitespace()
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The field of `options` named `name` (case-insensitive) when it is a boolean option.
@@ -849,221 +716,78 @@ fn bool_option<'a>(options: &'a mut SetOptions, name: &str) -> Option<&'a mut bo
     Some(field)
 }
 
-/// `ISOLATION LEVEL READ UNCOMMITTED|READ COMMITTED|REPEATABLE READ|SNAPSHOT|SERIALIZABLE`.
-fn parse_isolation(args: &[Token<'_>]) -> Option<IsolationLevel> {
-    let words: Vec<String> = args
-        .iter()
-        .map(|token| match token {
-            Token::Word(word) => Some(word.to_ascii_uppercase()),
-            _ => None,
-        })
-        .collect::<Option<_>>()?;
-    let words: Vec<&str> = words.iter().map(String::as_str).collect();
-    let level = match words.as_slice() {
-        ["ISOLATION", "LEVEL", "READ", "UNCOMMITTED"] => IsolationLevel::ReadUncommitted,
-        ["ISOLATION", "LEVEL", "READ", "COMMITTED"] => IsolationLevel::ReadCommitted,
-        ["ISOLATION", "LEVEL", "REPEATABLE", "READ"] => IsolationLevel::RepeatableRead,
-        ["ISOLATION", "LEVEL", "SNAPSHOT"] => IsolationLevel::Snapshot,
-        ["ISOLATION", "LEVEL", "SERIALIZABLE"] => IsolationLevel::Serializable,
+/// `READ UNCOMMITTED|READ COMMITTED|REPEATABLE READ|SNAPSHOT|SERIALIZABLE`.
+fn isolation_level(value: &SetOptionValue) -> Option<IsolationLevel> {
+    let SetOptionValue::Word(level) = value else {
+        return None;
+    };
+    let level = match normalised(level).as_str() {
+        "READ UNCOMMITTED" => IsolationLevel::ReadUncommitted,
+        "READ COMMITTED" => IsolationLevel::ReadCommitted,
+        "REPEATABLE READ" => IsolationLevel::RepeatableRead,
+        "SNAPSHOT" => IsolationLevel::Snapshot,
+        "SERIALIZABLE" => IsolationLevel::Serializable,
         _ => return None,
     };
     Some(level)
 }
 
 /// `LOW|NORMAL|HIGH|n` with `n` in `-10..=10`.
-fn parse_deadlock_priority(args: &[Token<'_>]) -> Option<i8> {
-    let word = single_word(args)?;
-    let priority = match word.to_ascii_uppercase().as_str() {
-        "LOW" => -5,
-        "NORMAL" => 0,
-        "HIGH" => 5,
-        number => number.parse::<i8>().ok()?,
+fn deadlock_priority(value: &SetOptionValue) -> Option<i8> {
+    let priority = match value {
+        SetOptionValue::Word(word) => match word.to_ascii_uppercase().as_str() {
+            "LOW" => -5,
+            "NORMAL" => 0,
+            "HIGH" => 5,
+            _ => return None,
+        },
+        _ => i8::try_from(integer(value)?).ok()?,
     };
     (-10..=10).contains(&priority).then_some(priority)
 }
 
-/// `ON|OFF` as the only argument.
-fn parse_on_off(args: &[Token<'_>]) -> Option<bool> {
-    on_off(single_word(args)?)
-}
-
-fn on_off(word: &str) -> Option<bool> {
-    if word.eq_ignore_ascii_case("ON") {
-        Some(true)
-    } else if word.eq_ignore_ascii_case("OFF") {
-        Some(false)
-    } else {
-        None
+/// `ON` or `OFF`.
+fn on_off(value: &SetOptionValue) -> Option<bool> {
+    match value {
+        SetOptionValue::On => Some(true),
+        SetOptionValue::Off => Some(false),
+        SetOptionValue::Value(_) | SetOptionValue::Word(_) => None,
     }
 }
 
-/// The only argument, which must be a word.
-fn single_word<'a>(args: &[Token<'a>]) -> Option<&'a str> {
-    match args {
-        [Token::Word(word)] => Some(word),
+/// An integer literal, signed or not: `5000`, `-1`, `+3`.
+fn integer(value: &SetOptionValue) -> Option<i64> {
+    let SetOptionValue::Value(expr) = value else {
+        return None;
+    };
+    integer_expr(expr)
+}
+
+fn integer_expr(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::Integer(digits), _) => digits.parse().ok(),
+        Expr::Unary {
+            op: UnaryOp::Minus,
+            expr,
+            ..
+        } => integer_expr(expr)?.checked_neg(),
+        Expr::Unary {
+            op: UnaryOp::Plus,
+            expr,
+            ..
+        } => integer_expr(expr),
         _ => None,
     }
 }
 
-/// The only argument, a word or a `'...'`/`N'...'` string, without its quotes.
-fn single_value(args: &[Token<'_>]) -> Option<String> {
-    match args {
-        [Token::Word(word)] => Some((*word).to_owned()),
-        [Token::Str(text)] => Some(text.clone()),
+/// A name written as a word or as a `'...'`/`N'...'` string: `SET LANGUAGE us_english`,
+/// `SET DATEFORMAT 'ymd'`.
+fn name_value(value: &SetOptionValue) -> Option<String> {
+    match value {
+        SetOptionValue::Word(word) => Some(word.clone()),
+        SetOptionValue::Value(Expr::Literal(Literal::Str { value, .. }, _)) => Some(value.clone()),
         _ => None,
     }
-}
-
-/// A lexical token of a batch. Comments and white space are skipped by the tokenizer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Token<'a> {
-    /// A keyword, an identifier or a number: a run of characters up to white space or a
-    /// delimiter.
-    Word(&'a str),
-    /// A `'...'` or `N'...'` literal, quotes removed and `''` unescaped.
-    Str(String),
-    /// `,`
-    Comma,
-    /// `;`
-    Semicolon,
-}
-
-impl Token<'_> {
-    fn is_word(&self, expected: &str) -> bool {
-        matches!(self, Token::Word(word) if word.eq_ignore_ascii_case(expected))
-    }
-}
-
-/// A token with its byte span and whether only white space (or comments) precede it on its
-/// line.
-#[derive(Debug)]
-struct Spanned<'a> {
-    token: Token<'a>,
-    start: usize,
-    end: usize,
-    line_start: bool,
-}
-
-/// Characters that end a word.
-fn is_delimiter(c: char) -> bool {
-    c.is_whitespace() || matches!(c, ',' | ';' | '\'' | '(' | ')')
-}
-
-/// Lexes `src` into tokens, skipping white space, `--` comments and (nested) `/* */`
-/// comments. Never fails: an unterminated string or comment runs to the end of the text.
-fn tokenize(src: &str) -> Vec<Spanned<'_>> {
-    let mut tokens = Vec::new();
-    let mut line_start = true;
-    let mut pos = 0;
-    while pos < src.len() {
-        let rest = &src[pos..];
-        let c = match rest.chars().next() {
-            Some(c) => c,
-            // `pos` is always on a char boundary: it advances by whole chars or by the
-            // length of ASCII markers.
-            None => break,
-        };
-        if c == '\n' {
-            line_start = true;
-            pos += 1;
-        } else if c.is_whitespace() {
-            pos += c.len_utf8();
-        } else if rest.starts_with("--") {
-            pos += rest.find('\n').unwrap_or(rest.len());
-        } else if rest.starts_with("/*") {
-            pos += block_comment_len(rest);
-        } else if c == '\'' || ((c == 'N' || c == 'n') && rest[1..].starts_with('\'')) {
-            let quote = if c == '\'' { 0 } else { 1 };
-            let (value, len) = string_literal(&rest[quote..]);
-            tokens.push(Spanned {
-                token: Token::Str(value),
-                start: pos,
-                end: pos + quote + len,
-                line_start,
-            });
-            line_start = false;
-            pos += quote + len;
-        } else if c == ',' || c == ';' {
-            let token = if c == ',' {
-                Token::Comma
-            } else {
-                Token::Semicolon
-            };
-            tokens.push(Spanned {
-                token,
-                start: pos,
-                end: pos + 1,
-                line_start,
-            });
-            line_start = false;
-            pos += 1;
-        } else if c == '(' || c == ')' {
-            // Parentheses are not part of any recognised statement: kept as one-character
-            // words so that they make the statement `Ignored` rather than vanish.
-            tokens.push(Spanned {
-                token: Token::Word(&rest[..1]),
-                start: pos,
-                end: pos + 1,
-                line_start,
-            });
-            line_start = false;
-            pos += 1;
-        } else {
-            let len = rest.find(is_delimiter).unwrap_or(rest.len());
-            tokens.push(Spanned {
-                token: Token::Word(&rest[..len]),
-                start: pos,
-                end: pos + len,
-                line_start,
-            });
-            line_start = false;
-            pos += len;
-        }
-    }
-    tokens
-}
-
-/// Length of the `/* ... */` comment at the start of `src`, nesting included; the whole
-/// text when it is unterminated.
-fn block_comment_len(src: &str) -> usize {
-    let mut depth = 0usize;
-    let mut pos = 0;
-    while pos < src.len() {
-        let rest = &src[pos..];
-        if rest.starts_with("/*") {
-            depth += 1;
-            pos += 2;
-        } else if rest.starts_with("*/") {
-            depth -= 1;
-            pos += 2;
-            if depth == 0 {
-                return pos;
-            }
-        } else {
-            pos += rest.chars().next().map_or(1, char::len_utf8);
-        }
-    }
-    src.len()
-}
-
-/// The value of the `'...'` literal at the start of `src` (`''` unescaped) and its length
-/// in bytes, quotes included; an unterminated literal runs to the end of the text.
-fn string_literal(src: &str) -> (String, usize) {
-    let mut value = String::new();
-    let mut chars = src.char_indices().skip(1).peekable();
-    while let Some((i, c)) = chars.next() {
-        if c == '\'' {
-            if chars.peek().is_some_and(|&(_, next)| next == '\'') {
-                value.push('\'');
-                chars.next();
-            } else {
-                return (value, i + 1);
-            }
-        } else {
-            value.push(c);
-        }
-    }
-    (value, src.len())
 }
 
 #[cfg(test)]
@@ -1074,8 +798,18 @@ mod tests {
         SessionState::new(51)
     }
 
+    /// The one `SET <option>` of `text`, as the parser builds it.
+    fn parsed(text: &str) -> SetOptionStatement {
+        let batch = vauban_parser::parse_batch(text, &ParseOptions::default())
+            .unwrap_or_else(|err| panic!("{text} parses: {}", err.message));
+        match batch.statements.as_slice() {
+            [vauban_parser::Statement::SetOption(set)] => (**set).clone(),
+            other => panic!("{text} is one SET of an option, got {other:?}"),
+        }
+    }
+
     fn apply(state: &mut SessionState, stmt: &str) -> SetOutcome {
-        apply_set_statement(state, stmt, None)
+        apply_set_option(state, &parsed(stmt), None)
     }
 
     #[test]
@@ -1107,67 +841,6 @@ mod tests {
         );
         assert_eq!(default_isolation(), IsolationLevel::ReadCommitted);
         assert_eq!(DateFormat::default(), DateFormat::Mdy);
-    }
-
-    #[test]
-    fn split_on_semicolons_and_keyword_lines() {
-        let statements =
-            split_statements("SET DATEFORMAT mdy; SET ANSI_NULLS ON\nSET TEXTSIZE 2147483647");
-        assert_eq!(
-            statements,
-            vec![
-                "SET DATEFORMAT mdy",
-                "SET ANSI_NULLS ON",
-                "SET TEXTSIZE 2147483647"
-            ]
-        );
-    }
-
-    #[test]
-    fn split_ignores_semicolons_in_strings_and_comments() {
-        assert_eq!(
-            split_statements("SET LANGUAGE 'a;b'; SET NOCOUNT ON"),
-            vec!["SET LANGUAGE 'a;b'", "SET NOCOUNT ON"]
-        );
-        assert_eq!(
-            split_statements("SET NOCOUNT ON -- a; b\nSET XACT_ABORT ON"),
-            vec!["SET NOCOUNT ON -- a; b", "SET XACT_ABORT ON"]
-        );
-        assert_eq!(
-            split_statements("SET NOCOUNT /* a; b\n SET */ ON; SET XACT_ABORT ON"),
-            vec!["SET NOCOUNT /* a; b\n SET */ ON", "SET XACT_ABORT ON"]
-        );
-        assert_eq!(
-            split_statements("SET LANGUAGE 'it''s; here'"),
-            vec!["SET LANGUAGE 'it''s; here'"]
-        );
-    }
-
-    #[test]
-    fn split_keeps_a_continued_statement_and_drops_empty_ones() {
-        // A keyword in the middle of a line does not split; neither does an unknown one at
-        // the start of a line.
-        assert_eq!(
-            split_statements("SET TRANSACTION ISOLATION LEVEL\n  READ COMMITTED"),
-            vec!["SET TRANSACTION ISOLATION LEVEL\n  READ COMMITTED"]
-        );
-        assert_eq!(
-            split_statements("select 1 set nocount on\nuse master\n\nWAITFOR DELAY '00:00:01'"),
-            vec![
-                "select 1 set nocount on",
-                "use master",
-                "WAITFOR DELAY '00:00:01'"
-            ]
-        );
-        assert_eq!(
-            split_statements(";; -- nothing\n/* still nothing */ ;"),
-            Vec::<&str>::new()
-        );
-        assert_eq!(split_statements(""), Vec::<&str>::new());
-        assert_eq!(
-            split_statements("-- leading\nSET NOCOUNT ON;"),
-            vec!["-- leading\nSET NOCOUNT ON"]
-        );
     }
 
     #[test]
@@ -1266,10 +939,6 @@ mod tests {
             assert_eq!(apply(&mut state, stmt), SetOutcome::Applied);
             assert_eq!(state.isolation, level);
         }
-        assert!(matches!(
-            apply(&mut state, "SET TRANSACTION ISOLATION LEVEL READ"),
-            SetOutcome::Ignored(_)
-        ));
         assert_eq!(state.isolation, IsolationLevel::Serializable);
     }
 
@@ -1381,33 +1050,48 @@ mod tests {
         for stmt in [
             "SET NOEXEC ON",
             "SET FOO ON",
-            "SET",
-            "SET ANSI_NULLS",
             "SET ANSI_NULLS MAYBE",
             "SET ANSI_NULLS, FOO ON",
-            "SET ANSI_NULLS ON extra",
-            "SET ANSI_NULLS, ON",
-            "SET ANSI_NULLS ,, NOCOUNT ON",
             "SET ROWCOUNT 10",
             "SET SHOWPLAN_XML ON",
+            "SET STATISTICS IO ON",
             "SET TEXTSIZE abc",
             "SET TEXTSIZE 99999999999",
+            "SET TEXTSIZE @size",
+            "SET LOCK_TIMEOUT 1.5",
             "SET DATEFIRST 8",
+            "SET DATEFIRST -1",
             "SET DATEFORMAT xyz",
+            "SET DATEFORMAT 5",
             "SET DEADLOCK_PRIORITY 11",
-            "SET TRANSACTION ISOLATION LEVEL 'READ COMMITTED'",
-            "SET @x = 1",
-            "SELECT 1",
-            "",
-            "''",
-            "SET 'ANSI_NULLS' ON",
+            "SET DEADLOCK_PRIORITY URGENT",
+            "SET LANGUAGE 5",
+            "SET ANSI_DEFAULTS 1",
+            "SET NOCOUNT 1",
         ] {
-            assert_eq!(
-                apply(&mut state, stmt),
-                SetOutcome::Ignored(stmt.to_owned())
-            );
+            assert_eq!(apply(&mut state, stmt), SetOutcome::Ignored, "{stmt}");
         }
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn negative_and_signed_numbers_are_read() {
+        let mut state = state();
+        assert_eq!(
+            apply(&mut state, "SET DEADLOCK_PRIORITY -10"),
+            SetOutcome::Applied
+        );
+        assert_eq!(state.options.deadlock_priority, -10);
+        assert_eq!(
+            apply(&mut state, "SET LOCK_TIMEOUT +250"),
+            SetOutcome::Applied
+        );
+        assert_eq!(state.options.lock_timeout, 250);
+        assert_eq!(
+            apply(&mut state, "SET DEADLOCK_PRIORITY -11"),
+            SetOutcome::Ignored
+        );
+        assert_eq!(state.options.deadlock_priority, -10);
     }
 
     #[test]
@@ -1457,10 +1141,11 @@ mod tests {
         assert_eq!(state.identity_insert, None);
     }
 
-    /// The three parts a name is read as, and the name as written with its delimiters
-    /// removed.
-    fn parts(written: &str) -> Option<(String, String, String, String)> {
-        parse_identity_table(written, "master", true).map(|target| {
+    /// The three parts the state keeps for the table of `text`, and the name 8107 writes.
+    fn parts(text: &str) -> Option<(String, String, String, String)> {
+        let set = parsed(text);
+        let table = set.table.expect("an IDENTITY_INSERT names a table");
+        identity_target(&table, "master").map(|target| {
             (
                 target.table.database,
                 target.table.schema,
@@ -1472,10 +1157,9 @@ mod tests {
 
     #[test]
     fn a_dot_or_a_bracket_inside_a_delimited_part_does_not_split_it() {
-        // One part holding a dot, not two parts: splitting on the dots before honouring
-        // the delimiters would answer `dbo` and `x`.
+        // One part holding a dot, not two parts.
         assert_eq!(
-            parts("[dbo.x]"),
+            parts("SET IDENTITY_INSERT [dbo.x] ON"),
             Some((
                 "master".to_owned(),
                 "dbo".to_owned(),
@@ -1483,24 +1167,34 @@ mod tests {
                 "dbo.x".to_owned()
             ))
         );
-        // The same name written in two parts is the same table.
         assert_eq!(
-            parts("[dbo].[dbo.x]").map(|p| p.2),
+            parts("SET IDENTITY_INSERT [dbo].[dbo.x] ON").map(|p| p.2),
             Some("dbo.x".to_owned())
         );
         // A doubled closing delimiter stands for itself: `a]b`, not `a]]b`.
-        assert_eq!(parts("[a]]b]").map(|p| p.2), Some("a]b".to_owned()));
-        assert_eq!(parts("\"a\"\"b\"").map(|p| p.2), Some("a\"b".to_owned()));
-        // Delimiters removed, part count kept.
-        assert_eq!(parts("[dbo].[ra]").map(|p| p.3), Some("dbo.ra".to_owned()));
-        assert_eq!(parts("[ra]").map(|p| p.3), Some("ra".to_owned()));
         assert_eq!(
-            parts("[db].[dbo].[ra]").map(|p| p.3),
+            parts("SET IDENTITY_INSERT [a]]b] ON").map(|p| p.2),
+            Some("a]b".to_owned())
+        );
+        assert_eq!(
+            parts("SET IDENTITY_INSERT \"a\"\"b\" ON").map(|p| p.2),
+            Some("a\"b".to_owned())
+        );
+        // Delimiters removed, part count kept.
+        assert_eq!(
+            parts("SET IDENTITY_INSERT [dbo].[ra] ON").map(|p| p.3),
+            Some("dbo.ra".to_owned())
+        );
+        assert_eq!(
+            parts("SET IDENTITY_INSERT [ra] ON").map(|p| p.3),
+            Some("ra".to_owned())
+        );
+        assert_eq!(
+            parts("SET IDENTITY_INSERT [db].[dbo].[ra] ON").map(|p| p.3),
             Some("db.dbo.ra".to_owned())
         );
-        // Undelimited names are unchanged.
         assert_eq!(
-            parts("dbo.ra"),
+            parts("SET IDENTITY_INSERT dbo.ra ON"),
             Some((
                 "master".to_owned(),
                 "dbo".to_owned(),
@@ -1508,18 +1202,12 @@ mod tests {
                 "dbo.ra".to_owned()
             ))
         );
-        assert_eq!(parts("db.dbo.ra").map(|p| p.0), Some("db".to_owned()));
-        // Shapes with no name to read.
-        for written in [
-            "", ".", "dbo.", ".ra", "a.b.c.d", "[ra", "[ra]]", "[dbo]x", "ra]", "[]",
-        ] {
-            assert_eq!(parts(written), None, "{written}");
-        }
-        // `"..."` is a name while QUOTED_IDENTIFIER is on, and not while it is off.
         assert_eq!(
-            parse_identity_table("\"dbo\".\"ra\"", "master", false).map(|t| t.written),
-            None
+            parts("SET IDENTITY_INSERT db.dbo.ra ON").map(|p| p.0),
+            Some("db".to_owned())
         );
+        // A linked server part names no table of this server.
+        assert_eq!(parts("SET IDENTITY_INSERT srv.db.dbo.ra ON"), None);
     }
 
     #[test]
@@ -1545,28 +1233,21 @@ mod tests {
     }
 
     #[test]
-    fn identity_insert_on_a_name_the_tokenizer_splits_is_ignored() {
-        // A delimited part holding white space reaches this module as several words, so
-        // the statement is not recognised and the state is untouched: nothing is opened,
-        // and a table already open stays open.
+    fn identity_insert_on_a_delimited_name_with_a_space_is_read_whole() {
         let mut state = state();
-        assert!(matches!(
-            apply(&mut state, "SET IDENTITY_INSERT [my table] ON"),
-            SetOutcome::Ignored(_)
-        ));
-        assert_eq!(state.identity_insert, None);
         assert_eq!(
-            apply(&mut state, "SET IDENTITY_INSERT dbo.ra ON"),
+            apply(&mut state, "SET IDENTITY_INSERT [my table] ON"),
             SetOutcome::Applied
         );
-        assert!(matches!(
-            apply(&mut state, "SET IDENTITY_INSERT [my table] OFF"),
-            SetOutcome::Ignored(_)
-        ));
         assert_eq!(
             state.identity_insert.as_ref().map(|t| t.name.as_str()),
-            Some("ra")
+            Some("my table")
         );
+        assert_eq!(
+            apply(&mut state, "SET IDENTITY_INSERT dbo.[my table] OFF"),
+            SetOutcome::Applied
+        );
+        assert_eq!(state.identity_insert, None);
     }
 
     #[test]
@@ -1576,10 +1257,15 @@ mod tests {
                      SET QUOTED_IDENTIFIER ON; SET NUMERIC_ROUNDABORT OFF; \
                      SET TEXTSIZE 2147483647; SET TRANSACTION ISOLATION LEVEL READ COMMITTED";
         let mut state = state();
-        let statements = split_statements(batch);
+        let statements = vauban_parser::parse_batch(batch, &ParseOptions::default())
+            .expect("the opening batch parses")
+            .statements;
         assert_eq!(statements.len(), 10);
-        for stmt in statements {
-            assert_eq!(apply(&mut state, stmt), SetOutcome::Applied, "{stmt}");
+        for stmt in &statements {
+            let vauban_parser::Statement::SetOption(set) = stmt else {
+                panic!("{stmt:?} is a SET of an option");
+            };
+            assert_eq!(apply_set_option(&mut state, set, None), SetOutcome::Applied);
         }
         assert!(state.options.arithabort);
         assert_eq!(state.options.textsize, 2147483647);
@@ -1594,21 +1280,5 @@ mod tests {
             SetOutcome::Applied
         );
         assert!(state.options.nocount);
-    }
-
-    #[test]
-    fn tokenizer_handles_unterminated_input() {
-        // Never panics, whatever the text.
-        let _ = tokenize("SET LANGUAGE 'unterminated");
-        let _ = tokenize("SET /* unterminated");
-        let _ = tokenize("N'x'' ");
-        let _ = tokenize("é;ü,'é''ü'--é\n/*é*/");
-        assert_eq!(
-            tokenize("N'a''b'")
-                .into_iter()
-                .map(|s| s.token)
-                .collect::<Vec<_>>(),
-            vec![Token::Str("a'b".into())]
-        );
     }
 }

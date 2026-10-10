@@ -1181,6 +1181,7 @@ fn display_flow_and_txn() {
     assert_eq!(
         SetOptionStatement {
             options: vec![("NOCOUNT".to_owned(), SetOptionValue::On)],
+            table: None,
             span: Span::EMPTY,
         }
         .to_string(),

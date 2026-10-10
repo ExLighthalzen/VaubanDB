@@ -175,7 +175,7 @@ use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
 use crate::procedures::NestedParam;
 use crate::server::Engine;
-use crate::set_options::{SetOutcome, apply_set_statement};
+use crate::set_options::{SetOutcome, apply_set_option};
 use crate::sink::{
     CUR_CMD_DELETE, CUR_CMD_INSERT, CUR_CMD_SELECT, CUR_CMD_SELECT_INTO, CUR_CMD_UPDATE,
     ResultSink, StatementSinkAdapter,
@@ -184,8 +184,8 @@ use crate::state::SessionState;
 use crate::statements::{
     INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, declare_variables_held_by,
     first_held_statement_line, first_undeclared_goto, labels_at_any_depth, last_line,
-    next_rowcount, statement_clears_last_error, statement_fragment, statement_line, statement_span,
-    statement_text, use_name_line,
+    next_rowcount, statement_clears_last_error, statement_fragment, statement_line, statement_text,
+    use_name_line,
 };
 use crate::txn_session::{self, StatementTxn};
 use vauban_binder::{
@@ -197,7 +197,7 @@ use vauban_executor::{
     Call, EnvironmentChange, ExecContext, ExecOutcome, ExecSession, Host, Program, ProgramEnd, Ran,
     Site, StatementSink, eval_expr,
 };
-use vauban_parser::{Statement, parse_batch};
+use vauban_parser::{SetOptionStatement, Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
 use vauban_txn::IsolationLevel;
@@ -275,13 +275,6 @@ impl Session {
 
 /// One statement after every compilation-stage check has succeeded for the whole batch.
 enum PreparedStatement {
-    /// A `SET` is replayed only during execution; preparation applies it to a cloned state.
-    Set {
-        text: String,
-        /// Line the `SET` starts on, which a `SET` that is refused carries
-        /// (`tests/set_options_effects.rs`, `identity_insert_8107_carries_the_line_of_its_statement`).
-        line: u32,
-    },
     /// A statement the binder does not bind, still served by the deliberately narrow fallback.
     Fallback { text: String, error: SqlError },
     /// A bound, planned and compile-checked statement, ready to execute without another
@@ -655,15 +648,6 @@ impl Session {
             }
             self.cancel.check()?;
             let raw = statement_text(text, original);
-            if matches!(original, Statement::SetOption(_)) {
-                apply_set_statement(state, &raw, Some(snapshot));
-                prepared.push(PreparedStatement::Set {
-                    text: raw,
-                    line: statement_span(original).line,
-                });
-                continue;
-            }
-
             let line = statement_line(original);
             let source = statement_fragment(text, original, statements.get(index + 1));
             let padded = format!("{}{}", "\n".repeat(line.saturating_sub(1) as usize), source);
@@ -680,10 +664,15 @@ impl Session {
                 }
                 Err(error) => return Err(error),
             };
-            let counts = matches!(
-                one,
-                PreparedStatement::Bound { .. } | PreparedStatement::Deferred { .. }
-            );
+            // A `SET` binds with the statement after it: a batch bound one statement at a
+            // time reads the options it sets.
+            let counts = match &one {
+                PreparedStatement::Bound { statement } => {
+                    !matches!(statement, PhysicalStatement::SetOption(_))
+                }
+                PreparedStatement::Deferred { .. } => true,
+                _ => false,
+            };
             prepared.push(one);
             if !counts {
                 continue;
@@ -702,8 +691,11 @@ impl Session {
     ///
     /// `padded` is the fragment of the statement preceded by as many newlines as it takes
     /// to put it on its line of the batch, so an error of the binder carries that line.
-    /// A `USE` moves `state.database` and a `DECLARE` enters its variables, which is what
-    /// the statements bound after this one read.
+    /// A `USE` moves `state.database`, a `DECLARE` enters its variables and a `SET <option>`
+    /// changes the options of `state`, which is what the statements bound after this one
+    /// read: `SET QUOTED_IDENTIFIER OFF; SELECT "a";` reparses its `SELECT` under `OFF`. A
+    /// `SET` the statement holds, in a branch or a block, changes nothing here: it applies
+    /// when the program reaches it.
     fn bind_one(
         &self,
         padded: &str,
@@ -758,6 +750,12 @@ impl Session {
         let mut exec = ExecContext::scalar(&eval, state.options.to_binder());
         vauban_executor::compile(&physical, &mut exec)
             .map_err(|error| at_statement(error, line))?;
+
+        if let PhysicalStatement::SetOption(set) = &physical {
+            // The live options change when the program reaches the statement; a refusal
+            // (8107) is raised then, on its line.
+            let _ = apply_set_option(state, set, Some(snapshot));
+        }
 
         if let PhysicalStatement::Use { database } = &physical {
             let found = snapshot
@@ -1397,7 +1395,6 @@ impl BatchHost<'_> {
     /// Runs one prepared statement written at the top level.
     fn run_prepared(&mut self, prepared: &PreparedStatement, site: Site) -> SqlResult<Ran> {
         match prepared {
-            PreparedStatement::Set { text, line } => self.run_set(text, *line),
             PreparedStatement::Fallback { text, error } => self.run_fallback(text, error),
             PreparedStatement::Deferred {
                 padded,
@@ -1418,8 +1415,11 @@ impl BatchHost<'_> {
         }
     }
 
-    /// A `SET` applied to the live state. A `SET` that is refused ends the program.
-    fn run_set(&mut self, text: &str, line: u32) -> SqlResult<Ran> {
+    /// A `SET <option>` applied to the options of the running level, written at the top
+    /// level of the body or held by a statement of the program at `site`
+    /// (`tests/set_options_effects.rs`, `a_set_held_by_a_block_or_a_branch_changes_the_options`).
+    /// A `SET` that is refused ends the program, on its own line.
+    fn run_set(&mut self, set: &SetOptionStatement, site: Site) -> SqlResult<Ran> {
         let session = &mut *self.session;
         let snapshot = if let Some(session_txn) = &session.state.txn {
             session.engine.catalog.snapshot(&session_txn.handle)
@@ -1433,9 +1433,11 @@ impl BatchHost<'_> {
             session.engine.txn.commit(binding)?;
             snap
         };
-        match apply_set_statement(&mut session.state, text, Some(&snapshot)) {
-            SetOutcome::Applied | SetOutcome::Ignored(_) => {}
-            SetOutcome::Failed(err) => return Ok(Ran::Stopped(at_statement(err, line))),
+        match apply_set_option(&mut session.state, set, Some(&snapshot)) {
+            SetOutcome::Applied | SetOutcome::Ignored => {}
+            SetOutcome::Failed(err) => {
+                return Ok(Ran::Stopped(self.place(err.with_line(set.span.line), site)));
+            }
         }
         // A `SET` carries no row count, under both values of `NOCOUNT`: its DONE is
         // `0x0001` (MORE) before a statement and `0x0000` last, without `DONE_COUNT`.
@@ -1531,6 +1533,9 @@ impl BatchHost<'_> {
         site: Site,
         target: Option<&str>,
     ) -> SqlResult<Ran> {
+        if let PhysicalStatement::SetOption(set) = bound {
+            return self.run_set(set, site);
+        }
         let line = self.line_of(site);
         // The adapter wraps the caller's sink: the executor calls
         // `StatementSink::columns` during execution, which the adapter converts to

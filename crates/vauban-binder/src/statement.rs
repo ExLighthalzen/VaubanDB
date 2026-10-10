@@ -116,6 +116,7 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
         Statement::Execute(execute) => bind_execute(execute, ctx),
         Statement::Goto { label, .. } => Ok(bind_goto(label)),
         Statement::Label { name, .. } => Ok(bind_label(name)),
+        Statement::SetOption(set) => Ok(BoundStatement::SetOption(set.clone())),
         other => Err(unsupported(other)),
     }
 }
@@ -135,8 +136,8 @@ fn select_into_target(
 ///
 /// The statements `bind` dispatches — `SELECT`, the DDL of `ddl.rs`, the two of
 /// `ddl_index.rs`, the DML, the control-of-flow and transaction statements routed to their
-/// own file, `TRUNCATE TABLE` included — do not reach this function, and are listed to keep
-/// the `match` exhaustive. `SET <option>` belongs to the session state, not to the binder.
+/// own file, `TRUNCATE TABLE` and `SET <option>` included — do not reach this function, and
+/// are listed to keep the `match` exhaustive.
 fn unsupported(stmt: &Statement) -> SqlError {
     let name = match stmt {
         // Bound by `bind`; listed so that the match stays exhaustive.

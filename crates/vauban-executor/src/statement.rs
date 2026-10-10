@@ -142,6 +142,14 @@ fn dispatch<'a>(
         | PhysicalStatement::Deferred(_) => control::execute(stmt, ctx, sink),
         PhysicalStatement::Transaction(txn) => txn_exec::execute(txn, ctx),
         PhysicalStatement::Execute(stmt) => crate::execute::execute(stmt, ctx),
+        // The options a `SET` changes are the session's, which this crate does not hold: the
+        // session applies the statement itself where its program reaches it, and a `SET`
+        // handed here has nothing to run it.
+        PhysicalStatement::SetOption(_) => Err(vauban_errors::SqlError::from(
+            vauban_errors::InternalError::Bug(
+                "SET <option> is applied by the session, not by the executor".to_owned(),
+            ),
+        )),
     }
 }
 

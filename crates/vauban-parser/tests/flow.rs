@@ -259,6 +259,39 @@ fn set_option() {
     );
 }
 
+/// The table of `SET IDENTITY_INSERT` is also kept as a parsed name, delimiters removed,
+/// and the other options carry none.
+#[test]
+fn identity_insert_keeps_its_table_as_a_parsed_name() {
+    let table = |text: &str| match one(text) {
+        Statement::SetOption(set) => set.table,
+        other => unreachable!("{text} is a SET of an option, got {other:?}"),
+    };
+    let parts = |text: &str| {
+        table(text).map(|name| {
+            (
+                name.database.map(|part| part.value),
+                name.schema.map(|part| part.value),
+                name.name.value,
+            )
+        })
+    };
+    assert_eq!(
+        parts("SET IDENTITY_INSERT [db].[dbo].[my table] ON"),
+        Some((
+            Some("db".to_owned()),
+            Some("dbo".to_owned()),
+            "my table".to_owned()
+        ))
+    );
+    assert_eq!(
+        parts("SET IDENTITY_INSERT [a]]b] OFF"),
+        Some((None, None, "a]b".to_owned()))
+    );
+    assert_eq!(parts("SET NOCOUNT ON"), None);
+    assert_eq!(parts("SET TRANSACTION ISOLATION LEVEL SNAPSHOT"), None);
+}
+
 /// The five isolation levels of T-SQL, and the refusal of anything else:
 /// `SET TRANSACTION ISOLATION LEVEL FOO` is a syntax error on `FOO`.
 #[test]

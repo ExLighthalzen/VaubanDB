@@ -99,3 +99,5 @@ pub use context::{
 pub use execute::{BoundExecArg, BoundExecTarget, BoundExecute};
 pub use statement::bind;
 pub use variables::BatchVariables;
+/// The `SET <option>` a [`BoundStatement::SetOption`] carries, as the parser built it.
+pub use vauban_parser::SetOptionStatement;

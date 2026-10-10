@@ -125,6 +125,9 @@ pub enum PhysicalStatement {
     Transaction(TxnStatement),
     /// `EXECUTE`, carried across from the bound statement.
     Execute(BoundExecute),
+    /// `SET <option>`, carried across from the bound statement: there is nothing to plan,
+    /// the session applies it to its options when it runs.
+    SetOption(Box<vauban_binder::SetOptionStatement>),
     /// A statement of a branch or of a loop body left unbound, carried across from the
     /// bound statement: there is nothing to plan until it is bound, which happens when the
     /// control of flow reaches it.

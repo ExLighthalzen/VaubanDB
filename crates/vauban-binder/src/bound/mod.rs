@@ -140,6 +140,13 @@ pub enum BoundStatement {
     Execute(BoundExecute),
     /// `BEGIN`, `COMMIT`, `ROLLBACK` and `SAVE TRANSACTION`..
     Transaction(TxnStatement),
+    /// `SET <option>`, `SET NOCOUNT ON` for instance, as the parser built it.
+    ///
+    /// The binder checks nothing here: the list of the options and what each one does
+    /// belong to the session that runs the statement, which applies it to the options of
+    /// the level it runs in, written at the top level of a body or held by an `IF`, a `WHILE`
+    /// or a `BEGIN … END` (`tests/bind_txn_stmt.rs`, `set_options_bind_as_they_were_parsed`).
+    SetOption(Box<vauban_parser::SetOptionStatement>),
     /// A statement of a branch or of a loop body that names a table the catalogue does not
     /// hold: kept as it was parsed, to be bound when the control of flow reaches it.
     ///

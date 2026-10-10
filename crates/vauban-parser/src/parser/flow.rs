@@ -81,7 +81,7 @@
 
 use vauban_errors::SqlResult;
 
-use crate::ast::expr::{Expr, Ident};
+use crate::ast::expr::{Expr, Ident, ObjectName};
 use crate::ast::stmt::{
     AssignOp, AssignTarget, DeclareItem, DeclareStatement, ExecuteArg, ExecuteStatement,
     ExecuteTarget, SetOptionStatement, SetOptionValue, SetStatement, SetValue, Statement,
@@ -212,10 +212,13 @@ fn parse_set_variable(p: &mut Parser, start: usize) -> SqlResult<Statement> {
 ///
 /// The syntax error that stopped the parse.
 fn parse_set_option(p: &mut Parser, start: usize) -> SqlResult<Statement> {
+    let mut table = None;
     let (names, value) = if p.at_keyword(Keyword::Transaction) {
         parse_isolation_level(p)?
     } else if p.at_keyword(Keyword::IdentityInsert) {
-        parse_identity_insert(p)?
+        let (name, parsed, value) = parse_identity_insert(p)?;
+        table = Some(parsed);
+        (name, value)
     } else {
         parse_named_option(p)?
     };
@@ -227,6 +230,7 @@ fn parse_set_option(p: &mut Parser, start: usize) -> SqlResult<Statement> {
         .collect();
     Ok(Statement::SetOption(Box::new(SetOptionStatement {
         options,
+        table,
         span: p.span_from(start),
     })))
 }
@@ -273,7 +277,8 @@ fn parse_isolation_level(p: &mut Parser) -> SqlResult<(Vec<String>, SetOptionVal
     Ok((vec![name], SetOptionValue::Word(value)))
 }
 
-/// Reads `IDENTITY_INSERT <table> {ON|OFF}`, whose option name carries the table.
+/// Reads `IDENTITY_INSERT <table> {ON|OFF}`, whose option name carries the table as
+/// written; the table is also answered as parsed.
 ///
 /// `IDENTITY_INSERT` is a reserved word and is read as a keyword, for the same reason as
 /// `TRANSACTION`.
@@ -281,7 +286,7 @@ fn parse_isolation_level(p: &mut Parser) -> SqlResult<(Vec<String>, SetOptionVal
 /// # Errors
 ///
 /// The syntax error that stopped the parse.
-fn parse_identity_insert(p: &mut Parser) -> SqlResult<(Vec<String>, SetOptionValue)> {
+fn parse_identity_insert(p: &mut Parser) -> SqlResult<(Vec<String>, ObjectName, SetOptionValue)> {
     let word = p.advance().text;
     let table = p.parse_object_name()?;
     let value = match p.peek().kind {
@@ -295,7 +300,7 @@ fn parse_identity_insert(p: &mut Parser) -> SqlResult<(Vec<String>, SetOptionVal
         }
         _ => return Err(p.error_here()),
     };
-    Ok((vec![format!("{word} {table}")], value))
+    Ok((vec![format!("{word} {table}")], table, value))
 }
 
 /// Reads the ordinary form: one or more option names, then one value for all of them.
@@ -381,8 +386,8 @@ fn parse_option_word(p: &mut Parser) -> SqlResult<String> {
 ///
 /// A run of one or more `;` right after the `THEN` branch is consumed only when `ELSE`
 /// follows the last of them, so a script that ends every statement with `;` still parses
-/// (`tests::semicolon_before_else_after_a_plain_statement`,
-/// `tests::semicolon_before_else_after_a_block`): `IF 1 = 1 SELECT 1; ELSE
+/// (`tests::semicolon_before_else_after_a_plain_statement`, and the test of the block form
+/// next to it): `IF 1 = 1 SELECT 1; ELSE
 /// SELECT 2;` takes the branch the condition selects, and so does the block form `IF
 /// 1 = 1 BEGIN SELECT 1 END; ELSE SELECT 2;`. A doubled `;`, or a comment between two of
 /// them, changes nothing (`tests::a_run_of_semicolons_before_else_is_consumed_as_one`,
