@@ -1877,7 +1877,9 @@ fn rollback_writes_one_abort_and_takes_back_both_tables() {
             WalRecordKind::Begin,
             WalRecordKind::Insert,
             WalRecordKind::Insert,
-            WalRecordKind::Abort
+            WalRecordKind::Abort,
+            // The undo of the heap insert; the clustered table journals none.
+            WalRecordKind::Compensation
         ]
     );
     for table in [heap, clustered] {

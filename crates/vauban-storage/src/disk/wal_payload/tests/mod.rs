@@ -79,3 +79,55 @@ fn decode_refuses_a_payload_shorter_than_the_prefix() {
     // The shortest payload this module reads is the one of a `Delete`.
     assert!(RowChange::decode(&[0u8; PREFIX_LEN]).is_ok());
 }
+
+/// A release of slot 5 of page 12 of table 9, freeing version 7 of row 3.
+fn slot_release(release: Release) -> SlotRelease {
+    SlotRelease {
+        table: TableId(9),
+        header: VersionHeader {
+            row: RowId(3),
+            xmin: TxnId(4),
+            xmax: Some(TxnId(6)),
+            seq: 7,
+        },
+        at: Rid {
+            page: PageId(12),
+            slot: 5,
+        },
+        release,
+    }
+}
+
+#[test]
+fn a_slot_release_is_47_bytes_and_reads_back() {
+    for (release, byte) in [(Release::Removed, 1u8), (Release::XmaxCleared, 2)] {
+        let payload = slot_release(release);
+        let bytes = payload.encode();
+        assert_eq!(SLOT_RELEASE_LEN, 47);
+        assert_eq!(bytes.len(), SLOT_RELEASE_LEN);
+        assert_eq!(&bytes[0..4], &9u32.to_le_bytes());
+        assert_eq!(&bytes[4..12], &3u64.to_le_bytes());
+        assert_eq!(&bytes[12..20], &4u64.to_le_bytes());
+        assert_eq!(&bytes[20..28], &6u64.to_le_bytes());
+        assert_eq!(&bytes[28..36], &7u64.to_le_bytes());
+        assert_eq!(&bytes[36..44], &12u64.to_le_bytes());
+        assert_eq!(&bytes[44..46], &5u16.to_le_bytes());
+        assert_eq!(bytes[46], byte);
+        assert_eq!(SlotRelease::decode(&bytes).expect("decode"), payload);
+    }
+}
+
+#[test]
+fn a_slot_release_of_another_length_or_release_is_corruption() {
+    let bytes = slot_release(Release::Removed).encode();
+    for cut in [&bytes[..46], &[bytes.as_slice(), &[0]].concat()[..]] {
+        let err = SlotRelease::decode(cut).expect_err("a payload of another length");
+        assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
+        assert!(err.to_string().contains("expected 47"), "{err}");
+    }
+    let mut unknown = bytes.clone();
+    unknown[46] = 3;
+    let err = SlotRelease::decode(&unknown).expect_err("release 3 is unknown");
+    assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
+    assert!(err.to_string().contains("release 3"), "{err}");
+}

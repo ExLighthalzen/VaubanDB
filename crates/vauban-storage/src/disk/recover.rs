@@ -20,7 +20,27 @@
 //!    took is not handed out again (`a_row_id_taken_by_a_loser_is_not_handed_out_again`). The
 //!    DDL records are replayed on the catalogue, which gives the head page of each heap
 //!    ([`redo_ddl`]).
-//! 2. **Redo.** The row records of the winners are applied to the heaps, in journal order.
+//! 2. **Redo.** The row records of the winners are applied to the heaps, in journal order,
+//!    and so are the records that free a heap slot ([`WalRecordKind::Compensation`],
+//!    [`WalRecordKind::Purge`]) of each transaction, winner or not ([`RedoHeap::release`]).
+//!
+//! # Records that free a slot
+//!
+//! The undo of a rollback, of a rollback to a savepoint, and a vacuum journal each version they
+//! take out of a heap slot ([`super::wal_payload::SlotRelease`]). The redo replays them at their
+//! place in the journal, by `(RowId, seq)` like the row records: a version the heap holds is
+//! taken out, or written again with its `xmax` unset when the record says so and the heap
+//! holds it with the `xmax` the record names; a version the heap does not hold leaves the
+//! record without effect ([`Recovery::released`] counts the ones that changed the heap). They
+//! are replayed for a loser too, and inside a range a rollback to a savepoint cancels: a
+//! compensation is what that rollback did, not one of the writes it took back.
+//!
+//! What this gives back is the room: a page another transaction shares may reach `data`
+//! holding the versions a rollback later took out, and a write after the rollback may have
+//! used that room. The redo takes those versions out before it replays that write
+//! (`a_rollback_on_a_page_already_on_data_gives_its_room_back_at_the_redo`), and a vacuumed
+//! version replayed from its `Insert` leaves again at its `Purge`
+//! (`a_vacuum_then_a_crash_recovers_the_committed_rows_without_the_purged_versions`).
 //!
 //! # Where the redo starts, and why not at the checkpoint
 //!
@@ -45,7 +65,8 @@
 //!
 //! # Losers
 //!
-//! A loser is not replayed, and this build runs no undo: under no-steal the page of a running
+//! A loser is not replayed, and the redo runs no undo of its own beyond the compensation records
+//! the journal holds: under no-steal the page of a running
 //! transaction is held back, so what it wrote is usually left in the pool a crash threw away.
 //! Usually, not in one case: two transactions that write the same page share it, and the
 //! commit of the first clears the `in_progress` flag of that page
@@ -54,7 +75,10 @@
 //! That leftover is hidden by the register rather than taken away:
 //! [`super::version::HeapTable::resume_after_recovery`] marks the losers `Aborted`, which
 //! [`crate::Snapshot::is_visible`] reads (`a_loser_whose_page_reached_data_is_invisible`).
-//! Taking the bytes back belongs to a vacuum, which is not implemented.
+//! A loser that rolled back before the crash journalled its undo, and the redo takes its
+//! versions out (above). The writes of a loser that neither a `ROLLBACK TO` nor a rollback the
+//! crash cut short had undone carry no compensation in the journal; their bytes stay until a
+//! vacuum takes them.
 //!
 //! The `in_progress` flag itself is a field of a frame of the pool
 //! ([`super::buffer::BufferPool::set_in_progress`] writes it on the frame of a pinned page),
@@ -95,7 +119,7 @@ use super::meta::{Catalogue, IndexEntry, TableEntry};
 use super::page::{Lsn, PageId, PageKind};
 use super::version::{VERSION_PREFIX_LEN, VersionHeader};
 use super::wal::{WalRecord, WalRecordKind};
-use super::wal_payload::RowChange;
+use super::wal_payload::{Release, RowChange, SlotRelease};
 use crate::{DbId, RowId, TableId, TableShape, TxnId};
 
 /// What the recovery found and did, kept by [`super::DiskStorage`] for the caller that rebuilds
@@ -121,6 +145,9 @@ pub(crate) struct Recovery {
     pub(crate) skipped: usize,
     /// Row records of winners naming a table no [`WalRecordKind::CreateTable`] record names.
     pub(crate) unplaced: usize,
+    /// [`WalRecordKind::Compensation`] and [`WalRecordKind::Purge`] records that changed a
+    /// heap: the version they name was there, and was taken out or had its `xmax` unset.
+    pub(crate) released: usize,
     /// Row records of a committed transaction that an undone savepoint took back before the
     /// commit ([`Scan::cancelled`]). The redo leaves them out.
     pub(crate) cancelled: BTreeSet<Lsn>,
@@ -138,6 +165,7 @@ impl Default for Recovery {
             applied: 0,
             skipped: 0,
             unplaced: 0,
+            released: 0,
             cancelled: BTreeSet::new(),
         }
     }
@@ -331,9 +359,10 @@ struct Scan {
     max_seq: u64,
     /// Row records the redo must leave out. A [`WalRecordKind::RollbackTo`] record cancels the
     /// row records of its transaction between the [`WalRecordKind::Savepoint`] its payload
-    /// names and itself: the undo of a rollback to a savepoint writes no record of
-    /// its own; a redo that replayed the writes the savepoint protected would put back
-    /// what the running transaction had taken away.
+    /// names and itself: a redo that replayed the writes the savepoint protected would put
+    /// back what the running transaction had taken away. The compensation records the undo
+    /// appends come after the `RollbackTo`, and the redo replays them inside a cancelled range
+    /// too (`a_compensation_inside_an_outer_rolled_back_range_is_replayed`).
     cancelled: BTreeSet<Lsn>,
 }
 
@@ -422,6 +451,7 @@ impl Scan {
             applied: 0,
             skipped: 0,
             unplaced: 0,
+            released: 0,
             cancelled: self.cancelled,
         })
     }
@@ -462,6 +492,17 @@ fn redo(
     let mut clustered_changes: BTreeMap<TableId, Vec<(WalRecordKind, RowChange)>> = BTreeMap::new();
     for record in records {
         let kind = record.kind;
+        if matches!(kind, WalRecordKind::Compensation | WalRecordKind::Purge) {
+            let release = SlotRelease::decode(&record.payload)?;
+            // A heap the catalogue no longer holds, or a clustered table, which journals no
+            // such record: nothing to take out.
+            if let Some(redo) = heaps.get_mut(&release.table)
+                && redo.release(&release)?
+            {
+                recovery.released += 1;
+            }
+            continue;
+        }
         if !matches!(
             kind,
             WalRecordKind::Insert | WalRecordKind::Update | WalRecordKind::Delete
@@ -670,11 +711,45 @@ impl<'storage> RedoHeap<'storage> {
         }
     }
 
+    /// Replays a record that frees a heap slot, and answers whether it changed the heap.
+    ///
+    /// The version is looked up by `(RowId, seq)`, not at the slot the record names: the redo
+    /// of this build places versions through the heap, which may put one at another address
+    /// than the instance that wrote the record did. A [`Release::Removed`] takes the version
+    /// out; a [`Release::XmaxCleared`] writes it again without its `xmax` when that `xmax` is the
+    /// one the record names, a later writer's being left in place.
+    fn release(&mut self, release: &SlotRelease) -> Result<bool, InternalError> {
+        let key = (release.header.row, release.header.seq);
+        let Some(placed) = self.versions.get(&key).copied() else {
+            return Ok(false);
+        };
+        match release.release {
+            Release::Removed => {
+                self.heap.free_slot(placed.rid, Lsn(0))?;
+                self.versions.remove(&key);
+                Ok(true)
+            }
+            Release::XmaxCleared => {
+                if placed.header.xmax.is_none() || placed.header.xmax != release.header.xmax {
+                    return Ok(false);
+                }
+                self.patch(placed, None)?;
+                Ok(true)
+            }
+        }
+    }
+
     /// Rewrites `placed` with `xmax` set to `txn`, when it does not carry one already.
     fn rewrite(&mut self, placed: Placed, txn: TxnId) -> Result<bool, InternalError> {
         if placed.header.xmax.is_some() {
             return Ok(false);
         }
+        self.patch(placed, Some(txn))?;
+        Ok(true)
+    }
+
+    /// Writes `placed` again with `xmax` set to `xmax`, its columns untouched.
+    fn patch(&mut self, placed: Placed, xmax: Option<TxnId>) -> Result<(), InternalError> {
         let Some(bytes) = self.heap.get(placed.rid)? else {
             return Err(InternalError::Corruption(format!(
                 "version {} of row {} of table {} is not at {} any more",
@@ -695,17 +770,17 @@ impl<'storage> RedoHeap<'storage> {
             )));
         };
         let header = VersionHeader {
-            xmax: Some(txn),
+            xmax,
             ..placed.header
         };
         let mut patched = Vec::with_capacity(bytes.len());
         header.write_to(&mut patched);
         patched.extend_from_slice(columns);
-        self.heap.delete(placed.rid)?;
+        self.heap.free_slot(placed.rid, Lsn(0))?;
         let rid = self.heap.insert(&patched)?;
         self.versions
             .insert((header.row, header.seq), Placed { rid, header });
-        Ok(true)
+        Ok(())
     }
 }
 

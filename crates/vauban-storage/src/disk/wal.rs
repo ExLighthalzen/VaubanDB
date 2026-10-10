@@ -193,6 +193,13 @@ pub(crate) enum WalRecordKind {
     Savepoint = 14,
     /// The transaction was rolled back to a savepoint.
     RollbackTo = 15,
+    /// The undo of a rollback, or of a rollback to a savepoint, took a version out of a heap
+    /// slot: the version left the heap, or was written again with its `xmax` unset. The
+    /// payload is a [`super::wal_payload::SlotRelease`].
+    Compensation = 16,
+    /// A vacuum took a version out of a heap slot. The payload is a
+    /// [`super::wal_payload::SlotRelease`].
+    Purge = 17,
 }
 
 impl WalRecordKind {
@@ -217,6 +224,8 @@ impl WalRecordKind {
             13 => Ok(Self::DropIndex),
             14 => Ok(Self::Savepoint),
             15 => Ok(Self::RollbackTo),
+            16 => Ok(Self::Compensation),
+            17 => Ok(Self::Purge),
             other => Err(InternalError::Corruption(format!(
                 "unknown wal record kind {other}"
             ))),
@@ -912,6 +921,22 @@ impl WalHandle {
         let lsn = wal.append_checkpoint(next_page_id, next_row_id)?;
         wal.flush()?;
         Ok(lsn)
+    }
+
+    /// `sync_all`s the journal, so that [`WalHandle::durable_lsn`] names the last record
+    /// appended so far.
+    ///
+    /// This is what a write that frees room in a heap page calls once its records are
+    /// appended, before a page carrying their LSN may be handed to the pool without the
+    /// `in_progress` flag ([`super::version::HeapTable::vacuum`],
+    /// [`super::version::HeapTable::finish`],
+    /// [`super::version::HeapTable::rollback_to_savepoint`]).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Wal::flush`], and [`InternalError::Corruption`] for a poisoned lock.
+    pub(crate) fn flush(&self) -> Result<(), InternalError> {
+        self.lock()?.flush()
     }
 
     /// The records of the journal, read from its first byte.

@@ -831,12 +831,14 @@ fn rollback_appends_abort() {
         vec![
             WalRecordKind::Begin,
             WalRecordKind::Insert,
-            WalRecordKind::Abort
+            WalRecordKind::Abort,
+            WalRecordKind::Compensation
         ]
     );
     // The `Abort` is flushed like a `Commit`, so a `Begin` left without either is a
-    // transaction a crash interrupted, for the recovery.
-    assert_eq!(storage.wal.durable_lsn(), Lsn(3));
+    // transaction a crash interrupted, for the recovery; the compensation of the undo is
+    // flushed after it.
+    assert_eq!(storage.wal.durable_lsn(), Lsn(4));
     assert!(chain(&table).is_empty());
     assert_eq!(table.get(&snap(9, 100, &[]), id).expect("get"), None);
     assert_eq!(table.status(TxnId(4)), TxnStatus::Aborted);
@@ -1011,4 +1013,177 @@ fn the_page_of_a_write_carries_the_lsn_of_its_record() {
         pin.with_page(|page| page.lsn()).expect("read the lsn"),
         Lsn(3)
     );
+}
+
+// --- Records of the slots an undo or a vacuum frees -----------------------------------
+
+/// The payloads of the records of `kind` the journal holds, in order, with their `txn`.
+fn releases(storage: &DiskStorage, kind: WalRecordKind) -> Vec<(TxnId, SlotRelease)> {
+    journal(storage)
+        .iter()
+        .filter(|record| record.kind == kind)
+        .map(|record| {
+            (
+                record.txn,
+                SlotRelease::decode(&record.payload).expect("a slot release payload"),
+            )
+        })
+        .collect()
+}
+
+/// The `(row, seq, xmax, release)` a release names.
+fn named(release: &SlotRelease) -> (u64, u64, Option<u64>, Release) {
+    (
+        release.header.row.0,
+        release.header.seq,
+        release.header.xmax.map(|x| x.0),
+        release.release,
+    )
+}
+
+#[test]
+fn a_rollback_journals_one_compensation_per_version_it_takes_out() {
+    let (_dir, storage) = instance("version-compensation");
+    let mut table = table_of(&storage);
+    let updated = table.insert(TxnId(4), &row(1)).expect("insert 1");
+    let deleted = table.insert(TxnId(4), &row(2)).expect("insert 2");
+    table.commit(TxnId(4)).expect("commit 4");
+
+    let inserted = table.insert(TxnId(5), &row(3)).expect("insert 3");
+    table.update(TxnId(5), updated, &row(10)).expect("update 1");
+    table.delete(TxnId(5), deleted).expect("delete 2");
+    // Where each version sits before the undo: the records name these slots.
+    let at = |table: &HeapTable<'_>, row: RowId, seq: u64| {
+        *table
+            .state
+            .versions
+            .get(&(row, seq))
+            .expect("the version is in the directory")
+    };
+    let slots = [
+        at(&table, deleted, 2),
+        at(&table, updated, 4),
+        at(&table, updated, 1),
+        at(&table, inserted, 3),
+    ];
+    table.rollback(TxnId(5)).expect("rollback 5");
+
+    let compensations = releases(&storage, WalRecordKind::Compensation);
+    // The undo walks the writes backwards: the delete, the update (its new version out,
+    // then the `xmax` of the version it replaced), the insert.
+    assert_eq!(
+        compensations
+            .iter()
+            .map(|(txn, release)| (txn.0, named(release)))
+            .collect::<Vec<_>>(),
+        vec![
+            (5, (2, 2, Some(5), Release::XmaxCleared)),
+            (5, (1, 4, None, Release::Removed)),
+            (5, (1, 1, Some(5), Release::XmaxCleared)),
+            (5, (3, 3, None, Release::Removed)),
+        ]
+    );
+    assert_eq!(
+        compensations
+            .iter()
+            .map(|(_, release)| release.at)
+            .collect::<Vec<_>>(),
+        slots
+    );
+    assert!(
+        compensations
+            .iter()
+            .all(|(_, release)| release.table == TABLE)
+    );
+    // The records are durable once the rollback returns, the flag of the pages being down.
+    let last = journal(&storage).last().expect("a record").lsn;
+    assert_eq!(storage.wal.durable_lsn(), last);
+    let records = journal(&storage);
+    assert_eq!(
+        records.last().map(|record| record.kind),
+        Some(WalRecordKind::Compensation)
+    );
+    // The heap page carries the LSN of the last compensation, and the checkpoint writes it.
+    let pin = storage.pool.pin(slots[3].page).expect("pin the page");
+    assert_eq!(
+        pin.with_page(super::super::page::Page::lsn).expect("lsn"),
+        last
+    );
+    drop(pin);
+    storage.checkpoint().expect("checkpoint");
+    assert_eq!(
+        chain(&table),
+        vec![(1, 1, 4, None), (2, 2, 4, None)],
+        "what the committed transaction wrote, nothing of the undone one"
+    );
+}
+
+#[test]
+fn a_rollback_to_a_savepoint_journals_its_compensations_and_syncs_them() {
+    let (_dir, storage) = instance("version-compensation-savepoint");
+    let mut table = table_of(&storage);
+    table.insert(TxnId(4), &row(1)).expect("insert kept");
+    let mark = table.writes_len(TxnId(4));
+    table.insert(TxnId(4), &row(2)).expect("insert undone");
+    table
+        .rollback_to_savepoint(TxnId(4), mark)
+        .expect("rollback to the savepoint");
+
+    let compensations = releases(&storage, WalRecordKind::Compensation);
+    assert_eq!(
+        compensations
+            .iter()
+            .map(|(txn, release)| (txn.0, named(release)))
+            .collect::<Vec<_>>(),
+        vec![(4, (2, 2, None, Release::Removed))]
+    );
+    let last = journal(&storage).last().expect("a record").lsn;
+    assert_eq!(storage.wal.durable_lsn(), last);
+    // Nothing undone, nothing journalled.
+    let before = journal(&storage).len();
+    table
+        .rollback_to_savepoint(TxnId(4), table.writes_len(TxnId(4)))
+        .expect("an empty rollback to a savepoint");
+    assert_eq!(journal(&storage).len(), before);
+}
+
+#[test]
+fn a_vacuum_journals_one_purge_per_version_and_syncs_before_the_pages_leave() {
+    let (_dir, storage) = instance("version-purge");
+    let mut table = table_of(&storage);
+    let gone = table.insert(TxnId(4), &row(1)).expect("insert 1");
+    let replaced = table.insert(TxnId(4), &row(2)).expect("insert 2");
+    table.commit(TxnId(4)).expect("commit 4");
+    table.delete(TxnId(5), gone).expect("delete 1");
+    table
+        .update(TxnId(5), replaced, &row(20))
+        .expect("update 2");
+    table.commit(TxnId(5)).expect("commit 5");
+    let before = journal(&storage).len();
+
+    let removed = table.vacuum(TxnId(6)).expect("vacuum");
+    assert_eq!(removed.len(), 2);
+    let purges = releases(&storage, WalRecordKind::Purge);
+    assert_eq!(
+        purges
+            .iter()
+            .map(|(txn, release)| (txn.0, named(release)))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, (1, 1, Some(5), Release::Removed)),
+            (0, (2, 2, Some(5), Release::Removed)),
+        ]
+    );
+    assert_eq!(journal(&storage).len(), before + 2);
+    let last = journal(&storage).last().expect("a record").lsn;
+    assert_eq!(storage.wal.durable_lsn(), last);
+    // The pages carry LSNs the journal covers: the pool writes them without complaint.
+    storage
+        .pool
+        .flush_all()
+        .expect("flush the pages of the vacuum");
+    assert_eq!(chain(&table), vec![(2, 3, 5, None)]);
+    // A vacuum with nothing to take out journals nothing.
+    table.vacuum(TxnId(6)).expect("vacuum again");
+    assert_eq!(journal(&storage).len(), before + 2);
 }

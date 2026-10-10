@@ -1,11 +1,12 @@
 //! Payload of the row records of the journal: what [`super::wal::WalRecordKind::Insert`],
 //! `Update` and `Delete` carry after the fixed fields [`super::wal`] writes.
 //!
-//! A record of the journal is logical: it names the table, the logical row and the version
+//! A row record of the journal is logical: it names the table, the logical row and the version
 //! the write produced, not the page it landed on. The address of the version ([`Rid`], the
 //! page and slot) is left out on purpose: a version moves when its `xmax` is set
 //! ([`super::version`]), and the redo ([`super::recover`]) replays the write through the heap rather
-//! than copying bytes back to a position.
+//! than copying bytes back to a position. The records that free a heap slot, below, do name
+//! the slot.
 //!
 //! [`Rid`]: super::heap::Rid
 //!
@@ -35,9 +36,30 @@
 //!
 //! `Begin`, `Commit` and `Abort` carry an empty payload: their `txn` field is in the fixed
 //! part of the record.
+//!
+//! # Records that free a heap slot
+//!
+//! [`super::wal::WalRecordKind::Compensation`] (the undo of a rollback) and
+//! [`super::wal::WalRecordKind::Purge`] (a vacuum) carry a [`SlotRelease`]: the version whose
+//! slot is freed, the slot itself and what became of the version.
+//!
+//! | Offset | Size | Field |
+//! |---|---|---|
+//! | 0 | 4 | `table` ([`TableId`]) |
+//! | 4 | 32 | the prefix of the version as it stood in the slot: `row`, `xmin`, `xmax`, `seq` |
+//! | 36 | 8 | the page of the freed slot ([`PageId`]) |
+//! | 44 | 2 | the slot freed in that page |
+//! | 46 | 1 | [`Release`]: 1 when the version leaves the heap, 2 when it is written again with its `xmax` unset |
+//!
+//! The payload is 47 bytes long (`a_slot_release_is_47_bytes_and_reads_back`): the columns are
+//! left out, the version being one the heap already holds.
+//! Its `txn` field names the transaction whose write is undone for a `Compensation`, and is
+//! `TxnId(0)` for a `Purge`.
 
 use vauban_errors::InternalError;
 
+use super::heap::Rid;
+use super::page::PageId;
 use super::version::{VERSION_PREFIX_LEN, VersionHeader};
 use crate::TableId;
 
@@ -100,6 +122,87 @@ fn short(len: usize) -> InternalError {
         "a row record of the journal carries {len} payload bytes, fewer than the {PREFIX_LEN} \
          of its table and version prefix"
     ))
+}
+
+/// Bytes a [`SlotRelease`] occupies: the table, the version prefix, the page, the slot and the
+/// kind of release.
+pub(crate) const SLOT_RELEASE_LEN: usize = PREFIX_LEN + 8 + 2 + 1;
+
+/// What became of a version whose slot a [`SlotRelease`] frees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Release {
+    /// The version left the heap: the undo of the write that created it, or a vacuum.
+    Removed = 1,
+    /// The version was written again with its `xmax` unset: the undo of the write that set it.
+    XmaxCleared = 2,
+}
+
+/// The payload of a [`super::wal::WalRecordKind::Compensation`] or a
+/// [`super::wal::WalRecordKind::Purge`] record: one heap slot freed, as the module describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlotRelease {
+    /// The table the version belongs to.
+    pub(crate) table: TableId,
+    /// The prefix of the version as it stood in the slot.
+    pub(crate) header: VersionHeader,
+    /// The slot freed.
+    pub(crate) at: Rid,
+    /// What became of the version.
+    pub(crate) release: Release,
+}
+
+impl SlotRelease {
+    /// The [`SLOT_RELEASE_LEN`] bytes of the payload.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(SLOT_RELEASE_LEN);
+        bytes.extend_from_slice(&self.table.0.to_le_bytes());
+        self.header.write_to(&mut bytes);
+        bytes.extend_from_slice(&self.at.page.0.to_le_bytes());
+        bytes.extend_from_slice(&self.at.slot.to_le_bytes());
+        bytes.push(self.release as u8);
+        bytes
+    }
+
+    /// Reads a payload back.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Corruption`] for a payload that is not [`SLOT_RELEASE_LEN`] bytes long
+    /// and for a release byte other than 1 and 2
+    /// (`a_slot_release_of_another_length_or_release_is_corruption`).
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, InternalError> {
+        let bytes: &[u8; SLOT_RELEASE_LEN] = bytes.try_into().map_err(|_| {
+            InternalError::Corruption(format!(
+                "a slot release record of the journal carries {} payload bytes, expected \
+                 {SLOT_RELEASE_LEN}",
+                bytes.len()
+            ))
+        })?;
+        let table = TableId(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        let header = VersionHeader::read_from(&bytes[OFF_HEADER..PREFIX_LEN])?;
+        let mut page = [0u8; 8];
+        page.copy_from_slice(&bytes[PREFIX_LEN..PREFIX_LEN + 8]);
+        let slot = u16::from_le_bytes([bytes[PREFIX_LEN + 8], bytes[PREFIX_LEN + 9]]);
+        let release = match bytes[PREFIX_LEN + 10] {
+            1 => Release::Removed,
+            2 => Release::XmaxCleared,
+            other => {
+                return Err(InternalError::Corruption(format!(
+                    "a slot release record of the journal carries release {other}, this build \
+                     reads 1 and 2"
+                )));
+            }
+        };
+        Ok(Self {
+            table,
+            header,
+            at: Rid {
+                page: PageId(u64::from_le_bytes(page)),
+                slot,
+            },
+            release,
+        })
+    }
 }
 
 #[cfg(test)]

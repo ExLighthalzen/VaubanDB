@@ -1,3 +1,4 @@
+use super::super::buffer::DurableLsn;
 use super::super::control::Control;
 use super::super::temp::TempDir;
 use super::super::{DATA_FILE_NAME, DiskOptions};
@@ -138,6 +139,50 @@ fn delete_makes_get_none() {
     );
     assert_eq!(heap.scan().expect("scan the heap"), vec![second]);
     assert!(!heap.delete(first).expect("delete the freed slot again"));
+}
+
+#[test]
+fn a_freed_slot_ties_the_page_to_the_lsn_it_is_given() {
+    let (_dir, storage) = instance("heap-delete-lsn");
+    let heap = heap_of(&storage);
+    let first = heap.insert(&payload(20, 1)).expect("insert the first row");
+    let second = heap.insert(&payload(20, 2)).expect("insert the second row");
+    assert_eq!(
+        storage.wal.durable_lsn(),
+        Lsn(0),
+        "nothing is journalled yet"
+    );
+
+    // The flag a caller set before the delete stays: the page is held back.
+    storage
+        .pool
+        .set_in_progress(first.page, true)
+        .expect("flag the page");
+    assert!(heap.free_slot(first, Lsn(5)).expect("delete under lsn 5"));
+    let pin = storage.pool.pin(first.page).expect("pin the page");
+    assert_eq!(pin.with_page(Page::lsn).expect("read the lsn"), Lsn(5));
+    drop(pin);
+    storage
+        .pool
+        .flush(first.page)
+        .expect("a flagged page is skipped, not written");
+
+    // Once the flag is down, the page carries a record the journal has not made durable, and
+    // the pool refuses to write it.
+    storage
+        .pool
+        .set_in_progress(first.page, false)
+        .expect("lower the flag");
+    let err = storage
+        .pool
+        .flush(first.page)
+        .expect_err("the page is ahead of the journal");
+    assert!(matches!(err, InternalError::Bug(_)), "{err:?}");
+
+    // `Lsn(0)` leaves the LSN of the page where it stands.
+    assert!(heap.free_slot(second, Lsn(0)).expect("delete under lsn 0"));
+    let pin = storage.pool.pin(second.page).expect("pin the page");
+    assert_eq!(pin.with_page(Page::lsn).expect("read the lsn"), Lsn(5));
 }
 
 #[test]

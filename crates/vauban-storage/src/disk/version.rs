@@ -56,6 +56,17 @@
 //! wrote is on disk (`commit_fsyncs_wal`); `data` is not synced, the pages leaving the pool
 //! afterwards.
 //!
+//! A write that frees a heap slot without being a row write of its own — the undo of a
+//! rollback or of a rollback to a savepoint, and a vacuum — appends a record of its own too,
+//! naming the version, the slot and what became of the version
+//! ([`super::wal_payload::SlotRelease`]): a [`WalRecordKind::Compensation`] for each version
+//! the undo takes out or rewrites, a [`WalRecordKind::Purge`] for each version a vacuum takes
+//! out. The page is tied to that record before the slot is freed, and the journal is
+//! `sync_all`ed before the pages leave the `in_progress` flag, so a page that reaches `data`
+//! with a slot freed is a page whose record is durable
+//! (`a_rollback_journals_one_compensation_per_version_it_takes_out`,
+//! `a_vacuum_journals_one_purge_per_version_and_syncs_before_the_pages_leave`).
+//!
 //! [`HeapTable::note_page`] also sets `in_progress` on the heap page a write lands on, and
 //! [`HeapTable::commit`] and [`HeapTable::rollback`] clear it, so the buffer pool leaves that
 //! page in the cache while the transaction runs (no-steal). With one transaction, one
@@ -106,7 +117,7 @@ use super::heap::{Heap, Rid};
 use super::index::IndexChange;
 use super::page::{Lsn, PageId};
 use super::wal::WalRecordKind;
-use super::wal_payload::RowChange;
+use super::wal_payload::{Release, RowChange, SlotRelease};
 use crate::{Row, RowId, Snapshot, TableId, TableShape, TxnId, TxnStatus};
 
 /// Number of bytes a version carries before its columns: `row`, `xmin`, `xmax`, `seq`.
@@ -496,7 +507,8 @@ impl<'storage> HeapTable<'storage> {
             let mut patched = Vec::with_capacity(version.bytes.len());
             header.write_to(&mut patched);
             patched.extend_from_slice(columns);
-            self.heap.delete(version.rid)?;
+            // The recovery replays the journal and appends nothing: `Lsn(0)`.
+            self.heap.free_slot(version.rid, Lsn(0))?;
             self.heap.insert(&patched)?;
         }
         Ok(())
@@ -847,10 +859,13 @@ impl<'storage> HeapTable<'storage> {
     /// Those of [`HeapTable::rollback`] for the undo, and of the buffer pool for the flag.
     pub(crate) fn finish(&mut self, txn: TxnId, status: TxnStatus) -> Result<(), InternalError> {
         let writes = self.finish_txn(txn);
-        if status == TxnStatus::Aborted {
+        if status == TxnStatus::Aborted && !writes.is_empty() {
             for entry in writes.into_iter().rev() {
                 self.undo(txn, entry)?;
             }
+            // The compensation records go to disk before the flag of the pages comes down: a
+            // page whose flag is down may be written, and it carries their LSN.
+            self.storage.wal.flush()?;
         }
         self.release_pages(txn)
     }
@@ -863,12 +878,14 @@ impl<'storage> HeapTable<'storage> {
     /// not handed out again.
     ///
     /// A [`WalRecordKind::Abort`] record is appended and the journal is `sync_all`ed before
-    /// the undo runs (`rollback_appends_abort`), although under no-steal the writes of the
-    /// transaction have not reached `data`: that flush is there so that a transaction whose
-    /// `Begin` is followed by neither a `Commit` nor an `Abort` is one a crash interrupted,
-    /// which is what the recovery sorts the losers by. The undo itself is journalled
-    /// by no record here, the versions it takes away being ones no committed transaction can
-    /// see.
+    /// the undo runs (`rollback_appends_abort`), so that a transaction whose `Begin` is
+    /// followed by neither a `Commit` nor an `Abort` is one a crash interrupted, which is what
+    /// the recovery sorts the losers by. The undo then appends one
+    /// [`WalRecordKind::Compensation`] per version it takes out or rewrites, and `sync_all`s
+    /// the journal again before the `in_progress` flag of the pages comes down
+    /// ([`HeapTable::finish`]): a page another transaction shares may have reached `data`
+    /// holding the versions of this one, and the redo takes them out by these records
+    /// (`recover::tests::a_rollback_on_a_page_already_on_data_gives_its_room_back_at_the_redo`).
     ///
     /// # Errors
     ///
@@ -1123,8 +1140,6 @@ impl<'storage> HeapTable<'storage> {
     /// [`super::buffer::BufferPool::set_in_progress`] ask for a page the pool holds. The LSN
     /// is what keeps the page in the cache until the journal is flushed: the pool refuses to
     /// write a page whose LSN is past the durable one (`flush_page_before_wal_flush_is_bug`).
-    /// `Lsn(0)` leaves the LSN of the page where it is, which is what the undo of a rollback
-    /// passes, having no record of its own.
     fn note_page(&mut self, txn: TxnId, page: PageId, lsn: Lsn) -> Result<(), InternalError> {
         let pin = self.storage.pool.pin(page)?;
         self.storage.pool.mark_dirty(page, lsn)?;
@@ -1168,21 +1183,27 @@ impl<'storage> HeapTable<'storage> {
 
     /// Applies one undo entry of `txn`.
     ///
-    /// The heap writes of the undo carry `Lsn(0)`: the `Abort` record was appended and
-    /// flushed before the undo ran, so the pages of the transaction sit at an LSN the journal
-    /// already covers, and this walk adds no record to move them past it.
+    /// Each version the undo takes out of its slot is journalled first, by a
+    /// [`WalRecordKind::Compensation`] whose LSN the pages of the undo carry: the version
+    /// created by an `Insert` or an `Update` leaves the heap ([`Release::Removed`]), the
+    /// version whose `xmax` an `Update` or a `Delete` set is written again without it
+    /// ([`Release::XmaxCleared`]). The caller `sync_all`s the journal once the walk is done.
     fn undo(&mut self, txn: TxnId, entry: UndoEntry) -> Result<(), InternalError> {
         match entry {
             UndoEntry::Insert(row) => {
                 let created = self.tail_created_by(txn, row)?;
-                self.remove_version(txn, Lsn(0), &created)?;
+                let lsn =
+                    self.log_release(WalRecordKind::Compensation, txn, &created, Release::Removed)?;
+                self.remove_version(txn, lsn, &created)?;
                 self.note_undone_version(&created)?;
                 self.state.directory.remove(&row);
                 Ok(())
             }
             UndoEntry::Update(row) => {
                 let created = self.tail_created_by(txn, row)?;
-                self.remove_version(txn, Lsn(0), &created)?;
+                let lsn =
+                    self.log_release(WalRecordKind::Compensation, txn, &created, Release::Removed)?;
+                self.remove_version(txn, lsn, &created)?;
                 self.note_undone_version(&created)?;
                 self.state.directory.remove(&row);
                 let Some(replaced) = self.stored_versions(Some(row))?.pop() else {
@@ -1200,7 +1221,13 @@ impl<'storage> HeapTable<'storage> {
                         self.table()
                     ));
                 }
-                let rid = self.set_xmax(txn, Lsn(0), &replaced, None)?;
+                let lsn = self.log_release(
+                    WalRecordKind::Compensation,
+                    txn,
+                    &replaced,
+                    Release::XmaxCleared,
+                )?;
+                let rid = self.set_xmax(txn, lsn, &replaced, None)?;
                 self.state.directory.insert(row, rid);
                 Ok(())
             }
@@ -1213,7 +1240,13 @@ impl<'storage> HeapTable<'storage> {
                         self.table()
                     ));
                 }
-                let rid = self.set_xmax(txn, Lsn(0), &deleted, None)?;
+                let lsn = self.log_release(
+                    WalRecordKind::Compensation,
+                    txn,
+                    &deleted,
+                    Release::XmaxCleared,
+                )?;
+                let rid = self.set_xmax(txn, lsn, &deleted, None)?;
                 self.state.directory.insert(row, rid);
                 Ok(())
             }
@@ -1236,13 +1269,18 @@ impl<'storage> HeapTable<'storage> {
 
     /// Removes one version from the heap and from the directory of the versions, the page it
     /// sat on flagged for `txn` at `lsn`.
+    ///
+    /// `lsn` is the record that describes the release, already appended. The page is flagged
+    /// and tied to it **before** the slot is freed, so that the pool does not write the freed
+    /// slot ahead of that record.
     fn remove_version(
         &mut self,
         txn: TxnId,
         lsn: Lsn,
         stored: &StoredVersion,
     ) -> Result<(), InternalError> {
-        if !self.heap.delete(stored.rid)? {
+        self.note_page(txn, stored.rid.page, lsn)?;
+        if !self.heap.free_slot(stored.rid, lsn)? {
             return corruption(format!(
                 "version {} of row {} is not at {} in table {}",
                 stored.header.seq,
@@ -1254,7 +1292,29 @@ impl<'storage> HeapTable<'storage> {
         self.state
             .versions
             .remove(&(stored.header.row, stored.header.seq));
-        self.note_page(txn, stored.rid.page, lsn)
+        Ok(())
+    }
+
+    /// Appends the record of `kind` that frees the slot of `stored`, and answers its LSN.
+    ///
+    /// `txn` is the transaction whose write is undone for a [`WalRecordKind::Compensation`],
+    /// `TxnId(0)` for a [`WalRecordKind::Purge`]. The record is appended, not synced: the
+    /// caller syncs once its walk is done.
+    fn log_release(
+        &self,
+        kind: WalRecordKind,
+        txn: TxnId,
+        stored: &StoredVersion,
+        release: Release,
+    ) -> Result<Lsn, InternalError> {
+        let payload = SlotRelease {
+            table: self.table(),
+            header: stored.header,
+            at: stored.rid,
+            release,
+        }
+        .encode();
+        self.storage.wal.append(kind, txn, &payload)
     }
 
     /// The most recent version of `id`, read through the directory.
@@ -1336,9 +1396,12 @@ impl<'storage> HeapTable<'storage> {
     /// Rolls back the writes of `txn` after position `mark`, which is what
     /// [`Storage::rollback_to`] calls on each table the transaction wrote in.
     ///
+    /// The undo journals what it takes out as [`HeapTable::finish`] does, and `sync_all`s the
+    /// journal once it is done.
+    ///
     /// # Errors
     ///
-    /// Those of [`HeapTable::undo`].
+    /// Those of [`HeapTable::undo`] and of the journal.
     pub(crate) fn rollback_to_savepoint(
         &mut self,
         txn: TxnId,
@@ -1348,10 +1411,13 @@ impl<'storage> HeapTable<'storage> {
             return Ok(());
         };
         let tail: Vec<UndoEntry> = state.writes.split_off(mark);
+        if tail.is_empty() {
+            return Ok(());
+        }
         for entry in tail.into_iter().rev() {
             self.undo(txn, entry)?;
         }
-        Ok(())
+        self.storage.wal.flush()
     }
 
     /// Removes the versions a `vacuum` below `horizon` would discard and answers the index
@@ -1361,22 +1427,43 @@ impl<'storage> HeapTable<'storage> {
     /// committed txn below the horizon, then versions created by an aborted txn — adapted to
     /// the on-disk layout. Callers drop the returned entries from the indexes of the table.
     ///
+    /// Each version taken out is journalled first, by a [`WalRecordKind::Purge`] that the
+    /// recovery replays; the journal is `sync_all`ed once the records are appended and
+    /// before the first slot is freed, so the pages the vacuum changes carry LSNs the journal
+    /// already covers and the pool may write them at once
+    /// (`a_vacuum_journals_one_purge_per_version_and_syncs_before_the_pages_leave`).
+    ///
     /// # Errors
     ///
-    /// The errors of reading and writing the heap.
+    /// The errors of reading and writing the heap, and of the journal.
     pub(crate) fn vacuum(&mut self, horizon: TxnId) -> Result<Vec<IndexChange>, InternalError> {
         let status = |t| self.status(t);
-        let mut removed = Vec::new();
+        let mut doomed = Vec::new();
         for version in self.stored_versions(None)? {
             let discard = match version.header.xmax {
                 Some(x) if x < horizon && status(x) == TxnStatus::Committed => true,
                 None => false,
                 _ => false,
             } || status(version.header.xmin) == TxnStatus::Aborted;
-            if !discard {
-                continue;
+            if discard {
+                doomed.push(version);
             }
-            self.heap.delete(version.rid)?;
+        }
+        let mut purges = Vec::with_capacity(doomed.len());
+        for version in &doomed {
+            purges.push(self.log_release(
+                WalRecordKind::Purge,
+                TxnId(0),
+                version,
+                Release::Removed,
+            )?);
+        }
+        if !doomed.is_empty() {
+            self.storage.wal.flush()?;
+        }
+        let mut removed = Vec::new();
+        for (version, lsn) in doomed.into_iter().zip(purges) {
+            self.heap.free_slot(version.rid, lsn)?;
             let row = version.row()?;
             removed.push(IndexChange::Removed {
                 row: version.header.row,

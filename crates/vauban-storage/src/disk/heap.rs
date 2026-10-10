@@ -72,15 +72,17 @@
 //! # Pins and the no-steal rule
 //!
 //! Each entry point pins the pages it reads or changes through [`super::buffer::BufferPool`]
-//! and releases them before it answers: [`Heap::insert`], [`Heap::get`], [`Heap::delete`] and
-//! [`Heap::scan`] answer a [`Rid`], a `Vec<u8>`, a `bool` and a `Vec<Rid>`, not a
-//! [`super::buffer::PinGuard`]. A page a call changed is marked
+//! and releases them before it answers: [`Heap::insert`], [`Heap::get`], [`Heap::delete`],
+//! [`Heap::free_slot`] and [`Heap::scan`] answer a [`Rid`], a `Vec<u8>`, a `bool` for each of
+//! the two frees and a `Vec<Rid>`, not a [`super::buffer::PinGuard`]. A page [`Heap::insert`] or [`Heap::delete`] changed is marked
 //! dirty at `Lsn(0)` — the journal record that describes the change is written by the caller,
 //! [`super::version::HeapTable`] — and the page that **took the record** has its `in_progress`
 //! flag cleared: the heap carries no transaction of its own, so the caller sets the flag back
-//! on the page it wrote. [`Heap::link_page`] is the exception: it changes the page that comes
-//! before a fresh one, which the caller does not visit afterwards, so it leaves that flag as
-//! it stands (`a_transaction_over_two_heap_pages_keeps_the_flag_on_both_of_them`).
+//! on the page it wrote. [`Heap::free_slot`] differs: it marks the page at the LSN its caller
+//! hands it and leaves the flag as it stands, so that a freed slot does not reach `data` ahead
+//! of the record that frees it. [`Heap::link_page`] leaves the flag too: it changes the page
+//! that comes before a fresh one, which the caller does not visit afterwards
+//! (`a_transaction_over_two_heap_pages_keeps_the_flag_on_both_of_them`).
 
 use std::fmt;
 
@@ -334,11 +336,42 @@ impl<'storage> Heap<'storage> {
     /// its page both answer `false` and change nothing. The bytes the record occupied stay in
     /// the page until a later [`Heap::insert`] compacts it.
     ///
+    /// The page is marked dirty at `Lsn(0)` and its `in_progress` flag cleared, as
+    /// [`Heap::insert`] does. This is the call of the overflow heap of
+    /// [`super::clustered::ClusteredTable`]; a heap table frees its slots through
+    /// [`Heap::free_slot`], which ties the page to the record that describes the release.
+    ///
     /// # Errors
     ///
     /// The errors of [`Heap::get`] while the slot is read, and those of
     /// [`super::alloc::free`] while the overflow pages are handed back.
     pub(crate) fn delete(&self, rid: Rid) -> Result<bool, InternalError> {
+        self.free(rid, Lsn(0), true)
+    }
+
+    /// Frees the slot of `rid` as [`Heap::delete`] does, the page tied to the journal record of
+    /// LSN `lsn` under the same pin and its `in_progress` flag left as it stands.
+    ///
+    /// `lsn` is the record that describes the release, appended by the caller before this call:
+    /// the record of the write that moves the version ([`super::version::HeapTable::update`],
+    /// [`super::version::HeapTable::delete`]), the compensation of an undo or the purge of a
+    /// vacuum. The pool then keeps the page out of `data` until that record is durable
+    /// (`a_freed_slot_ties_the_page_to_the_lsn_it_is_given`). `Lsn(0)` is what the recovery
+    /// passes, which replays the journal and appends nothing. The flag is left as it stands
+    /// because the caller that flags its pages has set it before the call, and clearing it here
+    /// would let the pool write a page whose record is not durable yet.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Heap::delete`].
+    pub(crate) fn free_slot(&self, rid: Rid, lsn: Lsn) -> Result<bool, InternalError> {
+        self.free(rid, lsn, false)
+    }
+
+    /// The body of [`Heap::delete`] and [`Heap::free_slot`]: the slot freed, the page marked
+    /// dirty at `lsn`, its flag cleared when `clear_flag` says so, then the overflow pages
+    /// handed back.
+    fn free(&self, rid: Rid, lsn: Lsn, clear_flag: bool) -> Result<bool, InternalError> {
         let pin = self.storage.pool.pin(rid.page)?;
         self.check_heap(&pin)?;
         let found = pin.with_page(|page| read_record(page, rid.slot))?;
@@ -347,8 +380,10 @@ impl<'storage> Heap<'storage> {
             return Ok(false);
         };
         pin.with_page_mut(|page| write_slot(page, rid.slot, 0, 0))?;
-        self.storage.pool.mark_dirty(rid.page, Lsn(0))?;
-        self.storage.pool.set_in_progress(rid.page, false)?;
+        self.storage.pool.mark_dirty(rid.page, lsn)?;
+        if clear_flag {
+            self.storage.pool.set_in_progress(rid.page, false)?;
+        }
         drop(pin);
 
         if let Record::Overflow { head, .. } = record {

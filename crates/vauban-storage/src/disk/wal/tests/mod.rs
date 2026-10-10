@@ -705,8 +705,10 @@ fn record_kind_bytes_are_part_of_the_format() {
         (WalRecordKind::DropIndex, 13),
         (WalRecordKind::Savepoint, 14),
         (WalRecordKind::RollbackTo, 15),
+        (WalRecordKind::Compensation, 16),
+        (WalRecordKind::Purge, 17),
     ];
-    assert_eq!(kinds.len(), 15);
+    assert_eq!(kinds.len(), 17);
     for (kind, byte) in kinds {
         assert_eq!(kind.as_byte(), byte);
         assert_eq!(
@@ -716,7 +718,7 @@ fn record_kind_bytes_are_part_of_the_format() {
     }
     // 0 is not a kind, so a run of zero bytes does not read as one.
     assert!(WalRecordKind::from_byte(0).is_err());
-    assert!(WalRecordKind::from_byte(16).is_err());
+    assert!(WalRecordKind::from_byte(18).is_err());
     let err = WalRecordKind::from_byte(u8::MAX).expect_err("255 is outside the enum");
     assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
     assert!(err.to_string().contains("255"), "{err}");
@@ -741,6 +743,8 @@ fn records_of_every_kind_make_the_round_trip() {
         WalRecordKind::DropIndex,
         WalRecordKind::Savepoint,
         WalRecordKind::RollbackTo,
+        WalRecordKind::Compensation,
+        WalRecordKind::Purge,
     ];
     for (index, kind) in kinds.iter().enumerate() {
         let payload = vec![index as u8; index];
