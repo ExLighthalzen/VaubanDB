@@ -27,17 +27,22 @@
 //! and its statement frame, and its results go to the [`StatementSink`]; the interpreter
 //! closes it with [`StatementSink::done`], the row count of a result set included.
 //!
-//! An error a statement raises goes to the sink, followed by the end of that statement,
-//! before anything else runs. Then the scope of the error decides: an error whose scope is
-//! the statement ([`vauban_errors::BatchErrorScope::Statement`]) lets the program go on
-//! with the next instruction, and any other error, or any error under `SET XACT_ABORT ON`,
-//! ends the program (`interp::tests::a_duplicate_key_in_a_loop_of_three_turns_answers_three_errors`).
-//! How far that end reaches is read from the scope too ([`ProgramEnd::ended_by`]): an error
-//! that stops its level ([`vauban_errors::ErrorScope::Level`], 208 for instance) ends this
+//! An error a statement raises comes back to the interpreter unsent, and reaches the sink
+//! once the interpreter has decided how far it reaches (`run.rs`, `decide`). The scope of
+//! the error decides: an error whose scope is the statement
+//! ([`vauban_errors::ErrorScope::Statement`]) lets the program go on with the next
+//! instruction, and any other error, or any error under `SET XACT_ABORT ON`, ends the
+//! program
+//! (`interp::tests::a_duplicate_key_in_a_loop_of_three_turns_answers_three_errors`). How
+//! far that end reaches is read from the scope too ([`ProgramEnd::ended_by`]): an error that
+//! stops its level ([`vauban_errors::ErrorScope::Level`], 208 for instance) ends this
 //! program with [`ProgramEnd::LevelAborted`], and the caller of a procedure or of a dynamic
 //! text goes on; an error that stops the batch, or any error under `SET XACT_ABORT ON`, ends
 //! it with [`ProgramEnd::Aborted`], and each caller stops too
-//! (`interp::tests::a_callee_ended_by_an_error_of_its_level_lets_the_caller_go_on`). An
+//! (`interp::tests::a_callee_ended_by_an_error_of_its_level_lets_the_caller_go_on`). Once
+//! decided, the error goes to the host ([`Host::raise`]) with its reach, and the host closes
+//! its statement as that reach requires
+//! (`interp::tests::an_error_reaches_the_host_with_the_reach_the_interpreter_decided`). An
 //! error raised while a condition is evaluated counts as a condition that is not true: an
 //! `IF` takes its `ELSE`, a `WHILE` ends.
 //!
@@ -87,7 +92,7 @@ pub(crate) use single::run_alone;
 use std::collections::HashMap;
 
 use vauban_binder::BoundExpr;
-use vauban_errors::{SqlError, SqlResult, error_behavior};
+use vauban_errors::{ErrorScope, SqlError, SqlResult};
 use vauban_planner::PhysicalStatement;
 
 use crate::context::ExecContext;
@@ -198,6 +203,12 @@ pub enum ProgramEnd {
     /// to the sink. The caller of a procedure or of a dynamic text that ended so goes on
     /// with its next statement.
     LevelAborted(SqlError),
+    /// The body of a call was refused before its first statement ran, by an error raised
+    /// while it was prepared (its syntax, a `GOTO` to a label it does not declare, its
+    /// binding). The error is not sent yet: the program that made the call decides it where
+    /// the `EXECUTE` is written, then hands it to its host
+    /// (`interp::tests::a_callee_refused_before_it_ran_is_decided_by_the_caller`).
+    Refused(SqlError),
 }
 
 impl ProgramEnd {
@@ -207,10 +218,9 @@ impl ProgramEnd {
     /// [`ProgramEnd::Aborted`] otherwise.
     #[must_use]
     pub fn ended_by(err: SqlError, xact_abort: bool) -> Self {
-        if xact_abort || error_behavior(err.number).scope.stops_the_caller() {
-            Self::Aborted(err)
-        } else {
-            Self::LevelAborted(err)
+        match run::ending_reach(run::reach(&err, xact_abort)) {
+            ErrorScope::Level => Self::LevelAborted(err),
+            _ => Self::Aborted(err),
         }
     }
 }
@@ -272,7 +282,9 @@ pub trait CallHandler {
     /// and the options are those of the caller. The level is closed after this method
     /// returns, so a value meant for the caller is not written here.
     ///
-    /// The handler hands the results of the callee to `sink` itself. A callee that ended by
+    /// The handler hands the results of the callee to `sink` itself. A body refused before
+    /// its first statement ran answers [`ProgramEnd::Refused`] with its error unsent, and
+    /// the program decides it. A callee that ended by
     /// an error it already handed to the sink answers [`ProgramEnd::ended_by`] that error:
     /// [`ProgramEnd::LevelAborted`] lets the calling program go on with its next
     /// instruction, [`ProgramEnd::Aborted`] ends it too; a callee cancelled answers
@@ -318,12 +330,17 @@ pub enum Ran {
     /// that names a call, a `RETURN`, a cancellation or an error of the whole batch is the
     /// program's to act on.
     Outcome(ExecOutcome),
-    /// It raised this error, which is in the sink already with the end of the statement;
-    /// the scope of the error decides whether the program goes on.
+    /// It raised this error, on the line the client reads it at. Nothing of the error is in
+    /// the sink yet: the interpreter decides how far it reaches, then hands it back to
+    /// [`Host::raise`].
     Failed(SqlError),
-    /// It ended by an error in the sink already, and the program ends with it, the scope of
-    /// the error left unread.
+    /// It raised this error, on the line the client reads it at, and the program ends with
+    /// it: its level at least, its batch when the scope of the error or `SET XACT_ABORT ON`
+    /// says so. Nothing of the error is in the sink yet, as for [`Ran::Failed`].
     Stopped(SqlError),
+    /// It ended by this error, which the statement handed to the sink itself with its end,
+    /// and the program ends with it as with [`Ran::Stopped`], the error not sent twice.
+    Reported(SqlError),
     /// The statement at this position, bound when the program reached it, holds others:
     /// the program runs it in place, its jumps resolved against the labels of the body.
     Holds(Box<PhysicalStatement>),
@@ -333,8 +350,9 @@ pub enum Ran {
 /// host that opens a context per statement").
 pub trait Host {
     /// Runs one statement that holds no other one: `stmt`, or the root at `site` when
-    /// `stmt` is `None`. The results, the end of the statement and the error it raises go
-    /// to the host's sink.
+    /// `stmt` is `None`. The results and the end of a statement that succeeded go to the
+    /// host's sink; the error a statement raises comes back in [`Ran::Failed`] or
+    /// [`Ran::Stopped`], unsent.
     ///
     /// # Errors
     ///
@@ -342,8 +360,9 @@ pub trait Host {
     fn statement(&mut self, stmt: Option<&PhysicalStatement>, site: Site) -> SqlResult<Ran>;
 
     /// Evaluates the condition of an `IF` or of a `WHILE` written at `site`: `Ok(true)`
-    /// when it is true, `Ok(false)` when it is false or unknown, `Err` with an error the
-    /// host already reported.
+    /// when it is true, `Ok(false)` when it is false or unknown, `Err` with the error the
+    /// evaluation raised, on the line the client reads it at and unsent, as for
+    /// [`Ran::Failed`].
     ///
     /// # Errors
     ///
@@ -364,19 +383,35 @@ pub trait Host {
         step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
     ) -> SqlResult<()>;
 
-    /// Hands an error the interpreter raised at `site` to the sink, with the end of its
-    /// statement.
+    /// Puts on `err`, an error the interpreter raised itself at `site` (a jump that leaves
+    /// the program, the value of a `RETURN`, the level of a call), the line the client reads
+    /// it at.
+    fn locate(&self, err: SqlError, site: Site) -> SqlError;
+
+    /// Hands `err` to the sink, with the end of its statement, once the interpreter decided
+    /// how far it reaches: [`ErrorScope::Statement`] when the program goes on with its next
+    /// instruction, [`ErrorScope::Level`] when the program ends and the caller of its level
+    /// goes on, a wider scope when the batch ends with it. `@@ERROR` takes its number.
+    ///
+    /// It is the path of an error of a level to the client, apart from an RPC, the
+    /// `WAITFOR` fall-back ([`Ran::Reported`]) and the 266 a called level raises when it ends
+    /// with another transaction count: the error of a statement, of a condition, of
+    /// an `EXECUTE`, and the error that refused the body of a callee before it ran
+    /// ([`ProgramEnd::Refused`]) each reach the client through it
+    /// (`interp::tests::an_error_reaches_the_host_with_the_reach_the_interpreter_decided`,
+    /// `interp::tests::a_callee_refused_before_it_ran_is_decided_by_the_caller`, and in the
+    /// session `tests/nested.rs`,
+    /// `a_dynamic_text_refused_before_it_ran_keeps_its_tokens_at_each_depth`).
     ///
     /// # Errors
     ///
     /// The error of the sink.
-    fn report(&mut self, err: &SqlError, site: Site) -> SqlResult<()>;
+    fn raise(&mut self, err: &SqlError, reach: ErrorScope) -> SqlResult<()>;
 
     /// Runs `call`, made at `site`, in the level the interpreter opened for it, as
     /// [`CallHandler::call`] does: `Ok` with how the callee ended, or `Err` with the error
     /// of the `EXECUTE` statement itself (a procedure that does not exist, for instance),
-    /// which the host already reported and whose scope decides whether the program goes
-    /// on.
+    /// on the line the client reads it at and unsent, as for [`Ran::Failed`].
     ///
     /// # Errors
     ///

@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use vauban_binder::{BindContext, CatalogView, SessionOptions, VariableScope, bind};
+use vauban_binder::{BindContext, BoundExpr, CatalogView, SessionOptions, VariableScope, bind};
 use vauban_catalog::Catalog;
-use vauban_errors::{SqlError, SqlResult};
+use vauban_errors::{ErrorScope, SqlError, SqlResult};
 use vauban_parser::{ParseOptions, parse_batch};
 use vauban_planner::{NoIndexes, PhysicalStatement, PlanCatalog, PlanContext, StorageIndexes};
 use vauban_storage::{MemoryStorage, Storage};
@@ -483,6 +483,215 @@ fn an_error_in_a_condition_counts_as_a_condition_that_is_not_true() {
     assert_eq!(first_column(&sink), [2, 100].map(Value::I32));
     let numbers: Vec<u32> = sink.errors().iter().map(|error| error.number).collect();
     assert_eq!(numbers, vec![8134, 8134]);
+}
+
+/// Under [`Program::run`], an error of a condition carries the line the condition starts
+/// on, not line 0: here each `IF` and each `WHILE` is written on the line of its condition,
+/// and the error answers the line of the statement that holds the condition.
+#[test]
+fn an_error_of_a_condition_carries_the_line_the_condition_starts_on() {
+    let mut session = ExecSession::default();
+    let (end, sink) = run_scalar(
+        "DECLARE @i int = 0;\nIF 1 / @i = 1\n  SELECT 1;\n\nWHILE 1 / @i = 1\n  SELECT 2;",
+        &mut session,
+        &mut Recorder::default(),
+    );
+    assert_eq!(end, ProgramEnd::Completed);
+    let lines: Vec<(u32, u32)> = sink
+        .errors()
+        .iter()
+        .map(|error| (error.number, error.line))
+        .collect();
+    assert_eq!(lines, vec![(8134, 2), (8134, 5)]);
+}
+
+/// A [`Host`] over one context that writes down the reach the interpreter gave each error
+/// it raised.
+struct Reaches<'r, 'a> {
+    inner: SingleContext<'r, 'a>,
+    raised: Vec<(u32, ErrorScope)>,
+}
+
+impl Host for Reaches<'_, '_> {
+    fn statement(&mut self, stmt: Option<&PhysicalStatement>, site: Site) -> SqlResult<Ran> {
+        self.inner.statement(stmt, site)
+    }
+
+    fn condition(
+        &mut self,
+        condition: &BoundExpr,
+        site: Site,
+    ) -> SqlResult<Result<bool, SqlError>> {
+        self.inner.condition(condition, site)
+    }
+
+    fn within(
+        &mut self,
+        site: Site,
+        step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
+    ) -> SqlResult<()> {
+        self.inner.within(site, step)
+    }
+
+    fn locate(&self, err: SqlError, site: Site) -> SqlError {
+        self.inner.locate(err, site)
+    }
+
+    fn raise(&mut self, err: &SqlError, reach: ErrorScope) -> SqlResult<()> {
+        self.raised.push((err.number, reach));
+        self.inner.raise(err, reach)
+    }
+
+    fn call(&mut self, call: Call, site: Site) -> SqlResult<Result<ProgramEnd, SqlError>> {
+        self.inner.call(call, site)
+    }
+
+    fn leave_call(&mut self, database: &str) -> SqlResult<()> {
+        self.inner.leave_call(database)
+    }
+
+    fn control(&mut self, site: Site) -> SqlResult<()> {
+        self.inner.control(site)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+
+    fn xact_abort(&self) -> bool {
+        self.inner.xact_abort()
+    }
+}
+
+/// Runs `text` through a [`Reaches`] host, `SET XACT_ABORT ON` held when `xact_abort`, and
+/// answers how it ended, the reaches written down and the number of errors in the sink.
+fn reaches(
+    text: &str,
+    xact_abort: bool,
+    calls: &mut dyn CallHandler,
+) -> (ProgramEnd, Vec<(u32, ErrorScope)>, usize) {
+    let statements = planned(text, None, None);
+    let program = Program::compile(&statements).expect("the program compiles");
+    let eval = StaticContext::default();
+    let mut session = ExecSession {
+        xact_abort,
+        ..ExecSession::default()
+    };
+    let mut sink = CollectSink::new();
+    let (end, raised) = {
+        let mut ctx =
+            ExecContext::scalar(&eval, SessionOptions::default()).with_session(&mut session);
+        let mut host = Reaches {
+            inner: SingleContext::new(&mut ctx, &mut sink, calls),
+            raised: Vec::new(),
+        };
+        let end = program
+            .run_hosted(&mut host)
+            .expect("the sink takes everything");
+        (end, host.raised)
+    };
+    (end, raised, sink.errors().len())
+}
+
+/// Each error reaches the host once, with the reach the interpreter decided from its scope:
+/// 8134 its statement, 245 the batch; under `SET XACT_ABORT ON` the 8134 reaches the batch.
+/// The error of an `EXECUTE` refused before a callee ran is decided the same way, and an
+/// error that ends the program is not raised twice.
+#[test]
+fn an_error_reaches_the_host_with_the_reach_the_interpreter_decided() {
+    let text = "SELECT 1 / 0; SELECT CAST('x' AS int); SELECT 2;";
+    let (end, raised, sent) = reaches(text, false, &mut Recorder::default());
+    assert!(
+        matches!(&end, ProgramEnd::Aborted(err) if err.number == 245),
+        "{end:?}"
+    );
+    assert_eq!(
+        raised,
+        vec![(8134, ErrorScope::Statement), (245, ErrorScope::Batch)]
+    );
+    assert_eq!(sent, 2);
+
+    let (end, raised, sent) = reaches(text, true, &mut Recorder::default());
+    assert!(
+        matches!(&end, ProgramEnd::Aborted(err) if err.number == 8134),
+        "{end:?}"
+    );
+    assert_eq!(raised, vec![(8134, ErrorScope::Batch)]);
+    assert_eq!(sent, 1);
+
+    let mut refused = Failing(SqlError::procedure_not_found("p"));
+    let (end, raised, sent) = reaches("EXEC p; SELECT 1;", false, &mut refused);
+    assert_eq!(end, ProgramEnd::Completed);
+    assert_eq!(raised, vec![(2812, ErrorScope::Statement)]);
+    assert_eq!(sent, 1);
+}
+
+/// Answers each call with the body refused before it ran, by the error it holds, unsent.
+struct Refusing(SqlError);
+
+impl CallHandler for Refusing {
+    fn call(
+        &mut self,
+        _call: Call,
+        _ctx: &mut ExecContext<'_>,
+        _sink: &mut dyn StatementSink,
+    ) -> SqlResult<ProgramEnd> {
+        Ok(ProgramEnd::Refused(self.0.clone()))
+    }
+
+    fn restore_database(&mut self, _database: &str, _ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+        Ok(())
+    }
+}
+
+/// The error of a body refused before it ran reaches the host once, through the decision of
+/// the program that made the call: an error that stops its level stops the callee, which
+/// is the `EXECUTE` of the caller, so the caller goes on (102, 208); an error of the batch,
+/// or any error under `SET XACT_ABORT ON`, ends the caller too.
+#[test]
+fn a_callee_refused_before_it_ran_is_decided_by_the_caller() {
+    let text = "EXEC('x'); SELECT 1;";
+    for number in [102, 208] {
+        let error = SqlError::new(number, 16, 1, "refused");
+        let (end, raised, sent) = reaches(text, false, &mut Refusing(error.clone()));
+        assert_eq!(end, ProgramEnd::Completed, "{number}");
+        assert_eq!(raised, vec![(number, ErrorScope::Statement)]);
+        assert_eq!(sent, 1);
+
+        let (end, raised, sent) = reaches(text, true, &mut Refusing(error));
+        assert!(
+            matches!(&end, ProgramEnd::Aborted(err) if err.number == number),
+            "{end:?}"
+        );
+        assert_eq!(raised, vec![(number, ErrorScope::Batch)]);
+        assert_eq!(sent, 1);
+    }
+    let batch = SqlError::new(245, 16, 1, "conversion");
+    let (end, raised, sent) = reaches(text, false, &mut Refusing(batch));
+    assert!(
+        matches!(&end, ProgramEnd::Aborted(err) if err.number == 245),
+        "{end:?}"
+    );
+    assert_eq!(raised, vec![(245, ErrorScope::Batch)]);
+    assert_eq!(sent, 1);
+}
+
+/// The reach of an error read from its scope: `XACT_ABORT` widens a statement or a level to
+/// the batch, and leaves a batch or a connection as it is; an error that ends its program
+/// reaches its level at least.
+#[test]
+fn the_reach_of_an_error_reads_its_scope_and_xact_abort() {
+    let statement = SqlError::new(8134, 16, 1, "divide");
+    let level = SqlError::new(208, 16, 1, "missing");
+    let batch = SqlError::new(245, 16, 1, "conversion");
+    assert_eq!(run::reach(&statement, false), ErrorScope::Statement);
+    assert_eq!(run::reach(&level, false), ErrorScope::Level);
+    assert_eq!(run::reach(&batch, false), ErrorScope::Batch);
+    assert_eq!(run::reach(&statement, true), ErrorScope::Batch);
+    assert_eq!(run::reach(&level, true), ErrorScope::Batch);
+    assert_eq!(run::reach(&batch, true), ErrorScope::Batch);
+    assert_eq!(run::ending_reach(ErrorScope::Statement), ErrorScope::Level);
+    assert_eq!(run::ending_reach(ErrorScope::Batch), ErrorScope::Batch);
 }
 
 /// `RETURN` ends the program with its status; what follows does not run.

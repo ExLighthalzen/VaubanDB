@@ -287,8 +287,8 @@ pub(crate) fn at_statement(err: SqlError, line: u32) -> SqlError {
 ///
 /// What it is read for: an error the executor lines at or after that line keeps that
 /// line, it was raised by a statement the `IF`, the `WHILE` or the `BEGIN … END` holds; an
-/// error of the **condition** arrives with no line of its own (the executor clears it,
-/// `crates/vauban-executor/src/control.rs`, `condition_error`), so [`at_statement`] puts
+/// error of the **condition** arrives with no line of its own (the host of the batch clears
+/// it, `batch.rs`, `BatchHost::condition`), so [`at_statement`] puts
 /// the enclosing statement's line on it, a condition folded onto the line of its first
 /// held statement included. Both halves are fixed by `tests/run_batch_pipeline.rs`,
 /// `an_error_of_a_condition_carries_the_line_of_the_statement_that_holds_it` and
@@ -355,15 +355,6 @@ pub(crate) fn declare_variables_held_by(stmt: &PhysicalStatement, exec: &mut Exe
         }
         other => declare_variables_of(other, exec),
     }
-}
-
-/// What the dispatch of an `EXEC` written in a batch decided about the rest of it
-/// (`procedures.rs`): go on with the next statement, or stop.
-pub(crate) enum Flow {
-    /// Go on with the next statement.
-    Continue,
-    /// Stop the batch here; the end of the call is in the sink.
-    Stop,
 }
 
 /// The labels `statements` declares at any depth, from the name folded to lower case to the

@@ -2,7 +2,7 @@
 //! documentation of `interp`).
 
 use vauban_binder::{BoundExpr, DeferredStatement};
-use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
+use vauban_errors::{ErrorScope, InternalError, SqlError, SqlResult, error_behavior};
 use vauban_planner::PhysicalStatement;
 use vauban_types::{SqlType, TypeInfo, Value, convert};
 
@@ -64,7 +64,7 @@ pub(crate) fn run(program: &Program<'_>, host: &mut dyn Host) -> SqlResult<End> 
                 };
                 match reached {
                     Reached::Ended(end) => Step::Stop(end),
-                    Reached::Failed(err) => decide(err, pc + 1, host),
+                    Reached::Failed(err) => go_on_or_stop(err, Origin::Statement, pc + 1, host)?,
                     Reached::Outcome(outcome) => {
                         if *tail && matches!(outcome, ExecOutcome::Rows(_) | ExecOutcome::NoRows) {
                             answer = outcome.clone();
@@ -91,9 +91,8 @@ pub(crate) fn run(program: &Program<'_>, host: &mut dyn Host) -> SqlResult<End> 
                             host.control(*site)?;
                             Step::Go(*otherwise)
                         }
-                        // An error of the condition counts as a condition that is not true;
-                        // the host reported it.
-                        Err(err) => decide(err, *otherwise, host),
+                        // An error of the condition counts as a condition that is not true.
+                        Err(err) => go_on_or_stop(err, Origin::Statement, *otherwise, host)?,
                     }
                 }
             }
@@ -127,7 +126,7 @@ pub(crate) fn run(program: &Program<'_>, host: &mut dyn Host) -> SqlResult<End> 
 enum Reached {
     /// The statement answered; its end is in the sink.
     Outcome(ExecOutcome),
-    /// The statement raised an error the sink holds already.
+    /// The statement raised an error, not sent yet.
     Failed(SqlError),
     /// A program the statement compiled at run time ended the run.
     Ended(End),
@@ -143,7 +142,8 @@ fn run_statement(
     Ok(match host.statement(stmt, site)? {
         Ran::Outcome(outcome) => Reached::Outcome(outcome),
         Ran::Failed(err) => Reached::Failed(err),
-        Ran::Stopped(err) => Reached::Ended(ended_by(err, host)),
+        Ran::Stopped(err) => Reached::Ended(stop(err, Origin::Ending, host)?),
+        Ran::Reported(err) => Reached::Ended(stop(err, Origin::Reported, host)?),
         Ran::Holds(statement) => run_held(&statement, site, host)?,
     })
 }
@@ -154,10 +154,7 @@ fn run_held(statement: &PhysicalStatement, site: Site, host: &mut dyn Host) -> S
     let roots = [Some(statement)];
     let program = match compile_roots(&roots, Labels::Open, false, Placement::Within(site.root)) {
         Ok(program) => program,
-        Err(err) => {
-            host.report(&err, site)?;
-            return Ok(Reached::Failed(err));
-        }
+        Err(err) => return Ok(Reached::Failed(host.locate(err, site))),
     };
     Ok(match run(&program, host)? {
         End::Completed(_) => Reached::Outcome(ExecOutcome::NoRows),
@@ -182,10 +179,7 @@ fn run_deferred(
     });
     let statement = match (checked, bound) {
         (Ok(()), Some(statement)) => statement,
-        (Err(err), _) => {
-            host.report(&err, site)?;
-            return Ok(Reached::Failed(err));
-        }
+        (Err(err), _) => return Ok(Reached::Failed(host.locate(err, site))),
         (Ok(()), None) => return Err(bug("interp: a deferred statement bound to nothing")),
     };
     let held = Site {
@@ -220,8 +214,7 @@ fn after_statement(
         ExecOutcome::Cancelled => Step::Stop(End::Cancelled),
         ExecOutcome::Return(code) => Step::Stop(End::Returned(code)),
         ExecOutcome::BatchAbort(err) => {
-            host.report(&err, site)?;
-            Step::Stop(End::Aborted(err))
+            go_on_or_stop(host.locate(err, site), Origin::Batch, pc + 1, host)?
         }
         call @ (ExecOutcome::CallProcedure { .. } | ExecOutcome::RunDynamic { .. }) => {
             let Some(call) = Call::from_outcome(call) else {
@@ -278,11 +271,18 @@ fn run_call(call: Call, pc: usize, site: Site, host: &mut dyn Host) -> SqlResult
             Ok(ProgramEnd::Completed | ProgramEnd::Returned(_) | ProgramEnd::LevelAborted(_)),
             Err(err),
         ) => fail(err, pc + 1, site, host)?,
-        // The `EXECUTE` itself failed: the host reported it, and its scope decides, as for
-        // any statement.
+        // The `EXECUTE` itself failed: its scope decides, as for any statement.
         (Err(err), left) => {
+            let step = go_on_or_stop(err, Origin::Statement, pc + 1, host)?;
             report_left(left, site, host)?;
-            decide(err, pc + 1, host)
+            step
+        }
+        // The body of the callee was refused before it ran: its error, unsent, is decided
+        // here, where the `EXECUTE` is written.
+        (Ok(ProgramEnd::Refused(err)), left) => {
+            let step = go_on_or_stop(err, Origin::Callee, pc + 1, host)?;
+            report_left(left, site, host)?;
+            step
         }
         (Ok(ProgramEnd::Cancelled), left) => {
             report_left(left, site, host)?;
@@ -346,44 +346,124 @@ fn jump(pc: usize, target: usize, host: &dyn Host) -> Step {
 }
 
 /// An error the interpreter raised at `site` (module documentation of `interp`, "Running
-/// it"): the host reports it, and the program goes to `next` when the error lets it go on.
+/// it"): the host puts its line on it, then [`decide`] hands it to the host, and the program
+/// goes to `next` when the error lets it go on.
 fn fail(err: SqlError, next: usize, site: Site, host: &mut dyn Host) -> SqlResult<Step> {
-    host.report(&err, site)?;
-    Ok(decide(err, next, host))
+    go_on_or_stop(host.locate(err, site), Origin::Statement, next, host)
 }
 
-/// Whether an error the sink holds lets the program go on at `next`: its scope is the
-/// statement and `SET XACT_ABORT ON` does not hold. When it does not, how far the end
-/// reaches is [`ended_by`]'s decision.
-fn decide(err: SqlError, next: usize, host: &dyn Host) -> Step {
-    let goes_on =
-        !host.xact_abort() && err.number != 0 && err.batch_scope() == BatchErrorScope::Statement;
-    if goes_on {
-        Step::Go(next)
-    } else {
-        Step::Stop(ended_by(err, host))
+/// [`decide`], read as the step of the program counter: `next` when the error lets the
+/// program go on, the end of the run otherwise.
+fn go_on_or_stop(
+    err: SqlError,
+    origin: Origin,
+    next: usize,
+    host: &mut dyn Host,
+) -> SqlResult<Step> {
+    Ok(match decide(err, origin, host)? {
+        None => Step::Go(next),
+        Some(end) => Step::Stop(end),
+    })
+}
+
+/// [`decide`] for an error that ends the program, its level at least.
+fn stop(err: SqlError, origin: Origin, host: &mut dyn Host) -> SqlResult<End> {
+    match decide(err, origin, host)? {
+        Some(end) => Ok(end),
+        None => Err(bug("interp: an error that ends the program let it go on")),
     }
 }
 
-/// How a program that `err` ended ends ([`ProgramEnd::ended_by`]): its level alone, or its
-/// batch with it.
-fn ended_by(err: SqlError, host: &dyn Host) -> End {
-    match ProgramEnd::ended_by(err, host.xact_abort()) {
-        ProgramEnd::LevelAborted(err) => End::LevelAborted(err),
-        ProgramEnd::Aborted(err) => End::Aborted(err),
-        other => End::Aborted(bug(&format!(
-            "interp: an error ended a program as {other:?}"
-        ))),
+/// Where an error handed to [`decide`] comes from, which bounds how far it reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// A statement of this program, a condition, or the interpreter itself: the scope of
+    /// the error alone decides.
+    Statement,
+    /// A statement that ends the program: the scope of its error, widened to the level
+    /// ([`Ran::Stopped`]).
+    Ending,
+    /// As [`Origin::Ending`], for an error the statement already handed to the sink
+    /// ([`Ran::Reported`]): it is not sent twice.
+    Reported,
+    /// An error that ends the batch ([`ExecOutcome::BatchAbort`]).
+    Batch,
+    /// The body of a call, refused before its first statement ran ([`ProgramEnd::Refused`]):
+    /// an error that stops its level stops the callee, which is the `EXECUTE` statement of
+    /// this program, and this program goes on; a wider scope reaches this program too.
+    Callee,
+}
+
+/// The point where an error a statement, a callee refused before it ran, or the
+/// interpreter raised is acted on, before anything of it is sent (module documentation of
+/// `interp`, "Running it"): how far it reaches is [`reach`] bounded by `origin`, the host
+/// hands it to the sink with that reach ([`Host::raise`]) unless `origin` says it is there
+/// already, and the answer is `None` when the program goes on with its next instruction,
+/// the end of the run otherwise.
+fn decide(err: SqlError, origin: Origin, host: &mut dyn Host) -> SqlResult<Option<End>> {
+    let read = reach(&err, host.xact_abort());
+    let reach = match origin {
+        Origin::Statement => read,
+        Origin::Ending | Origin::Reported => ending_reach(read),
+        Origin::Batch => widest(read, ErrorScope::Batch),
+        Origin::Callee => match read {
+            ErrorScope::Statement | ErrorScope::Level => ErrorScope::Statement,
+            wider => wider,
+        },
+    };
+    if origin != Origin::Reported {
+        host.raise(&err, reach)?;
+    }
+    Ok(match reach {
+        ErrorScope::Statement => None,
+        ErrorScope::Level => Some(End::LevelAborted(err)),
+        ErrorScope::Batch | ErrorScope::Connection => Some(End::Aborted(err)),
+    })
+}
+
+/// How far `err` reaches, `xact_abort` telling whether `SET XACT_ABORT ON` holds: the scope
+/// the catalogue gives its number, widened to the batch under `XACT_ABORT`. A number the
+/// catalogue does not hold reaches the batch, and the number 0 does not stop at its
+/// statement.
+pub(crate) fn reach(err: &SqlError, xact_abort: bool) -> ErrorScope {
+    let scope = error_behavior(err.number).scope;
+    match scope {
+        ErrorScope::Statement | ErrorScope::Level if xact_abort => ErrorScope::Batch,
+        ErrorScope::Statement if err.number == 0 => ErrorScope::Level,
+        scope => scope,
     }
 }
 
-/// Hands the error of [`Host::leave_call`] to the sink when the call already ended the
-/// program or failed itself: the caller does not lose it, and its end stays the one the
-/// call decided.
+/// The reach of an error that ends its program: the statement alone is widened to the
+/// level.
+pub(crate) fn ending_reach(reach: ErrorScope) -> ErrorScope {
+    widest(reach, ErrorScope::Level)
+}
+
+/// The wider of two reaches.
+fn widest(a: ErrorScope, b: ErrorScope) -> ErrorScope {
+    fn rank(scope: ErrorScope) -> u8 {
+        match scope {
+            ErrorScope::Statement => 0,
+            ErrorScope::Level => 1,
+            ErrorScope::Batch => 2,
+            ErrorScope::Connection => 3,
+        }
+    }
+    if rank(a) >= rank(b) { a } else { b }
+}
+
+/// Hands the error of [`Host::leave_call`] to [`decide`] when the call already ended the
+/// program or failed itself: the caller does not lose it, it is decided as the error of any
+/// statement is, and the end of the program stays the one the call decided, since the
+/// call's own error or end came first.
 fn report_left(left: SqlResult<()>, site: Site, host: &mut dyn Host) -> SqlResult<()> {
     match left {
         Ok(()) => Ok(()),
-        Err(err) => host.report(&err, site),
+        Err(err) => {
+            let err = host.locate(err, site);
+            decide(err, Origin::Statement, host).map(|_| ())
+        }
     }
 }
 
@@ -412,10 +492,11 @@ pub(crate) fn evaluate_return(expr: &BoundExpr, ctx: &mut ExecContext<'_>) -> Sq
 }
 
 /// An error raised while the condition of an `IF` or a `WHILE` is evaluated belongs to
-/// that statement, not to the sub-expression that failed: its line is cleared here, and
-/// the host puts the line of the statement that holds the condition on it.
-pub(crate) fn condition_error(err: SqlError) -> SqlError {
-    err.with_line(0)
+/// that statement, not to the sub-expression that failed: it takes `line`, the line the
+/// condition starts on. The program holds no line of the statement itself, so a condition
+/// written below its `IF` answers its own line.
+pub(crate) fn condition_error(err: SqlError, line: u32) -> SqlError {
+    err.with_line(line)
 }
 
 /// The internal error 50000 for a broken precondition.

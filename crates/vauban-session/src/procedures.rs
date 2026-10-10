@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use crate::rpc::{DescribeKind, ProcAction, ProcArg, ProcParam, StaticResultColumn};
-use vauban_errors::{BatchErrorScope, SqlError, SqlResult};
+use vauban_errors::{SqlError, SqlResult};
 use vauban_executor::{EvaluatedExecArg, ExecSession, ProgramEnd};
 use vauban_tds::{ColumnFlags, ColumnMeta, RpcParam};
 use vauban_txn::IsolationLevel;
@@ -40,7 +40,6 @@ use vauban_types::{Len, SqlType, TypeInfo, Value};
 use crate::batch::{Level, Session, cancelled};
 use crate::eval_context::apply_exec_session;
 use crate::sink::ResultSink;
-use crate::statements::Flow;
 use crate::txn_session;
 
 /// One parameter of a called level, declared before its text is bound.
@@ -172,7 +171,14 @@ fn run_level(
         exec.nest_level = exec.nest_level.saturating_sub(1);
     }
     let mut level_state = std::mem::replace(session.state_mut(), caller_state);
-    let (end, track) = ran?;
+    let (mut end, track) = ran?;
+    // A body refused before it ran leaves its error unsent for the program that called it
+    // (`vauban_executor::ProgramEnd::Refused`); the text of an RPC has no such program, and
+    // sends it here.
+    if !in_program && let ProgramEnd::Refused(err) = end {
+        sink.error(&err)?;
+        end = ProgramEnd::ended_by(err, level_state.options.xact_abort);
+    }
     if end == ProgramEnd::Cancelled {
         return Err(cancelled());
     }
@@ -229,7 +235,9 @@ fn close_level(
     let rowcount =
         nested_done_proc_rowcount(outcome.failed, outcome.had_result_set, outcome.rowcount);
     match (in_proc, end) {
-        (true, ProgramEnd::Aborted(_)) => Ok(()),
+        // The program that made the call sends the error and the token that closes the
+        // `EXECUTE` once it decided the reach of that error.
+        (_, ProgramEnd::Refused(_)) | (true, ProgramEnd::Aborted(_)) => Ok(()),
         (true, _) => sink.done_in_proc(rowcount, true),
         (false, _) => sink.done(rowcount, true),
     }
@@ -251,7 +259,7 @@ pub(crate) enum ProcFinish<'a> {
 }
 
 /// How a call ended, for the program that made it: how the callee ended, or the error of
-/// the `EXECUTE` itself, already in the sink (`vauban_executor::Host::call`).
+/// the `EXECUTE` itself, not sent yet (`vauban_executor::Host::call`).
 pub(crate) type CallEnd = Result<ProgramEnd, SqlError>;
 
 /// An `EXEC` of a procedure written in a program, its arguments evaluated.
@@ -401,7 +409,7 @@ pub(crate) fn run_batch_procedure(
     let database = match resolve_call_database(session, call.qualifier) {
         Ok(database) => database,
         Err(err) => {
-            return refuse_call(session, at_line(err, call.line), call.in_proc, sink);
+            return Ok(refuse_call(at_line(err, call.line)));
         }
     };
     let stored = exec_args_to_proc_args(call.name, call.args);
@@ -417,14 +425,14 @@ pub(crate) fn run_batch_procedure(
         .collect();
     let Some(resolver) = super::rpc::system_procedure_resolver(session) else {
         let err = SqlError::procedure_not_found(call.name).with_line(call.line);
-        return refuse_call(session, err, call.in_proc, sink);
+        return Ok(refuse_call(err));
     };
     match resolver(call.name, &proc_args) {
         None => {
             let err = SqlError::procedure_not_found(call.name).with_line(call.line);
-            refuse_call(session, err, call.in_proc, sink)
+            Ok(refuse_call(err))
         }
-        Some(Err(err)) => refuse_call(session, at_call_line(err), call.in_proc, sink),
+        Some(Err(err)) => Ok(refuse_call(at_call_line(err))),
         Some(Ok(action)) => {
             let finish = ProcFinish::Batch {
                 in_proc: call.in_proc,
@@ -580,7 +588,9 @@ fn execute_static(
     ))
 }
 
-/// Refuses a resolved call with `err`: the error goes to the client, and closes the call.
+/// Refuses a resolved call with `err`: for an RPC, the error goes to the client and closes
+/// the call; for an `EXEC` written in a program, it is the error of that statement
+/// ([`refuse_call`]).
 fn fail_proc(
     session: &mut Session,
     err: SqlError,
@@ -594,28 +604,16 @@ fn fail_proc(
             sink.done_proc(None)?;
             Ok((Err(err.clone()), refused_outcome(&err)))
         }
-        ProcFinish::Batch { in_proc } => refuse_call(session, err, in_proc, sink),
+        ProcFinish::Batch { .. } => Ok(refuse_call(err)),
     }
 }
 
-/// The `EXECUTE` written in a program failed with `err` before a callee ran: the error
-/// goes to the client as the error of that statement, which ends with a DONE in the batch,
-/// and with a DONEINPROC in a called level when the level goes on after it.
-fn refuse_call(
-    session: &mut Session,
-    err: SqlError,
-    in_proc: bool,
-    sink: &mut dyn ResultSink,
-) -> SqlResult<(CallEnd, BatchProcOutcome)> {
-    session.state_mut().last_error = err.number;
-    sink.error(&err)?;
-    match (in_proc, after_refusal(session, &err)) {
-        (false, _) => sink.done(None, true)?,
-        (true, Flow::Continue) => sink.done_in_proc(None, true)?,
-        (true, Flow::Stop) => {}
-    }
+/// The `EXECUTE` written in a program failed with `err` before a callee ran: the error is
+/// the error of that statement, which the interpreter acts on and hands to the client
+/// (`vauban_executor::Host::call`).
+fn refuse_call(err: SqlError) -> (CallEnd, BatchProcOutcome) {
     let outcome = refused_outcome(&err);
-    Ok((Err(err), outcome))
+    (Err(err), outcome)
 }
 
 /// What a call refused with `err` leaves to its caller.
@@ -628,16 +626,6 @@ fn refused_outcome(err: &SqlError) -> BatchProcOutcome {
         error_number: err.number,
         had_result_set: false,
     }
-}
-
-/// What the program that made a call does after `err`, the error of the `EXECUTE` itself,
-/// as the interpreter decides it: it goes on when the scope of the error is the statement
-/// and `SET XACT_ABORT ON` does not hold, and stops otherwise.
-fn after_refusal(session: &Session, err: &SqlError) -> Flow {
-    let goes_on = !session.state().options.xact_abort
-        && err.number != 0
-        && err.batch_scope() == BatchErrorScope::Statement;
-    if goes_on { Flow::Continue } else { Flow::Stop }
 }
 
 fn apply_batch_outputs(

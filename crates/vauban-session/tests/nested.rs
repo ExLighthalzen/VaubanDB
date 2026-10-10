@@ -1464,6 +1464,147 @@ fn an_error_of_the_batch_two_levels_down_ends_the_response_with_one_done() {
     );
 }
 
+/// The same two levels with an error of a statement: the inner level closes that statement
+/// with a DONEINPROC and goes on, each level above it goes on too, and the statement after
+/// the outer call runs. The error comes once, before the DONEINPROC that closes its
+/// statement, and the inner call is closed by its own DONEINPROC.
+#[test]
+fn an_error_of_a_statement_two_levels_down_lets_each_level_go_on() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('EXEC(''SELECT 1/0''); SELECT 3'); SELECT 2;",
+    );
+    assert_eq!(
+        token_shape(&events.0),
+        [
+            "columns",
+            "error 8134",
+            "doneinproc None true",
+            "doneinproc None true",
+            "columns",
+            "row Some(I32(3))",
+            "doneinproc Some(1) true",
+            "done None true",
+            "columns",
+            "row Some(I32(2))",
+            "done Some(1) false",
+        ],
+        "{:?}",
+        events.0
+    );
+}
+
+/// The tokens of `events`, one word each, with the row count and `more` of each DONE.
+fn token_shape(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| match event {
+            Event::Columns(_) => "columns".to_owned(),
+            Event::Row(row) => format!("row {:?}", row.first()),
+            Event::Done(count, more) => format!("done {count:?} {more}"),
+            Event::DoneInProc(count, more) => format!("doneinproc {count:?} {more}"),
+            Event::Error(err) => format!("error {}", err.number),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+/// A dynamic text refused before it ran (a syntax error) is decided by the program that
+/// made the call: its error comes once, closed by the DONE of the `EXEC` in the batch and
+/// by a DONEINPROC one or two levels down, and each caller goes on; under
+/// `SET XACT_ABORT ON` it ends the batch at each depth. `@@ROWCOUNT` keeps the count the
+/// caller had, since the text ran no statement, and `@@ERROR` takes the number.
+#[test]
+fn a_dynamic_text_refused_before_it_ran_keeps_its_tokens_at_each_depth() {
+    let shapes = [
+        (
+            "EXEC('SELECT FROM'); SELECT 2;",
+            vec![
+                "error 156",
+                "done None true",
+                "columns",
+                "row Some(I32(2))",
+                "done Some(1) false",
+            ],
+        ),
+        (
+            "EXEC('EXEC(''SELECT FROM''); SELECT 3'); SELECT 2;",
+            vec![
+                "error 156",
+                "doneinproc None true",
+                "columns",
+                "row Some(I32(3))",
+                "doneinproc Some(1) true",
+                "done None true",
+                "columns",
+                "row Some(I32(2))",
+                "done Some(1) false",
+            ],
+        ),
+        (
+            "EXEC('EXEC(''EXEC(''''SELECT FROM''''); SELECT 4''); SELECT 3'); SELECT 2;",
+            vec![
+                "error 156",
+                "doneinproc None true",
+                "columns",
+                "row Some(I32(4))",
+                "doneinproc Some(1) true",
+                "doneinproc None true",
+                "columns",
+                "row Some(I32(3))",
+                "doneinproc Some(1) true",
+                "done None true",
+                "columns",
+                "row Some(I32(2))",
+                "done Some(1) false",
+            ],
+        ),
+    ];
+    for (text, expected) in shapes {
+        let events = run_batch(&mut session(), text);
+        assert_eq!(token_shape(&events.0), expected, "{text}");
+        let events = run_batch(&mut session(), &format!("SET XACT_ABORT ON; {text}"));
+        assert_eq!(
+            token_shape(&events.0),
+            ["done None true", "error 156", "done None false"],
+            "XACT_ABORT ON; {text}"
+        );
+    }
+    let events = run_batch(
+        &mut session(),
+        "SELECT 1; EXEC('SELECT FROM'); SELECT @@ROWCOUNT, @@ERROR;",
+    );
+    let last = events.0.iter().rev().find_map(|event| match event {
+        Event::Row(row) => Some(row.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        last,
+        Some(vec![Value::I32(1), Value::I32(156)]),
+        "{:?}",
+        events.0
+    );
+}
+
+/// A call refused before a callee ran (2812) ends its statement as an error of any
+/// statement does: `@@ROWCOUNT` goes back to 0, in the batch and in a dynamic text.
+#[test]
+fn a_refused_call_puts_the_row_count_back_to_zero() {
+    let events = run_batch(
+        &mut session(),
+        "SELECT 1; EXEC nested_no_such_procedure; SELECT @@ROWCOUNT;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2812], "{:?}", events.0);
+    assert_eq!(int_rows(&events.0), [1, 0], "{:?}", events.0);
+
+    let events = run_batch(
+        &mut session(),
+        "SELECT 1; EXEC('EXEC nested_no_such_procedure; SELECT @@ROWCOUNT');",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2812], "{:?}", events.0);
+    assert_eq!(int_rows(&events.0), [1, 0], "{:?}", events.0);
+}
+
 /// `SET XACT_ABORT ON` written in a callee holds for the errors of that callee: a 2812
 /// there ends the batch, where without it the caller would go on.
 #[test]

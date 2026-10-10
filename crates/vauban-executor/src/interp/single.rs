@@ -3,7 +3,7 @@
 //! run alone through [`crate::execute`].
 
 use vauban_binder::BoundExpr;
-use vauban_errors::{InfoMessage, SqlError, SqlResult};
+use vauban_errors::{ErrorScope, InfoMessage, SqlError, SqlResult};
 use vauban_planner::PhysicalStatement;
 use vauban_types::Value;
 
@@ -20,7 +20,9 @@ use super::{Call, CallHandler, Host, ProgramEnd, Ran, Site};
 ///
 /// Each statement runs through [`crate::execute`] in that context and is closed in the
 /// sink with its row count, `NULL` under `SET NOCOUNT ON`; an error goes to the sink with
-/// the end of its statement, and `@@ERROR` takes its number.
+/// the end of its statement once the interpreter decided its reach, whatever that reach
+/// (`interp::tests::an_error_reaches_the_host_with_the_reach_the_interpreter_decided`), and
+/// `@@ERROR` takes its number.
 pub(crate) struct SingleContext<'r, 'a> {
     ctx: &'r mut ExecContext<'a>,
     sink: &'r mut dyn StatementSink,
@@ -60,10 +62,7 @@ impl Host for SingleContext<'_, '_> {
                 Ok(Ran::Outcome(ExecOutcome::NoRows))
             }
             Ok(outcome) => Ok(Ran::Outcome(outcome)),
-            Err(err) => {
-                report(&err, self.ctx, &mut *self.sink)?;
-                Ok(Ran::Failed(err))
-            }
+            Err(err) => Ok(Ran::Failed(err)),
         }
     }
 
@@ -74,11 +73,7 @@ impl Host for SingleContext<'_, '_> {
     ) -> SqlResult<Result<bool, SqlError>> {
         match eval_expr(condition, None, self.ctx) {
             Ok(value) => Ok(Ok(matches!(value, Value::Bit(true)))),
-            Err(err) => {
-                let err = condition_error(err);
-                report(&err, self.ctx, &mut *self.sink)?;
-                Ok(Err(err))
-            }
+            Err(err) => Ok(Err(condition_error(err, condition.line))),
         }
     }
 
@@ -90,20 +85,18 @@ impl Host for SingleContext<'_, '_> {
         step(self.ctx)
     }
 
-    fn report(&mut self, err: &SqlError, _site: Site) -> SqlResult<()> {
+    // The line an error carries is the one the executor gave it: a program run in one
+    // context knows no line of the statements it holds.
+    fn locate(&self, err: SqlError, _site: Site) -> SqlError {
+        err
+    }
+
+    fn raise(&mut self, err: &SqlError, _reach: ErrorScope) -> SqlResult<()> {
         report(err, self.ctx, &mut *self.sink)
     }
 
-    // The error of the `EXECUTE` itself goes to the sink here, with the end of its
-    // statement, as the error of any statement does.
     fn call(&mut self, call: Call, _site: Site) -> SqlResult<Result<ProgramEnd, SqlError>> {
-        match self.calls.call(call, self.ctx, &mut *self.sink) {
-            Ok(end) => Ok(Ok(end)),
-            Err(err) => {
-                report(&err, self.ctx, &mut *self.sink)?;
-                Ok(Err(err))
-            }
-        }
+        Ok(self.calls.call(call, self.ctx, &mut *self.sink))
     }
 
     fn leave_call(&mut self, database: &str) -> SqlResult<()> {

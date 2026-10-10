@@ -189,7 +189,7 @@ use vauban_binder::{
     BatchVariables, BindContext, BoundExecute, BoundExpr, BoundStatement, OutputSchema,
 };
 use vauban_catalog::CatalogSnapshot;
-use vauban_errors::{BatchErrorScope, InfoMessage, InternalError, SqlError, SqlResult};
+use vauban_errors::{ErrorScope, InfoMessage, InternalError, SqlError, SqlResult};
 use vauban_executor::{
     Call, EnvironmentChange, ExecContext, ExecOutcome, ExecSession, Host, Program, ProgramEnd, Ran,
     Site, StatementSink, eval_expr,
@@ -459,9 +459,14 @@ impl Session {
         Ok((end, track))
     }
 
-    /// Hands `err`, raised before the first statement of a body ran, to `sink`, and
-    /// answers how the body ends: the batch closed by its DONE, a called level ended as
-    /// the scope of the error decides ([`ProgramEnd::ended_by`]).
+    /// Answers how a body ends when `err` was raised before its first statement ran.
+    ///
+    /// The batch hands the error to `sink` and closes the response with its DONE: no level
+    /// encloses it, so no program is left to decide anything. A called level sends nothing:
+    /// it answers [`ProgramEnd::Refused`], and the program that made the call decides the
+    /// error where the `EXECUTE` is written (`vauban_executor::Host::raise`); a level that
+    /// no program called, the text of an RPC, is closed by its caller
+    /// (`procedures.rs`, `run_level`).
     fn fail_body(
         &mut self,
         err: SqlError,
@@ -470,15 +475,17 @@ impl Session {
         sink: &mut dyn ResultSink,
     ) -> SqlResult<(ProgramEnd, LevelTrack)> {
         match level {
-            Level::Batch => self.fail(&err, sink)?,
+            Level::Batch => {
+                self.fail(&err, sink)?;
+                let xact_abort = self.state.options.xact_abort;
+                Ok((ProgramEnd::ended_by(err, xact_abort), track))
+            }
             Level::Called => {
-                sink.error(&err)?;
                 track.failed = true;
                 track.status = error_status(&err);
+                Ok((ProgramEnd::Refused(err), track))
             }
         }
-        let xact_abort = self.state.options.xact_abort;
-        Ok((ProgramEnd::ended_by(err, xact_abort), track))
     }
 
     /// Compiles the statements of a body into one program and runs it through a
@@ -563,6 +570,7 @@ impl Session {
                 bind_state,
                 batch_variables,
                 outputs: Vec::new(),
+                refused_rowcount: None,
             };
             program.run_hosted(&mut host)?
         };
@@ -1122,6 +1130,10 @@ struct BatchHost<'h> {
     /// The values a call wrote for its caller, written into the caller's level once the
     /// level of the call is closed ([`Host::leave_call`]).
     outputs: Vec<(String, Value)>,
+    /// `@@ROWCOUNT` as a call whose body was refused before it ran found it: that body ran
+    /// no statement, so the count outlives its error, which [`Host::raise`] sends next
+    /// (`tests/nested.rs`, `a_dynamic_text_refused_before_it_ran_keeps_its_tokens_at_each_depth`).
+    refused_rowcount: Option<i64>,
 }
 
 impl Host for BatchHost<'_> {
@@ -1168,11 +1180,7 @@ impl Host for BatchHost<'_> {
             }
             // An error of the condition belongs to the statement that holds it, not to the
             // sub-expression that failed (`statements.rs`, `first_held_statement_line`).
-            Err(err) => {
-                let err = err.with_line(0);
-                self.report(&err, site)?;
-                Ok(Err(self.place(err, site)))
-            }
+            Err(err) => Ok(Err(self.place(err.with_line(0), site))),
         }
     }
 
@@ -1184,9 +1192,30 @@ impl Host for BatchHost<'_> {
         self.session.within_a_transaction(step, &mut *self.sink)
     }
 
-    fn report(&mut self, err: &SqlError, site: Site) -> SqlResult<()> {
-        let err = self.place(err.clone(), site);
-        self.failed(&err)
+    fn locate(&self, err: SqlError, site: Site) -> SqlError {
+        self.place(err, site)
+    }
+
+    // The error goes to the client, and `@@ERROR` takes its number while `@@ROWCOUNT` goes
+    // back to 0. In the batch its statement ends with a DONE. In a called level it ends with
+    // a DONEINPROC when the level goes on after it, and with nothing when the error ends
+    // the level, whose end the call that opened it sends.
+    fn raise(&mut self, err: &SqlError, reach: ErrorScope) -> SqlResult<()> {
+        self.session.state.last_error = err.number;
+        self.session.state.rowcount = self.refused_rowcount.take().unwrap_or(0);
+        self.sink.error(err)?;
+        match self.level {
+            Level::Batch => self.sink.done(None, true),
+            Level::Called => {
+                self.track.failed = true;
+                self.track.status = error_status(err);
+                if reach == ErrorScope::Statement {
+                    self.sink.done_in_proc(None, true)
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 
     fn call(&mut self, call: Call, _site: Site) -> SqlResult<Result<ProgramEnd, SqlError>> {
@@ -1214,6 +1243,9 @@ impl Host for BatchHost<'_> {
                 crate::procedures::run_batch_dynamic(self.session, &text, in_proc, &mut *self.sink)?
             }
         };
+        if let Ok(ProgramEnd::Refused(_)) = &end {
+            self.refused_rowcount = Some(self.session.state.rowcount);
+        }
         if !outcome.failed {
             self.session.state.rowcount = outcome.rowcount;
         }
@@ -1300,58 +1332,12 @@ impl BatchHost<'_> {
         }
     }
 
-    /// Whether the program goes on after `err`, as the interpreter decides it: the scope of
-    /// the error is the statement and `SET XACT_ABORT ON` does not hold.
-    fn goes_on(&self, err: &SqlError) -> bool {
-        !self.session.state.options.xact_abort
-            && err.number != 0
-            && err.batch_scope() == BatchErrorScope::Statement
-    }
-
-    /// Hands `err`, raised by a statement, to the client, and closes the statement: `@@ERROR`
-    /// takes its number and `@@ROWCOUNT` goes back to 0. In the batch the statement ends
-    /// with its DONE. In a called level it ends with a DONEINPROC when the level goes on
-    /// after it, and with nothing when the error ends the level, whose end the call that
-    /// opened it sends.
-    fn failed(&mut self, err: &SqlError) -> SqlResult<()> {
-        self.session.state.last_error = err.number;
-        self.session.state.rowcount = 0;
-        self.sink.error(err)?;
-        match self.level {
-            Level::Batch => self.sink.done(None, true),
-            Level::Called => {
-                self.track.failed = true;
-                self.track.status = error_status(err);
-                if self.goes_on(err) {
-                    self.sink.done_in_proc(None, true)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    /// Hands `err`, which ends the program, to the client: the batch closes its statement
-    /// with a DONE, a called level leaves its end to the call that opened it.
-    fn stopped(&mut self, err: SqlError) -> SqlResult<Ran> {
-        self.session.state.last_error = err.number;
-        self.sink.error(&err)?;
-        match self.level {
-            Level::Batch => self.sink.done(None, true)?,
-            Level::Called => {
-                self.track.failed = true;
-                self.track.status = error_status(&err);
-            }
-        }
-        Ok(Ran::Stopped(err))
-    }
-
     /// Runs the statement written at the top level at `site`, bound now when the batch is
     /// bound one statement at a time.
     fn run_root(&mut self, site: Site) -> SqlResult<Ran> {
         let index = site.root;
         if let Err(err) = self.bind_up_to(index)? {
-            return self.stopped(err);
+            return Ok(Ran::Stopped(err));
         }
         let Some(slot) = self.slots.get_mut(index) else {
             return Err(SqlError::from(InternalError::Bug(format!(
@@ -1444,7 +1430,7 @@ impl BatchHost<'_> {
         };
         match apply_set_statement(&mut session.state, text, Some(&snapshot)) {
             SetOutcome::Applied | SetOutcome::Ignored(_) => {}
-            SetOutcome::Failed(err) => return self.stopped(at_statement(err, line)),
+            SetOutcome::Failed(err) => return Ok(Ran::Stopped(at_statement(err, line))),
         }
         // A `SET` carries no row count, under both values of `NOCOUNT`: its DONE is
         // `0x0001` (MORE) before a statement and `0x0000` last, without `DONE_COUNT`.
@@ -1467,10 +1453,10 @@ impl BatchHost<'_> {
     fn run_fallback(&mut self, text: &str, error: &SqlError) -> SqlResult<Ran> {
         match fake_engine::answer(&self.session.cancel, text, true, &mut *self.sink)? {
             Some(true) => Ok(Ran::Outcome(ExecOutcome::NoRows)),
-            Some(false) => Ok(Ran::Stopped(SqlError::from(InternalError::Bug(
+            Some(false) => Ok(Ran::Reported(SqlError::from(InternalError::Bug(
                 "the fallback answered an error".to_owned(),
             )))),
-            None => self.stopped(error.clone()),
+            None => Ok(Ran::Stopped(error.clone())),
         }
     }
 
@@ -1497,10 +1483,7 @@ impl BatchHost<'_> {
             }
             Ok(prepared) => self.run_prepared(&prepared, site),
             Err(err) if self.session.cancel.is_cancelled() => Err(err),
-            Err(err) => {
-                self.failed(&err)?;
-                Ok(Ran::Failed(err))
-            }
+            Err(err) => Ok(Ran::Failed(err)),
         }
     }
 
@@ -1526,7 +1509,6 @@ impl BatchHost<'_> {
             Ok(outcome) => Ok(Ran::Outcome(outcome)),
             Err(err) => {
                 let err = at_statement(err, line);
-                self.failed(&err)?;
                 let session = &mut *self.session;
                 apply_exec_session(&mut session.state, &session.exec, true, false);
                 session.exec.identity_updated = false;
@@ -1622,11 +1604,7 @@ impl BatchHost<'_> {
             // decide whether the program goes on. It is not handed to the fake engine even
             // when it is internal: a cancelled request raises one, and running it again
             // would ignore the ATTENTION.
-            Err(err) => {
-                let err = self.place(err, site);
-                self.failed(&err)?;
-                Ok(Ran::Failed(err))
-            }
+            Err(err) => Ok(Ran::Failed(self.place(err, site))),
         }
     }
 }
