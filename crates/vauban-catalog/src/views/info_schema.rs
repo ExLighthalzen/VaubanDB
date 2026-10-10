@@ -97,12 +97,10 @@
 //! `views/sys_tables.rs`. Deliberate difference from SQL Server for now.
 //!
 //! `COLUMN_DEFAULT` is the text of the `DEFAULT` of the column, `NULL` when it has none, and
-//! `NULL` on an `IDENTITY` column and on a computed column. This file writes the rendering of
-//! [`Expr`](vauban_parser::Expr) inside one pair of parentheses, which differs from the text
-//! SQL Server stores: `DEFAULT 0` is `((0))` there and `(0)` here, `DEFAULT (1 + 2)` is
-//! `((1)+(2))` there and `((1 + 2))` here, while `DEFAULT 'x'` is `('x')` on both (unit test
-//! `the_column_default_is_the_parenthesised_text_of_the_expression`). Normalising the text of
-//! a constraint the way SQL Server does is not done; deliberate difference for now.
+//! `NULL` on an `IDENTITY` column and on a computed column. The text is the one
+//! `sys.default_constraints.definition` publishes, `definition_text` of `meta.rs`: `DEFAULT 0`
+//! is `((0))`, `DEFAULT (1 + 2)` is `((1)+(2))` and `DEFAULT 'x'` is `('x')` (unit test
+//! `the_column_default_is_the_parenthesised_text_of_the_expression`).
 //!
 //! # Execution
 //!
@@ -910,13 +908,12 @@ fn column_row(database: i32, table: &TableMeta, column: &ColumnMeta) -> Row {
     ])
 }
 
-/// `COLUMN_DEFAULT` of a column: the text of its `DEFAULT` inside one pair of parentheses,
-/// `NULL` for a column declared without a `DEFAULT` clause (unit test
-/// `the_column_default_is_the_parenthesised_text_of_the_expression`). See the module
-/// documentation for the text SQL Server stores instead.
+/// `COLUMN_DEFAULT` of a column: the text of its `DEFAULT`, the one
+/// `sys.default_constraints.definition` publishes, `NULL` for a column declared without a
+/// `DEFAULT` clause (unit test `the_column_default_is_the_parenthesised_text_of_the_expression`).
 fn column_default(column: &ColumnMeta) -> Value {
     match &column.default {
-        Some(expr) => text(&format!("({expr})")),
+        Some(expr) => text(&crate::meta::definition_text(expr)),
         None => Value::Null,
     }
 }
@@ -2460,10 +2457,7 @@ mod tests {
 
     #[test]
     fn the_column_default_is_the_parenthesised_text_of_the_expression() {
-        // In SQL Server, `DEFAULT 0` is stored `((0))`, `DEFAULT 'x'` is `('x')`,
-        // `DEFAULT (1 + 2)` is `((1)+(2))`, and an `IDENTITY` column publishes `NULL`. This
-        // file writes one pair of parentheses around the text of the expression, so the first
-        // and the third differ.
+        // `DEFAULT 0` is stored `((0))` and an `IDENTITY` column publishes `NULL`.
         let catalog = bootstrapped();
         let zero = Expr::Literal(Literal::Integer("0".to_owned()), Span::EMPTY);
         let tables = created(
@@ -2478,7 +2472,7 @@ mod tests {
         let rows = column_rows(&tables).expect("column_rows");
         assert_eq!(
             column_field(&rows[0], "column_default"),
-            Some("(0)".to_owned())
+            Some("((0))".to_owned())
         );
         assert_eq!(column_field(&rows[1], "column_default"), None);
         assert_eq!(column_field(&rows[2], "column_default"), None);

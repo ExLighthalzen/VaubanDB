@@ -74,6 +74,12 @@ fn column(name: &str, ty: SqlType, default: Option<Expr>) -> ColumnDef {
     }
 }
 
+/// What `Display` writes for a tree the catalogue read back from its stored text: the text
+/// itself, `((0))` for `DEFAULT 0`.
+fn stored_text(expr: Option<&Expr>) -> Option<String> {
+    expr.map(ToString::to_string)
+}
+
 /// The integer literal `value` as an [`Expr`].
 fn integer(value: &str) -> Expr {
     Expr::Literal(Literal::Integer(value.to_owned()), Span::EMPTY)
@@ -170,9 +176,12 @@ fn a_created_table_with_a_default_writes_the_default_constraints_row() {
         .expect("a column-level DEFAULT is stored by create_table");
     txn.commit(handle).expect("commit");
 
-    // The catalogue kept the expression on the column, which is what the rows of
-    // `sys.default_constraints` are built from.
-    assert_eq!(meta.columns[1].default, Some(integer("0")));
+    // The catalogue kept the tree read back from the stored text on the column, which is
+    // what the rows of `sys.default_constraints` are built from.
+    assert_eq!(
+        stored_text(meta.columns[1].default.as_ref()),
+        Some("((0))".to_owned())
+    );
     let after: Vec<usize> = constraint_tables
         .iter()
         .map(|&table| row_count(&storage, &txn, table))
@@ -510,8 +519,12 @@ fn a_named_default_fills_the_column_and_keeps_its_name() {
         .expect("a named DEFAULT is accepted");
     txn.commit(handle).expect("commit");
 
-    // The column carries the expression, which is what the executor reads...
-    assert_eq!(meta.columns[1].default, Some(integer("0")));
+    // The column carries the tree read back from the stored text, which is what the
+    // executor reads...
+    assert_eq!(
+        stored_text(meta.columns[1].default.as_ref()),
+        Some("((0))".to_owned())
+    );
     // ...and the constraint keeps its name, which is what the catalogue views read.
     let constraints = catalog.constraints_of(meta.id).expect("constraints_of");
     assert_eq!(constraints.len(), 1);
@@ -669,8 +682,14 @@ fn two_named_defaults_on_distinct_columns_succeed() {
         )
         .expect("one default per column");
     txn.commit(handle).expect("commit");
-    assert_eq!(meta.columns[0].default, Some(integer("1")));
-    assert_eq!(meta.columns[1].default, Some(integer("2")));
+    assert_eq!(
+        stored_text(meta.columns[0].default.as_ref()),
+        Some("((1))".to_owned())
+    );
+    assert_eq!(
+        stored_text(meta.columns[1].default.as_ref()),
+        Some("((2))".to_owned())
+    );
 }
 
 #[test]
@@ -744,7 +763,10 @@ fn identity_and_default_on_another_column_succeed() {
     txn.commit(handle).expect("commit");
     assert!(meta.columns[0].identity.is_some());
     assert_eq!(meta.columns[0].default, None);
-    assert_eq!(meta.columns[1].default, Some(integer("0")));
+    assert_eq!(
+        stored_text(meta.columns[1].default.as_ref()),
+        Some("((0))".to_owned())
+    );
 }
 
 fn fk_table(storage: &Arc<dyn Storage>) -> TableId {
@@ -1171,5 +1193,170 @@ fn bit_at(row: &[vauban_types::Value], position: usize) -> bool {
     match row.get(position) {
         Some(vauban_types::Value::Bit(value)) => *value,
         other => panic!("column {position} is not a bit: {other:?}"),
+    }
+}
+
+/// The tree `vauban-parser` reads for `text`: the `WHERE` of `SELECT 1 WHERE <text>` for a
+/// predicate, the one item of `SELECT <text>` for a value.
+fn read_back(text: &str, predicate: bool) -> Expr {
+    use vauban_parser::{ParseOptions, QueryBody, SelectItem, Statement, parse_batch};
+    let batch = if predicate {
+        format!("SELECT 1 WHERE {text}")
+    } else {
+        format!("SELECT {text}")
+    };
+    let batch = parse_batch(&batch, &ParseOptions::default()).expect(text);
+    let [Statement::Select(select)] = batch.statements.as_slice() else {
+        panic!("{text} is not one SELECT");
+    };
+    let QueryBody::Select(spec) = &select.body else {
+        panic!("{text} is not one query specification");
+    };
+    if predicate {
+        return spec.where_.clone().expect(text);
+    }
+    let [SelectItem::Expr { expr, .. }] = spec.items.as_slice() else {
+        panic!("{text} is not one item");
+    };
+    expr.clone()
+}
+
+/// `CREATE TABLE dbo.<name> (a int NULL DEFAULT <a>, c datetime NULL DEFAULT <c>,
+/// CONSTRAINT <check_name> CHECK (<check>))`.
+fn table_with_expressions(name: &str, a: Expr, c: Expr, check: Expr) -> TableDef {
+    table(
+        name,
+        vec![
+            column("a", SqlType::Int, Some(a)),
+            column("c", SqlType::DateTime, Some(c)),
+        ],
+        vec![ConstraintDef::Check {
+            name: Some(format!("ck_{name}")),
+            expr: check,
+        }],
+    )
+}
+
+/// The `definition` of the rows `table` has in the two tables of [`constraint_shape`]: the
+/// `CHECK` texts, then the `DEFAULT` texts in column order.
+fn stored_texts(
+    storage: &Arc<dyn Storage>,
+    txn: &Arc<TransactionManager>,
+    table: &TableMeta,
+) -> (Vec<String>, Vec<String>) {
+    let mut found: Vec<Vec<(i32, String)>> = tables_shaped(storage, &constraint_shape())
+        .into_iter()
+        .map(|internal| {
+            rows_of_parent(storage, txn, internal, table.id, 4)
+                .iter()
+                .map(|row| (int_at(row, 5), text_at(row, 6)))
+                .collect()
+        })
+        .collect();
+    found.iter_mut().for_each(|texts| texts.sort());
+    // The table with one row holds the `CHECK`, the other the two `DEFAULT`s, sorted by
+    // `parent_column_id`.
+    found.sort_by_key(Vec::len);
+    let [checks, defaults] = found.as_slice() else {
+        panic!("two constraint tables: {found:?}");
+    };
+    let texts = |rows: &[(i32, String)]| rows.iter().map(|(_, text)| text.clone()).collect();
+    (texts(checks), texts(defaults))
+}
+
+#[test]
+fn a_table_rebuilt_from_its_stored_text_holds_the_same_expressions() {
+    let (catalog, storage, txn) = instance();
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let original = catalog
+        .create_table(
+            &handle,
+            &table_with_expressions(
+                "tbl_written",
+                read_back("-(1)", false),
+                read_back("CURRENT_TIMESTAMP", false),
+                read_back("a BETWEEN 1 AND 5", true),
+            ),
+        )
+        .expect("the written table");
+    txn.commit(handle).expect("commit");
+
+    let (checks, defaults) = stored_texts(&storage, &txn, &original);
+    assert_eq!(checks, vec!["([a]>=(1) AND [a]<=(5))".to_owned()]);
+    assert_eq!(
+        defaults,
+        vec!["((-1))".to_owned(), "(getdate())".to_owned()]
+    );
+
+    let handle = txn.begin(IsolationLevel::ReadCommitted);
+    let rebuilt = catalog
+        .create_table(
+            &handle,
+            &table_with_expressions(
+                "tbl_rebuilt",
+                read_back(&defaults[0], false),
+                read_back(&defaults[1], false),
+                read_back(&checks[0], true),
+            ),
+        )
+        .expect("the table rebuilt from the stored text");
+    txn.commit(handle).expect("commit");
+    assert_eq!(stored_texts(&storage, &txn, &rebuilt), (checks, defaults));
+
+    // The same default value and the same predicate, tree for tree.
+    for position in 0..2 {
+        assert_eq!(
+            rebuilt.columns[position].default,
+            original.columns[position].default
+        );
+    }
+    let check = |meta: &TableMeta| {
+        meta.constraints
+            .iter()
+            .find_map(|constraint| match constraint {
+                vauban_catalog::ConstraintMeta::Check {
+                    expr, definition, ..
+                } => Some((expr.clone(), definition.clone())),
+                _ => None,
+            })
+            .expect("the check")
+    };
+    assert_eq!(check(&rebuilt), check(&original));
+
+    // The same result of the `CHECK` on a row: `a = 7` is refused by both predicates, read
+    // against the row by `ALTER TABLE … ADD CONSTRAINT`, and `a = 3` is accepted by both.
+    for (value, accepted) in [(7, false), (3, true)] {
+        for (meta, label) in [(&original, "original"), (&rebuilt, "rebuilt")] {
+            let handle = txn.begin(IsolationLevel::ReadCommitted);
+            storage
+                .insert(
+                    handle.id,
+                    meta.storage_id,
+                    &vauban_storage::Row(vec![
+                        vauban_types::Value::I32(value),
+                        vauban_types::Value::Null,
+                    ]),
+                )
+                .expect("insert");
+            let (predicate, _) = check(meta);
+            let outcome = catalog.alter_table(
+                &handle,
+                meta.id,
+                &AlterTable::AddConstraint {
+                    constraint: Box::new(ConstraintDef::Check {
+                        name: Some(format!("ck_again_{label}")),
+                        expr: predicate,
+                    }),
+                },
+            );
+            match outcome {
+                Ok(_) => assert!(accepted, "{label}: a = {value} passes"),
+                Err(error) => {
+                    assert!(!accepted, "{label}: a = {value} fails with {error:?}");
+                    assert_eq!(error.number, 547, "{label}");
+                }
+            }
+            txn.rollback(handle).expect("rollback");
+        }
     }
 }

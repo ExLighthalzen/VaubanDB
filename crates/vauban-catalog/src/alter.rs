@@ -17,7 +17,9 @@ use crate::catalog::Catalog;
 use crate::def::{AlterTable, ColumnDef, ConstraintDef, IndexDef, SortedColumn, TableDef};
 use crate::ids::{ColumnId, ObjectId};
 use crate::index;
-use crate::meta::{ColumnMeta, ConstraintMeta, QualifiedName, TableMeta};
+use crate::meta::{
+    ColumnMeta, ConstraintMeta, ExpressionKind, QualifiedName, TableMeta, stored_expression,
+};
 use crate::table::{self, TableStore};
 
 /// The highest `column_id` already used on the table, live or dropped.
@@ -177,7 +179,11 @@ fn alter_table_constraint(
         && let ConstraintDef::Check { name, expr } = constraint.as_ref()
     {
         let meta = table_meta_for_alter(catalog, table)?;
-        refuse_check_violated_by_existing_rows(catalog, txn, &meta, name, expr)?;
+        // The rows are read against the tree the constraint will hold, the one read back from
+        // its stored text (`meta.rs`, `stored_expression`): `a BETWEEN 1 AND 5` is checked as
+        // `[a]>=(1) AND [a]<=(5)`.
+        let (_, stored) = stored_expression(expr, ExpressionKind::Predicate)?;
+        refuse_check_violated_by_existing_rows(catalog, txn, &meta, name, &stored)?;
     }
     let mut store = table::store(catalog);
     table::refresh(catalog, &mut store)?;
@@ -269,6 +275,14 @@ fn plan_add_column(
             old.name
         ))
     })?;
+    // The tree read back from the stored text, the one the column and its `DEFAULT` hold
+    // once `apply_table_constraints` has run (`meta.rs`, `stored_expression`); a `DEFAULT`
+    // that is not a literal, `GETDATE()`, is stored the same way (`tests/alter.rs`,
+    // `add_nullable_column_with_a_getdate_default_is_accepted`).
+    let default = match &column.default {
+        Some(expr) => Some(stored_expression(expr, ExpressionKind::Value)?.1),
+        None => None,
+    };
     *watermark += 1;
     columns.push(ColumnMeta {
         id: ColumnId(*watermark),
@@ -280,11 +294,11 @@ fn plan_add_column(
         // `plan.columns` before `apply_table_constraints` runs
         // (`crates/vauban-executor/tests/ddl_alter.rs`,
         // `add_column_with_default_fills_existing_rows`).
-        default: column.default.clone(),
+        default: default.clone(),
         identity: column.identity,
         computed: column.computed.clone(),
     });
-    if let Some(expr) = &column.default {
+    if let Some(expr) = &default {
         // Registered under `default_name` (or generated when `None`) so the object and the
         // row of `sys.default_constraints` carry the name the client wrote, instead of
         // falling to the bare, always-generated-name path of `apply_table_constraints`

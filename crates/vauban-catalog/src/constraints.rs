@@ -62,11 +62,15 @@
 //!   `ON DELETE` and `ON UPDATE` are stored as declared and not applied;
 //! - resolve the single column a `CHECK` names, which SQL Server publishes as
 //!   `parent_column_id` (`views/sys_constraints.rs`, module documentation);
-//! - reprint a `CHECK` as SQL Server stores it. The text kept in
-//!   [`ConstraintMeta::Check::definition`] is the expression printed between parentheses,
-//!   where SQL Server publishes `([a]>=(0))` for `CHECK (a >= 0)` and `([b]<>'z' AND
-//!   [a]<(10))` for `CHECK (b <> 'z' AND a < 10)`: the brackets around an identifier and the
-//!   parentheses around a literal are not written here.
+//!
+//! # The text of a `CHECK` and of a `DEFAULT`
+//!
+//! Each expression is stored as text, the one `sys.check_constraints.definition` and
+//! `sys.default_constraints.definition` publish (`([a]>=(0))` for `CHECK (a >= 0)`, `((0))`
+//! for `DEFAULT 0`), and the tree the constraint and its column hold is read back from that
+//! text (`meta.rs`, `stored_expression`): a table rebuilt from its stored text holds the same
+//! trees as the table the statement built (`tests/sys_constraints.rs`,
+//! `a_table_rebuilt_from_its_stored_text_holds_the_same_expressions`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -80,7 +84,8 @@ use crate::catalog::Catalog;
 use crate::def::{ColumnDef, ConstraintDef, TableDef};
 use crate::ids::{ColumnId, ObjectId};
 use crate::meta::{
-    ColumnMeta, ConstraintMeta, IndexMeta, ObjectKind, ObjectMeta, QualifiedName, TableMeta,
+    ColumnMeta, ConstraintMeta, ExpressionKind, IndexMeta, ObjectKind, ObjectMeta, QualifiedName,
+    TableMeta, stored_expression,
 };
 use crate::table::{self, TableStore};
 use crate::views::sys_constraints::generated_constraint_name;
@@ -390,12 +395,13 @@ pub(crate) fn apply_table_constraints(
             ConstraintDef::Check { name, expr } => {
                 let written = name.clone();
                 let name = name_for("CK", written.as_deref(), None, meta);
+                let (definition, expr) = stored_expression(expr, ExpressionKind::Predicate)?;
                 let id = register(store, meta, &database, &mut made, &name)?;
                 meta.constraints.push(ConstraintMeta::Check {
                     constraint: id,
                     system_named: written.is_none(),
-                    expr: expr.clone(),
-                    definition: definition_text(expr),
+                    expr,
+                    definition,
                 });
             }
             ConstraintDef::Default { name, column, expr } => {
@@ -409,13 +415,14 @@ pub(crate) fn apply_table_constraints(
                         meta.name
                     ))
                 })?;
+                let (_, expr) = stored_expression(expr, ExpressionKind::Value)?;
                 let id = register(store, meta, &database, &mut made, &name)?;
                 columns_with_a_named_default.push(target);
                 meta.constraints.push(ConstraintMeta::Default {
                     constraint: id,
                     system_named: written.is_none(),
                     column: target,
-                    expr: expr.clone(),
+                    expr,
                 });
             }
         }
@@ -445,6 +452,7 @@ pub(crate) fn apply_table_constraints(
         .collect();
     for (column_name, column, expr) in bare {
         let name = name_for("DF", None, Some(&column_name), meta);
+        let (_, expr) = stored_expression(&expr, ExpressionKind::Value)?;
         let id = register(store, meta, &database, &mut made, &name)?;
         meta.constraints.push(ConstraintMeta::Default {
             constraint: id,
@@ -453,6 +461,7 @@ pub(crate) fn apply_table_constraints(
             expr,
         });
     }
+    store_column_expressions(meta)?;
     let objects: Vec<ObjectMeta> = store
         .constraints
         .of_table(meta.id)
@@ -497,15 +506,6 @@ pub(crate) fn add_table_constraint(
         .skip(count)
         .filter_map(constraint_object_id)
         .collect();
-    if let ConstraintDef::Default { column, expr, .. } = constraint
-        && let Some(column) = meta
-            .columns
-            .iter_mut()
-            .find(|candidate| candidate.name.eq_ignore_ascii_case(column))
-        && column.default.is_none()
-    {
-        column.default = Some(expr.clone());
-    }
     if let Some(session) = store.constraints.alter_sessions.get_mut(&txn.id)
         && let Some(state) = session.tables.get_mut(&table)
     {
@@ -1156,13 +1156,35 @@ fn compatible_types(here: &TypeInfo, there: &TypeInfo) -> bool {
     here.ty == there.ty
 }
 
-/// The text `sys.check_constraints.definition` publishes for `expr`: what `Display` writes,
-/// between parentheses.
+/// Puts on each column of `meta` the trees read back from the stored text: the `DEFAULT` of
+/// the first [`ConstraintMeta::Default`] that names the column, and its computed expression.
 ///
-/// The same rule as `views/sys_constraints.rs`, whose `definition_text` the rows of the four
-/// views go through; the form SQL Server stores is in the module documentation.
-fn definition_text(expr: &Expr) -> String {
-    format!("({expr})")
+/// A column whose default the statement wrote (`ColumnMeta::default` filled by `table.rs` or
+/// by `alter.rs` from the [`ColumnDef`]) receives the tree of its constraint, so that the
+/// column and the constraint hold one tree, the one [`stored_expression`] read back from the
+/// text the rows carry.
+///
+/// # Errors
+///
+/// Those of [`stored_expression`].
+fn store_column_expressions(meta: &mut TableMeta) -> SqlResult<()> {
+    let mut defaults: Vec<(ColumnId, Expr)> = Vec::new();
+    for constraint in &meta.constraints {
+        if let ConstraintMeta::Default { column, expr, .. } = constraint
+            && !defaults.iter().any(|(seen, _)| seen == column)
+        {
+            defaults.push((*column, expr.clone()));
+        }
+    }
+    for column in &mut meta.columns {
+        if let Some((_, expr)) = defaults.iter().find(|(id, _)| *id == column.id) {
+            column.default = Some(expr.clone());
+        }
+        if let Some(computed) = &column.computed {
+            column.computed = Some(stored_expression(computed, ExpressionKind::Value)?.1);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

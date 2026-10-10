@@ -42,7 +42,10 @@
 //!
 //! `constraints.rs` stores them: the object of a constraint carries its identifier and its
 //! name, and the [`ConstraintMeta`] carries the identifier, the flag `is_system_named`
-//! publishes and, for a `CHECK`, the text of its definition. The four builders read those
+//! publishes and, for a `CHECK`, the text of its definition. The `definition` of a `DEFAULT`
+//! is `definition_text` (`meta.rs`) of the tree the constraint holds, which gives back the
+//! text that tree was read from (`meta.rs`, unit test
+//! `the_text_of_a_stored_tree_is_the_stored_text`). The four builders read those
 //! fields, and take the objects beside the tables to write the name a statement wrote (unit
 //! tests `foreign_key_row_when_tabledef_has_one`, `check_constraint_row_stores_the_expression`,
 //! `a_row_falls_back_on_the_generated_name_without_its_object`).
@@ -81,7 +84,7 @@ use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
 use crate::ids::ColumnId;
 use crate::ids::ObjectId;
 use crate::index::IndexStore;
-use crate::meta::{ColumnMeta, ConstraintMeta, QualifiedName, TableMeta};
+use crate::meta::{ColumnMeta, ConstraintMeta, QualifiedName, TableMeta, definition_text};
 
 /// Internal table of the foreign keys, read by `sys.foreign_keys`.
 ///
@@ -462,8 +465,9 @@ pub(crate) fn foreign_key_column_rows(tables: &[TableMeta]) -> SqlResult<Vec<Row
 
 /// The rows of [`CHECK_CONSTRAINTS_TABLE`] for `tables`: one per [`ConstraintMeta::Check`].
 ///
-/// `definition` is the predicate the constraint was given, written by the `Display` of
-/// [`Expr`] between parentheses (unit test `check_constraint_row_stores_the_expression`).
+/// `definition` is the text the constraint stores, [`ConstraintMeta::Check::definition`]: the
+/// normalised form of `meta.rs`, `([amount]>=(0))` for `CHECK (amount >= 0)` (unit test
+/// `check_constraint_row_stores_the_expression`).
 /// `parent_column_id` is [`check_parent_column_id`] of the predicate: see the module
 /// documentation. `names` gives the written name of a constraint that has one, keyed by the
 /// [`ObjectId`] `constraints.rs` gave it; a constraint absent from `names` — read without the
@@ -727,18 +731,6 @@ pub(crate) fn single_column<'a>(table: &'a TableMeta, columns: &[ColumnId]) -> O
         [only] => column_name(table, *only),
         _ => None,
     }
-}
-
-/// The text `definition` publishes for `expr`: what `Display` writes, between parentheses.
-///
-/// SQL Server normalises the text it stores — `CHECK (amount >= 0)` comes back as
-/// `([amount]>=(0))` and `DEFAULT 'x'` as `('x')` — where this writes the expression the
-/// caller gave, re-serialised by `vauban-parser` (unit test
-/// `check_constraint_row_stores_the_expression`). The outer parentheses are the part of that
-/// normalisation this file keeps; the brackets around an identifier and the parentheses
-/// around a literal are a deliberate difference for now.
-fn definition_text(expr: &Expr) -> String {
-    format!("({expr})")
 }
 
 /// The code `delete_referential_action` and `update_referential_action` publish.
@@ -1883,10 +1875,10 @@ mod tests {
             row[constraint_columns::PARENT_OBJECT_ID],
             Value::I32(1_000_000)
         );
-        // The text stored is the expression given, re-serialised between parentheses;
-        // SQL Server writes `([amount]>=(0))` for the same declaration.
-        assert_eq!(row[constraint_columns::DEFINITION], text("(amount >= 0)"));
-        assert_eq!(definition_text(&expr), "(amount >= 0)");
+        // The text stored is the normalised form of the expression, `([amount]>=(0))` for
+        // `CHECK (amount >= 0)`.
+        assert_eq!(row[constraint_columns::DEFINITION], text("([amount]>=(0))"));
+        assert_eq!(definition_text(&expr), "([amount]>=(0))");
         // The predicate names one column of `target`, `amount`, at position 2 (`id` is 1):
         // SQL Server resolves a single-column `CHECK` to that column (module documentation).
         assert_eq!(row[constraint_columns::PARENT_COLUMN_ID], Value::I32(2));
@@ -1947,7 +1939,7 @@ mod tests {
             Value::I32(1_000_000)
         );
         assert_eq!(row[constraint_columns::PARENT_COLUMN_ID], Value::I32(2));
-        assert_eq!(row[constraint_columns::DEFINITION], text("(0)"));
+        assert_eq!(row[constraint_columns::DEFINITION], text("((0))"));
         assert_eq!(row[constraint_columns::SCHEMA_ID], Value::I32(1));
     }
 
@@ -1976,7 +1968,7 @@ mod tests {
             .map(|row| row.0[constraint_columns::PARENT_COLUMN_ID].clone())
             .collect();
         assert_eq!(columns, vec![Value::I32(2), Value::I32(1)]);
-        assert_eq!(rows[1].0[constraint_columns::DEFINITION], text("(7)"));
+        assert_eq!(rows[1].0[constraint_columns::DEFINITION], text("((7))"));
     }
 
     #[test]

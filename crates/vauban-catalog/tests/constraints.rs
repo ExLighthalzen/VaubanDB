@@ -645,10 +645,10 @@ fn a_check_keeps_its_expression_and_its_text() {
     else {
         panic!("the constraint is a check");
     };
-    assert_eq!(*expr, integer("1"));
-    // The text is the expression between parentheses; SQL Server stores `([a]>=(0))` for
-    // `CHECK (a >= 0)`, a form `src/constraints.rs` documents and does not reproduce.
-    assert_eq!(definition, "(1)");
+    // The text is the normalised one, a number between parentheses inside the outer pair,
+    // and the tree is the one read back from it.
+    assert_eq!(definition, "((1))");
+    assert_eq!(expr.to_string(), "((1))");
 }
 
 #[test]

@@ -314,10 +314,13 @@ fn not_null_and_identity_are_on_column_meta() {
     assert_eq!(meta.columns[0].default, None);
     assert!(meta.columns[1].ty.nullable);
     assert_eq!(meta.columns[1].identity, None);
-    assert_eq!(meta.columns[1].default, Some(zero));
+    // The tree read back from the stored text `((0))`.
+    let stored = meta.columns[1].default.as_ref().map(ToString::to_string);
+    assert_eq!(stored.as_deref(), Some("((0))"), "{zero}");
 }
 
-/// A bare `IDENTITY` is `IDENTITY(1, 1)`, and a computed column is stored as its expression.
+/// A bare `IDENTITY` is `IDENTITY(1, 1)`, and a computed column is stored as the tree read back
+/// from the text of its expression.
 #[test]
 fn a_bare_identity_and_a_computed_column_are_stored_as_written() {
     let (catalog, _storage, txn) = instance();
@@ -342,7 +345,8 @@ fn a_bare_identity_and_a_computed_column_are_stored_as_written() {
             increment: 1
         })
     );
-    assert_eq!(meta.columns[1].computed, Some(expr));
+    let stored = meta.columns[1].computed.as_ref().map(ToString::to_string);
+    assert_eq!(stored.as_deref(), Some("((42))"), "{expr}");
 }
 
 /// `ColumnMeta::id` is one-based, `ColumnMeta::ordinal` is the position in the row, from `0`.

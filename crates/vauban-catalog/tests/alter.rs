@@ -411,6 +411,54 @@ fn add_nullable_column_with_default_leaves_existing_rows_null() {
 }
 
 #[test]
+fn add_nullable_column_with_a_getdate_default_is_accepted() {
+    // `ALTER TABLE t ADD d datetime DEFAULT GETDATE()`: a default that is not a literal is
+    // stored as the text `(getdate())`, the existing row keeps `NULL`, and the column holds
+    // the tree read back from that text.
+    let (catalog, storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &two_int_columns("getdate_default"))
+        .expect("create_table");
+    insert_rows(&storage, &handle, meta.storage_id, &[(1, 2)]);
+    let mut with_default = column("d", SqlType::DateTime, true);
+    with_default.default = Some(Expr::Function {
+        name: vauban_parser::ObjectName {
+            server: None,
+            database: None,
+            schema: None,
+            name: vauban_parser::Ident {
+                value: "GETDATE".to_owned(),
+                quoted: false,
+            },
+            span: Span::EMPTY,
+        },
+        args: Vec::new(),
+        star: false,
+        distinct: false,
+        over: None,
+        span: Span::EMPTY,
+    });
+    let altered = catalog
+        .alter_table(
+            &handle,
+            meta.id,
+            &AlterTable::AddColumn {
+                column: Box::new(with_default),
+                default_name: None,
+            },
+        )
+        .expect("ALTER TABLE getdate_default ADD d datetime DEFAULT GETDATE();");
+    let rows = scan_values(&storage, &handle, &txn, altered.storage_id, 3);
+    assert_eq!(rows[0][2], Value::Null);
+    let stored = altered.columns[2].default.as_ref().map(ToString::to_string);
+    assert_eq!(stored.as_deref(), Some("(getdate())"));
+    let objects = catalog.constraints_of(meta.id).expect("constraints_of");
+    assert_eq!(objects.len(), 1, "the DEFAULT is an object of its own");
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
 fn add_not_null_column_with_default_still_fills_existing_rows() {
     let (catalog, storage, txn) = instance();
     let handle = begin(&txn);
