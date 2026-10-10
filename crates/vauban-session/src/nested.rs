@@ -898,7 +898,7 @@ impl Session {
                 default: arg.default,
             })
             .collect();
-        let Some(resolver) = crate::rpc::system_procedure_resolver() else {
+        let Some(resolver) = crate::rpc::system_procedure_resolver(self) else {
             let err = SqlError::procedure_not_found(name).with_line(line);
             return self.finish_nested_procedure_error(err, more, nested_state, sink, outcome);
         };

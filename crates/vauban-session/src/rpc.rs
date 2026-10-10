@@ -1,7 +1,5 @@
 //! RPC dispatch: decode parameters, resolve a system procedure, execute its action.
 
-use std::sync::OnceLock;
-
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::ParameterDeclaration;
 use vauban_tds::{Rpc, RpcProc};
@@ -43,7 +41,7 @@ pub struct ProcParam {
 }
 
 /// One column of a static procedure result set.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticResultColumn {
     /// Column name sent in COLMETADATA.
     pub name: String,
@@ -124,25 +122,24 @@ pub enum ProcAction {
     Refuse(SqlError),
 }
 
-/// Function registered by `vauban-compat` at process start-up.
-pub type SystemProcedureResolver = fn(&str, &[ProcArg<'_>]) -> Option<Result<ProcAction, SqlError>>;
+/// Resolver of system procedures: maps a procedure name and its arguments to the action the
+/// session runs, or `None` when the name is not a system procedure (error 2812).
+///
+/// `vauban-compat` provides one (`resolve_system_procedure`); the caller that builds the
+/// [`crate::Engine`] hands it over with [`crate::Engine::with_system_procedures`], which keeps
+/// `session` free of a dependency on `compat`.
+pub type SystemProcedureResolver =
+    dyn Fn(&str, &[ProcArg<'_>]) -> Option<Result<ProcAction, SqlError>> + Send + Sync;
 
-static SYSTEM_PROCEDURE_RESOLVER: OnceLock<SystemProcedureResolver> = OnceLock::new();
-
-/// Registers the compatibility-layer resolver without introducing a `session → compat`
-/// dependency cycle. Repeated registration is harmless, like the function registry.
-pub fn register_system_procedure_resolver(resolver: SystemProcedureResolver) {
-    let _ = SYSTEM_PROCEDURE_RESOLVER.set(resolver);
-}
-
-pub(crate) fn system_procedure_resolver() -> Option<SystemProcedureResolver> {
-    SYSTEM_PROCEDURE_RESOLVER.get().copied()
+/// The resolver of the engine `session` runs on, `None` when the engine was built without one.
+pub(crate) fn system_procedure_resolver(session: &Session) -> Option<&SystemProcedureResolver> {
+    session.engine().system_procedures()
 }
 
 impl Session {
     /// Runs an RPC ([MS-TDS] 2.2.6.6). Same contract as [`super::batch::Session::run_batch`].
     ///
-    /// The registered resolver serves known system procedures. An unresolved RPC name is
+    /// The resolver of the engine serves known system procedures. An unresolved RPC name is
     /// answered with error 2812 then a DONEPROC carrying `DoneStatus::ERROR`. A `ProcID` is named
     /// after the special procedure it stands for ([MS-TDS] 2.2.6.6, e.g. 10 →
     /// `sp_executesql`).
@@ -174,7 +171,7 @@ impl Session {
                 default: arg.default,
             })
             .collect();
-        let Some(resolver) = SYSTEM_PROCEDURE_RESOLVER.get() else {
+        let Some(resolver) = system_procedure_resolver(self) else {
             return fail_rpc(&name, sink);
         };
         match resolver(&name, &params) {

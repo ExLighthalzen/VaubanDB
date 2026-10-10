@@ -2,14 +2,8 @@
 
 use vauban_types::{Collation, Len, SqlString, SqlType, TypeInfo, Value};
 
-/// One result column, without any dependency on the TDS or session layers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResultColumn {
-    /// Column name, as SQL Server names it.
-    pub name: String,
-    /// SQL type, length, nullability and collation.
-    pub ty: TypeInfo,
-}
+/// One result column: the column type a static procedure result carries to the session.
+pub use vauban_session::StaticResultColumn as ResultColumn;
 
 /// The single result set returned by `sp_datatype_info_100`.
 #[derive(Debug, Clone, PartialEq)]

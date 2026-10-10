@@ -6,12 +6,12 @@
 //! described column. The resolver also serves `sp_executesql`, which brings the describe call
 //! one nesting level down.
 
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_session::{
     DescribeKind, Engine, ProcAction, ProcArg, ResultSink, Session, SessionState,
-    StaticResultColumn, register_system_procedure_resolver,
+    StaticResultColumn,
 };
 use vauban_storage::MemoryStorage;
 use vauban_tds::{ColumnMeta, EnvChange};
@@ -265,10 +265,11 @@ fn resolve_describe(name: &str, args: &[ProcArg<'_>]) -> Option<Result<ProcActio
 
 fn session() -> Session {
     vauban_sysfn::register_builtins();
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| register_system_procedure_resolver(resolve_describe));
     Session::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            Arc::new(resolve_describe),
+        )),
         SessionState::new(SPID),
     )
 }

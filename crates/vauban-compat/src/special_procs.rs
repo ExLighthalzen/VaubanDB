@@ -8,20 +8,7 @@ use vauban_types::{Len, SqlType, TypeInfo, Value};
 
 use crate::procedures::{ProcAction, ProcParam};
 
-/// One argument of a system procedure call, as the session received it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ProcArg<'a> {
-    /// Parameter name when the call used `@name = value`.
-    pub name: Option<&'a str>,
-    /// Declared type of the argument.
-    pub ty: &'a TypeInfo,
-    /// Argument value.
-    pub value: &'a Value,
-    /// True when the RPC marked the parameter as output.
-    pub output: bool,
-    /// True when the RPC marked the parameter as default.
-    pub default: bool,
-}
+pub use vauban_session::ProcArg;
 
 struct FixedParam {
     canonical: &'static str,

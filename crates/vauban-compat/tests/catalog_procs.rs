@@ -152,7 +152,10 @@ fn batch_exec_sp_columns_returns_rows() {
     vauban_sysfn::register_builtins();
     register_functions();
     let mut session = Session::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            vauban_compat::system_procedures(),
+        )),
         SessionState::new(91),
     );
     let mut sink = Recording::default();
@@ -176,7 +179,10 @@ fn batch_exec_sp_server_info_returns_rows() {
     vauban_sysfn::register_builtins();
     register_functions();
     let mut session = Session::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            vauban_compat::system_procedures(),
+        )),
         SessionState::new(91),
     );
     let mut sink = Recording::default();
@@ -198,7 +204,10 @@ fn two_database_session() -> Session {
     vauban_sysfn::register_builtins();
     register_functions();
     let mut session = Session::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            vauban_compat::system_procedures(),
+        )),
         SessionState::new(91),
     );
     for text in [

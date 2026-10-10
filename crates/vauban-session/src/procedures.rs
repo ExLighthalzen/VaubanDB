@@ -163,7 +163,7 @@ pub(crate) fn run_batch_procedure(
             default: arg.default,
         })
         .collect();
-    let Some(resolver) = super::rpc::system_procedure_resolver() else {
+    let Some(resolver) = super::rpc::system_procedure_resolver(session) else {
         let err = SqlError::procedure_not_found(name).with_line(line);
         return finish_batch_exec_error(session, err, more, sink);
     };

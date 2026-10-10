@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::sync::Once;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
@@ -12,8 +11,8 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_session::{
-    Engine, ProcAction, ProcArg, ProcParam, ResultSink, Session, SessionState, TdsSink,
-    register_system_procedure_resolver,
+    Engine, ProcAction, ProcArg, ProcParam, ResultSink, Session, SessionState,
+    SystemProcedureResolver, TdsSink,
 };
 use vauban_storage::MemoryStorage;
 use vauban_tds::{
@@ -78,21 +77,19 @@ impl ResultSink for Recording {
     }
 }
 
-fn register_test_resolver() {
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| {
-        register_system_procedure_resolver(|name, args| {
-            if !name.eq_ignore_ascii_case("sp_executesql")
-                && !name.to_ascii_lowercase().ends_with(".sp_executesql")
-            {
-                return None;
-            }
-            Some(Ok(ProcAction::ExecuteSql {
-                statement: stmt_arg(args).unwrap_or_else(|| "SELECT @a + 1 AS n".into()),
-                params: bound_params(args),
-            }))
-        });
-    });
+fn test_resolver() -> Arc<SystemProcedureResolver> {
+    fn resolve(name: &str, args: &[ProcArg<'_>]) -> Option<Result<ProcAction, SqlError>> {
+        if !name.eq_ignore_ascii_case("sp_executesql")
+            && !name.to_ascii_lowercase().ends_with(".sp_executesql")
+        {
+            return None;
+        }
+        Some(Ok(ProcAction::ExecuteSql {
+            statement: stmt_arg(args).unwrap_or_else(|| "SELECT @a + 1 AS n".into()),
+            params: bound_params(args),
+        }))
+    }
+    Arc::new(resolve)
 }
 
 fn stmt_arg(args: &[ProcArg<'_>]) -> Option<String> {
@@ -138,9 +135,11 @@ fn bound_params(args: &[ProcArg<'_>]) -> Vec<ProcParam> {
 
 fn session() -> Session {
     vauban_sysfn::register_builtins();
-    register_test_resolver();
     Session::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            test_resolver(),
+        )),
         SessionState::new(SPID),
     )
 }
@@ -311,10 +310,12 @@ async fn serve_tiberius_parameterized_query(listener: TcpListener) {
     msg_rx.recv().await.unwrap();
 
     let (token_tx, mut token_rx) = mpsc::channel(32);
-    let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+    let engine = Arc::new(Engine::with_system_procedures(
+        Arc::new(MemoryStorage::new()),
+        test_resolver(),
+    ));
     let handle = spawn_blocking(move || {
         vauban_sysfn::register_builtins();
-        register_test_resolver();
         let mut session = Session::new(engine, SessionState::new(SPID));
         let mut sink = TdsSink::new(token_tx);
         session

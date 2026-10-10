@@ -92,7 +92,10 @@ fn session(spid: i16) -> Session {
     vauban_sysfn::register_builtins();
     register_functions();
     Session::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            vauban_compat::system_procedures(),
+        )),
         SessionState::new(spid),
     )
 }

@@ -1,11 +1,11 @@
 //! Integration tests of batch `EXEC` routed through procedure dispatch.
 
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_session::{
-    Engine, ProcAction, ProcParam, ResultSink, Session, SessionState,
-    register_system_procedure_resolver,
+    Engine, ProcAction, ProcArg, ProcParam, ResultSink, Session, SessionState,
+    SystemProcedureResolver,
 };
 use vauban_storage::MemoryStorage;
 use vauban_tds::{ColumnMeta, EnvChange};
@@ -61,57 +61,54 @@ impl ResultSink for Recording {
     }
 }
 
-fn register_test_resolver() {
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| {
-        register_system_procedure_resolver(|name, args| {
-            if is_catalogue_name(name) {
-                return Some(catalogue_answer(args));
+fn test_resolver() -> Arc<SystemProcedureResolver> {
+    fn resolve(name: &str, args: &[ProcArg<'_>]) -> Option<Result<ProcAction, SqlError>> {
+        if is_catalogue_name(name) {
+            return Some(catalogue_answer(args));
+        }
+        if !name.eq_ignore_ascii_case("sp_executesql")
+            && !name.to_ascii_lowercase().ends_with(".sp_executesql")
+        {
+            return None;
+        }
+        if let Some(number) = refused_number(args) {
+            return Some(Err(SqlError::new(number, 16, 2, "argument error")));
+        }
+        if let Some(arg) = statement_argument(args)
+            && !is_unicode_text(arg.ty)
+        {
+            return Some(Err(SqlError::procedure_expects_type(
+                "@statement",
+                "ntext/nchar/nvarchar",
+            )));
+        }
+        let mut params = Vec::new();
+        for arg in args {
+            let Some(name) = arg.name.filter(|name| name.starts_with('@')) else {
+                continue;
+            };
+            if name == "@statement" || name == "@stmt" || name == "@params" || name == "params" {
+                continue;
             }
-            if !name.eq_ignore_ascii_case("sp_executesql")
-                && !name.to_ascii_lowercase().ends_with(".sp_executesql")
-            {
-                return None;
-            }
-            if let Some(number) = refused_number(args) {
-                return Some(Err(SqlError::new(number, 16, 2, "argument error")));
-            }
-            if let Some(arg) = statement_argument(args)
-                && !is_unicode_text(arg.ty)
-            {
-                return Some(Err(SqlError::procedure_expects_type(
-                    "@statement",
-                    "ntext/nchar/nvarchar",
-                )));
-            }
-            let mut params = Vec::new();
-            for arg in args {
-                let Some(name) = arg.name.filter(|name| name.starts_with('@')) else {
-                    continue;
-                };
-                if name == "@statement" || name == "@stmt" || name == "@params" || name == "params"
-                {
-                    continue;
+            params.push(ProcParam {
+                name: name.to_owned(),
+                ty: arg.ty.clone(),
+                value: arg.value.clone(),
+                output: arg.output,
+            });
+        }
+        let statement = args
+            .iter()
+            .find_map(|arg| match (arg.name, arg.value) {
+                (None | Some("@statement") | Some("@stmt"), Value::String(text)) => {
+                    Some(text.text.clone())
                 }
-                params.push(ProcParam {
-                    name: name.to_owned(),
-                    ty: arg.ty.clone(),
-                    value: arg.value.clone(),
-                    output: arg.output,
-                });
-            }
-            let statement = args
-                .iter()
-                .find_map(|arg| match (arg.name, arg.value) {
-                    (None | Some("@statement") | Some("@stmt"), Value::String(text)) => {
-                        Some(text.text.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| "SET @o = @a + 1".into());
-            Some(Ok(ProcAction::ExecuteSql { statement, params }))
-        });
-    });
+                _ => None,
+            })
+            .unwrap_or_else(|| "SET @o = @a + 1".into());
+        Some(Ok(ProcAction::ExecuteSql { statement, params }))
+    }
+    Arc::new(resolve)
 }
 
 /// The argument carrying the statement of an `sp_executesql` call: the first positional
@@ -168,9 +165,11 @@ fn refused_number(args: &[vauban_session::ProcArg<'_>]) -> Option<u32> {
 
 fn session() -> Session {
     vauban_sysfn::register_builtins();
-    register_test_resolver();
     Session::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            test_resolver(),
+        )),
         SessionState::new(SPID),
     )
 }

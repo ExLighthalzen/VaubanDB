@@ -97,6 +97,7 @@ use crate::batch::Session;
 use crate::cancel::CancelHandle;
 use crate::disconnect::{Release, release};
 use crate::login::{self, EDITION, MASTER, VERSION_BANNER};
+use crate::rpc::SystemProcedureResolver;
 use crate::sink::{CHANNEL_CAPACITY, ResultSink, TdsSink};
 use crate::state::SessionState;
 use crate::txn_request;
@@ -149,7 +150,8 @@ pub const REQUEST_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 ///
 /// [`Engine::new`] builds the [`TransactionManager`] over the storage and runs
 /// [`Catalog::bootstrap`], so that a fresh instance holds its system databases before the
-/// first login.
+/// first login. [`Engine::with_system_procedures`] builds it likewise and installs the
+/// resolver of system procedures.
 pub struct Engine {
     /// The storage engine behind every table.
     pub storage: Arc<dyn Storage>,
@@ -157,6 +159,10 @@ pub struct Engine {
     pub txn: Arc<TransactionManager>,
     /// The metadata of the instance, bootstrapped by [`Engine::new`].
     pub catalog: Arc<Catalog>,
+    /// Resolver of system procedures (`sp_executesql`, `sp_prepare`, catalog procedures).
+    /// `None` answers error 2812 to a procedure call
+    /// (`an_engine_built_without_the_resolver_answers_2812_next_to_one_built_with_it`).
+    system_procedures: Option<Arc<SystemProcedureResolver>>,
 }
 
 impl Engine {
@@ -186,12 +192,36 @@ impl Engine {
             storage,
             txn,
             catalog,
+            system_procedures: None,
         };
         engine.txn.bump_next_id_above_storage();
         if let Err(err) = engine.clear_session_registry() {
             panic!("{BOOTSTRAP_PANIC}: session registry clear failed: {err}");
         }
         engine
+    }
+
+    /// Builds the engine as [`Engine::new`] does, with `resolver` serving the system
+    /// procedures a session calls by RPC or by `EXEC`.
+    ///
+    /// The resolver belongs to this engine: two engines in one process may carry different
+    /// resolvers, and an engine built by [`Engine::new`] carries no resolver.
+    ///
+    /// # Panics
+    ///
+    /// As [`Engine::new`].
+    pub fn with_system_procedures(
+        storage: Arc<dyn Storage>,
+        resolver: Arc<SystemProcedureResolver>,
+    ) -> Self {
+        let mut engine = Self::new(storage);
+        engine.system_procedures = Some(resolver);
+        engine
+    }
+
+    /// The resolver of system procedures, `None` when the engine was built without one.
+    pub(crate) fn system_procedures(&self) -> Option<&SystemProcedureResolver> {
+        self.system_procedures.as_deref()
     }
 }
 

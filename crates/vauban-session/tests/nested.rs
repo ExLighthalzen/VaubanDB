@@ -1,7 +1,7 @@
 //! Integration tests of `Session::run_nested`: parameter scope, procedure-style DONE
 //! tokens, and output parameters.
 
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
@@ -13,7 +13,7 @@ use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_parser::{ParseOptions, parse_parameter_declarations};
 use vauban_session::{
     Engine, NestedOutcome, NestedParam, ProcAction, ProcArg, ProcParam, ResultSink, Session,
-    SessionState, TdsSink, register_system_procedure_resolver,
+    SessionState, SystemProcedureResolver, TdsSink,
 };
 use vauban_storage::MemoryStorage;
 use vauban_tds::{
@@ -144,18 +144,16 @@ impl ResultSink for CountingSink {
     }
 }
 
-fn register_test_resolver() {
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| {
-        register_system_procedure_resolver(|name, args| {
-            let base = name.rsplit('.').next().unwrap_or(name);
-            if base.eq_ignore_ascii_case("sp_executesql") {
-                Some(resolve_executesql(args))
-            } else {
-                None
-            }
-        });
-    });
+fn test_resolver() -> Arc<SystemProcedureResolver> {
+    fn resolve(name: &str, args: &[ProcArg<'_>]) -> Option<Result<ProcAction, SqlError>> {
+        let base = name.rsplit('.').next().unwrap_or(name);
+        if base.eq_ignore_ascii_case("sp_executesql") {
+            Some(resolve_executesql(args))
+        } else {
+            None
+        }
+    }
+    Arc::new(resolve)
 }
 
 fn resolve_executesql(args: &[ProcArg<'_>]) -> Result<ProcAction, SqlError> {
@@ -223,9 +221,11 @@ fn resolve_executesql(args: &[ProcArg<'_>]) -> Result<ProcAction, SqlError> {
 
 fn session() -> Session {
     vauban_sysfn::register_builtins();
-    register_test_resolver();
     Session::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            test_resolver(),
+        )),
         SessionState::new(SPID),
     )
 }
@@ -1006,7 +1006,10 @@ async fn serve_one_nested_query(listener: TcpListener) {
     msg_rx.recv().await.unwrap();
 
     let (token_tx, mut token_rx) = mpsc::channel(32);
-    let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+    let engine = Arc::new(Engine::with_system_procedures(
+        Arc::new(MemoryStorage::new()),
+        test_resolver(),
+    ));
     let handle = spawn_blocking(move || {
         vauban_sysfn::register_builtins();
         let mut session = Session::new(engine, SessionState::new(SPID));

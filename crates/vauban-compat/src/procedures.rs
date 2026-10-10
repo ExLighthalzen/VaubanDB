@@ -1,87 +1,13 @@
 //! Resolving a system procedure name and its arguments into a session action.
 
 use vauban_errors::{SqlError, SqlResult};
-use vauban_parser::ParameterDeclaration;
-use vauban_types::{TypeInfo, Value};
+use vauban_types::Value;
 
-use crate::describe_procs::DescribeKind;
-use crate::sp_datatype_info::{ResultColumn, sp_datatype_info_100_static};
+use crate::sp_datatype_info::sp_datatype_info_100_static;
 use crate::special_procs;
 
 pub use special_procs::ProcArg;
-
-/// One bound parameter of dynamic SQL, ready for the session to execute.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProcParam {
-    /// Parameter name, `@` included.
-    pub name: String,
-    /// Declared type.
-    pub ty: TypeInfo,
-    /// Bound value.
-    pub value: Value,
-    /// True when the declaration or the call marked the parameter `OUTPUT`.
-    pub output: bool,
-}
-
-/// What the session should do after a system procedure has been resolved.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ProcAction {
-    /// `sp_executesql`: run a statement with bound parameters.
-    ExecuteSql {
-        /// Dynamic SQL text.
-        statement: String,
-        /// Values for the parameters declared in `@params`.
-        params: Vec<ProcParam>,
-    },
-    /// `sp_prepare` or `sp_prepexec`: prepare a handle, optionally executing once.
-    Prepare {
-        /// Statement text to prepare.
-        statement: String,
-        /// Declarations read from the `@params` argument.
-        params: Vec<ParameterDeclaration>,
-        /// Index of the output handle argument in the original call.
-        handle_arg: usize,
-        /// Values supplied by `sp_prepexec` after the fixed arguments.
-        execute_with: Option<Vec<ProcParam>>,
-    },
-    /// `sp_execute`: run a prepared handle with new parameter values.
-    Execute {
-        /// Prepared-statement handle.
-        handle: i32,
-        /// Bound parameter values.
-        params: Vec<ProcParam>,
-    },
-    /// `sp_unprepare`: drop a prepared handle.
-    Unprepare {
-        /// Prepared-statement handle.
-        handle: i32,
-    },
-    /// Catalog procedure template (T-SQL batch on the current database).
-    Template {
-        /// T-SQL batch to run on the current database.
-        sql: String,
-        /// Named arguments of the catalog call.
-        params: Vec<ProcParam>,
-    },
-    /// Describe a T-SQL batch without running it.
-    Describe {
-        /// The batch to describe.
-        statement: String,
-        /// Which description the caller asked for.
-        kind: DescribeKind,
-        /// Result metadata of the description.
-        columns: Vec<ResultColumn>,
-    },
-    /// Static result set, such as `sp_datatype_info_100`.
-    Static {
-        /// Result metadata.
-        columns: Vec<ResultColumn>,
-        /// Result rows.
-        rows: Vec<Vec<Value>>,
-    },
-    /// Known procedure deliberately refused (for example cursor RPCs).
-    Refuse(SqlError),
-}
+pub use vauban_session::{ProcAction, ProcParam};
 
 /// Catalog procedure entry placeholder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +112,7 @@ fn resolve_catalog_procedure(name: &str, args: &[ProcArg<'_>]) -> Option<SqlResu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vauban_types::{Len, SqlString, SqlType};
+    use vauban_types::{Len, SqlString, SqlType, TypeInfo};
 
     fn nvarchar(value: &str) -> Value {
         Value::String(SqlString {

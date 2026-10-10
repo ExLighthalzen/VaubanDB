@@ -1,7 +1,7 @@
 //! RESETCONNECTION: session reset and SqlClient pooling.
 
 use std::process::Command;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -11,7 +11,7 @@ use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_parser::{ParseOptions, parse_parameter_declarations};
 use vauban_session::{
     Engine, NoAuth, ProcAction, ProcArg, ProcParam, ResultSink, Server, ServerConfig, Session,
-    SessionState, apply_reset, register_system_procedure_resolver,
+    SessionState, SystemProcedureResolver, apply_reset,
 };
 use vauban_storage::MemoryStorage;
 use vauban_tds::{ColumnMeta, EnvChange, ResetConnection, Rpc, RpcParam, RpcProc};
@@ -61,18 +61,16 @@ impl ResultSink for Recording {
     }
 }
 
-fn register_prepare_resolver() {
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| {
-        register_system_procedure_resolver(|name, args| {
-            let base = name.rsplit('.').next().unwrap_or(name);
-            match base.to_ascii_lowercase().as_str() {
-                "sp_prepexec" => Some(resolve_prepexec(args)),
-                "sp_execute" => Some(resolve_execute(args)),
-                _ => None,
-            }
-        });
-    });
+fn prepare_resolver() -> Arc<SystemProcedureResolver> {
+    fn resolve(name: &str, args: &[ProcArg<'_>]) -> Option<Result<ProcAction, SqlError>> {
+        let base = name.rsplit('.').next().unwrap_or(name);
+        match base.to_ascii_lowercase().as_str() {
+            "sp_prepexec" => Some(resolve_prepexec(args)),
+            "sp_execute" => Some(resolve_execute(args)),
+            _ => None,
+        }
+    }
+    Arc::new(resolve)
 }
 
 fn read_int(value: &Value) -> Option<i32> {
@@ -159,8 +157,10 @@ fn resolve_execute(args: &[ProcArg<'_>]) -> Result<ProcAction, SqlError> {
 
 fn session() -> (Session, Arc<Engine>) {
     vauban_sysfn::register_builtins();
-    register_prepare_resolver();
-    let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+    let engine = Arc::new(Engine::with_system_procedures(
+        Arc::new(MemoryStorage::new()),
+        prepare_resolver(),
+    ));
     let session = Session::new(Arc::clone(&engine), SessionState::new(SPID));
     (session, engine)
 }
@@ -405,7 +405,10 @@ async fn sqlclient_pool_reset_returns_login_database() {
     let port = addr.port();
     let shutdown = CancellationToken::new();
     let server = Server::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            prepare_resolver(),
+        )),
         ServerConfig {
             encrypt: vauban_tds::EncryptPolicy::Off,
             tls: None,
@@ -754,7 +757,10 @@ mod wire {
         let addr = listener.local_addr().unwrap();
         let shutdown = CancellationToken::new();
         let server = Server::new(
-            Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+            Arc::new(Engine::with_system_procedures(
+                Arc::new(MemoryStorage::new()),
+                super::prepare_resolver(),
+            )),
             ServerConfig {
                 encrypt: vauban_tds::EncryptPolicy::Off,
                 tls: None,

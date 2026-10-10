@@ -4,7 +4,8 @@
 //! ODBC type-info procedure `sp_datatype_info_100`. The version constants
 //! ([`PRODUCT_VERSION`], [`VERSION_BANNER`]) are re-exported from `session`, because
 //! `compat` depends on it; [`register_functions`] registers the server functions into the
-//! `sysfn` registry and the procedure dispatcher into `session`.
+//! `sysfn` registry, and [`system_procedures`] is the resolver a `session` engine is built
+//! with.
 
 mod catalog_keys;
 mod catalog_procs;
@@ -20,9 +21,10 @@ mod stored_procedures;
 mod version;
 mod who_procs;
 
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use vauban_errors::SqlResult;
+use vauban_session::SystemProcedureResolver;
 use vauban_sysfn::{Arity, EvalArgs, EvalContext, FunctionDef, FunctionKind};
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
@@ -32,139 +34,10 @@ pub use sp_datatype_info::{ResultColumn, ResultSetData, sp_datatype_info_100};
 pub use special_procs::ProcArg;
 pub use version::{PRODUCT_VERSION, VERSION_BANNER};
 
-/// Result of a compatibility procedure, before `session` turns it into TDS tokens.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SystemProcResult {
-    /// Metadata and rows of the single result set.
-    pub result_set: ResultSetData,
-    /// Stored-procedure return status.
-    pub return_status: i32,
-}
-
-/// Looks up and executes the system procedure named by an RPC.
-///
-/// Names are ASCII case-insensitive; brackets and the optional `sys.` prefix are ignored.
-/// Unknown names return `None`, allowing `session` to preserve error 2812.
-pub fn call_system_procedure(
-    name: &str,
-    params: &[(Option<&str>, &Value)],
-) -> Option<SystemProcResult> {
-    let normalized = normalize_procedure_name(name);
-    if normalized != "sp_datatype_info_100" {
-        return None;
-    }
-
-    let integer = |value: &Value| match value {
-        Value::I16(value) => Some(i32::from(*value)),
-        Value::I32(value) => Some(*value),
-        Value::I64(value) => i32::try_from(*value).ok(),
-        _ => None,
-    };
-    let data_type = params.first().and_then(|(_, value)| integer(value))?;
-    let odbc_ver = params
-        .get(1)
-        .and_then(|(_, value)| integer(value))
-        .unwrap_or(4);
-
-    Some(SystemProcResult {
-        result_set: sp_datatype_info_100(data_type, odbc_ver),
-        return_status: 0,
-    })
-}
-
-fn compat_args<'a>(params: &[vauban_session::ProcArg<'a>]) -> Vec<special_procs::ProcArg<'a>> {
-    params
-        .iter()
-        .map(|arg| special_procs::ProcArg {
-            name: arg.name,
-            ty: arg.ty,
-            value: arg.value,
-            output: arg.output,
-            default: arg.default,
-        })
-        .collect()
-}
-
-fn resolve_for_session(
-    name: &str,
-    params: &[vauban_session::ProcArg<'_>],
-) -> Option<SqlResult<vauban_session::ProcAction>> {
-    match resolve_system_procedure(name, &compat_args(params))? {
-        Err(err) => Some(Err(err)),
-        Ok(action) => Some(Ok(convert_proc_action(action))),
-    }
-}
-
-fn convert_proc_action(action: ProcAction) -> vauban_session::ProcAction {
-    match action {
-        ProcAction::ExecuteSql { statement, params } => vauban_session::ProcAction::ExecuteSql {
-            statement,
-            params: convert_proc_params(params),
-        },
-        ProcAction::Prepare {
-            statement,
-            params,
-            handle_arg,
-            execute_with,
-        } => vauban_session::ProcAction::Prepare {
-            statement,
-            params,
-            handle_arg,
-            execute_with: execute_with.map(convert_proc_params),
-        },
-        ProcAction::Execute { handle, params } => vauban_session::ProcAction::Execute {
-            handle,
-            params: convert_proc_params(params),
-        },
-        ProcAction::Unprepare { handle } => vauban_session::ProcAction::Unprepare { handle },
-        ProcAction::Template { sql, params } => vauban_session::ProcAction::Template {
-            sql,
-            params: convert_proc_params(params),
-        },
-        ProcAction::Static { columns, rows } => vauban_session::ProcAction::Static {
-            columns: columns
-                .into_iter()
-                .map(|column| vauban_session::StaticResultColumn {
-                    name: column.name,
-                    ty: column.ty,
-                })
-                .collect(),
-            rows,
-        },
-        ProcAction::Refuse(err) => vauban_session::ProcAction::Refuse(err),
-        ProcAction::Describe {
-            statement,
-            kind,
-            columns,
-        } => vauban_session::ProcAction::Describe {
-            statement,
-            kind: match kind {
-                DescribeKind::FirstResultSet => vauban_session::DescribeKind::FirstResultSet,
-                DescribeKind::UndeclaredParameters => {
-                    vauban_session::DescribeKind::UndeclaredParameters
-                }
-            },
-            columns: columns
-                .into_iter()
-                .map(|column| vauban_session::StaticResultColumn {
-                    name: column.name,
-                    ty: column.ty,
-                })
-                .collect(),
-        },
-    }
-}
-
-fn convert_proc_params(params: Vec<ProcParam>) -> Vec<vauban_session::ProcParam> {
-    params
-        .into_iter()
-        .map(|param| vauban_session::ProcParam {
-            name: param.name,
-            ty: param.ty,
-            value: param.value,
-            output: param.output,
-        })
-        .collect()
+/// The resolver of system procedures that [`vauban_session::Engine::with_system_procedures`]
+/// takes: [`resolve_system_procedure`], shared behind an `Arc`.
+pub fn system_procedures() -> Arc<SystemProcedureResolver> {
+    Arc::new(resolve_system_procedure)
 }
 
 /// Result type of `SELECT @@VERSION`.
@@ -308,7 +181,6 @@ pub fn register_functions() {
         vauban_sysfn::register(SERVER_PROPERTY_DEF);
         vauban_sysfn::register(DATABASE_PROPERTY_DEF);
         server_functions::register_server_functions();
-        vauban_session::register_system_procedure_resolver(resolve_for_session);
     });
 }
 

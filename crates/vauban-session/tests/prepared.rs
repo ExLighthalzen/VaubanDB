@@ -1,7 +1,7 @@
 //! Prepared-statement RPC tests (`sp_prepare`, `sp_prepexec`, `sp_execute`, `sp_unprepare`).
 
 use std::process::Command;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -11,7 +11,7 @@ use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_parser::{ParseOptions, parse_parameter_declarations};
 use vauban_session::{
     Engine, ProcAction, ProcArg, ProcParam, ResultSink, Session, SessionState,
-    register_system_procedure_resolver,
+    SystemProcedureResolver,
 };
 use vauban_storage::MemoryStorage;
 use vauban_tds::{
@@ -94,21 +94,19 @@ fn nvarchar_ty() -> TypeInfo {
     TypeInfo::new(SqlType::NVarChar(Len::Max), false)
 }
 
-fn register_prepare_resolver() {
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| {
-        register_system_procedure_resolver(|name, args| {
-            let base = name.rsplit('.').next().unwrap_or(name);
-            match base.to_ascii_lowercase().as_str() {
-                "sp_executesql" => Some(resolve_executesql(args)),
-                "sp_prepare" => Some(resolve_prepare(args, false)),
-                "sp_prepexec" => Some(resolve_prepare(args, true)),
-                "sp_execute" => Some(resolve_execute(args)),
-                "sp_unprepare" => Some(resolve_unprepare(args)),
-                _ => None,
-            }
-        });
-    });
+fn prepare_resolver() -> Arc<SystemProcedureResolver> {
+    fn resolve(name: &str, args: &[ProcArg<'_>]) -> Option<Result<ProcAction, SqlError>> {
+        let base = name.rsplit('.').next().unwrap_or(name);
+        match base.to_ascii_lowercase().as_str() {
+            "sp_executesql" => Some(resolve_executesql(args)),
+            "sp_prepare" => Some(resolve_prepare(args, false)),
+            "sp_prepexec" => Some(resolve_prepare(args, true)),
+            "sp_execute" => Some(resolve_execute(args)),
+            "sp_unprepare" => Some(resolve_unprepare(args)),
+            _ => None,
+        }
+    }
+    Arc::new(resolve)
 }
 
 fn resolve_executesql(args: &[ProcArg<'_>]) -> Result<ProcAction, SqlError> {
@@ -301,9 +299,11 @@ fn execute_events(value: i32) -> Vec<Event> {
 
 fn session() -> Session {
     vauban_sysfn::register_builtins();
-    register_prepare_resolver();
     Session::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            prepare_resolver(),
+        )),
         SessionState::new(SPID),
     )
 }
@@ -769,11 +769,13 @@ async fn serve_jdbc_prepare(listener: TcpListener) {
         }
     });
 
-    let engine = Arc::new(Engine::new(Arc::new(MemoryStorage::new())));
+    let engine = Arc::new(Engine::with_system_procedures(
+        Arc::new(MemoryStorage::new()),
+        prepare_resolver(),
+    ));
     let (work_tx, work_rx) = std::sync::mpsc::channel::<(Rpc, mpsc::Sender<vauban_tds::Token>)>();
     let worker = spawn_blocking(move || {
         vauban_sysfn::register_builtins();
-        register_prepare_resolver();
         let mut session = Session::new(engine, SessionState::new(SPID));
         while let Ok((rpc, token_tx)) = work_rx.recv() {
             let mut sink = vauban_session::TdsSink::new(token_tx);

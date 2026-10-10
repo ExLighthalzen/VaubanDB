@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use vauban_compat::{
-    ProcAction, ProcArg, call_system_procedure, register_functions, resolve_system_procedure,
-    sp_datatype_info_100,
+    ProcAction, ProcArg, register_functions, resolve_system_procedure, sp_datatype_info_100,
+    system_procedures,
 };
 use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_session::{Engine, ResultSink, Session, SessionState};
@@ -277,16 +277,36 @@ fn rows_of_each_data_type() {
 fn name_normalisation() {
     let data_type = Value::I32(12);
     let odbc_ver = Value::I32(4);
-    let params = [(None, &data_type), (Some("@ODBCVer"), &odbc_ver)];
+    let ty = TypeInfo::new(SqlType::Int, false);
+    let params = [
+        ProcArg {
+            name: None,
+            ty: &ty,
+            value: &data_type,
+            output: false,
+            default: false,
+        },
+        ProcArg {
+            name: Some("@ODBCVer"),
+            ty: &ty,
+            value: &odbc_ver,
+            output: false,
+            default: false,
+        },
+    ];
     for name in [
         "[sys].sp_datatype_info_100",
         "sys.sp_datatype_info_100",
         "SP_DATATYPE_INFO_100",
         "sp_datatype_info_100",
     ] {
-        let result = call_system_procedure(name, &params).expect(name);
-        assert_eq!(result.result_set.rows.len(), 1, "{name}");
-        assert_eq!(result.return_status, 0, "{name}");
+        let action = resolve_system_procedure(name, &params)
+            .expect(name)
+            .expect(name);
+        match action {
+            ProcAction::Static { rows, .. } => assert_eq!(rows.len(), 1, "{name}"),
+            other => panic!("{name}: expected a static result, got {other:?}"),
+        }
     }
 }
 
@@ -341,7 +361,10 @@ impl ResultSink for Recording {
 fn session() -> Session {
     register_functions();
     Session::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(Engine::with_system_procedures(
+            Arc::new(MemoryStorage::new()),
+            system_procedures(),
+        )),
         SessionState::new(51),
     )
 }

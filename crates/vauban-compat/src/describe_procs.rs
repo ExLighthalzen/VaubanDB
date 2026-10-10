@@ -35,14 +35,7 @@ use crate::procedures::ProcAction;
 use crate::sp_datatype_info::ResultColumn;
 use crate::special_procs::ProcArg;
 
-/// Which of the two descriptions a call asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DescribeKind {
-    /// Columns of the first result set of the batch.
-    FirstResultSet,
-    /// Parameters the batch uses without declaring them.
-    UndeclaredParameters,
-}
+pub use vauban_session::DescribeKind;
 
 /// Name of the procedure that describes the first result set.
 const FIRST_RESULT_SET: &str = "sp_describe_first_result_set";

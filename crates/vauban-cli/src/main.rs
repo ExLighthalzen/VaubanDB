@@ -222,7 +222,10 @@ async fn run_server(cfg: Config, tls: Option<Arc<rustls::ServerConfig>>) -> anyh
         )
     };
     let on_disk = !cfg.in_memory;
-    let engine = Arc::new(Engine::new(Arc::clone(&storage)));
+    let engine = Arc::new(Engine::with_system_procedures(
+        Arc::clone(&storage),
+        vauban_compat::system_procedures(),
+    ));
     let authenticator: Arc<dyn Authenticator> = match (cfg.no_auth, &cfg.sa_password) {
         (true, _) => Arc::new(NoAuth),
         (false, Some(password)) => Arc::new(SaPasswordAuthenticator(password.clone())),
