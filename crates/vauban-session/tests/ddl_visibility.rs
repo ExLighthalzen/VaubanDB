@@ -669,30 +669,119 @@ fn an_insert_bound_before_a_committed_alter_is_bound_again() {
     assert_eq!(errors(&events), vec![208], "{events:#?}");
 }
 
-/// A statement held by an `IF` is bound with the `IF`, and not alone: when its table is
-/// rebuilt by an `ALTER TABLE` another session commits while the statement waits, it fails
-/// with the internal error 50000 rather than write its row in the table the `ALTER` dropped.
-/// The same statement written at the top level writes its row
-/// (`an_insert_bound_before_an_alter_waits_and_keeps_its_row`).
+/// A block whose `INSERT`, on line 5, runs after a read of `dbo.w` that waits for the
+/// other session, written alone, then after a `CREATE TABLE` that makes the batch bind one
+/// statement at a time. `SELECT 0` and the read (5) run before the `INSERT`, `SELECT 3` and
+/// `SELECT 4` after it.
+const HELD_BY_AN_IF: [&str; 2] = [
+    "IF 1 = 1\nBEGIN\n  SELECT 0;\n  EXEC ('SELECT a FROM dbo.w');\n  \
+     INSERT INTO dbo.t (a) VALUES (2);\n  SELECT 3;\nEND\nSELECT 4;",
+    "CREATE TABLE dbo.o (a int);\nIF 1 = 1\nBEGIN\n  SELECT 0;\n  EXEC ('SELECT a FROM dbo.w');\n  \
+     INSERT INTO dbo.t (a) VALUES (2);\n  SELECT 3;\nEND\nSELECT 4;",
+];
+
+/// A loop of two turns whose `INSERT`, on line 5, writes `10 + @i`: the first turn ends on
+/// a read of `dbo.w` that waits for the other session, the second runs after it.
+const HELD_BY_A_WHILE: &str = "DECLARE @i int = 0;\nWHILE @i < 2\nBEGIN\n  \
+     SELECT @i;\n  INSERT INTO dbo.t (a) VALUES (10 + @i);\n  SET @i = @i + 1;\n  \
+     IF @i = 1 EXEC ('DECLARE @n int; SELECT @n = a FROM dbo.w;');\nEND\nSELECT 9;";
+
+/// Runs `text` on a session of `engine` while another one, in a transaction, holds the row
+/// of `dbo.w` that `text` reads, runs `ddl` while `text` waits for that row, then commits;
+/// answers what the first session received.
+fn held_while_another_session_commits(
+    engine: &Arc<Engine>,
+    text: &'static str,
+    ddl: &str,
+) -> Vec<Event> {
+    let mut a = session(engine, 61);
+    let b = session(engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.w (a int); INSERT INTO dbo.w VALUES (5); \
+         BEGIN TRANSACTION; UPDATE dbo.w SET a = 5;",
+    );
+    let waiting = Waiting::start(b, text);
+    run(&mut a, ddl);
+    run(&mut a, "COMMIT TRANSACTION;");
+    waiting.finish().1
+}
+
+/// The number and the line of each error of `events`.
+fn numbers_and_lines(events: &[Event]) -> Vec<(u32, u32)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Error(err) => Some((err.number, err.line)),
+            Event::Row(_) => None,
+        })
+        .collect()
+}
+
+/// A statement held by an `IF` or by the second turn of a `WHILE`, whose table another
+/// session rebuilds by an `ALTER TABLE` it commits while the statement waits, is bound
+/// again with the statement that holds it and writes its row in the altered table. The
+/// statements that ran before it, the first turn of the loop included, are not run again.
 #[test]
-fn a_held_statement_whose_table_went_fails_instead_of_writing_nowhere() {
-    let engine = engine();
-    let mut a = session(&engine, 61);
-    let b = session(&engine, 62);
+fn a_held_statement_whose_table_was_rebuilt_is_bound_again() {
+    for text in HELD_BY_AN_IF {
+        let engine = engine();
+        let mut a = session(&engine, 61);
+        run(
+            &mut a,
+            "CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1);",
+        );
+        let events =
+            held_while_another_session_commits(&engine, text, "ALTER TABLE dbo.t ADD c int;");
+        assert!(errors(&events).is_empty(), "{text}: {events:#?}");
+        assert_eq!(ints(&events), vec![0, 5, 3, 4], "{text}");
+        assert_eq!(
+            run(&mut a, "SELECT a, c FROM dbo.t ORDER BY a;"),
+            vec![
+                Event::Row(vec![Value::I32(1), Value::Null]),
+                Event::Row(vec![Value::I32(2), Value::Null]),
+            ],
+            "{text}"
+        );
+    }
+
+    let other = engine();
+    let mut a = session(&other, 61);
+    run(&mut a, "CREATE TABLE dbo.t (a int);");
+    let events =
+        held_while_another_session_commits(&other, HELD_BY_A_WHILE, "ALTER TABLE dbo.t ADD c int;");
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(ints(&events), vec![0, 1, 9]);
+    assert_eq!(
+        run(&mut a, "SELECT a, c FROM dbo.t ORDER BY a;"),
+        vec![
+            Event::Row(vec![Value::I32(10), Value::Null]),
+            Event::Row(vec![Value::I32(11), Value::Null]),
+        ]
+    );
+}
+
+/// The same statements, when the other session drops the table: the new binding of the
+/// statement that holds them answers 208 on the line of the `INSERT`, and the batch stops
+/// there, after what ran before it.
+#[test]
+fn a_held_statement_whose_table_was_dropped_is_208() {
+    let first = engine();
+    let mut a = session(&first, 61);
     run(
         &mut a,
         "CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1);",
     );
-    let delayed = Delayed::start(
-        b,
-        "WAITFOR DELAY '00:00:00.400'; IF 1 = 1 INSERT INTO dbo.t (a) VALUES (2);",
-    );
-    run(&mut a, "BEGIN TRANSACTION; ALTER TABLE dbo.t ADD c int;");
-    assert!(delayed.still_running_after(900), "the INSERT waits");
-    run(&mut a, "COMMIT TRANSACTION;");
-    let (_b, events) = delayed.finish();
-    assert_eq!(errors(&events), vec![50000], "{events:#?}");
-    assert_eq!(ints(&run(&mut a, "SELECT a FROM dbo.t;")), vec![1]);
+    let events = held_while_another_session_commits(&first, HELD_BY_AN_IF[0], "DROP TABLE dbo.t;");
+    assert_eq!(numbers_and_lines(&events), vec![(208, 5)], "{events:#?}");
+    assert_eq!(ints(&events), vec![0, 5]);
+
+    let other = engine();
+    let mut a = session(&other, 61);
+    run(&mut a, "CREATE TABLE dbo.t (a int);");
+    let events = held_while_another_session_commits(&other, HELD_BY_A_WHILE, "DROP TABLE dbo.t;");
+    assert_eq!(numbers_and_lines(&events), vec![(208, 5)], "{events:#?}");
+    assert_eq!(ints(&events), vec![0, 1]);
 }
 
 /// A transaction that has read a table in `READ COMMITTED`, its statement over, does not

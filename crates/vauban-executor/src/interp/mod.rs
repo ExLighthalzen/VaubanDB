@@ -73,6 +73,23 @@
 //! compiled by [`Program::compile_roots`]: a root the host leaves as `None` is run by the
 //! host from its position.
 //!
+//! # A statement bound again
+//!
+//! A statement held by an `IF`, a `WHILE` or a `BEGIN … END` is bound with the statement
+//! written at the top level of the body that holds it, its root. When a table it was bound
+//! against went before it ran, the host answers [`Ran::Rebind`]: nothing of it ran. The
+//! program asks the host to bind the root again ([`Host::rebind`]), compiles the new binding
+//! alone, and when it compiles to instructions of the same shape, runs them in place of the
+//! instructions of the root, from the position of the statement that came back. The
+//! statements of the root that ran before it are not run again, the turns of a loop
+//! included (`interp::tests::a_statement_bound_again_runs_from_its_new_binding`), and a
+//! jump that comes back into the root later lands in the new binding
+//! (`interp::tests::a_jump_back_into_a_root_bound_again_lands_in_its_new_binding`). An
+//! error of the new binding is the error of the statement
+//! (`interp::tests::an_error_of_the_new_binding_is_the_error_of_the_statement`); a binding
+//! of another shape, or a statement bound when the program reached it, fails with the
+//! internal error.
+//!
 //! # A statement run alone
 //!
 //! `control.rs` runs a single `IF`, `WHILE` or `BEGIN … END` handed to [`crate::execute`]
@@ -344,6 +361,11 @@ pub enum Ran {
     /// The statement at this position, bound when the program reached it, holds others:
     /// the program runs it in place, its jumps resolved against the labels of the body.
     Holds(Box<PhysicalStatement>),
+    /// Nothing ran: a table the statement, held by the root at its site, was bound against
+    /// went before it ran. The program asks the host to bind that root again
+    /// ([`Host::rebind`]) and runs the statement from the new binding (module
+    /// documentation, "A statement bound again").
+    Rebind,
 }
 
 /// What runs the steps of a program for [`Program::run_hosted`] (module documentation, "A
@@ -449,6 +471,22 @@ pub trait Host {
     /// Whether `SET XACT_ABORT ON` holds, under which an error of statement scope ends the
     /// program too (`interp::tests::a_duplicate_key_under_xact_abort_ends_the_program`).
     fn xact_abort(&self) -> bool;
+
+    /// Binds again the statement written at the top level of the body at `site`, which
+    /// holds a statement that came back with [`Ran::Rebind`], against the catalogue of this
+    /// moment: `Ok` with the new binding, or `Err` with the error of that binding, on the
+    /// line the client reads it at and unsent, as for [`Ran::Failed`].
+    ///
+    /// A host that binds nothing again answers the internal error, which is what a host
+    /// that does not override this method answers.
+    ///
+    /// # Errors
+    ///
+    /// An error that ends the run at once.
+    fn rebind(&mut self, site: Site) -> SqlResult<Result<PhysicalStatement, SqlError>> {
+        let _ = site;
+        Ok(Err(run::gone_error()))
+    }
 }
 
 #[cfg(test)]

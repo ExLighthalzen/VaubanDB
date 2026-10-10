@@ -1,6 +1,8 @@
 //! The program counter: runs the instructions of a [`Program`] through a [`Host`] (module
 //! documentation of `interp`).
 
+use std::ops::Range;
+
 use vauban_binder::DeferredStatement;
 use vauban_errors::{ErrorScope, InternalError, SqlError, SqlResult, error_behavior};
 use vauban_planner::{PhysicalStatement, StatementExpr};
@@ -45,9 +47,79 @@ enum Step {
 
 /// Runs `program` from its first instruction.
 pub(crate) fn run(program: &Program<'_>, host: &mut dyn Host) -> SqlResult<End> {
-    let mut pc = 0;
+    Ok(match run_from(program, 0, host, Rebinding::Here)? {
+        Ended::End(end) => end,
+        // A program that binds its own roots again hands no binding upward.
+        Ended::Rebind { .. } => End::Aborted(bug("interp: a root to bind again left its program")),
+    })
+}
+
+/// What a program does with a statement that came back with [`Ran::Rebind`] (module
+/// documentation of `interp`, "A statement bound again").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebinding {
+    /// It asks the host to bind again the root that holds the statement, and runs the rest
+    /// of that root from the new binding.
+    Here,
+    /// It runs the new binding of a root: the program that holds the root binds it again.
+    Above,
+    /// It holds a statement bound when the program reached it, which is not bound again:
+    /// the statement fails with the internal error.
+    Refused,
+}
+
+/// How [`run_from`] ended.
+enum Ended {
+    /// The run ended.
+    End(End),
+    /// The statement at position `at` came back with [`Ran::Rebind`], in a program run
+    /// with [`Rebinding::Above`].
+    Rebind {
+        /// Its position in the program.
+        at: usize,
+        /// Where it sits in the body.
+        site: Site,
+    },
+}
+
+/// A root of the program the host bound again, whose instructions run in place of the
+/// ones of `range`.
+struct Replacement {
+    /// The position, in the body, of the root.
+    root: usize,
+    /// The instructions of the root in the program.
+    range: Range<usize>,
+    /// The new binding of the root.
+    statement: Box<PhysicalStatement>,
+}
+
+/// Runs `program` from position `start`.
+fn run_from(
+    program: &Program<'_>,
+    start: usize,
+    host: &mut dyn Host,
+    rebinding: Rebinding,
+) -> SqlResult<Ended> {
+    let mut pc = start;
     let mut answer = ExecOutcome::NoRows;
-    while let Some(instr) = program.code.get(pc) {
+    let mut replaced: Vec<Replacement> = Vec::new();
+    loop {
+        if let Some(replacement) = replaced.iter().find(|r| r.range.contains(&pc)) {
+            let step = match run_replacement(program, replacement, pc, host)? {
+                Resumed::Step(step) => step,
+                Resumed::Rebind { at, site } => {
+                    rebind_root(program, &mut replaced, at, site, host)?
+                }
+            };
+            match step {
+                Step::Go(next) => pc = next,
+                Step::Stop(end) => return Ok(Ended::End(end)),
+            }
+            continue;
+        }
+        let Some(instr) = program.code.get(pc) else {
+            break;
+        };
         let step = match instr {
             Instr::Run {
                 stmt,
@@ -64,6 +136,16 @@ pub(crate) fn run(program: &Program<'_>, host: &mut dyn Host) -> SqlResult<End> 
                 match reached {
                     Reached::Ended(end) => Step::Stop(end),
                     Reached::Failed(err) => go_on_or_stop(err, Origin::Statement, pc + 1, host)?,
+                    Reached::Rebind => match rebinding {
+                        Rebinding::Here => rebind_root(program, &mut replaced, pc, *site, host)?,
+                        Rebinding::Above => {
+                            return Ok(Ended::Rebind {
+                                at: pc,
+                                site: *site,
+                            });
+                        }
+                        Rebinding::Refused => fail(gone_error(), pc + 1, *site, host)?,
+                    },
                     Reached::Outcome(outcome) => {
                         if *tail && matches!(outcome, ExecOutcome::Rows(_) | ExecOutcome::NoRows) {
                             answer = outcome.clone();
@@ -119,10 +201,133 @@ pub(crate) fn run(program: &Program<'_>, host: &mut dyn Host) -> SqlResult<End> 
         };
         match step {
             Step::Go(next) => pc = next,
-            Step::Stop(end) => return Ok(end),
+            Step::Stop(end) => return Ok(Ended::End(end)),
         }
     }
-    Ok(End::Completed(answer))
+    Ok(Ended::End(End::Completed(answer)))
+}
+
+/// What running the new binding of a root reached.
+enum Resumed {
+    /// The program counter goes on, or the run stops.
+    Step(Step),
+    /// A statement of it came back with [`Ran::Rebind`]: its position in the enclosing
+    /// program, and where it sits in the body.
+    Rebind { at: usize, site: Site },
+}
+
+/// Runs the new binding of a root from `pc`, a position inside the instructions it
+/// replaces, up to the end of those instructions or to a jump that leaves them.
+fn run_replacement(
+    program: &Program<'_>,
+    replacement: &Replacement,
+    pc: usize,
+    host: &mut dyn Host,
+) -> SqlResult<Resumed> {
+    let range = &replacement.range;
+    let site = Site {
+        root: replacement.root,
+        nested: true,
+    };
+    let roots = [Some(replacement.statement.as_ref())];
+    let sub = compile_roots(&roots, Labels::Open, false, Placement::Within(site.root))?;
+    let ended = run_from(&sub, pc - range.start, host, Rebinding::Above)?;
+    let last = range.end.saturating_sub(1);
+    Ok(Resumed::Step(match ended {
+        Ended::Rebind { at, site } => {
+            return Ok(Resumed::Rebind {
+                at: range.start + at,
+                site,
+            });
+        }
+        Ended::End(End::Completed(_)) => Step::Go(range.end),
+        // A `GOTO` to a label written outside the root: this program lands on it, or lets
+        // it leave as the instructions the root replaced would have.
+        Ended::End(End::Escaped(ExecOutcome::Goto(label))) => {
+            match program.labels.get(&label.to_ascii_lowercase()) {
+                Some(&target) => jump(last, target, host),
+                None => Step::Stop(End::Escaped(ExecOutcome::Goto(label))),
+            }
+        }
+        Ended::End(end) => Step::Stop(end),
+    }))
+}
+
+/// Asks the host to bind again the root that holds the statement at `pc`, which came back
+/// with [`Ran::Rebind`], and goes back to `pc` to run it from the new binding.
+///
+/// The new binding replaces the instructions of the root when it compiles to the same
+/// instructions, so that each position of the root keeps its statement: the statements
+/// of the root that ran are not run again. Otherwise, the statement fails with the
+/// internal error, as it does when the host cannot bind the root again.
+fn rebind_root(
+    program: &Program<'_>,
+    replaced: &mut Vec<Replacement>,
+    pc: usize,
+    site: Site,
+    host: &mut dyn Host,
+) -> SqlResult<Step> {
+    let statement = match host.rebind(site)? {
+        Ok(statement) => statement,
+        Err(err) => return go_on_or_stop(err, Origin::Statement, pc + 1, host),
+    };
+    let start = program
+        .code
+        .iter()
+        .position(|instr| site_of(instr).is_some_and(|at| at.root == site.root));
+    let range = start.and_then(|start| {
+        let roots = [Some(&statement)];
+        let sub = compile_roots(&roots, Labels::Open, false, Placement::Within(site.root)).ok()?;
+        let range = start..start + sub.code.len();
+        let old = program.code.get(range.clone())?;
+        same_shape(old, start, &sub.code).then_some(range)
+    });
+    match range {
+        Some(range) if range.contains(&pc) => {
+            replaced.retain(|replacement| replacement.range != range);
+            replaced.push(Replacement {
+                root: site.root,
+                range,
+                statement: Box::new(statement),
+            });
+            Ok(Step::Go(pc))
+        }
+        _ => fail(gone_error(), pc + 1, site, host),
+    }
+}
+
+/// Where the statement an instruction comes from sits in the body, `None` for a jump the
+/// control of flow implies.
+fn site_of(instr: &Instr<'_>) -> Option<Site> {
+    match instr {
+        Instr::Run { site, .. }
+        | Instr::Test { site, .. }
+        | Instr::Return { site, .. }
+        | Instr::Escape { site, .. } => Some(*site),
+        Instr::Jump { stated, .. } => *stated,
+    }
+}
+
+/// Whether `new`, a root compiled alone, holds the instructions `old` holds from position
+/// `start` of its program, its jumps counted from that position.
+fn same_shape(old: &[Instr<'_>], start: usize, new: &[Instr<'_>]) -> bool {
+    old.len() == new.len()
+        && old.iter().zip(new).all(|pair| match pair {
+            (Instr::Run { .. }, Instr::Run { .. })
+            | (Instr::Return { .. }, Instr::Return { .. })
+            | (Instr::Jump { .. } | Instr::Escape { .. }, Instr::Escape { .. }) => true,
+            (Instr::Test { otherwise: a, .. }, Instr::Test { otherwise: b, .. })
+            | (Instr::Jump { target: a, .. }, Instr::Jump { target: b, .. }) => {
+                a.checked_sub(start) == Some(*b)
+            }
+            _ => false,
+        })
+}
+
+/// The internal error of a statement whose tables went before it ran, and which is not
+/// bound again.
+pub(crate) fn gone_error() -> SqlError {
+    bug("a table this statement was bound against was altered or dropped before it ran")
 }
 
 /// What running one statement reached.
@@ -133,6 +338,8 @@ enum Reached {
     Failed(SqlError),
     /// A program the statement compiled at run time ended the run.
     Ended(End),
+    /// Nothing ran: a table the statement was bound against went first ([`Ran::Rebind`]).
+    Rebind,
 }
 
 /// Runs one statement that holds no other one through the host, or the program of a
@@ -147,22 +354,30 @@ fn run_statement(
         Ran::Failed(err) => Reached::Failed(err),
         Ran::Stopped(err) => Reached::Ended(stop(err, Origin::Ending, host)?),
         Ran::Reported(err) => Reached::Ended(stop(err, Origin::Reported, host)?),
-        Ran::Holds(statement) => run_held(&statement, site, host)?,
+        Ran::Holds(statement) => run_held(&statement, site, host, Rebinding::Here)?,
+        Ran::Rebind => Reached::Rebind,
     })
 }
 
 /// Runs `statement`, which holds others, as a program of its own whose jumps the
-/// enclosing program resolves.
-fn run_held(statement: &PhysicalStatement, site: Site, host: &mut dyn Host) -> SqlResult<Reached> {
+/// enclosing program resolves. `rebinding` is [`Rebinding::Here`] for a root the host bound
+/// when the program reached it, and [`Rebinding::Refused`] for a statement a root holds.
+fn run_held(
+    statement: &PhysicalStatement,
+    site: Site,
+    host: &mut dyn Host,
+    rebinding: Rebinding,
+) -> SqlResult<Reached> {
     let roots = [Some(statement)];
     let program = match compile_roots(&roots, Labels::Open, false, Placement::Within(site.root)) {
         Ok(program) => program,
         Err(err) => return Ok(Reached::Failed(host.locate(err, site))),
     };
-    Ok(match run(&program, host)? {
-        End::Completed(_) => Reached::Outcome(ExecOutcome::NoRows),
-        End::Escaped(outcome) => Reached::Outcome(outcome),
-        end => Reached::Ended(end),
+    Ok(match run_from(&program, 0, host, rebinding)? {
+        Ended::End(End::Completed(_)) => Reached::Outcome(ExecOutcome::NoRows),
+        Ended::End(End::Escaped(outcome)) => Reached::Outcome(outcome),
+        Ended::End(end) => Reached::Ended(end),
+        Ended::Rebind { .. } => Reached::Failed(host.locate(gone_error(), site)),
     })
 }
 
@@ -198,7 +413,7 @@ fn run_deferred(
         | PhysicalStatement::Break
         | PhysicalStatement::Continue
         | PhysicalStatement::Return(_)
-        | PhysicalStatement::Deferred(_) => run_held(&statement, held, host),
+        | PhysicalStatement::Deferred(_) => run_held(&statement, held, host, Rebinding::Refused),
         statement => run_statement(Some(&statement), held, host),
     }
 }

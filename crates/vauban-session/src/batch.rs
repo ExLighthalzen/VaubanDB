@@ -118,11 +118,13 @@
 //! the statement runs, until its end (`txn_session.rs`, "The schema a statement runs on"): a
 //! statement whose table another session dropped in between, or rebuilt by an
 //! `ALTER TABLE`, is bound again before it runs ([`BatchHost::run_bound`]). A statement
-//! held by an `IF`, a `WHILE` or a `BEGIN … END` is bound with the statement that holds it
-//! and is not bound alone: when one of its tables is gone by the time it runs, it fails
-//! with the internal error 50000 rather than run a plan written for that table
-//! (`tests/ddl_visibility.rs`,
-//! `a_held_statement_whose_table_went_fails_instead_of_writing_nowhere`).
+//! held by an `IF`, a `WHILE` or a `BEGIN … END` is bound with the statement written at the
+//! top level that holds it: when one of its tables is gone by the time it runs, that
+//! statement is bound again ([`BatchHost::rebind`]), and the program runs the held
+//! statement from the new binding without running again what ran before it
+//! (`vauban_executor::Host::rebind`; `tests/ddl_visibility.rs`,
+//! `a_held_statement_whose_table_was_rebuilt_is_bound_again`,
+//! `a_held_statement_whose_table_was_dropped_is_208`).
 //!
 //! # Where the column metadata of a statement goes out
 //!
@@ -642,6 +644,7 @@ impl Session {
                 batch_variables,
                 held_stamps,
                 rebinds: 0,
+                held_rebinds: 0,
                 went_by_this_body: Vec::new(),
                 outputs: Vec::new(),
                 refused_rowcount: None,
@@ -1347,6 +1350,9 @@ struct BatchHost<'h> {
     /// How many times in a row the running statement was sent back to be bound again
     /// ([`BatchHost::run_rebound`]).
     rebinds: u32,
+    /// How many times in a row a statement held by another one was sent back, its root
+    /// bound again ([`BatchHost::rebind`]).
+    held_rebinds: u32,
     /// The storage tables a `DROP TABLE` or an `ALTER TABLE` of this body dropped: a
     /// statement held by the same block was bound against them, and does not count them as
     /// gone ([`note_tables_this_body_dropped`]).
@@ -1531,6 +1537,43 @@ impl Host for BatchHost<'_> {
     fn xact_abort(&self) -> bool {
         self.session.state.options.xact_abort
     }
+
+    /// Binds the statement written at `site` again, as [`BatchHost::run_rebound`] does for
+    /// a statement written at the top level, and keeps what the new binding read for the
+    /// statements it holds. A root sent back [`MAX_REBINDS`] times in a row, with no held
+    /// statement run in between, fails with the internal error.
+    fn rebind(&mut self, site: Site) -> SqlResult<Result<PhysicalStatement, SqlError>> {
+        if self.held_rebinds >= MAX_REBINDS {
+            return Ok(Err(self.place(gone_before_it_ran(), site)));
+        }
+        let Some((padded, raw)) = self.root_source(site.root) else {
+            return Err(SqlError::from(InternalError::Bug(format!(
+                "rebind: the batch holds no statement {}",
+                site.root
+            ))));
+        };
+        self.held_rebinds += 1;
+        match self
+            .session
+            .bind_deferred(&padded, &raw, &self.batch_variables)
+        {
+            Ok(PreparedStatement::Bound { statement, stamp }) if compiled_in_place(&statement) => {
+                self.hold_stamp(site, &stamp);
+                Ok(Ok(statement))
+            }
+            Ok(_) => Ok(Err(self.place(gone_before_it_ran(), site))),
+            Err(err) if self.session.cancel.is_cancelled() => Err(err),
+            Err(err) => Ok(Err(self.place(err, site))),
+        }
+    }
+}
+
+/// The internal error of a statement whose table went before it ran, and which is not
+/// bound again.
+fn gone_before_it_ran() -> SqlError {
+    SqlError::from(InternalError::Bug(
+        "a table this statement was bound against was altered or dropped before it ran".to_owned(),
+    ))
 }
 
 impl BatchHost<'_> {
@@ -1751,33 +1794,41 @@ impl BatchHost<'_> {
     /// Binds again, against the catalogue of this moment, the statement written at `site`,
     /// whose tables another transaction altered or dropped after it was bound, then runs it.
     ///
-    /// `rebindable` is `false` for a statement held by another one, which is not bound
-    /// alone: it fails with the internal error 50000 instead of running a plan written for
-    /// a table that is no longer there (module documentation, "A binding waits for the
-    /// schema of what it names"). A statement sent back [`MAX_REBINDS`] times in a row fails
-    /// the same way.
+    /// `rebindable` is `false` for a statement that is not bound alone: it fails with the
+    /// internal error 50000 instead of running a plan written for a table that is no longer
+    /// there (module documentation, "A binding waits for the schema of what it names"). A
+    /// statement held by another one is not run here: the program binds its root again
+    /// ([`BatchHost::rebind`]). A statement sent back [`MAX_REBINDS`] times in a row fails
+    /// with the internal error too.
     fn run_rebound(&mut self, site: Site, rebindable: bool) -> SqlResult<Ran> {
-        let Some(original) = self.statements.get(site.root) else {
+        if site.nested {
+            return Ok(Ran::Rebind);
+        }
+        if !rebindable || self.rebinds >= MAX_REBINDS {
+            return Ok(Ran::Failed(gone_before_it_ran()));
+        }
+        let Some((padded, raw)) = self.root_source(site.root) else {
             return Err(SqlError::from(InternalError::Bug(format!(
                 "run_rebound: the batch holds no statement {}",
                 site.root
             ))));
         };
-        if site.nested || !rebindable || self.rebinds >= MAX_REBINDS {
-            return Ok(Ran::Failed(SqlError::from(InternalError::Bug(
-                "a table this statement was bound against was altered or dropped before it ran"
-                    .to_owned(),
-            ))));
-        }
-        let raw = statement_text(self.text, original);
-        let line = statement_line(original);
-        let source = statement_fragment(self.text, original, self.statements.get(site.root + 1));
-        let padded = format!("{}{}", "\n".repeat(line.saturating_sub(1) as usize), source);
         let variables = self.batch_variables.clone();
         self.rebinds += 1;
         let ran = self.run_deferred(&padded, &raw, &variables, site);
         self.rebinds -= 1;
         ran
+    }
+
+    /// The text of the statement written at the top level at `index`, put on its line by
+    /// the newlines before it, and as written.
+    fn root_source(&self, index: usize) -> Option<(String, String)> {
+        let original = self.statements.get(index)?;
+        let raw = statement_text(self.text, original);
+        let line = statement_line(original);
+        let source = statement_fragment(self.text, original, self.statements.get(index + 1));
+        let padded = format!("{}{}", "\n".repeat(line.saturating_sub(1) as usize), source);
+        Some((padded, raw))
     }
 
     /// Runs a bound `EXECUTE` written at the top level: what it answers is the call the
@@ -1842,7 +1893,10 @@ impl BatchHost<'_> {
             &mut adapter,
         );
         let result = match executed {
-            Executed::Ran(result) => result,
+            Executed::Ran(result) => {
+                self.held_rebinds = 0;
+                result
+            }
             Executed::Rebind => {
                 // Nothing ran: the transaction of the statement is closed as a failed one,
                 // which undoes nothing, and the statement is bound again.

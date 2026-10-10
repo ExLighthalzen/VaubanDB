@@ -731,3 +731,193 @@ fn a_raised_token_stops_a_loop_at_its_next_jump_backward() {
         assert_eq!(end, ProgramEnd::Cancelled, "{text}");
     }
 }
+
+/// A [`Host`] over one context that sends back the statements it is handed at the given
+/// turns ([`Ran::Rebind`]), and answers each [`Host::rebind`] with `binding`.
+struct Rebinding<'r, 'a> {
+    inner: SingleContext<'r, 'a>,
+    /// How many statements the host was handed so far.
+    handed: usize,
+    /// The turns, counted from 1, whose statement is sent back.
+    send_back: Vec<usize>,
+    /// What [`Host::rebind`] answers.
+    binding: Result<PhysicalStatement, SqlError>,
+    /// The sites [`Host::rebind`] was asked for.
+    rebound: Vec<Site>,
+}
+
+impl Host for Rebinding<'_, '_> {
+    fn statement(&mut self, stmt: Option<&PhysicalStatement>, site: Site) -> SqlResult<Ran> {
+        self.handed += 1;
+        if self.send_back.contains(&self.handed) {
+            return Ok(Ran::Rebind);
+        }
+        self.inner.statement(stmt, site)
+    }
+
+    fn condition(
+        &mut self,
+        site: Site,
+        evaluate: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<Value>,
+    ) -> SqlResult<Result<bool, SqlError>> {
+        self.inner.condition(site, evaluate)
+    }
+
+    fn within(
+        &mut self,
+        site: Site,
+        step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
+    ) -> SqlResult<()> {
+        self.inner.within(site, step)
+    }
+
+    fn locate(&self, err: SqlError, site: Site) -> SqlError {
+        self.inner.locate(err, site)
+    }
+
+    fn raise(&mut self, err: &SqlError, reach: ErrorScope) -> SqlResult<()> {
+        self.inner.raise(err, reach)
+    }
+
+    fn call(&mut self, call: Call, site: Site) -> SqlResult<Result<ProgramEnd, SqlError>> {
+        self.inner.call(call, site)
+    }
+
+    fn leave_call(&mut self, database: &str) -> SqlResult<()> {
+        self.inner.leave_call(database)
+    }
+
+    fn control(&mut self, site: Site) -> SqlResult<()> {
+        self.inner.control(site)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+
+    fn xact_abort(&self) -> bool {
+        self.inner.xact_abort()
+    }
+
+    fn rebind(&mut self, site: Site) -> SqlResult<Result<PhysicalStatement, SqlError>> {
+        self.rebound.push(site);
+        Ok(self.binding.clone())
+    }
+}
+
+/// Runs `text` through a [`Rebinding`] host that sends back the statements handed to it at
+/// the turns of `send_back` and binds their root again into `binding`; answers how the
+/// program ended, the sites bound again, the first column of each row and the numbers of
+/// the errors.
+fn rebinding(
+    text: &str,
+    send_back: &[usize],
+    binding: Result<PhysicalStatement, SqlError>,
+) -> (ProgramEnd, Vec<Site>, Vec<Value>, Vec<u32>) {
+    let statements = planned(text, None, None);
+    let program = Program::compile(&statements).expect("the program compiles");
+    let eval = StaticContext::default();
+    let mut session = ExecSession::default();
+    let mut sink = CollectSink::new();
+    let mut calls = Recorder::default();
+    let (end, rebound) = {
+        let mut ctx =
+            ExecContext::scalar(&eval, SessionOptions::default()).with_session(&mut session);
+        let mut host = Rebinding {
+            inner: SingleContext::new(&mut ctx, &mut sink, &mut calls),
+            handed: 0,
+            send_back: send_back.to_vec(),
+            binding,
+            rebound: Vec::new(),
+        };
+        let end = program
+            .run_hosted(&mut host)
+            .expect("the sink takes everything");
+        (end, host.rebound)
+    };
+    let numbers = sink.errors().iter().map(|error| error.number).collect();
+    (end, rebound, first_column(&sink), numbers)
+}
+
+/// The second statement, `0`-based, of `text` once planned: the root a test binds again,
+/// after the `DECLARE` that gives its variable a type.
+fn second_root(text: &str) -> PhysicalStatement {
+    planned(text, None, None).swap_remove(1)
+}
+
+/// A statement of the second turn of a loop sent back runs from the new binding of the
+/// loop: the first turn and the statement before it in the second turn are not run again,
+/// and the loop ends on the condition of the new binding.
+#[test]
+fn a_statement_bound_again_runs_from_its_new_binding() {
+    let binding = second_root(
+        "DECLARE @i int; WHILE @i < 2 BEGIN SELECT @i; SELECT 100 + @i; SET @i = @i + 1; END;",
+    );
+    let (end, rebound, rows, errors) = rebinding(
+        "DECLARE @i int = 0; WHILE @i < 2 BEGIN SELECT @i; SELECT 10 + @i; SET @i = @i + 1; END; \
+         SELECT 9;",
+        &[6],
+        Ok(binding),
+    );
+    assert_eq!(end, ProgramEnd::Completed);
+    assert_eq!(
+        rebound,
+        vec![Site {
+            root: 1,
+            nested: true
+        }]
+    );
+    assert_eq!(
+        rows,
+        vec![
+            Value::I32(0),
+            Value::I32(10),
+            Value::I32(1),
+            Value::I32(101),
+            Value::I32(9)
+        ]
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// A `GOTO` that jumps back into a root bound again runs the new binding from the label.
+#[test]
+fn a_jump_back_into_a_root_bound_again_lands_in_its_new_binding() {
+    let binding =
+        second_root("DECLARE @i int; IF 1 = 1 BEGIN SELECT 100 + @i; SET @i = @i + 1; END;");
+    let (end, rebound, rows, errors) = rebinding(
+        "DECLARE @i int = 0; again: IF 1 = 1 BEGIN SELECT 10 + @i; SET @i = @i + 1; END; \
+         IF @i < 2 GOTO again; SELECT 9;",
+        &[3],
+        Ok(binding),
+    );
+    assert_eq!(end, ProgramEnd::Completed);
+    assert_eq!(rebound.len(), 1);
+    assert_eq!(rows, vec![Value::I32(10), Value::I32(101), Value::I32(9)]);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// The error of the new binding is the error of the statement sent back: 208 ends the
+/// level, after the statements that ran; an error of statement scope lets the program go
+/// on past it. A new binding of another shape is the internal error.
+#[test]
+fn an_error_of_the_new_binding_is_the_error_of_the_statement() {
+    let text = "SELECT 1; IF 1 = 1 BEGIN SELECT 2; SELECT 3; END; SELECT 4;";
+    let (end, _, rows, errors) = rebinding(text, &[3], Err(SqlError::invalid_object_name("t")));
+    assert!(
+        matches!(&end, ProgramEnd::LevelAborted(err) if err.number == 208),
+        "{end:?}"
+    );
+    assert_eq!(rows, vec![Value::I32(1), Value::I32(2)]);
+    assert_eq!(errors, vec![208]);
+
+    let (end, _, rows, errors) = rebinding(text, &[3], Err(SqlError::divide_by_zero()));
+    assert_eq!(end, ProgramEnd::Completed);
+    assert_eq!(rows, vec![Value::I32(1), Value::I32(2), Value::I32(4)]);
+    assert_eq!(errors, vec![8134]);
+
+    let other_shape = planned("SELECT 5;", None, None).swap_remove(0);
+    let (_, _, rows, errors) = rebinding(text, &[3], Ok(other_shape));
+    assert!(!rows.contains(&Value::I32(5)), "{rows:?}");
+    assert_eq!(errors, vec![50000]);
+}
