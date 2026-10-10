@@ -119,6 +119,31 @@ struct ConstraintAlterSession {
     tables: BTreeMap<ObjectId, TableAlterState>,
     rollback_marker: TableId,
     commit_marker: TableId,
+    /// One entry per `ADD` or `DROP CONSTRAINT` of the transaction, in statement order.
+    steps: Vec<AlterStep>,
+}
+
+/// What one in-place `ADD` or `DROP CONSTRAINT` changed, to undo it when a
+/// `ROLLBACK TRANSACTION` to a savepoint taken before it runs.
+///
+/// `marker` is a storage table created for the step, dropped by the compensation the
+/// transaction manager runs on a rollback to an earlier savepoint, and by the `COMMIT` or
+/// the `ROLLBACK` of the transaction: a marker gone while its transaction is still open is
+/// a step a savepoint has undone ([`undo_steps_a_savepoint_undid`]; `tests/constraints.rs`,
+/// `a_savepoint_rollback_undoes_an_added_constraint`).
+#[derive(Debug, Clone)]
+struct AlterStep {
+    marker: TableId,
+    table: ObjectId,
+    /// Whether the step opened the [`TableAlterState`] of `table`.
+    opened_table: bool,
+    meta_before: TableMeta,
+    added_ids_before: Vec<ObjectId>,
+    removed_before: Vec<(ObjectMeta, ConstraintMeta)>,
+    /// The constraint objects the step put into [`ConstraintStore::entries`].
+    inserted: Vec<ObjectId>,
+    /// The constraint objects the step took out of [`ConstraintStore::entries`].
+    taken_out: Vec<ObjectMeta>,
 }
 
 #[derive(Debug, Default)]
@@ -542,10 +567,11 @@ pub(crate) fn add_table_constraint(
     constraint: &ConstraintDef,
 ) -> SqlResult<()> {
     refresh_sessions(catalog, store)?;
-    begin_constraint_session(catalog, txn, store, table)?;
+    let opened_table = begin_constraint_session(catalog, txn, store, table)?;
     let before = store.get(table).cloned().ok_or_else(|| {
         InternalError::Bug(format!("Catalog::alter_table: table {table} vanished"))
     })?;
+    let mut step = begin_step(catalog, txn, store, table, opened_table, &before)?;
     let mut meta = before.clone();
     let count = meta.constraints.len();
     apply_table_constraints(
@@ -559,10 +585,12 @@ pub(crate) fn add_table_constraint(
         .skip(count)
         .filter_map(constraint_object_id)
         .collect();
-    if let Some(session) = store.constraints.alter_sessions.get_mut(&txn.id)
-        && let Some(state) = session.tables.get_mut(&table)
-    {
-        state.added_ids.extend(added);
+    step.inserted.clone_from(&added);
+    if let Some(session) = store.constraints.alter_sessions.get_mut(&txn.id) {
+        if let Some(state) = session.tables.get_mut(&table) {
+            state.added_ids.extend(added);
+        }
+        session.steps.push(step);
     }
     store
         .entries
@@ -591,7 +619,7 @@ pub(crate) fn drop_table_constraint(
     name: &str,
 ) -> SqlResult<()> {
     refresh_sessions(catalog, store)?;
-    begin_constraint_session(catalog, txn, store, table)?;
+    let opened_table = begin_constraint_session(catalog, txn, store, table)?;
     let Some(before) = store.get(table).cloned() else {
         return Err(
             InternalError::Bug(format!("Catalog::alter_table: table {table} vanished")).into(),
@@ -600,6 +628,7 @@ pub(crate) fn drop_table_constraint(
     let Some(object_id) = constraint_id_on_table(store, &before, name) else {
         return Err(SqlError::constraint_not_on_table(name));
     };
+    let mut step = begin_step(catalog, txn, store, table, opened_table, &before)?;
     let Some(object) = store.constraints.entries.remove(&object_id) else {
         return Err(SqlError::constraint_not_on_table(name));
     };
@@ -619,14 +648,16 @@ pub(crate) fn drop_table_constraint(
     {
         column.default = None;
     }
-    if let Some(session) = store.constraints.alter_sessions.get_mut(&txn.id)
-        && let Some(state) = session.tables.get_mut(&table)
-    {
-        if state.added_ids.contains(&object_id) {
-            state.added_ids.retain(|id| *id != object_id);
-        } else {
-            state.removed.push((object, constraint));
+    step.taken_out.push(object.clone());
+    if let Some(session) = store.constraints.alter_sessions.get_mut(&txn.id) {
+        if let Some(state) = session.tables.get_mut(&table) {
+            if state.added_ids.contains(&object_id) {
+                state.added_ids.retain(|id| *id != object_id);
+            } else {
+                state.removed.push((object, constraint));
+            }
         }
+        session.steps.push(step);
     }
     store
         .entries
@@ -650,6 +681,7 @@ pub(crate) fn refresh_sessions(catalog: &Catalog, store: &mut TableStore) -> Sql
         .into_iter()
         .map(|info| info.id)
         .collect();
+    undo_steps_a_savepoint_undid(catalog, store, &live, &open)?;
     let mut rollbacks = Vec::new();
     let mut restores = Vec::new();
     let mut finished = Vec::new();
@@ -684,6 +716,123 @@ pub(crate) fn refresh_sessions(catalog: &Catalog, store: &mut TableStore) -> Sql
     Ok(())
 }
 
+/// Undoes, for each open transaction, the steps whose marker a `ROLLBACK TRANSACTION` to a
+/// savepoint has dropped, last step first, and forgets a session whose own markers that
+/// rollback has undone.
+///
+/// `live` is read before `open`, as [`refresh_sessions`] does: the transaction manager closes
+/// a transaction under the lock `active_sessions` takes, so a transaction found open in
+/// `open` had not run its `COMMIT` or its `ROLLBACK` when `live` was read, and a marker
+/// missing from `live` was dropped by a savepoint (`tests/constraints.rs`,
+/// `a_savepoint_rollback_undoes_an_added_constraint`,
+/// `a_constraint_added_after_an_undone_session_survives_the_commit`).
+fn undo_steps_a_savepoint_undid(
+    catalog: &Catalog,
+    store: &mut TableStore,
+    live: &BTreeSet<TableId>,
+    open: &BTreeSet<TxnId>,
+) -> SqlResult<()> {
+    let owners: Vec<TxnId> = store
+        .constraints
+        .alter_sessions
+        .keys()
+        .copied()
+        .filter(|txn| open.contains(txn))
+        .collect();
+    for owner in owners {
+        let mut undone = Vec::new();
+        if let Some(session) = store.constraints.alter_sessions.get_mut(&owner) {
+            while let Some(step) = session.steps.pop_if(|step| !live.contains(&step.marker)) {
+                undone.push(step);
+            }
+        }
+        for step in &undone {
+            undo_step(store, owner, step);
+        }
+        let orphaned = store
+            .constraints
+            .alter_sessions
+            .get(&owner)
+            .filter(|session| !live.contains(&session.rollback_marker))
+            .map(|session| session.commit_marker);
+        if let Some(commit_marker) = orphaned {
+            // The savepoint predates the session: its markers were registered after it, so
+            // the rollback dropped the first one and forgot the deferred drop of the second.
+            store.constraints.alter_sessions.remove(&owner);
+            if live.contains(&commit_marker) {
+                catalog.storage.drop_table(commit_marker)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Puts the store back as it stood before `step`, a step of the transaction `owner`.
+fn undo_step(store: &mut TableStore, owner: TxnId, step: &AlterStep) {
+    for id in &step.inserted {
+        store.constraints.entries.remove(id);
+    }
+    for object in &step.taken_out {
+        store.constraints.entries.insert(object.id, object.clone());
+    }
+    if let Some(entry) = store.entries.get_mut(&step.table) {
+        entry.meta = step.meta_before.clone();
+    }
+    let Some(session) = store.constraints.alter_sessions.get_mut(&owner) else {
+        return;
+    };
+    if step.opened_table {
+        session.tables.remove(&step.table);
+    } else if let Some(state) = session.tables.get_mut(&step.table) {
+        state.added_ids.clone_from(&step.added_ids_before);
+        state.removed.clone_from(&step.removed_before);
+    }
+}
+
+/// Creates the marker of one step and registers its drop on a rollback, to a savepoint or
+/// of the transaction, and on the commit.
+fn begin_step(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    store: &TableStore,
+    table: ObjectId,
+    opened_table: bool,
+    before: &TableMeta,
+) -> SqlResult<AlterStep> {
+    let marker = catalog
+        .storage
+        .create_table(before.database, &marker_table_shape())?;
+    if let Err(err) = catalog
+        .txn
+        .register_on_rollback(txn, RollbackAction::DropTable(marker))
+    {
+        catalog.storage.drop_table(marker)?;
+        return Err(err);
+    }
+    // A rollback to an earlier savepoint forgets this deferred drop and runs the
+    // compensation above; a commit runs this one.
+    catalog
+        .txn
+        .register_on_commit(txn, CommitAction::DropTable(marker))?;
+    let state = store
+        .constraints
+        .alter_sessions
+        .get(&txn.id)
+        .and_then(|session| session.tables.get(&table));
+    Ok(AlterStep {
+        marker,
+        table,
+        opened_table,
+        meta_before: before.clone(),
+        added_ids_before: state
+            .map(|state| state.added_ids.clone())
+            .unwrap_or_default(),
+        removed_before: state.map(|state| state.removed.clone()).unwrap_or_default(),
+        inserted: Vec::new(),
+        taken_out: Vec::new(),
+    })
+}
+
 fn restore_table_alter(store: &mut TableStore, table: ObjectId, state: &TableAlterState) {
     for added in &state.added_ids {
         store.constraints.entries.remove(added);
@@ -696,18 +845,23 @@ fn restore_table_alter(store: &mut TableStore, table: ObjectId, state: &TableAlt
     }
 }
 
+/// Opens the alter session of `txn` and the undo state of `table` in it, and answers
+/// whether this call opened that undo state.
 fn begin_constraint_session(
     catalog: &Catalog,
     txn: &TxnHandle,
     store: &mut TableStore,
     table: ObjectId,
-) -> SqlResult<()> {
+) -> SqlResult<bool> {
     if store.constraints.alter_sessions.contains_key(&txn.id) {
-        if !store
+        if store
             .constraints
             .alter_sessions
             .get(&txn.id)
             .is_some_and(|session| session.tables.contains_key(&table))
+        {
+            return Ok(false);
+        }
         {
             let meta = store.get(table).cloned().ok_or_else(|| {
                 InternalError::Bug(format!(
@@ -722,7 +876,7 @@ fn begin_constraint_session(
                 .tables
                 .insert(table, table_alter_state(meta));
         }
-        return Ok(());
+        return Ok(true);
     }
     let meta = store.get(table).cloned().ok_or_else(|| {
         InternalError::Bug(format!(
@@ -765,9 +919,10 @@ fn begin_constraint_session(
             tables,
             rollback_marker,
             commit_marker,
+            steps: Vec::new(),
         },
     );
-    Ok(())
+    Ok(true)
 }
 
 fn table_alter_state(meta: TableMeta) -> TableAlterState {

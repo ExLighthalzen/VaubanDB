@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use vauban_catalog::{
-    Catalog, ColumnDef, ConstraintDef, ConstraintMeta, ObjectId, ObjectKind, QualifiedName,
-    SortedColumn, TableDef, TableMeta,
+    AlterTable, Catalog, ColumnDef, ConstraintDef, ConstraintMeta, ObjectId, ObjectKind,
+    QualifiedName, SortedColumn, TableDef, TableMeta,
 };
 use vauban_parser::{Expr, Literal, RefAction, Span};
 use vauban_storage::{DbId, MemoryStorage, Storage};
@@ -879,4 +879,321 @@ fn a_constraint_named_like_its_own_table_is_2714() {
             ),
         )
         .expect("a name of its own");
+}
+
+/// The constraint `ck`, `fk` or `df` of `master.dbo.t (a int)`, the kind given by `kind`:
+/// a `CHECK`, a `FOREIGN KEY` on `a` pointing at `p (id)`, a `DEFAULT` on `a`.
+fn named_constraint(kind: &str) -> ConstraintDef {
+    match kind {
+        "ck" => ConstraintDef::Check {
+            name: Some("ck".to_owned()),
+            expr: integer("1"),
+        },
+        "fk" => foreign_key(Some("fk"), &["a"], "p", &["id"]),
+        _ => ConstraintDef::Default {
+            name: Some("df".to_owned()),
+            column: "a".to_owned(),
+            expr: integer("0"),
+        },
+    }
+}
+
+/// `ALTER TABLE t ADD CONSTRAINT <constraint>` in `handle`.
+fn add_constraint(
+    catalog: &Catalog,
+    handle: &TxnHandle,
+    table: ObjectId,
+    constraint: ConstraintDef,
+) -> vauban_errors::SqlResult<TableMeta> {
+    catalog.alter_table(
+        handle,
+        table,
+        &AlterTable::AddConstraint {
+            constraint: Box::new(constraint),
+        },
+    )
+}
+
+/// `ALTER TABLE t DROP CONSTRAINT <name>` in `handle`.
+fn drop_constraint(
+    catalog: &Catalog,
+    handle: &TxnHandle,
+    table: ObjectId,
+    name: &str,
+) -> vauban_errors::SqlResult<TableMeta> {
+    catalog.alter_table(
+        handle,
+        table,
+        &AlterTable::DropConstraint {
+            name: name.to_owned(),
+        },
+    )
+}
+
+/// The names of the constraint objects of `table`, and the number of `FOREIGN KEY`,
+/// `CHECK` and `DEFAULT` entries the snapshot of `handle` gives the table.
+fn constraint_state(
+    catalog: &Catalog,
+    handle: &TxnHandle,
+    table: ObjectId,
+) -> (Vec<String>, usize) {
+    let names = catalog
+        .constraints_of(table)
+        .expect("constraints_of")
+        .into_iter()
+        .map(|object| object.name.name)
+        .collect();
+    let snapshot = catalog.snapshot(handle);
+    let held = snapshot
+        .table(table)
+        .expect("the table is in the snapshot")
+        .constraints
+        .iter()
+        .filter(|constraint| {
+            !matches!(
+                constraint,
+                ConstraintMeta::PrimaryKey(_) | ConstraintMeta::Unique(_)
+            )
+        })
+        .count();
+    (names, held)
+}
+
+/// `p (id PRIMARY KEY, code)` and `t (a)`, both committed, `t` carrying `constraints`.
+fn parent_and_child(
+    catalog: &Catalog,
+    txn: &Arc<TransactionManager>,
+    constraints: Vec<ConstraintDef>,
+) -> TableMeta {
+    parent(catalog, txn, "p");
+    let handle = begin(txn);
+    let child = catalog
+        .create_table(&handle, &table("t", &["a"], constraints))
+        .expect("the child table");
+    txn.commit(handle).expect("commit");
+    child
+}
+
+/// `SAVE TRANSACTION s; ALTER TABLE t ADD CONSTRAINT …; ROLLBACK TRANSACTION s;` takes the
+/// constraint off the table and frees its name, for a `CHECK`, a `FOREIGN KEY` and a
+/// `DEFAULT`; the same `ADD` then succeeds and survives the `COMMIT`.
+#[test]
+fn a_savepoint_rollback_undoes_an_added_constraint() {
+    for kind in ["ck", "fk", "df"] {
+        let (catalog, storage, txn) = instance();
+        let child = parent_and_child(&catalog, &txn, Vec::new());
+        let parent_id = catalog
+            .resolve_constraint(master(&storage), "dbo", "p")
+            .expect("resolve");
+        assert!(parent_id.is_none(), "p is a table, not a constraint");
+
+        let handle = begin(&txn);
+        let mark = txn.savepoint(&handle).expect("SAVE TRANSACTION s");
+        add_constraint(&catalog, &handle, child.id, named_constraint(kind))
+            .unwrap_or_else(|err| panic!("{kind}: {err:?}"));
+        assert_eq!(
+            constraint_state(&catalog, &handle, child.id),
+            (vec![kind.to_owned()], 1),
+            "{kind} after the ADD"
+        );
+        txn.rollback_to(&handle, mark)
+            .expect("ROLLBACK TRANSACTION s");
+        assert_eq!(
+            constraint_state(&catalog, &handle, child.id),
+            (Vec::new(), 0),
+            "{kind} after ROLLBACK TRANSACTION s"
+        );
+        assert!(
+            catalog
+                .resolve_constraint(master(&storage), "dbo", kind)
+                .expect("resolve")
+                .is_none(),
+            "{kind} name freed"
+        );
+        let p = catalog
+            .snapshot(&handle)
+            .resolve_object("master", Some("dbo"), "p", "dbo")
+            .map(|object| object.id)
+            .expect("p");
+        assert!(
+            catalog
+                .referencing_foreign_keys(p)
+                .expect("referencing_foreign_keys")
+                .is_empty(),
+            "{kind}: no foreign key points at p"
+        );
+        if kind == "df" {
+            let snapshot = catalog.snapshot(&handle);
+            let meta = snapshot.table(child.id).expect("t");
+            assert!(meta.columns[0].default.is_none(), "df left the column");
+        }
+
+        add_constraint(&catalog, &handle, child.id, named_constraint(kind))
+            .unwrap_or_else(|err| panic!("{kind} again: {err:?}"));
+        txn.commit(handle).expect("commit");
+        let reader = begin(&txn);
+        assert_eq!(
+            constraint_state(&catalog, &reader, child.id),
+            (vec![kind.to_owned()], 1),
+            "{kind} after the COMMIT"
+        );
+        txn.commit(reader).expect("commit the reader");
+    }
+}
+
+/// `SAVE TRANSACTION s; ALTER TABLE t DROP CONSTRAINT …; ROLLBACK TRANSACTION s;` gives the
+/// constraint back under its object id, for a `CHECK`, a `FOREIGN KEY` and a `DEFAULT`; the
+/// same `DROP` then succeeds and survives the `COMMIT`.
+#[test]
+fn a_savepoint_rollback_gives_a_dropped_constraint_back() {
+    for kind in ["ck", "fk", "df"] {
+        let (catalog, storage, txn) = instance();
+        let child = parent_and_child(&catalog, &txn, vec![named_constraint(kind)]);
+        let before = catalog
+            .resolve_constraint(master(&storage), "dbo", kind)
+            .expect("resolve")
+            .expect("the constraint");
+
+        let handle = begin(&txn);
+        let mark = txn.savepoint(&handle).expect("SAVE TRANSACTION s");
+        drop_constraint(&catalog, &handle, child.id, kind)
+            .unwrap_or_else(|err| panic!("{kind}: {err:?}"));
+        assert_eq!(
+            constraint_state(&catalog, &handle, child.id),
+            (Vec::new(), 0)
+        );
+        txn.rollback_to(&handle, mark)
+            .expect("ROLLBACK TRANSACTION s");
+        assert_eq!(
+            constraint_state(&catalog, &handle, child.id),
+            (vec![kind.to_owned()], 1),
+            "{kind} after ROLLBACK TRANSACTION s"
+        );
+        assert_eq!(
+            catalog
+                .resolve_constraint(master(&storage), "dbo", kind)
+                .expect("resolve"),
+            Some(before.clone()),
+            "{kind} keeps its object"
+        );
+        if kind == "df" {
+            let snapshot = catalog.snapshot(&handle);
+            let meta = snapshot.table(child.id).expect("t");
+            assert!(meta.columns[0].default.is_some(), "df back on the column");
+        }
+
+        drop_constraint(&catalog, &handle, child.id, kind)
+            .unwrap_or_else(|err| panic!("{kind} again: {err:?}"));
+        txn.commit(handle).expect("commit");
+        let reader = begin(&txn);
+        assert_eq!(
+            constraint_state(&catalog, &reader, child.id),
+            (Vec::new(), 0),
+            "{kind} after the COMMIT"
+        );
+        txn.commit(reader).expect("commit the reader");
+    }
+}
+
+/// A constraint added after a `ROLLBACK TRANSACTION s` that undid the first `ADD` of the
+/// transaction stays after the `COMMIT`, and one added before the savepoint stays while
+/// the later `ADD` and `DROP` are undone; a full `ROLLBACK` then takes everything back.
+#[test]
+fn a_constraint_added_after_an_undone_session_survives_the_commit() {
+    let (catalog, _storage, txn) = instance();
+    let child = parent_and_child(&catalog, &txn, Vec::new());
+    let check = |name: &str| ConstraintDef::Check {
+        name: Some(name.to_owned()),
+        expr: integer("1"),
+    };
+
+    let handle = begin(&txn);
+    let mark = txn.savepoint(&handle).expect("SAVE TRANSACTION s");
+    add_constraint(&catalog, &handle, child.id, check("ck1")).expect("ck1");
+    txn.rollback_to(&handle, mark)
+        .expect("ROLLBACK TRANSACTION s");
+    add_constraint(&catalog, &handle, child.id, check("ck2")).expect("ck2");
+    txn.commit(handle).expect("commit");
+    let reader = begin(&txn);
+    assert_eq!(
+        constraint_state(&catalog, &reader, child.id),
+        (vec!["ck2".to_owned()], 1)
+    );
+    txn.commit(reader).expect("commit the reader");
+
+    for commit in [true, false] {
+        let handle = begin(&txn);
+        add_constraint(&catalog, &handle, child.id, check("ck3")).expect("ck3");
+        let mark = txn.savepoint(&handle).expect("SAVE TRANSACTION s");
+        add_constraint(&catalog, &handle, child.id, check("ck4")).expect("ck4");
+        drop_constraint(&catalog, &handle, child.id, "ck3").expect("drop ck3");
+        drop_constraint(&catalog, &handle, child.id, "ck2").expect("drop ck2");
+        txn.rollback_to(&handle, mark)
+            .expect("ROLLBACK TRANSACTION s");
+        assert_eq!(
+            constraint_state(&catalog, &handle, child.id),
+            (vec!["ck2".to_owned(), "ck3".to_owned()], 2),
+            "inside the transaction"
+        );
+        if commit {
+            txn.commit(handle).expect("commit");
+        } else {
+            txn.rollback(handle).expect("rollback");
+        }
+        let reader = begin(&txn);
+        let expected: Vec<String> = if commit {
+            vec!["ck2".to_owned(), "ck3".to_owned()]
+        } else {
+            vec!["ck2".to_owned()]
+        };
+        let held = expected.len();
+        assert_eq!(
+            constraint_state(&catalog, &reader, child.id),
+            (expected, held),
+            "commit {commit}"
+        );
+        txn.commit(reader).expect("commit the reader");
+        if commit {
+            let handle = begin(&txn);
+            drop_constraint(&catalog, &handle, child.id, "ck3").expect("drop ck3");
+            txn.commit(handle).expect("commit the drop");
+        }
+    }
+}
+
+/// `ALTER TABLE t ADD CONSTRAINT uq UNIQUE (a)` undone by `ROLLBACK TRANSACTION s` leaves no
+/// index named `uq`, and the same `ADD` then succeeds.
+#[test]
+fn a_savepoint_rollback_undoes_an_added_unique() {
+    let (catalog, _storage, txn) = instance();
+    let child = parent_and_child(&catalog, &txn, Vec::new());
+    let unique = || ConstraintDef::Unique {
+        name: Some("uq".to_owned()),
+        columns: vec![SortedColumn {
+            column: "a".to_owned(),
+            descending: false,
+        }],
+        clustered: false,
+    };
+    let index_names = |handle: &TxnHandle| -> Vec<String> {
+        catalog
+            .snapshot(handle)
+            .indexes_of(child.id)
+            .iter()
+            .map(|index| index.name.clone())
+            .collect()
+    };
+
+    let handle = begin(&txn);
+    let mark = txn.savepoint(&handle).expect("SAVE TRANSACTION s");
+    add_constraint(&catalog, &handle, child.id, unique()).expect("uq");
+    assert_eq!(index_names(&handle), vec!["uq".to_owned()]);
+    txn.rollback_to(&handle, mark)
+        .expect("ROLLBACK TRANSACTION s");
+    assert!(index_names(&handle).is_empty());
+    add_constraint(&catalog, &handle, child.id, unique()).expect("uq again");
+    txn.commit(handle).expect("commit");
+    let reader = begin(&txn);
+    assert_eq!(index_names(&reader), vec!["uq".to_owned()]);
+    txn.commit(reader).expect("commit the reader");
 }
