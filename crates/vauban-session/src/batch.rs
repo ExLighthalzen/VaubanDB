@@ -24,8 +24,8 @@
 //! statement on each error, and runs each call, `EXEC` of a procedure or of a dynamic text,
 //! where it is written, so an `EXEC` in the body of a `WHILE` runs once per turn
 //! (`tests/run_batch_pipeline.rs`, `a_loop_runs_its_dynamic_text_on_each_turn`). A batch
-//! that holds an `ALTER TABLE` is bound one statement at a time, when the program reaches
-//! each ([`bind_limit_for`]).
+//! that holds an `ALTER TABLE`, a `DROP TABLE`, a `DROP INDEX`, a `ROLLBACK` or an `EXECUTE`
+//! is bound one statement at a time, when the program reaches each ([`bind_limit_for`]).
 //!
 //! Whether a DONE carries `MORE` depends on what follows it in the response, which a jump
 //! decides: the DONE is held back until the next token, and the last one goes out without
@@ -228,6 +228,25 @@ const DEFERRED_UNTIL_EXECUTION: [u32; 3] = [
     ALTER_TABLE_MISSING_TABLE,
 ];
 
+/// The errors a batch defers when a name it creates is **taken** rather than missing: an
+/// earlier statement of the batch may drop what holds it, the shape of a migration script
+/// that writes `IF OBJECT_ID('t') IS NOT NULL DROP TABLE t; CREATE TABLE t (…);`
+/// (`tests/recreate_in_one_batch.rs`). Each entry is a number and the state that picks it
+/// out: 2714 state 6 for a `CREATE TABLE` or a `SELECT … INTO`, 2714 state 5 for an
+/// `ADD CONSTRAINT`, 2705 state 4 for an `ALTER TABLE … ADD` of a column the table has.
+/// Under state 3, 2705 is a column list that writes one name twice, a fault of the text that
+/// stays a compilation error. The same entries are deferred in a branch by the binder.
+const DEFERRED_WHEN_TAKEN: [(u32, u8); 3] = [(2714, 6), (2714, 5), (2705, 4)];
+
+/// Whether `error`, answered while the batch is bound, waits for the statement to be
+/// reached ([`DEFERRED_UNTIL_EXECUTION`], [`DEFERRED_WHEN_TAKEN`]).
+fn deferred_until_execution(error: &SqlError) -> bool {
+    DEFERRED_UNTIL_EXECUTION.contains(&error.number)
+        || DEFERRED_WHEN_TAKEN
+            .iter()
+            .any(|&(number, state)| error.number == number && error.state == state)
+}
+
 /// The state and the execution of one connection after its login.
 pub struct Session {
     state: SessionState,
@@ -292,7 +311,7 @@ enum PreparedStatement {
     },
     /// A bound `EXECUTE`, evaluated at run time without going through the planner.
     Execute { stmt: BoundExecute, line: u32 },
-    /// A statement whose binding answered one of [`DEFERRED_UNTIL_EXECUTION`] while the
+    /// A statement whose binding answered one of [`deferred_until_execution`] while the
     /// batch was prepared: the table it names may be created by a statement before it, in
     /// this batch or in a nested one, so it is bound, planned and compile-checked again
     /// when the program reaches it, against the catalogue of that moment
@@ -310,7 +329,7 @@ enum PreparedStatement {
 
 /// What the batch holds at one position of its text.
 enum Slot {
-    /// Not bound yet: a batch that holds an `ALTER TABLE` binds each statement when the
+    /// Not bound yet: a batch that moves the catalogue binds each statement when the
     /// program reaches it ([`bind_limit_for`]).
     Unbound,
     /// Bound, planned and checked, run by the host when the program reaches it.
@@ -425,10 +444,23 @@ impl Session {
             return self.fail_body(err, level, track, sink);
         }
         let prepared = if bind_limit_for(statements).is_some() {
-            declared_parameters(params).map(|variables| {
-                let slots = statements.iter().map(|_| Slot::Unbound).collect();
-                (slots, self.state.clone(), variables)
-            })
+            // Without an `ALTER TABLE` at the top level, the whole batch is bound once
+            // against the catalogue it starts from, so that a compilation error still stops
+            // it before its first statement runs, and the result is set aside: each
+            // statement is bound again when the program reaches it
+            // (`tests/recreate_in_one_batch.rs`,
+            // `a_compilation_error_after_a_drop_still_stops_the_batch_before_the_drop`).
+            let checked = if batch_has_alter_table(statements) {
+                Ok(())
+            } else {
+                self.prepare_batch(text, statements, params).map(|_| ())
+            };
+            checked
+                .and_then(|()| declared_parameters(params))
+                .map(|variables| {
+                    let slots = statements.iter().map(|_| Slot::Unbound).collect();
+                    (slots, self.state.clone(), variables)
+                })
         } else {
             self.prepare_batch(text, statements, params)
                 .map(|(prepared, state, variables)| {
@@ -616,7 +648,7 @@ impl Session {
         }
     }
 
-    /// Binds the statements of a batch that holds an `ALTER TABLE` from the first of
+    /// Binds the statements of a batch that moves the catalogue from the first of
     /// `statements`, against the catalogue of this moment, up to the first one that is not
     /// a `SET` ([`bind_limit_for`]).
     fn reprepare_tail(
@@ -662,24 +694,24 @@ impl Session {
             let padded = format!("{}{}", "\n".repeat(line.saturating_sub(1) as usize), source);
             let one = match self.bind_one(&padded, raw, snapshot, state, batch_variables) {
                 Ok(one) => one,
-                // A table the catalogue does not hold yet is not a compilation error: the
-                // statement is kept as text and bound when the program reaches it.
-                Err(error) if DEFERRED_UNTIL_EXECUTION.contains(&error.number) => {
-                    PreparedStatement::Deferred {
-                        padded,
-                        raw: statement_text(text, original),
-                        variables: batch_variables.clone(),
-                    }
-                }
+                // A table the catalogue does not hold yet, or a name an earlier statement
+                // may free, is not a compilation error: the statement is kept as text and
+                // bound when the program reaches it.
+                Err(error) if deferred_until_execution(&error) => PreparedStatement::Deferred {
+                    padded,
+                    raw: statement_text(text, original),
+                    variables: batch_variables.clone(),
+                },
                 Err(error) => return Err(error),
             };
             // A `SET` binds with the statement after it: a batch bound one statement at a
-            // time reads the options it sets.
+            // time reads the options it sets. An `EXECUTE` counts, so the statement after it
+            // is bound once its text has run.
             let counts = match &one {
                 PreparedStatement::Bound { statement } => {
                     !matches!(statement, PhysicalStatement::SetOption(_))
                 }
-                PreparedStatement::Deferred { .. } => true,
+                PreparedStatement::Deferred { .. } | PreparedStatement::Execute { .. } => true,
                 _ => false,
             };
             prepared.push(one);
@@ -1133,7 +1165,7 @@ struct BatchHost<'h> {
     statements: &'h [Statement],
     slots: Vec<Slot>,
     /// How many statements, from the first, are bound: the length of the text, except in a
-    /// body that holds an `ALTER TABLE`.
+    /// body that moves the catalogue ([`batch_moves_the_catalogue`]).
     bound: usize,
     bind_state: SessionState,
     batch_variables: BatchVariables,
@@ -1849,12 +1881,52 @@ pub(crate) fn batch_has_alter_table(statements: &[Statement]) -> bool {
         .any(|statement| matches!(statement, Statement::AlterTable(_)))
 }
 
-/// How many statements to bind at once when the batch will reach an `ALTER TABLE`.
+/// Whether the batch still holds, at any depth, a statement that changes or removes a
+/// table or an index the catalogue holds, or that undoes what its transaction did to them:
+/// `ALTER TABLE`, `DROP TABLE`, `DROP INDEX`, `ROLLBACK`, and an `EXECUTE`, whose text or
+/// procedure may run one of them. A statement bound before it has run would read the shape
+/// it leaves behind as it was before: the `CREATE TABLE` of a name a `DROP TABLE` frees, the
+/// `SELECT` after a `ROLLBACK` of an `ALTER TABLE`, or the `SELECT` after an `EXEC` that
+/// recreates its table (`tests/recreate_in_one_batch.rs`).
+pub(crate) fn batch_moves_the_catalogue(statements: &[Statement]) -> bool {
+    statements.iter().any(moves_the_catalogue)
+}
+
+/// [`batch_moves_the_catalogue`] for one statement and the statements it holds.
+fn moves_the_catalogue(statement: &Statement) -> bool {
+    match statement {
+        Statement::AlterTable(_)
+        | Statement::DropTable { .. }
+        | Statement::DropIndex(_)
+        | Statement::Rollback { .. }
+        | Statement::Execute(_) => true,
+        Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            moves_the_catalogue(then_branch)
+                || else_branch.as_deref().is_some_and(moves_the_catalogue)
+        }
+        Statement::While { body, .. } => moves_the_catalogue(body),
+        Statement::Block { statements, .. } => batch_moves_the_catalogue(statements),
+        Statement::TryCatch {
+            try_block,
+            catch_block,
+            ..
+        } => batch_moves_the_catalogue(try_block) || batch_moves_the_catalogue(catch_block),
+        _ => false,
+    }
+}
+
+/// How many statements to bind at once when the batch will reach a statement that moves
+/// the catalogue ([`batch_moves_the_catalogue`]).
 ///
-/// A `CREATE TABLE` before the `ALTER` must run before the `ALTER` is bound, so
-/// the tail is prepared one statement at a time when the batch holds an `ALTER TABLE`.
+/// A `CREATE TABLE` before an `ALTER` must run before the `ALTER` is bound, and a
+/// `DROP TABLE`, a `ROLLBACK` or an `EXECUTE` before the statements after it, so the tail is
+/// prepared one statement at a time up to the last of them.
 pub(crate) fn bind_limit_for(statements: &[Statement]) -> Option<usize> {
-    batch_has_alter_table(statements).then_some(1)
+    batch_moves_the_catalogue(statements).then_some(1)
 }
 
 /// The catalogue a statement is bound against, for a session in `state`: what the open
