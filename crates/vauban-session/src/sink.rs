@@ -33,13 +33,25 @@ pub(crate) const CUR_CMD_SELECT: u16 = 0xC1;
 /// `CurCmd` of the closing DONEPROC of a nested batch or an RPC.
 pub(crate) const CUR_CMD_PROC: u16 = 0xE0;
 
+/// `CurCmd` of the DONE that closes a `SELECT … INTO`.
+pub(crate) const CUR_CMD_SELECT_INTO: u16 = 0xC2;
+
+/// `CurCmd` of the DONE that closes an `INSERT`.
+pub(crate) const CUR_CMD_INSERT: u16 = 0xC3;
+
+/// `CurCmd` of the DONE that closes a `DELETE`.
+pub(crate) const CUR_CMD_DELETE: u16 = 0xC4;
+
+/// `CurCmd` of the DONE that closes an `UPDATE`.
+pub(crate) const CUR_CMD_UPDATE: u16 = 0xC5;
+
 /// Where the results of a statement go: implemented for TDS here, and by the recording
 /// sinks of the tests.
 ///
 /// Rule of the DONE: `done(rowcount, more)` does not carry the error flag. A call to
 /// `error()` since the last `done()` makes the TDS implementation emit
-/// `DoneStatus::ERROR`; `cur_cmd` is 0xC1 (SELECT) when `columns()` was emitted since the
-/// last `done()`, 0 otherwise.
+/// `DoneStatus::ERROR`; `cur_cmd` is the one [`ResultSink::next_cur_cmd`] named since the
+/// last `done()`, else 0xC1 (SELECT) when `columns()` was emitted since then, 0 otherwise.
 pub trait ResultSink {
     /// A result set starts: the metadata of its columns ([MS-TDS] 2.2.7 COLMETADATA).
     fn columns(&mut self, cols: &[ColumnMeta]) -> SqlResult<()>;
@@ -68,6 +80,15 @@ pub trait ResultSink {
     /// ([MS-TDS] 2.2.7 DONEPROC). The default delegates to [`done`].
     fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
         self.done(rowcount, false)
+    }
+    /// The `CurCmd` of the next `done` or `done_in_proc`, which closes a statement of that
+    /// kind ([MS-TDS] 2.2.7 DONE). A driver reads the count of a DONE whose `CurCmd` is
+    /// `SELECT` (0xC1) as the size of a result set rather than as rows affected, which is
+    /// why `SET @v` closes with 0xC1 (`tests/row_counts.rs`). A sink that wraps another
+    /// passes it on; the default drops it.
+    fn next_cur_cmd(&mut self, cur_cmd: u16) -> SqlResult<()> {
+        let _ = cur_cmd;
+        Ok(())
     }
 }
 
@@ -207,6 +228,8 @@ pub struct TdsSink {
     error_since_done: bool,
     /// A `columns()` was emitted since the last `done()`.
     columns_since_done: bool,
+    /// The `CurCmd` [`ResultSink::next_cur_cmd`] named since the last `done()`.
+    next_cur_cmd: Option<u16>,
 }
 
 impl TdsSink {
@@ -217,6 +240,7 @@ impl TdsSink {
             rpc: false,
             error_since_done: false,
             columns_since_done: false,
+            next_cur_cmd: None,
         }
     }
 
@@ -256,6 +280,8 @@ impl TdsSink {
         }
         let cur_cmd = if proc_close {
             CUR_CMD_PROC
+        } else if let Some(cur_cmd) = self.next_cur_cmd {
+            cur_cmd
         } else if self.columns_since_done {
             CUR_CMD_SELECT
         } else {
@@ -279,6 +305,7 @@ impl ResultSink for TdsSink {
         let (status, cur_cmd) = self.done_fields(rowcount, more, false);
         self.error_since_done = false;
         self.columns_since_done = false;
+        self.next_cur_cmd = None;
         let token = if self.rpc {
             Token::DoneProc {
                 status,
@@ -299,6 +326,7 @@ impl ResultSink for TdsSink {
         let (status, cur_cmd) = self.done_fields(rowcount, more, false);
         self.error_since_done = false;
         self.columns_since_done = false;
+        self.next_cur_cmd = None;
         self.send(Token::DoneInProc {
             status,
             cur_cmd,
@@ -310,6 +338,7 @@ impl ResultSink for TdsSink {
         let (status, cur_cmd) = self.done_fields(rowcount, false, true);
         self.error_since_done = false;
         self.columns_since_done = false;
+        self.next_cur_cmd = None;
         self.send(Token::DoneProc {
             status,
             cur_cmd,
@@ -319,6 +348,11 @@ impl ResultSink for TdsSink {
 
     fn info(&mut self, msg: &InfoMessage) -> SqlResult<()> {
         self.send(Token::Info(msg.clone()))
+    }
+
+    fn next_cur_cmd(&mut self, cur_cmd: u16) -> SqlResult<()> {
+        self.next_cur_cmd = Some(cur_cmd);
+        Ok(())
     }
 
     fn error(&mut self, err: &SqlError) -> SqlResult<()> {

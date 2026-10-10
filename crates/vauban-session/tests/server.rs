@@ -899,17 +899,19 @@ const INTERNAL_ERROR: u32 = 50000;
 /// through SQL; the corruption is written straight to the storage, because assignment now
 /// refuses `UPDATE … SET a = NULL` on a `NOT NULL` column.
 async fn trap_a_row(client: &mut TcpStream, engine: &Engine) {
-    for text in [
-        "CREATE TABLE dbo.t (a int NOT NULL)",
-        "INSERT INTO dbo.t (a) VALUES (1)",
+    // The `INSERT` closes with `DONE_COUNT` (0x10), its `CurCmd` (0xC3) and the row it
+    // wrote.
+    for (text, status, cur_cmd, row_count) in [
+        ("CREATE TABLE dbo.t (a int NOT NULL)", 0, 0, 0),
+        ("INSERT INTO dbo.t (a) VALUES (1)", 0x10, 0xC3, 1),
     ] {
         let response = run_batch(client, text, RESPONSE_BUDGET).await;
         assert_eq!(
             response,
             vec![Tok::Done {
-                status: 0,
-                cur_cmd: 0,
-                row_count: 0,
+                status,
+                cur_cmd,
+                row_count,
             }],
             "`{text}` was answered {response:?}"
         );

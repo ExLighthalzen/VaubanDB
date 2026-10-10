@@ -176,7 +176,10 @@ use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
 use crate::procedures::NestedParam;
 use crate::server::Engine;
 use crate::set_options::{SetOutcome, apply_set_statement};
-use crate::sink::{ResultSink, StatementSinkAdapter};
+use crate::sink::{
+    CUR_CMD_DELETE, CUR_CMD_INSERT, CUR_CMD_SELECT, CUR_CMD_SELECT_INTO, CUR_CMD_UPDATE,
+    ResultSink, StatementSinkAdapter,
+};
 use crate::state::SessionState;
 use crate::statements::{
     INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, declare_variables_held_by,
@@ -1323,11 +1326,13 @@ impl BatchHost<'_> {
     }
 
     /// Closes a statement that ended without an error, with a DONE in the batch and a
-    /// DONEINPROC in a called level.
+    /// DONEINPROC in a called level, which `SET NOCOUNT ON` leaves out
+    /// ([`StatementEnd::Silent`]).
     fn end_statement(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
         self.track.status = 0;
         match self.level {
             Level::Batch => self.sink.done(rowcount, true),
+            Level::Called if self.session.state.options.nocount => Ok(()),
             Level::Called => self.sink.done_in_proc(rowcount, true),
         }
     }
@@ -1583,12 +1588,20 @@ impl BatchHost<'_> {
                 if let Some(database) = target {
                     session.switch_database(database, line, &mut adapter)?;
                 }
-                adapter.done(None)?;
-                self.track.status = 0;
                 // A `DECLARE` sets `@@ROWCOUNT` by its own rule, over what the statement
                 // left in `exec.rowcount` (`next_rowcount`).
-                session.state.rowcount =
-                    next_rowcount(bound, session.state.rowcount, session.exec.rowcount);
+                let rowcount = next_rowcount(bound, session.state.rowcount, session.exec.rowcount);
+                match quiet_end(bound, rowcount, session.state.options.nocount, self.level) {
+                    StatementEnd::Silent => {}
+                    StatementEnd::Done(reported) => {
+                        if let Some(cur_cmd) = cur_cmd_of(bound) {
+                            adapter.tds().next_cur_cmd(cur_cmd)?;
+                        }
+                        adapter.done(reported)?;
+                    }
+                }
+                self.track.status = 0;
+                session.state.rowcount = rowcount;
                 apply_exec_session(
                     &mut session.state,
                     &session.exec,
@@ -1609,13 +1622,84 @@ impl BatchHost<'_> {
     }
 }
 
+/// How a statement that ended without an error and without a result set closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementEnd {
+    /// No token.
+    Silent,
+    /// A DONE in the batch, a DONEINPROC in a called level, with this row count.
+    Done(Option<u64>),
+}
+
+/// The end of `stmt`, a statement that sent no result set, run at `level` and leaving
+/// `rowcount` in `@@ROWCOUNT`.
+///
+/// - A `DECLARE` that gives no variable a value sends nothing: `DECLARE @x int; SELECT 1`
+///   answers the result set and its DONE alone.
+/// - In a called level, `SET NOCOUNT ON` silences the statement; in the batch it clears
+///   the count and keeps the DONE.
+/// - Under `SET NOCOUNT OFF`, the statements that write rows or variables carry the count
+///   they leave in `@@ROWCOUNT`: `INSERT`, `UPDATE`, `DELETE` and `SELECT … INTO` the rows
+///   they wrote, `0` included; `SET @v`, `SELECT @v = …` and a `DECLARE` that gives a value
+///   their own count. The other statements (DDL, `TRUNCATE TABLE`, `USE`, `PRINT`, a
+///   transaction statement) carry no count.
+///
+/// `tests/row_counts.rs` pins each of these shapes, in the batch, in `EXEC('…')` and in
+/// `sp_executesql`.
+fn quiet_end(stmt: &PhysicalStatement, rowcount: i64, nocount: bool, level: Level) -> StatementEnd {
+    if let PhysicalStatement::Declare(declarations) = stmt
+        && declarations
+            .iter()
+            .all(|declaration| declaration.value.is_none())
+    {
+        return StatementEnd::Silent;
+    }
+    if nocount {
+        return match level {
+            Level::Batch => StatementEnd::Done(None),
+            Level::Called => StatementEnd::Silent,
+        };
+    }
+    let counted = matches!(
+        stmt,
+        PhysicalStatement::Insert(_)
+            | PhysicalStatement::Update(_)
+            | PhysicalStatement::Delete(_)
+            | PhysicalStatement::SelectInto(_)
+            | PhysicalStatement::SetVariable { .. }
+            | PhysicalStatement::SelectAssign { .. }
+            | PhysicalStatement::Declare(_)
+    );
+    StatementEnd::Done(counted.then(|| u64::try_from(rowcount).unwrap_or(0)))
+}
+
+/// The `CurCmd` of the DONE of `stmt` when it is not 0: `INSERT`, `UPDATE`, `DELETE` and
+/// `SELECT … INTO` have their own, and `SET @v`, `SELECT @v = …` and a `DECLARE` that
+/// gives a value close as a `SELECT` does, so a driver does not add their count to the
+/// rows a batch affected (`tests/row_counts.rs`,
+/// `the_done_of_each_statement_names_its_kind`).
+fn cur_cmd_of(stmt: &PhysicalStatement) -> Option<u16> {
+    match stmt {
+        PhysicalStatement::Insert(_) => Some(CUR_CMD_INSERT),
+        PhysicalStatement::Update(_) => Some(CUR_CMD_UPDATE),
+        PhysicalStatement::Delete(_) => Some(CUR_CMD_DELETE),
+        PhysicalStatement::SelectInto(_) => Some(CUR_CMD_SELECT_INTO),
+        PhysicalStatement::SetVariable { .. }
+        | PhysicalStatement::SelectAssign { .. }
+        | PhysicalStatement::Declare(_) => Some(CUR_CMD_SELECT),
+        _ => None,
+    }
+}
+
 /// A [`ResultSink`] that holds the last DONE back until the next token, so the DONE
 /// carries `MORE` exactly when something follows it in the response, wherever the program
 /// jumps: the last DONE of the response goes out without it ([`HeldDone::finish`]).
 struct HeldDone<'s> {
     sink: &'s mut dyn ResultSink,
-    /// The row count of the DONE held back.
-    held: Option<Option<u64>>,
+    /// The row count and the `CurCmd` of the DONE held back.
+    held: Option<(Option<u64>, Option<u16>)>,
+    /// The `CurCmd` named for the next DONE or DONEINPROC, not passed on yet.
+    cur_cmd: Option<u16>,
     /// A DONE went out.
     sent: bool,
 }
@@ -1625,6 +1709,7 @@ impl<'s> HeldDone<'s> {
         Self {
             sink,
             held: None,
+            cur_cmd: None,
             sent: false,
         }
     }
@@ -1632,8 +1717,11 @@ impl<'s> HeldDone<'s> {
     /// Sends the DONE held back, with `more`.
     fn release(&mut self, more: bool) -> SqlResult<()> {
         match self.held.take() {
-            Some(rowcount) => {
+            Some((rowcount, cur_cmd)) => {
                 self.sent = true;
+                if let Some(cur_cmd) = cur_cmd {
+                    self.sink.next_cur_cmd(cur_cmd)?;
+                }
                 self.sink.done(rowcount, more)
             }
             None => Ok(()),
@@ -1666,7 +1754,12 @@ impl ResultSink for HeldDone<'_> {
 
     fn done(&mut self, rowcount: Option<u64>, _more: bool) -> SqlResult<()> {
         self.release(true)?;
-        self.held = Some(rowcount);
+        self.held = Some((rowcount, self.cur_cmd.take()));
+        Ok(())
+    }
+
+    fn next_cur_cmd(&mut self, cur_cmd: u16) -> SqlResult<()> {
+        self.cur_cmd = Some(cur_cmd);
         Ok(())
     }
 
@@ -1697,6 +1790,9 @@ impl ResultSink for HeldDone<'_> {
 
     fn done_in_proc(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
         self.release(true)?;
+        if let Some(cur_cmd) = self.cur_cmd.take() {
+            self.sink.next_cur_cmd(cur_cmd)?;
+        }
         self.sink.done_in_proc(rowcount, more)
     }
 

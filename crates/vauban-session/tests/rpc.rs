@@ -215,7 +215,7 @@ fn output_parameter_comes_back_as_return_value() {
 }
 
 #[test]
-fn executesql_insert_reports_done_proc_count() {
+fn executesql_insert_reports_its_count_on_its_doneinproc() {
     let mut session = session();
     session
         .run_batch(
@@ -234,12 +234,15 @@ fn executesql_insert_reports_done_proc_count() {
 
     let mut sink = Recording::default();
     session.run_rpc(&rpc, &mut sink).expect("rpc completes");
-    assert!(
-        sink.0
-            .iter()
-            .any(|event| matches!(event, Event::DoneProc(Some(1)))),
-        "expected done_proc(Some(1)), got {:?}",
-        sink.0
+    // The INSERT carries its count on its DONEINPROC (`tests/row_counts.rs`); the
+    // DONEPROC that closes the call carries none.
+    assert_eq!(
+        sink.0,
+        vec![
+            Event::DoneInProc,
+            Event::ReturnStatus(0),
+            Event::DoneProc(None),
+        ]
     );
 }
 

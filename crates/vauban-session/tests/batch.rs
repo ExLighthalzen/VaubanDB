@@ -787,8 +787,8 @@ async fn declare_set_select_returns_three_over_the_wire() {
         toks.iter()
             .filter(|token| matches!(token, Tok::Done { .. }))
             .count(),
-        3,
-        "DECLARE, SET and SELECT each close with a DONE: {toks:?}"
+        2,
+        "SET and SELECT each close with a DONE, the DECLARE without a value with none: {toks:?}"
     );
 
     drop(client);

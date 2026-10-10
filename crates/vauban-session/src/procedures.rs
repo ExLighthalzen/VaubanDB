@@ -78,18 +78,6 @@ pub struct NestedOutcome {
     pub had_result_set: bool,
 }
 
-/// Row count for the closing DONEPROC of a nested batch or RPC when it is known.
-pub(crate) fn nested_done_proc_rowcount(
-    failed: bool,
-    had_result_set: bool,
-    rowcount: i64,
-) -> Option<u64> {
-    if failed || had_result_set {
-        return None;
-    }
-    u64::try_from(rowcount).ok().filter(|count| *count > 0)
-}
-
 impl Session {
     /// Runs `text` like the body of `sp_executesql` an RPC calls: a level of its own whose
     /// variables are `params` (module documentation, "A called level"), then RETURNSTATUS
@@ -109,11 +97,9 @@ impl Session {
         if !outcome.failed {
             sink.return_status(outcome.return_status)?;
         }
-        sink.done_proc(nested_done_proc_rowcount(
-            outcome.failed,
-            outcome.had_result_set,
-            outcome.rowcount,
-        ))?;
+        // The statements of the text carried their counts; the DONEPROC that closes the
+        // call carries none (`tests/row_counts.rs`).
+        sink.done_proc(None)?;
         Ok(outcome)
     }
 }
@@ -229,17 +215,23 @@ fn collect_outputs(params: &[NestedParam], exec: &ExecSession) -> Vec<(String, V
 fn close_level(
     sink: &mut dyn ResultSink,
     in_proc: bool,
-    outcome: &NestedOutcome,
+    nocount: bool,
     end: &ProgramEnd,
 ) -> SqlResult<()> {
-    let rowcount =
-        nested_done_proc_rowcount(outcome.failed, outcome.had_result_set, outcome.rowcount);
     match (in_proc, end) {
         // The program that made the call sends the error and the token that closes the
         // `EXECUTE` once it decided the reach of that error.
         (_, ProgramEnd::Refused(_)) | (true, ProgramEnd::Aborted(_)) => Ok(()),
-        (true, _) => sink.done_in_proc(rowcount, true),
-        (false, _) => sink.done(rowcount, true),
+        // In a called level, `SET NOCOUNT ON` of the caller silences the end of the call as
+        // it does the end of a statement, except for a level an error ended: that error
+        // sent no DONEINPROC of its own, and the end of the call is the one that carries it
+        // (`tests/row_counts.rs`).
+        (true, ProgramEnd::LevelAborted(_)) => sink.done_in_proc(None, true),
+        (true, _) if nocount => Ok(()),
+        // The statements of the text carried their counts; the end of the call carries no
+        // count.
+        (true, _) => sink.done_in_proc(None, true),
+        (false, _) => sink.done(None, true),
     }
 }
 
@@ -455,7 +447,8 @@ pub(crate) fn run_batch_dynamic(
     let mut tracked = TrackedSink::new(sink);
     let (nested, end) = run_level(session, text, &[], None, true, &mut tracked)?;
     let error_number = tracked.last_error;
-    close_level(sink, in_proc, &nested, &end)?;
+    let nocount = session.state().options.nocount;
+    close_level(sink, in_proc, nocount, &end)?;
     let outcome = BatchProcOutcome {
         outputs: nested.outputs,
         rowcount: nested.rowcount,
@@ -499,13 +492,12 @@ fn execute_nested_sql(
                 emit_rpc_return_values(sink, rpc_params, &nested)?;
                 sink.return_status(nested.return_status)?;
             }
-            sink.done_proc(nested_done_proc_rowcount(
-                nested.failed,
-                nested.had_result_set,
-                nested.rowcount,
-            ))?;
+            sink.done_proc(None)?;
         }
-        ProcFinish::Batch { in_proc } => close_level(sink, in_proc, &nested, &end)?,
+        ProcFinish::Batch { in_proc } => {
+            let nocount = session.state().options.nocount;
+            close_level(sink, in_proc, nocount, &end)?;
+        }
     }
     session.state_mut().last_error = if nested.failed { last_error } else { 0 };
     Ok((
@@ -880,6 +872,9 @@ impl ResultSink for TrackedSink<'_> {
 
     fn return_status(&mut self, status: i32) -> SqlResult<()> {
         self.inner.return_status(status)
+    }
+    fn next_cur_cmd(&mut self, cur_cmd: u16) -> SqlResult<()> {
+        self.inner.next_cur_cmd(cur_cmd)
     }
 }
 

@@ -996,6 +996,9 @@ impl ResultSink for PrepareExecSink<'_> {
     fn return_status(&mut self, _status: i32) -> SqlResult<()> {
         Ok(())
     }
+    fn next_cur_cmd(&mut self, cur_cmd: u16) -> SqlResult<()> {
+        self.inner.next_cur_cmd(cur_cmd)
+    }
 }
 
 #[cfg(test)]

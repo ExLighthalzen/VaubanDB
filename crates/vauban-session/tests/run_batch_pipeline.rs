@@ -579,8 +579,7 @@ fn a_table_created_earlier_in_the_batch_is_read_by_the_rest_of_it() {
     // The shape of a migration script sent as one batch: the `INSERT` and the `SELECT`
     // name a table the catalogue does not hold when the batch is bound. Both are bound when
     // the batch reaches them, after the `CREATE TABLE` committed: one row, no error, and the
-    // DONE of each statement in order (the DONE of an `INSERT` carries no count at this
-    // layer, in one batch as in two).
+    // DONE of each statement in order, the one of the `INSERT` with the row it wrote.
     let events =
         run("CREATE TABLE dbo.m1 (a int); INSERT INTO dbo.m1 VALUES (1); SELECT * FROM dbo.m1;");
     assert!(
@@ -591,7 +590,7 @@ fn a_table_created_earlier_in_the_batch_is_read_by_the_rest_of_it() {
     assert_eq!(columns(&events, 0)[0].name, "a");
     assert_eq!(
         dones(&events),
-        vec![(None, true), (None, true), (Some(1), false)],
+        vec![(None, true), (Some(1), true), (Some(1), false)],
         "{events:#?}"
     );
 }
