@@ -10,14 +10,16 @@
 //! catalogue snapshot and no text to read again (`tests/fk_check.rs`,
 //! `an_insert_select_builds_one_catalogue_snapshot`).
 //!
+//! The snapshot is the one of the transaction that writes: a `FOREIGN KEY` another
+//! transaction has added and not committed is not checked on either of its tables
+//! (`fk_check/tests/mod.rs`, `a_foreign_key_another_transaction_has_not_committed_is_not_checked`).
+//!
 //! A `CHECK` the plan does not carry, because its stored text did not bind, is not skipped:
 //! a row written under it is refused with the internal error, which names the constraint
 //! (`tests/fk_check.rs`, `a_check_missing_from_the_plan_refuses_the_row`).
 
-use std::collections::HashMap;
-
 use vauban_binder::{BoundExpr, BoundObjectExpression};
-use vauban_catalog::{Catalog, CatalogSnapshot, ColumnId, ConstraintMeta, ObjectId, TableMeta};
+use vauban_catalog::{CatalogSnapshot, ColumnId, ConstraintMeta, ObjectId, TableMeta};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::{Direction, IndexId, KeyRange, TableId};
 use vauban_types::Value;
@@ -87,24 +89,24 @@ impl WriteChecks {
     /// foreign keys that point at the table, which an `UPDATE` and a `DELETE` need and an
     /// `INSERT` does not.
     ///
+    /// Names, foreign keys and indexes are read in `snap` alone, which the caller built for
+    /// the transaction of the statement.
+    ///
     /// # Errors
     ///
-    /// The internal error when the snapshot no longer holds a table a constraint names, and
-    /// what reading the constraints of the catalogue raises.
+    /// The internal error when the snapshot no longer holds a table a constraint names.
     pub(crate) fn resolve(
         table: &TableMeta,
         snap: &CatalogSnapshot,
         checks: &[BoundObjectExpression],
         statement: &'static str,
         incoming: bool,
-        ctx: &ExecContext<'_>,
+        _ctx: &ExecContext<'_>,
     ) -> SqlResult<Self> {
-        let catalog = ctx.catalog()?;
         let database = snap
             .database_by_id(table.database)
             .map_or_else(|| "?".to_owned(), |db| db.name.clone());
-        let names = constraint_names(catalog, table.id)?;
-        let name_of = |id: &ObjectId| names.get(id).cloned().unwrap_or_else(|| "?".to_owned());
+        let name_of = |id: &ObjectId| constraint_name(snap, *id);
         let mut rules = Vec::new();
         for constraint in &table.constraints {
             match constraint {
@@ -143,7 +145,7 @@ impl WriteChecks {
             }
         }
         let incoming = if incoming {
-            resolve_incoming(table, snap, catalog)?
+            resolve_incoming(table, snap)?
         } else {
             Vec::new()
         };
@@ -263,33 +265,40 @@ impl WriteChecks {
     }
 }
 
-/// The foreign keys of the other tables that point at `table`, resolved.
-fn resolve_incoming(
-    table: &TableMeta,
-    snap: &CatalogSnapshot,
-    catalog: &Catalog,
-) -> SqlResult<Vec<Incoming>> {
-    let mut resolved = Vec::new();
-    for reference in catalog.referencing_foreign_keys(table.id)? {
-        let Some(child) = snap.table(reference.table) else {
-            return Err(bug("REFERENCE: child table is missing from the snapshot"));
-        };
-        let names = constraint_names(catalog, child.id)?;
-        let child_ordinals = ordinals(child, &reference.columns)?;
-        resolved.push(Incoming {
-            name: names
-                .get(&reference.constraint)
-                .cloned()
-                .unwrap_or_else(|| "?".to_owned()),
-            child: child.storage_id,
-            child_index: index_for_key(snap, child, &child_ordinals)?,
-            child_ordinals,
-            referenced_ordinals: ordinals(table, &reference.referenced_columns)?,
-            object: format!("{}.{}", child.schema, child.name),
-            column: column_name(child, reference.columns.first()),
-        });
+/// The foreign keys of the tables of `snap` that point at `table`, resolved, by increasing
+/// child [`ObjectId`] then constraint [`ObjectId`].
+fn resolve_incoming(table: &TableMeta, snap: &CatalogSnapshot) -> SqlResult<Vec<Incoming>> {
+    let mut found: Vec<((ObjectId, ObjectId), Incoming)> = Vec::new();
+    for child in snap.tables() {
+        for constraint in &child.constraints {
+            let ConstraintMeta::ForeignKey {
+                constraint,
+                columns,
+                referenced_table,
+                referenced_columns,
+                ..
+            } = constraint
+            else {
+                continue;
+            };
+            if *referenced_table != table.id {
+                continue;
+            }
+            let child_ordinals = ordinals(child, columns)?;
+            let incoming = Incoming {
+                name: constraint_name(snap, *constraint),
+                child: child.storage_id,
+                child_index: index_for_key(snap, child, &child_ordinals)?,
+                child_ordinals,
+                referenced_ordinals: ordinals(table, referenced_columns)?,
+                object: format!("{}.{}", child.schema, child.name),
+                column: column_name(child, columns.first()),
+            };
+            found.push(((child.id, *constraint), incoming));
+        }
     }
-    Ok(resolved)
+    found.sort_by_key(|(key, _)| *key);
+    Ok(found.into_iter().map(|(_, incoming)| incoming).collect())
 }
 
 /// An index of `child` whose leading columns are `ordinals`, in that order.
@@ -350,12 +359,11 @@ fn child_row_exists(
     Ok(false)
 }
 
-fn constraint_names(catalog: &Catalog, table: ObjectId) -> SqlResult<HashMap<ObjectId, String>> {
-    Ok(catalog
-        .constraints_of(table)?
-        .into_iter()
-        .map(|object| (object.id, object.name.name))
-        .collect())
+/// The name of the constraint `id` in `snap`, `?` when the snapshot names no such
+/// constraint.
+fn constraint_name(snap: &CatalogSnapshot, id: ObjectId) -> String {
+    snap.constraint_name(id)
+        .map_or_else(|| "?".to_owned(), |name| name.name)
 }
 
 fn key_values(row: &[Value], ordinals: &[usize]) -> SqlResult<Vec<Value>> {
@@ -396,3 +404,6 @@ fn column_name(table: &TableMeta, column: Option<&ColumnId>) -> Option<String> {
 fn bug(what: &str) -> SqlError {
     SqlError::from(InternalError::Bug(what.to_owned()))
 }
+
+#[cfg(test)]
+mod tests;

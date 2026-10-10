@@ -76,7 +76,7 @@ use std::collections::HashMap;
 use vauban_binder::{BindContext, BoundExpr, CatalogView, DeferredStatement, VariableScope};
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
 use vauban_planner::{
-    NoIndexes, PhysicalPlan, PhysicalStatement, PlanCatalog, PlanContext, StorageIndexes, SubPlan,
+    NoIndexes, PhysicalPlan, PhysicalStatement, PlanCatalog, PlanContext, SnapshotIndexes, SubPlan,
 };
 use vauban_types::{TypeInfo, Value, convert, default_display};
 
@@ -171,6 +171,12 @@ pub(crate) fn execute<'a>(
 
 /// Binds `deferred` against the catalogue `ctx` carries and plans what comes out.
 ///
+/// The plan reads the indexes the snapshot of the transaction of `ctx` sees: an index
+/// another transaction has created and not committed is left out of it, although `storage`
+/// holds it (`control/tests/mod.rs`,
+/// `a_deferred_statement_does_not_seek_an_index_another_transaction_has_not_committed`).
+/// A context without a catalogue or a transaction plans the read as a scan.
+///
 /// The variables are the ones the session holds at this moment, so a `DECLARE` written
 /// before the enclosing statement is in scope (`tests/control.rs`,
 /// `a_deferred_statement_reads_a_variable_declared_before_it`). The database, the default
@@ -201,7 +207,10 @@ pub(crate) fn bind_and_plan(
         options: ctx.options,
     };
     let bound = vauban_binder::bind(&deferred.statement, &bind_ctx)?;
-    let indexes = ctx.storage.map(StorageIndexes);
+    let indexes = ctx
+        .storage
+        .zip(snapshot.as_ref())
+        .map(|(storage, snapshot)| SnapshotIndexes { storage, snapshot });
     let catalog: &dyn PlanCatalog = match &indexes {
         Some(indexes) => indexes,
         None => &NoIndexes,
@@ -351,3 +360,6 @@ pub(crate) fn eval_statement_expr(
 fn bug(what: &str) -> SqlError {
     SqlError::from(InternalError::Bug(what.to_owned()))
 }
+
+#[cfg(test)]
+mod tests;
