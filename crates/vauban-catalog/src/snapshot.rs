@@ -602,6 +602,15 @@ impl CatalogSnapshot {
     pub fn constraint_name(&self, id: ObjectId) -> Option<QualifiedName> {
         self.constraint_names.get(&id).cloned()
     }
+
+    /// The tables of this snapshot, of each database, by increasing [`ObjectId`].
+    ///
+    /// The way to the constraints that point **at** a table: a `FOREIGN KEY` lives in the
+    /// [`TableMeta`] of the table that declares it, so the execution of `TRUNCATE TABLE`
+    /// reads the other tables to find one whose `referenced_table` is the table at hand.
+    pub fn tables(&self) -> impl Iterator<Item = &TableMeta> {
+        self.tables.values()
+    }
 }
 
 /// Builds the snapshot [`Catalog::snapshot`] returns.

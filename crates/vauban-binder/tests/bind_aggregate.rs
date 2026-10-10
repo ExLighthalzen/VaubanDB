@@ -68,6 +68,45 @@ impl CatalogView for TwoTables {
             kind: ResolvedTableKind::Table,
         })
     }
+
+    fn view_definition(&self, _object: vauban_catalog::ObjectId) -> Option<&str> {
+        None
+    }
+
+    fn identity_column(
+        &self,
+        _object: vauban_catalog::ObjectId,
+    ) -> Option<vauban_catalog::ColumnId> {
+        None
+    }
+
+    fn computed_columns(&self, _object: vauban_catalog::ObjectId) -> Vec<vauban_catalog::ColumnId> {
+        Vec::new()
+    }
+
+    fn constraint_names_on_table(&self, _table: vauban_catalog::ObjectId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn primary_key_columns(&self, _table: vauban_catalog::ObjectId) -> Option<Vec<String>> {
+        None
+    }
+
+    fn unique_key_on(&self, _table: vauban_catalog::ObjectId, _columns: &[String]) -> bool {
+        false
+    }
+
+    fn classify_table_reference(
+        &self,
+        name: &vauban_parser::ObjectName,
+        database: &str,
+        default_schema: &str,
+    ) -> vauban_binder::TableReferenceKind {
+        match vauban_binder::CatalogView::resolve_table(self, name, database, default_schema) {
+            Some(_) => vauban_binder::TableReferenceKind::Table,
+            None => vauban_binder::TableReferenceKind::Unknown,
+        }
+    }
 }
 
 fn column(id: ColumnId, index: usize, name: &str, ty: SqlType, nullable: bool) -> ColumnBinding {

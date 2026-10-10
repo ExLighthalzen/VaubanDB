@@ -557,14 +557,15 @@ pub(crate) fn bind_drop_table(
 ///
 /// A name the catalogue does not resolve answers 4701 state 1 on the line of the statement
 /// (`TRUNCATE TABLE dbo.nosuch;`). A table another table references through a `FOREIGN KEY`
-/// answers 4712 state 1 (`TRUNCATE TABLE dbo.parent;` while `dbo.child` references it).
-/// A view or a temporary table is
-/// the internal error 50000 naming V2, as for [`bind_drop_table`].
+/// binds: its 4712 is raised while the statement runs, against the catalogue of that moment
+/// (`vauban-executor`, `dml/truncate.rs`), so a `TRUNCATE` the control of flow does not
+/// reach raises nothing (`tests/catalog_view.rs`,
+/// `truncate_of_a_referenced_table_binds_and_leaves_4712_to_the_execution`). A view or a
+/// temporary table is the internal error 50000 naming V2, as for [`bind_drop_table`].
 ///
 /// # Errors
 ///
 /// - 4701 when the target is not in the catalogue;
-/// - 4712 when [`CatalogView::is_referenced_by_foreign_key`] is true for the table;
 /// - the internal 50000 for a view, a temporary table or a four-part name.
 pub(crate) fn bind_truncate(
     table: &ObjectName,
@@ -585,10 +586,6 @@ pub(crate) fn bind_truncate(
             ));
         }
         ResolvedTableKind::Table => {}
-    }
-    if catalog.is_referenced_by_foreign_key(resolved.object) {
-        let printed = format!("{}.{}", name.schema, name.name);
-        return Err(SqlError::cannot_truncate_referenced_table(&printed).with_line(span.line));
     }
     Ok(BoundStatement::Ddl(DdlStatement::TruncateTable { name }))
 }

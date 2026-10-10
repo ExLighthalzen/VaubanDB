@@ -769,6 +769,45 @@ fn classified_table_functions_do_not_reread_hints() {
             assert_eq!(default_schema, "dbo");
             self.0
         }
+
+        fn resolve_table(
+            &self,
+            _name: &vauban_parser::ObjectName,
+            _database: &str,
+            _default_schema: &str,
+        ) -> Option<vauban_binder::ResolvedTable> {
+            None
+        }
+
+        fn view_definition(&self, _object: vauban_catalog::ObjectId) -> Option<&str> {
+            None
+        }
+
+        fn identity_column(
+            &self,
+            _object: vauban_catalog::ObjectId,
+        ) -> Option<vauban_catalog::ColumnId> {
+            None
+        }
+
+        fn computed_columns(
+            &self,
+            _object: vauban_catalog::ObjectId,
+        ) -> Vec<vauban_catalog::ColumnId> {
+            Vec::new()
+        }
+
+        fn constraint_names_on_table(&self, _table: vauban_catalog::ObjectId) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn primary_key_columns(&self, _table: vauban_catalog::ObjectId) -> Option<Vec<String>> {
+            None
+        }
+
+        fn unique_key_on(&self, _table: vauban_catalog::ObjectId, _columns: &[String]) -> bool {
+            false
+        }
     }
     for (argument, function_error) in [("NOLOCK", 207), ("1", 208), ("", 208)] {
         let text = format!("SELECT * FROM dbo.f ({argument});");

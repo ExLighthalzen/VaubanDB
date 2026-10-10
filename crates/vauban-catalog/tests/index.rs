@@ -144,7 +144,7 @@ fn table_with_a_key(
 
 /// The same table plus the ordinary index `ix_b` on `b`, which is the one a `DROP INDEX` is
 /// allowed to take: the index of a constraint answers 3723
-/// (`dropping_the_index_of_a_primary_key_names_3723`).
+/// (`dropping_the_index_of_a_primary_key_is_3723`).
 fn table_with_an_ordinary_index(
     catalog: &Catalog,
     txn: &Arc<TransactionManager>,
@@ -674,19 +674,15 @@ fn a_savepoint_rollback_leaves_the_drop_mark_in_place() {
 /// identifier `storage` no longer knows. SQL Server refuses it at 3723 state 4, a number
 /// `vauban-errors` does not carry.
 #[test]
-fn dropping_the_index_of_a_primary_key_names_3723() {
+fn dropping_the_index_of_a_primary_key_is_3723() {
     let (catalog, storage, txn) = instance();
     let (meta, clustered) = table_with_a_key(&catalog, &txn, "t");
     let handle = begin(&txn);
     let err = catalog
         .drop_index(&handle, clustered)
         .expect_err("the index backs the primary key");
-    assert!(err.message.contains("3723"), "{}", err.message);
-    assert!(
-        err.message.contains("PRIMARY KEY constraint enforcement"),
-        "{}",
-        err.message
-    );
+    assert_eq!((err.number, err.severity, err.state), (3723, 16, 4));
+    assert!(err.message.contains("PRIMARY KEY"), "{}", err.message);
     txn.commit(handle).expect("commit");
     assert!(
         indexes_of(&storage, meta.storage_id)
@@ -699,7 +695,7 @@ fn dropping_the_index_of_a_primary_key_names_3723() {
 /// The same refusal for the index of a `UNIQUE` constraint, which SQL Server sends at
 /// state 5.
 #[test]
-fn dropping_the_index_of_a_unique_constraint_names_3723() {
+fn dropping_the_index_of_a_unique_constraint_is_3723() {
     let (catalog, _storage, txn) = instance();
     let handle = begin(&txn);
     let meta = catalog
@@ -715,12 +711,80 @@ fn dropping_the_index_of_a_unique_constraint_names_3723() {
     let err = catalog
         .drop_index(&handle, backing)
         .expect_err("the index backs the unique constraint");
-    assert!(err.message.contains("3723"), "{}", err.message);
+    assert_eq!((err.number, err.severity, err.state), (3723, 16, 5));
+    assert!(err.message.contains("UNIQUE KEY"), "{}", err.message);
+}
+
+/// A unique index a `CREATE UNIQUE INDEX` made is refused at state 6 while a `FOREIGN KEY`
+/// of another table points at it, and dropped once that `FOREIGN KEY` is gone. An ordinary
+/// index of the same table is dropped all along.
+#[test]
+fn dropping_a_unique_index_a_foreign_key_points_at_is_3723_state_6() {
+    let (catalog, storage, txn) = instance();
+    let handle = begin(&txn);
+    let referenced = catalog
+        .create_table(&handle, &table("r", Vec::new()))
+        .expect("create r");
+    let ux = catalog
+        .create_index(
+            &handle,
+            &IndexDef {
+                unique: true,
+                ..index(referenced.id, "ux_r", &[("b", false)])
+            },
+        )
+        .expect("create ux_r");
+    let ix = catalog
+        .create_index(&handle, &index(referenced.id, "ix_a", &[("a", false)]))
+        .expect("create ix_a");
+    let referencing = catalog
+        .create_table(
+            &handle,
+            &table(
+                "f",
+                vec![ConstraintDef::ForeignKey {
+                    name: Some("fk_f".to_owned()),
+                    columns: vec!["a".to_owned()],
+                    referenced: QualifiedName {
+                        database: "master".to_owned(),
+                        schema: "dbo".to_owned(),
+                        name: "r".to_owned(),
+                    },
+                    referenced_columns: vec!["b".to_owned()],
+                    on_delete: vauban_parser::RefAction::NoAction,
+                    on_update: vauban_parser::RefAction::NoAction,
+                }],
+            ),
+        )
+        .expect("create f");
+    txn.commit(handle).expect("commit");
+
+    let handle = begin(&txn);
+    let err = catalog
+        .drop_index(&handle, ux.id)
+        .expect_err("a foreign key reads the index");
+    assert_eq!((err.number, err.severity, err.state), (3723, 16, 6));
+    assert!(err.message.contains("'dbo.r.ux_r'"), "{}", err.message);
+    assert!(err.message.contains("FOREIGN KEY"), "{}", err.message);
+    catalog
+        .drop_index(&handle, ix.id)
+        .expect("ix_a serves no constraint");
+    txn.commit(handle).expect("commit");
     assert!(
-        err.message.contains("UNIQUE KEY constraint enforcement"),
-        "{}",
-        err.message
+        indexes_of(&storage, referenced.storage_id)
+            .iter()
+            .any(|(id, _)| *id == ux.id),
+        "ux_r is still there"
     );
+
+    let handle = begin(&txn);
+    catalog.drop_table(&handle, referencing.id).expect("drop f");
+    txn.commit(handle).expect("commit");
+    let handle = begin(&txn);
+    catalog
+        .drop_index(&handle, ux.id)
+        .expect("no foreign key reads ux_r any more");
+    txn.commit(handle).expect("commit");
 }
 
 /// A `DROP INDEX` over an index whose table carries a deferred `DROP TABLE` of the same

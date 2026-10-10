@@ -51,11 +51,20 @@ impl<'a> BindContext<'a> {
 
 /// The view of the catalogue the binder needs.
 ///
-/// Each method has a default that answers as an empty catalogue would — `None`, and
-/// `Unknown` for the classification — so that a caller which knows one thing (the fake views
-/// of the tests) implements that one thing. `catalog_view.rs` implements the
-/// trait for a [`CatalogSnapshot`](vauban_catalog::CatalogSnapshot), which is what `session`
-/// hands over in production.
+/// No method has a default body: an implementation answers each question itself, so a
+/// question the production implementation leaves out does not compile instead of
+/// answering as an empty catalogue would. `catalog_view.rs` implements the trait for a
+/// [`CatalogSnapshot`](vauban_catalog::CatalogSnapshot), which is what `session` hands over
+/// in production, and `tests/catalog_view.rs` asks each method of it over a catalogue built
+/// by [`Catalog::bootstrap`](vauban_catalog::Catalog::bootstrap).
+///
+/// What the catalogue checks itself when a statement runs is not asked here: the objects
+/// that still depend on a column an `ALTER TABLE … DROP COLUMN` removes (5074), and the
+/// name an `ADD CONSTRAINT` takes (2714 state 5), are refused by
+/// [`Catalog::alter_table`](vauban_catalog::Catalog::alter_table); the index a constraint
+/// is used for (3723) by [`Catalog::drop_index`](vauban_catalog::Catalog::drop_index); the
+/// table a `FOREIGN KEY` of another table references (4712) by the execution of
+/// `TRUNCATE TABLE`.
 pub trait CatalogView {
     /// Resolves a one- to four-part table or view name against the current database and the
     /// default schema of the session, or `None` when it names nothing resolvable.
@@ -68,17 +77,11 @@ pub trait CatalogView {
         name: &vauban_parser::ObjectName,
         database: &str,
         default_schema: &str,
-    ) -> Option<ResolvedTable> {
-        let _ = (name, database, default_schema);
-        None
-    }
+    ) -> Option<ResolvedTable>;
 
     /// The T-SQL text of the view of identifier `object`, `None` when `object` is not a
     /// view. `view.rs` parses that text to expand the view into the plan.
-    fn view_definition(&self, object: ObjectId) -> Option<&str> {
-        let _ = object;
-        None
-    }
+    fn view_definition(&self, object: ObjectId) -> Option<&str>;
 
     /// The `IDENTITY` column of the table of identifier `object`, `None` for a table
     /// declared without one and when `object` is not a table.
@@ -86,119 +89,35 @@ pub trait CatalogView {
     /// An `INSERT` leaves that column out of the list it builds when none was written, and
     /// refuses a value written for it unless `SET IDENTITY_INSERT` is open for the table
     /// (`insert.rs`).
-    fn identity_column(&self, object: ObjectId) -> Option<ColumnId> {
-        let _ = object;
-        None
-    }
+    fn identity_column(&self, object: ObjectId) -> Option<ColumnId>;
 
     /// The computed columns of the table of identifier `object`, empty when it declares
     /// none or when `object` is not a table. An `INSERT` cannot fill them (`insert.rs`).
-    fn computed_columns(&self, object: ObjectId) -> Vec<ColumnId> {
-        let _ = object;
-        Vec::new()
-    }
+    fn computed_columns(&self, object: ObjectId) -> Vec<ColumnId>;
 
-    /// Whether another table holds a `FOREIGN KEY` that references `object`.
-    fn is_referenced_by_foreign_key(&self, object: ObjectId) -> bool {
-        let _ = object;
-        false
-    }
+    /// Names of the constraints on `table` (`alter.rs`, 3728 on `DROP CONSTRAINT`).
+    fn constraint_names_on_table(&self, table: ObjectId) -> Vec<String>;
 
-    /// Name of a non-key index on `column` of `table`, when the catalogue knows one
-    /// (`alter.rs`).
-    fn index_on_column(&self, table: ObjectId, column: &str) -> Option<String> {
-        let _ = (table, column);
-        None
-    }
+    /// Key columns of the `PRIMARY KEY` of `table`, when one is declared (`alter.rs`, the
+    /// key a `FOREIGN KEY` points at).
+    fn primary_key_columns(&self, table: ObjectId) -> Option<Vec<String>>;
 
-    /// Names of constraints on `table` (`alter.rs`).
-    fn constraint_names_on_table(&self, table: ObjectId) -> Vec<String> {
-        let _ = table;
-        Vec::new()
-    }
-
-    /// Whether an object named `name` already exists in the current database (`alter.rs`).
-    fn object_name_taken(&self, name: &str) -> bool {
-        let _ = name;
-        false
-    }
-
-    /// Key columns of the `PRIMARY KEY` of `table`, when one is declared (`alter.rs`).
-    fn primary_key_columns(&self, table: ObjectId) -> Option<Vec<String>> {
-        let _ = table;
-        None
-    }
-
-    /// Name of the `PRIMARY KEY` constraint on `table`, when one is declared (`alter.rs`).
-    fn primary_key_constraint_name(&self, table: ObjectId) -> Option<String> {
-        let _ = table;
-        None
-    }
-
-    /// Whether the named `FOREIGN KEY` on `table` references `column` (`alter.rs`).
-    fn foreign_key_constraint_on_column(
-        &self,
-        table: ObjectId,
-        constraint: &str,
-        column: &str,
-    ) -> bool {
-        let _ = (table, constraint, column);
-        false
-    }
-
-    /// Whether the named `UNIQUE` constraint on `table` includes `column` (`alter.rs`).
-    fn unique_constraint_on_column(&self, table: ObjectId, constraint: &str, column: &str) -> bool {
-        let _ = (table, constraint, column);
-        false
-    }
-
-    /// Whether `table` declares a `UNIQUE` key exactly on `columns`, in order (`alter.rs`).
-    fn unique_key_on(&self, table: ObjectId, columns: &[String]) -> bool {
-        let _ = (table, columns);
-        false
-    }
-
-    /// Whether the named `CHECK` on `table` mentions `column` (`alter.rs`).
-    fn check_constraint_mentions_column(
-        &self,
-        table: ObjectId,
-        constraint: &str,
-        column: &str,
-    ) -> bool {
-        let _ = (table, constraint, column);
-        false
-    }
-
-    /// Whether the named `DEFAULT` on `table` applies to `column` (`alter.rs`).
-    fn default_constraint_on_column(
-        &self,
-        table: ObjectId,
-        constraint: &str,
-        column: &str,
-    ) -> bool {
-        let _ = (table, constraint, column);
-        false
-    }
+    /// Whether `table` carries a unique index exactly on `columns`, in order (`alter.rs`,
+    /// the key a `FOREIGN KEY` points at when the `PRIMARY KEY` is not it).
+    fn unique_key_on(&self, table: ObjectId, columns: &[String]) -> bool;
 
     /// Classifies the written name in the current database and default schema.
     /// `Unknown` means no classification is available, not that the object is absent.
     ///
-    /// The default answers from [`CatalogView::resolve_table`]: a name that resolves to a
-    /// table or to a view is a [`TableReferenceKind::Table`], and a name that resolves to
-    /// nothing keeps `Unknown` (unit tests `classify_known_table_is_table` and
-    /// `classify_unknown_table_stays_unknown`). A view that knows table-valued functions
-    /// overrides the method.
+    /// A name that resolves to a table or to a view is a [`TableReferenceKind::Table`], and
+    /// a name that resolves to nothing keeps `Unknown` (`tests/catalog_view.rs`,
+    /// `classify_known_table_is_table` and `classify_unknown_table_stays_unknown`).
     fn classify_table_reference(
         &self,
         name: &vauban_parser::ObjectName,
         database: &str,
         default_schema: &str,
-    ) -> TableReferenceKind {
-        match self.resolve_table(name, database, default_schema) {
-            Some(_) => TableReferenceKind::Table,
-            None => TableReferenceKind::Unknown,
-        }
-    }
+    ) -> TableReferenceKind;
 }
 
 /// What [`CatalogView::resolve_table`] found behind a written name.

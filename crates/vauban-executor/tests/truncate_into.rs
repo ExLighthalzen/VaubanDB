@@ -6,7 +6,9 @@ use vauban_binder::{
     BoundExpr, BoundExprKind, ColumnBinding, DdlStatement, LockHints, OutputColumn, OutputSchema,
     SessionOptions,
 };
-use vauban_catalog::{Catalog, ColumnDef, IdentitySpec, QualifiedName, TableDef};
+use vauban_catalog::{
+    Catalog, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, SortedColumn, TableDef,
+};
 use vauban_errors::SqlResult;
 use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSet, execute_collect};
 use vauban_planner::{PhysicalInsert, PhysicalPlan, PhysicalSelectInto, PhysicalStatement};
@@ -517,4 +519,91 @@ fn select_into_of_an_empty_source_creates_the_table() {
     let table = snap.table(meta.id).expect("is a table").storage_id;
     let rows = fixture.scan(table, &[col_binding(0, "a", int(true))]);
     assert!(rows.is_empty());
+}
+
+/// `id int NOT NULL` with a `PRIMARY KEY`, and `parent int` when `parent` names the table
+/// whose key it references.
+fn keyed(name: &str, references: Option<&str>) -> TableDef {
+    let column = |name: &str, nullable: bool| ColumnDef {
+        name: name.to_owned(),
+        ty: int(nullable),
+        default: None,
+        identity: None,
+        computed: None,
+    };
+    let mut constraints = vec![ConstraintDef::PrimaryKey {
+        name: None,
+        columns: vec![SortedColumn {
+            column: "id".to_owned(),
+            descending: false,
+        }],
+        clustered: true,
+    }];
+    if let Some(referenced) = references {
+        constraints.push(ConstraintDef::ForeignKey {
+            name: None,
+            columns: vec!["parent".to_owned()],
+            referenced: tbl_name(referenced),
+            referenced_columns: vec!["id".to_owned()],
+            on_delete: vauban_parser::RefAction::NoAction,
+            on_update: vauban_parser::RefAction::NoAction,
+        });
+    }
+    TableDef {
+        name: tbl_name(name),
+        columns: vec![column("id", false), column("parent", true)],
+        constraints,
+    }
+}
+
+#[test]
+fn truncate_of_a_referenced_table_is_4712() {
+    let mut fixture = Fixture::new();
+    for def in [keyed("p", None), keyed("c", Some("p"))] {
+        fixture
+            .catalog
+            .create_table(&fixture.handle, &def)
+            .expect("create");
+    }
+    let error = fixture
+        .run(&truncate_stmt("p"))
+        .expect_err("a foreign key references p");
+    assert_eq!((error.number, error.severity, error.state), (4712, 16, 1));
+    fixture
+        .run(&truncate_stmt("c"))
+        .expect("nothing references c");
+}
+
+#[test]
+fn truncate_of_a_self_referencing_table_empties_it() {
+    let mut fixture = Fixture::new();
+    fixture
+        .catalog
+        .create_table(&fixture.handle, &keyed("s", Some("s")))
+        .expect("create");
+    fixture
+        .run(&truncate_stmt("s"))
+        .expect("its own foreign key does not count");
+}
+
+/// The catalogue the statement reads is the one of the moment it runs: the referencing table
+/// dropped earlier in the transaction no longer counts.
+#[test]
+fn truncate_after_the_referencing_table_is_dropped_empties_the_table() {
+    let mut fixture = Fixture::new();
+    fixture
+        .catalog
+        .create_table(&fixture.handle, &keyed("p", None))
+        .expect("create p");
+    let child = fixture
+        .catalog
+        .create_table(&fixture.handle, &keyed("c", Some("p")))
+        .expect("create c");
+    fixture
+        .catalog
+        .drop_table(&fixture.handle, child.id)
+        .expect("drop c");
+    fixture
+        .run(&truncate_stmt("p"))
+        .expect("nothing references p any more");
 }

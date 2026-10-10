@@ -1,7 +1,8 @@
 //! Binding of `SELECT … INTO` and `TRUNCATE TABLE` against a hand-built [`CatalogView`].
 //!
 //! The catalogue knows `dbo.t (a int NOT NULL, b nvarchar(10) NULL)`, `dbo.ex` (two columns
-//! already taken), and `dbo.parent` referenced by a foreign key from `dbo.child`.
+//! already taken), and `dbo.parent`. A `TRUNCATE` of a referenced table binds: its
+//! 4712 is raised while the statement runs.
 
 use vauban_binder::{
     BindContext, BoundStatement, CatalogView, DdlStatement, ResolvedTable, ResolvedTableKind,
@@ -12,9 +13,7 @@ use vauban_errors::SqlError;
 use vauban_parser::{ObjectName, ParseOptions, parse_batch};
 use vauban_types::{Len, SqlType, TypeInfo};
 
-struct Tables {
-    parent_referenced: bool,
-}
+struct Tables;
 
 fn column(
     id: i32,
@@ -74,8 +73,43 @@ impl CatalogView for Tables {
         }
     }
 
-    fn is_referenced_by_foreign_key(&self, object: ObjectId) -> bool {
-        self.parent_referenced && object == ObjectId(3)
+    fn view_definition(&self, _object: vauban_catalog::ObjectId) -> Option<&str> {
+        None
+    }
+
+    fn identity_column(
+        &self,
+        _object: vauban_catalog::ObjectId,
+    ) -> Option<vauban_catalog::ColumnId> {
+        None
+    }
+
+    fn computed_columns(&self, _object: vauban_catalog::ObjectId) -> Vec<vauban_catalog::ColumnId> {
+        Vec::new()
+    }
+
+    fn constraint_names_on_table(&self, _table: vauban_catalog::ObjectId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn primary_key_columns(&self, _table: vauban_catalog::ObjectId) -> Option<Vec<String>> {
+        None
+    }
+
+    fn unique_key_on(&self, _table: vauban_catalog::ObjectId, _columns: &[String]) -> bool {
+        false
+    }
+
+    fn classify_table_reference(
+        &self,
+        name: &vauban_parser::ObjectName,
+        database: &str,
+        default_schema: &str,
+    ) -> vauban_binder::TableReferenceKind {
+        match vauban_binder::CatalogView::resolve_table(self, name, database, default_schema) {
+            Some(_) => vauban_binder::TableReferenceKind::Table,
+            None => vauban_binder::TableReferenceKind::Unknown,
+        }
     }
 }
 
@@ -91,22 +125,11 @@ fn bind_with(text: &str, catalog: &Tables) -> Result<BoundStatement, SqlError> {
 }
 
 fn err(text: &str) -> SqlError {
-    bind_with(
-        text,
-        &Tables {
-            parent_referenced: true,
-        },
-    )
-    .expect_err("this statement does not bind")
+    bind_with(text, &Tables).expect_err("this statement does not bind")
 }
 
 fn select_into(text: &str) -> SelectIntoPlan {
-    match bind_with(
-        text,
-        &Tables {
-            parent_referenced: true,
-        },
-    ) {
+    match bind_with(text, &Tables) {
         Ok(BoundStatement::SelectInto(plan)) => plan,
         other => unreachable!("{text} binds to SelectInto, got {other:?}"),
     }
@@ -155,12 +178,7 @@ fn select_into_duplicate_output_name_is_2705() {
 
 #[test]
 fn truncate_binds_to_ddl() {
-    match bind_with(
-        "TRUNCATE TABLE dbo.t;",
-        &Tables {
-            parent_referenced: false,
-        },
-    ) {
+    match bind_with("TRUNCATE TABLE dbo.t;", &Tables) {
         Ok(BoundStatement::Ddl(DdlStatement::TruncateTable { name })) => {
             assert_eq!(name.name, "t");
             assert_eq!(name.schema, "dbo");
@@ -174,10 +192,4 @@ fn truncate_binds_to_ddl() {
 fn truncate_unknown_table_is_4701() {
     let error = err("TRUNCATE TABLE dbo.nosuch;");
     assert_eq!((error.number, error.severity, error.state), (4701, 16, 1));
-}
-
-#[test]
-fn truncate_referenced_by_fk_is_4712() {
-    let error = err("TRUNCATE TABLE dbo.parent;");
-    assert_eq!((error.number, error.severity, error.state), (4712, 16, 1));
 }

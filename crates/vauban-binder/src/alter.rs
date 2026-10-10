@@ -9,19 +9,26 @@
 //!
 //! # What is checked here, and what waits for the control of flow
 //!
-//! Two of the numbers this file raises name an object the catalogue already holds: 2705
-//! state 4, an `ADD` of a column the table has, and 2714 state 5, an `ADD CONSTRAINT` of a
-//! name the database holds. Written at the head of a batch, both are binding errors raised
-//! here (`tests/bind_alter_table.rs`, `add_existing_column_is_2705`,
-//! `duplicate_constraint_name_is_2714`). Written inside `IF`, `WHILE` or `BEGIN … END`, the
-//! statement is not bound here at all: `control.rs` keeps it as it was parsed until the
-//! control of flow reaches it, so a branch that is not taken raises neither
-//! (`add_existing_column_in_a_branch_binds_deferred`,
-//! `duplicate_constraint_name_in_a_branch_binds_deferred`).
+//! One of the numbers this file raises names an object the catalogue already holds: 2705
+//! state 4, an `ADD` of a column the table has. Written at the head of a batch, it is a
+//! binding error raised here (`tests/bind_alter_table.rs`, `add_existing_column_is_2705`).
+//! Written inside `IF`, `WHILE` or `BEGIN … END`, the statement is not bound here at all:
+//! `control.rs` keeps it as it was parsed until the control of flow reaches it, so a branch
+//! that is not taken does not raise it (`add_existing_column_in_a_branch_binds_deferred`).
 //!
 //! The state is what separates 2705 state 4 from 2705 state 3, the column list that writes
 //! one name twice: a fault of the written text, which stays a binding error inside a branch
 //! (`add_two_columns_duplicate_within_the_list_in_a_branch_is_still_2705`).
+//!
+//! # What is left to the catalogue
+//!
+//! Two refusals belong to [`Catalog::alter_table`](vauban_catalog::Catalog::alter_table),
+//! which runs them when the statement runs, and are not repeated here: the object that
+//! still depends on a dropped column (5074), and the constraint name a table, a
+//! `FOREIGN KEY`, a `CHECK` or a `DEFAULT` of the schema already holds (2714 state 5). This
+//! file binds both statements (`tests/catalog_view.rs`,
+//! `drop_indexed_column_binds_and_leaves_5074_to_the_catalogue`,
+//! `a_taken_constraint_name_binds_and_leaves_2714_to_the_catalogue`).
 
 use vauban_catalog::{
     AlterTable, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, SortedColumn,
@@ -45,9 +52,6 @@ use crate::star::Source;
 
 /// State 4 for error 2705 when an `ALTER TABLE … ADD` names a column the table already has.
 const DUPLICATE_COLUMN_2705_ALTER_TABLE_STATE: u8 = 4;
-
-/// State 5 for error 2714 when an `ADD CONSTRAINT` reuses a name the database already holds.
-const CONSTRAINT_EXISTS_2714_STATE: u8 = 5;
 
 /// Binds an `ALTER TABLE` into [`BoundStatement::Ddl`].
 ///
@@ -83,7 +87,7 @@ pub(crate) fn bind_alter_table(
         AlterTableAction::DropColumns {
             names,
             if_exists: _,
-        } => bind_drop_column(first_ident(names)?, &table, &resolved, catalog, &stmt.span)?,
+        } => bind_drop_column(first_ident(names)?, &table, &resolved, &stmt.span)?,
         AlterTableAction::AddConstraints {
             constraints,
             with_check,
@@ -186,11 +190,12 @@ fn bind_add_columns(
     Ok(AlterTable::AddColumns { columns: added })
 }
 
+/// Binds `DROP COLUMN c`: 4924 when the table has no column `c`. The objects that depend on
+/// `c` are the catalogue's to refuse (module documentation).
 fn bind_drop_column(
     name: &str,
     table: &QualifiedName,
     resolved: &ResolvedTable,
-    catalog: &dyn CatalogView,
     span: &Span,
 ) -> SqlResult<AlterTable> {
     let Some(column) = resolved
@@ -202,38 +207,6 @@ fn bind_drop_column(
             SqlError::alter_table_drop_column_missing(name, &table.name).with_line(span.line)
         );
     };
-    if let Some(index) = catalog.index_on_column(resolved.object, &column.name) {
-        return Err(
-            SqlError::object_depends_on_column("index", &index, &column.name).with_line(span.line),
-        );
-    }
-    if catalog
-        .primary_key_columns(resolved.object)
-        .is_some_and(|columns| {
-            columns
-                .iter()
-                .any(|key| key.eq_ignore_ascii_case(&column.name))
-        })
-    {
-        let name = catalog
-            .primary_key_constraint_name(resolved.object)
-            .unwrap_or_else(|| "PRIMARY KEY".to_owned());
-        return Err(
-            SqlError::object_depends_on_column("object", &name, &column.name).with_line(span.line),
-        );
-    }
-    for constraint in catalog.constraint_names_on_table(resolved.object) {
-        if catalog.check_constraint_mentions_column(resolved.object, &constraint, &column.name)
-            || catalog.default_constraint_on_column(resolved.object, &constraint, &column.name)
-            || catalog.foreign_key_constraint_on_column(resolved.object, &constraint, &column.name)
-            || catalog.unique_constraint_on_column(resolved.object, &constraint, &column.name)
-        {
-            return Err(
-                SqlError::object_depends_on_column("object", &constraint, &column.name)
-                    .with_line(span.line),
-            );
-        }
-    }
     Ok(AlterTable::DropColumn {
         name: column.name.clone(),
     })
@@ -247,9 +220,6 @@ fn bind_add_constraint(
     span: &Span,
     ctx: &BindContext<'_>,
 ) -> SqlResult<AlterTable> {
-    if let Some(name) = constraint.name.as_ref() {
-        refuse_constraint_name(&name.value, catalog, span)?;
-    }
     let scope = table_scope(resolved, table, ctx);
     let def = table_constraint_def(constraint, &scope, ctx, span)?;
     if let ConstraintDef::ForeignKey {
@@ -532,15 +502,6 @@ fn foreign_key_invalid_table(constraint: &str, referenced: &str) -> SqlError {
         0,
         format!("Foreign key '{constraint}' references invalid table '{referenced}'."),
     )
-}
-
-fn refuse_constraint_name(name: &str, catalog: &dyn CatalogView, span: &Span) -> SqlResult<()> {
-    if catalog.object_name_taken(name) {
-        let mut err = SqlError::object_already_exists(name);
-        err.state = CONSTRAINT_EXISTS_2714_STATE;
-        return Err(err.with_line(span.line));
-    }
-    Ok(())
 }
 
 fn refuse_with_check(with_check: &Option<vauban_parser::ConstraintCheck>) -> SqlResult<()> {

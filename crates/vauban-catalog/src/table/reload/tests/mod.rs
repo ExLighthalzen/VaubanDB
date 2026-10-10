@@ -8,6 +8,56 @@ use vauban_txn::{IsolationLevel, TransactionManager};
 
 use crate::def::{ColumnDef, ConstraintDef, IndexDef, SortedColumn, TableDef};
 
+/// A subscriber that keeps the message of each `WARN` event, for the warning a reopening
+/// writes when it leaves a part of a table out.
+#[derive(Clone, Default)]
+struct Warnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl Warnings {
+    fn messages(&self) -> Vec<String> {
+        self.0.lock().map(|kept| kept.clone()).unwrap_or_default()
+    }
+}
+
+/// Reads the `message` field of an event.
+struct Message(String);
+
+impl tracing::field::Visit for Message {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for Warnings {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            if let Ok(mut kept) = self.0.lock() {
+                kept.push(message.0);
+            }
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
 /// A directory of its own under the temporary directory, removed when dropped.
 struct TempDir(std::path::PathBuf);
 
@@ -608,11 +658,29 @@ fn a_foreign_key_whose_index_has_gone_is_left_out() {
         )
         .expect("f");
     let other = first.create_table(&handle, &parent()).expect("parent");
-    first.drop_index(&handle, index.id).expect("drop ux_r");
+    manager.commit(handle).expect("commit");
+    // `Catalog::drop_index` refuses an index a foreign key reads (3723): the drop below
+    // passes over that refusal to leave the foreign key without its index.
+    let handle = manager.begin(IsolationLevel::ReadCommitted);
+    let refused = first
+        .drop_index(&handle, index.id)
+        .expect_err("a foreign key reads ux_r");
+    assert_eq!(refused.number, 3723);
+    crate::index::drop_index_under_its_constraints(&first, &handle, index.id).expect("drop ux_r");
     manager.commit(handle).expect("commit");
 
-    let second =
-        Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&manager)).expect("the instance opens");
+    let warnings = Warnings::default();
+    let second = tracing::subscriber::with_default(warnings.clone(), || {
+        Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&manager)).expect("the instance opens")
+    });
+    // The foreign key is reported in the log.
+    let logged = warnings.messages();
+    assert!(
+        logged
+            .iter()
+            .any(|message| message.contains("a foreign key is left out")),
+        "{logged:?}"
+    );
     // The other tables come back whole.
     assert_eq!(held(&second, other.id), held(&first, other.id));
     assert_eq!(

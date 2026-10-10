@@ -45,6 +45,45 @@ impl CatalogView for OneTable {
             kind: ResolvedTableKind::Table,
         })
     }
+
+    fn view_definition(&self, _object: vauban_catalog::ObjectId) -> Option<&str> {
+        None
+    }
+
+    fn identity_column(
+        &self,
+        _object: vauban_catalog::ObjectId,
+    ) -> Option<vauban_catalog::ColumnId> {
+        None
+    }
+
+    fn computed_columns(&self, _object: vauban_catalog::ObjectId) -> Vec<vauban_catalog::ColumnId> {
+        Vec::new()
+    }
+
+    fn constraint_names_on_table(&self, _table: vauban_catalog::ObjectId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn primary_key_columns(&self, _table: vauban_catalog::ObjectId) -> Option<Vec<String>> {
+        None
+    }
+
+    fn unique_key_on(&self, _table: vauban_catalog::ObjectId, _columns: &[String]) -> bool {
+        false
+    }
+
+    fn classify_table_reference(
+        &self,
+        name: &vauban_parser::ObjectName,
+        database: &str,
+        default_schema: &str,
+    ) -> crate::TableReferenceKind {
+        match crate::CatalogView::resolve_table(self, name, database, default_schema) {
+            Some(_) => crate::TableReferenceKind::Table,
+            None => crate::TableReferenceKind::Unknown,
+        }
+    }
 }
 
 /// A double that resolves any name it is handed to the same table, four-part names
@@ -66,6 +105,45 @@ impl CatalogView for AnyName {
             kind: ResolvedTableKind::Table,
         })
     }
+
+    fn view_definition(&self, _object: vauban_catalog::ObjectId) -> Option<&str> {
+        None
+    }
+
+    fn identity_column(
+        &self,
+        _object: vauban_catalog::ObjectId,
+    ) -> Option<vauban_catalog::ColumnId> {
+        None
+    }
+
+    fn computed_columns(&self, _object: vauban_catalog::ObjectId) -> Vec<vauban_catalog::ColumnId> {
+        Vec::new()
+    }
+
+    fn constraint_names_on_table(&self, _table: vauban_catalog::ObjectId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn primary_key_columns(&self, _table: vauban_catalog::ObjectId) -> Option<Vec<String>> {
+        None
+    }
+
+    fn unique_key_on(&self, _table: vauban_catalog::ObjectId, _columns: &[String]) -> bool {
+        false
+    }
+
+    fn classify_table_reference(
+        &self,
+        name: &vauban_parser::ObjectName,
+        database: &str,
+        default_schema: &str,
+    ) -> crate::TableReferenceKind {
+        match crate::CatalogView::resolve_table(self, name, database, default_schema) {
+            Some(_) => crate::TableReferenceKind::Table,
+            None => crate::TableReferenceKind::Unknown,
+        }
+    }
 }
 
 /// A double that resolves the name it is handed to a view, to reach the branch of
@@ -85,6 +163,45 @@ impl CatalogView for OneView {
             columns: Vec::new(),
             kind: ResolvedTableKind::View,
         })
+    }
+
+    fn view_definition(&self, _object: vauban_catalog::ObjectId) -> Option<&str> {
+        None
+    }
+
+    fn identity_column(
+        &self,
+        _object: vauban_catalog::ObjectId,
+    ) -> Option<vauban_catalog::ColumnId> {
+        None
+    }
+
+    fn computed_columns(&self, _object: vauban_catalog::ObjectId) -> Vec<vauban_catalog::ColumnId> {
+        Vec::new()
+    }
+
+    fn constraint_names_on_table(&self, _table: vauban_catalog::ObjectId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn primary_key_columns(&self, _table: vauban_catalog::ObjectId) -> Option<Vec<String>> {
+        None
+    }
+
+    fn unique_key_on(&self, _table: vauban_catalog::ObjectId, _columns: &[String]) -> bool {
+        false
+    }
+
+    fn classify_table_reference(
+        &self,
+        name: &vauban_parser::ObjectName,
+        database: &str,
+        default_schema: &str,
+    ) -> crate::TableReferenceKind {
+        match crate::CatalogView::resolve_table(self, name, database, default_schema) {
+            Some(_) => crate::TableReferenceKind::Table,
+            None => crate::TableReferenceKind::Unknown,
+        }
     }
 }
 
@@ -276,7 +393,7 @@ fn four_part_local_server_is_208_too() {
 /// A view holds no row of its own, so this module builds no `Scan` for it: it hands the
 /// name to `view.rs`, which expands the definition.
 ///
-/// `OneView` answers a view and **no** definition — the default of the trait — so what
+/// `OneView` answers a view and **no** definition (its `view_definition` is `None`), so what
 /// comes back here is the bug `view::expand` raises for a view the catalogue has no text
 /// for, naming the view. The expansion of a real definition is tested in `view.rs`,
 /// `from_sys_databases_expands_to_scan_of_internal_table`.

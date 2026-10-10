@@ -36,10 +36,10 @@
 //! - `CREATE TABLE t (a int NOT NULL CONSTRAINT pk_t PRIMARY KEY NONCLUSTERED, b int);`
 //!   keeps the written name and leaves the table a `HEAP`.
 //!
-//! # Eight numbers this file does not raise
+//! # Seven numbers this file does not raise
 //!
-//! Eight numbers of SQL Server are not in `vauban-errors` — 8110, 8112, 1902, 1913, 1911,
-//! 3723, 1909 and 8168. A shape that would send one of them answers an
+//! Seven numbers of SQL Server are not in `vauban-errors` — 8110, 8112, 1902, 1913, 1911,
+//! 1909 and 8168. A shape that would send one of them answers an
 //! [`InternalError::Bug`] naming it, as `table.rs` does for 2744:
 //!
 //! | Shape | Number |
@@ -49,15 +49,17 @@
 //! | `CREATE CLUSTERED INDEX ix ON t (b);` over a clustered `PRIMARY KEY` | 1902 state 3 |
 //! | `CREATE INDEX ix ON t (b);` twice under one name | 1913 state 1 |
 //! | `CREATE INDEX ix ON t (nope);` | 1911 state 1 |
-//! | `DROP INDEX` over the index of a `PRIMARY KEY` | 3723 state 4 |
-//! | `DROP INDEX` over the index of a `UNIQUE` constraint | 3723 state 5 |
 //! | `PRIMARY KEY (a, a)` and `CREATE INDEX ix ON t (a ASC, a DESC);` | 1909 state 1 |
 //! | two constraints of one name in one `CREATE TABLE` | 8168 state 0 |
 //!
-//! 3701 is the neighbour that **is** catalogued: state 7 for an index over a table that
+//! 3701 is a neighbour that **is** catalogued: state 7 for an index over a table that
 //! exists, state 6 for one over a table the caller did not find (`vauban-errors`,
 //! `CANNOT_DROP_3701_STATES`), and [`drop_index`] sends both, the second for
 //! `BEGIN TRANSACTION; DROP TABLE t; DROP INDEX ix ON t;`.
+//!
+//! 3723 is the other one: [`drop_index`] refuses the index a constraint is used for, at
+//! state 4 for the index of a `PRIMARY KEY`, 5 for the index of a `UNIQUE` constraint, and
+//! 6 for a unique index a `FOREIGN KEY` of any table points at ([`enforced_constraint`]).
 //!
 //! # Where the metadata sits
 //!
@@ -456,11 +458,14 @@ pub(crate) fn create_index(
 ///
 /// # Errors
 ///
-/// - an [`InternalError::Bug`] naming 3723 when `index` is the index of a `PRIMARY KEY` or of
-///   a `UNIQUE` constraint of its table ([`backed_constraint`]): dropping it would leave the
-///   clustered key of the shape without its index and [`TableMeta::clustered`] pointing at an
-///   identifier `storage` no longer knows. SQL Server refuses it too, at states 4 and 5
-///   (module documentation);
+/// - 3723 when `index` is the index of a `PRIMARY KEY` or of a `UNIQUE` constraint of its
+///   table, at states 4 and 5, or a unique index a `FOREIGN KEY` points at, at state 6
+///   ([`enforced_constraint`]): dropping the first two would leave the clustered key of the
+///   shape without its index and [`TableMeta::clustered`] pointing at an identifier
+///   `storage` no longer knows, and dropping the third would leave the `FOREIGN KEY` without
+///   the key it reads (`tests/index.rs`, `dropping_the_index_of_a_primary_key_is_3723`,
+///   `dropping_the_index_of_a_unique_constraint_is_3723`,
+///   `dropping_a_unique_index_a_foreign_key_points_at_is_3723_state_6`);
 /// - 3701 at state 6 when the table of `index` carries a deferred `DROP TABLE` of the same
 ///   transaction: the commit actions run in registration order, so the table would take the
 ///   index with it before the action registered here runs, and the `COMMIT` would stop on an
@@ -474,6 +479,37 @@ pub(crate) fn create_index(
 ///   when it holds the name and the bare identifier when it does not, the client-facing name
 ///   having been resolved before the call.
 pub(crate) fn drop_index(catalog: &Catalog, txn: &TxnHandle, index: IndexId) -> SqlResult<()> {
+    drop_index_with(catalog, txn, index, Constraints::Refuse)
+}
+
+/// Whether [`drop_index_with`] refuses the index a constraint is used for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Constraints {
+    /// 3723 for the index a constraint is used for: [`drop_index`].
+    Refuse,
+    /// The index goes, constraints or not: [`drop_index_under_its_constraints`].
+    #[cfg(test)]
+    Ignore,
+}
+
+/// [`drop_index`] without its 3723: leaves a constraint without the index it reads, the
+/// shape the reopening of a catalogue is tested against (`table/reload/tests/mod.rs`,
+/// `a_foreign_key_whose_index_has_gone_is_left_out`).
+#[cfg(test)]
+pub(crate) fn drop_index_under_its_constraints(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    index: IndexId,
+) -> SqlResult<()> {
+    drop_index_with(catalog, txn, index, Constraints::Ignore)
+}
+
+fn drop_index_with(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    index: IndexId,
+    constraints: Constraints,
+) -> SqlResult<()> {
     let mut store = table::store(catalog);
     table::refresh(catalog, &mut store)?;
     refresh(catalog, &mut store)?;
@@ -490,14 +526,15 @@ pub(crate) fn drop_index(catalog: &Catalog, txn: &TxnHandle, index: IndexId) -> 
     if dropped {
         return Err(SqlError::cannot_drop("drop", "index", &name));
     }
-    if let Some(table) = table
-        && let Some(constraint) = backed_constraint(table, index)
+    if constraints == Constraints::Refuse
+        && let Some(table) = table
+        && let Some(constraint) = enforced_constraint(&store, table, index)
     {
-        return Err(InternalError::Bug(format!(
-            "Catalog::drop_index: index {name} is being used for {constraint} constraint \
-             enforcement; SQL Server answers 3723, which vauban-errors does not catalogue"
-        ))
-        .into());
+        let mut err = SqlError::cannot_drop_constraint_index(&name, constraint);
+        if constraint == FOREIGN_KEY {
+            err.state = FOREIGN_KEY_INDEX_3723_STATE;
+        }
+        return Err(err);
     }
     // The table of the index carries a deferred `DROP`: its `CommitAction` runs before the
     // one registered here and takes the index with it, so this call would leave the `COMMIT`
@@ -616,23 +653,54 @@ fn create_one_index(
     Ok(id)
 }
 
-/// `PRIMARY KEY` or `UNIQUE` when `index` is the index of a constraint of `table`, `None`
-/// for an index a `CREATE INDEX` made.
+/// The kind of constraint 3723 prints for the unique index a `FOREIGN KEY` points at.
+const FOREIGN_KEY: &str = "FOREIGN KEY";
+
+/// State of error 3723 for the unique index a `FOREIGN KEY` points at; `vauban-errors` keys
+/// states 4 and 5 on `PRIMARY KEY` and `UNIQUE KEY` and not this one.
+const FOREIGN_KEY_INDEX_3723_STATE: u8 = 6;
+
+/// The constraint `index` of `table` is used for, as 3723 prints it: `PRIMARY KEY` or
+/// `UNIQUE KEY` when it is the index of a constraint of `table`, otherwise `FOREIGN KEY`
+/// when a `FOREIGN KEY` of a live table of `store` — `table` included — reads it; `None`
+/// for an index no constraint needs.
 ///
-/// Read from [`TableMeta::constraints`] rather than from a flag of the [`IndexMeta`]: the
-/// index of a `UNIQUE` constraint and the one of a `CREATE UNIQUE INDEX` have the same
-/// fields, and the constraint list is what tells them apart (`tests/index.rs`,
-/// `dropping_the_index_of_a_primary_key_names_3723`,
-/// `dropping_the_index_of_a_unique_constraint_names_3723`).
-fn backed_constraint(table: &TableMeta, index: IndexId) -> Option<&'static str> {
-    table
+/// The key constraints are read from [`TableMeta::constraints`] rather than from a flag of
+/// the [`IndexMeta`]: the index of a `UNIQUE` constraint and the one of a
+/// `CREATE UNIQUE INDEX` have the same fields, and the constraint list is what tells them
+/// apart. A `FOREIGN KEY` that points at the index of a key constraint leaves the kind of
+/// that constraint (`tests/index.rs`, `dropping_the_index_of_a_primary_key_is_3723`,
+/// `dropping_the_index_of_a_unique_constraint_is_3723`,
+/// `dropping_a_unique_index_a_foreign_key_points_at_is_3723_state_6`).
+fn enforced_constraint(
+    store: &TableStore,
+    table: &TableMeta,
+    index: IndexId,
+) -> Option<&'static str> {
+    let key = table
         .constraints
         .iter()
         .find_map(|constraint| match constraint {
             ConstraintMeta::PrimaryKey(id) if *id == index => Some("PRIMARY KEY"),
             ConstraintMeta::Unique(id) if *id == index => Some("UNIQUE KEY"),
             _ => None,
-        })
+        });
+    key.or_else(|| {
+        store
+            .live()
+            .flat_map(|live| live.constraints.iter())
+            .any(|constraint| {
+                matches!(
+                    constraint,
+                    ConstraintMeta::ForeignKey {
+                        referenced_table,
+                        referenced_index,
+                        ..
+                    } if *referenced_table == table.id && *referenced_index == index
+                )
+            })
+            .then_some(FOREIGN_KEY)
+    })
 }
 
 /// The [`KeyColumn`] of each column of `declared`, in key order.

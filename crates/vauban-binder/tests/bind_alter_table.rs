@@ -10,10 +10,7 @@ use vauban_parser::{ObjectName, ParseOptions, parse_batch};
 use vauban_sysfn::register_builtins;
 use vauban_types::{Len, SqlType, TypeInfo};
 
-struct Tables {
-    taken_names: Vec<String>,
-    index_on_b: bool,
-}
+struct Tables;
 
 fn column(id: i32, index: usize, name: &str, ty: SqlType, nullable: bool) -> ColumnBinding {
     ColumnBinding {
@@ -70,23 +67,12 @@ impl CatalogView for Tables {
         }
     }
 
-    fn index_on_column(&self, table: ObjectId, column: &str) -> Option<String> {
-        (self.index_on_b && table == ObjectId(1) && column.eq_ignore_ascii_case("b"))
-            .then(|| "ix_b".to_owned())
-    }
-
     fn constraint_names_on_table(&self, table: ObjectId) -> Vec<String> {
         if table == ObjectId(1) {
             vec!["pk_t".to_owned(), "ck_t".to_owned()]
         } else {
             Vec::new()
         }
-    }
-
-    fn object_name_taken(&self, name: &str) -> bool {
-        self.taken_names
-            .iter()
-            .any(|taken| taken.eq_ignore_ascii_case(name))
     }
 
     fn primary_key_columns(&self, table: ObjectId) -> Option<Vec<String>> {
@@ -98,21 +84,35 @@ impl CatalogView for Tables {
         }
     }
 
-    fn primary_key_constraint_name(&self, table: ObjectId) -> Option<String> {
-        match table {
-            ObjectId(1) => Some("pk_t".to_owned()),
-            ObjectId(4) => Some("pk_pkonly".to_owned()),
-            _ => None,
-        }
+    fn view_definition(&self, _object: vauban_catalog::ObjectId) -> Option<&str> {
+        None
     }
 
-    fn check_constraint_mentions_column(
+    fn identity_column(
         &self,
-        table: ObjectId,
-        constraint: &str,
-        column: &str,
-    ) -> bool {
-        table == ObjectId(1) && constraint.eq_ignore_ascii_case("ck_t") && column == "a"
+        _object: vauban_catalog::ObjectId,
+    ) -> Option<vauban_catalog::ColumnId> {
+        None
+    }
+
+    fn computed_columns(&self, _object: vauban_catalog::ObjectId) -> Vec<vauban_catalog::ColumnId> {
+        Vec::new()
+    }
+
+    fn unique_key_on(&self, _table: vauban_catalog::ObjectId, _columns: &[String]) -> bool {
+        false
+    }
+
+    fn classify_table_reference(
+        &self,
+        name: &vauban_parser::ObjectName,
+        database: &str,
+        default_schema: &str,
+    ) -> vauban_binder::TableReferenceKind {
+        match vauban_binder::CatalogView::resolve_table(self, name, database, default_schema) {
+            Some(_) => vauban_binder::TableReferenceKind::Table,
+            None => vauban_binder::TableReferenceKind::Unknown,
+        }
     }
 }
 
@@ -148,17 +148,7 @@ fn alter(text: &str, catalog: &Tables) -> AlterTable {
 }
 
 fn catalog() -> Tables {
-    Tables {
-        taken_names: vec![],
-        index_on_b: false,
-    }
-}
-
-fn indexed_catalog() -> Tables {
-    Tables {
-        taken_names: vec![],
-        index_on_b: true,
-    }
+    Tables
 }
 
 #[test]
@@ -266,18 +256,6 @@ fn drop_column_binds() {
 fn drop_unknown_column_is_4924() {
     let error = err("ALTER TABLE dbo.t DROP COLUMN nosuch;", &catalog());
     assert_eq!((error.number, error.severity, error.state), (4924, 16, 1));
-}
-
-#[test]
-fn drop_indexed_column_is_5074() {
-    let error = err("ALTER TABLE dbo.t DROP COLUMN b;", &indexed_catalog());
-    assert_eq!((error.number, error.severity, error.state), (5074, 16, 1));
-}
-
-#[test]
-fn drop_primary_key_column_is_5074() {
-    let error = err("ALTER TABLE dbo.pkonly DROP COLUMN a;", &catalog());
-    assert_eq!((error.number, error.severity, error.state), (5074, 16, 1));
 }
 
 #[test]
@@ -431,31 +409,6 @@ fn alter_unknown_table_is_4902() {
     // statement's, not the first line of the text.
     let multiline = err("\n\nALTER TABLE dbo.nosuch2 ADD c int NULL;", &catalog());
     assert_eq!(multiline.line, 3);
-}
-
-#[test]
-fn duplicate_constraint_name_is_2714() {
-    let error = err(
-        "ALTER TABLE dbo.t ADD CONSTRAINT taken CHECK (a > 0);",
-        &Tables {
-            taken_names: vec!["taken".to_owned()],
-            index_on_b: false,
-        },
-    );
-    assert_eq!((error.number, error.severity, error.state), (2714, 16, 5));
-}
-
-/// The `IF` around the same `ADD CONSTRAINT` binds: 2714 state 5 joins 2705 state 4 in
-/// waiting for the control of flow.
-#[test]
-fn duplicate_constraint_name_in_a_branch_binds_deferred() {
-    assert_branch_is_deferred(
-        "IF 1 = 0 ALTER TABLE dbo.t ADD CONSTRAINT taken CHECK (a > 0);",
-        &Tables {
-            taken_names: vec!["taken".to_owned()],
-            index_on_b: false,
-        },
-    );
 }
 
 /// Binds `text`, an `IF` whose branch holds one statement, and asserts that the branch

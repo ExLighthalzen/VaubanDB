@@ -9,8 +9,9 @@
 //!
 //! Each method forwards to the method of [`CatalogSnapshot`] that answers it
 //! ([`CatalogSnapshot::resolve_object`], [`CatalogSnapshot::table`],
-//! [`CatalogSnapshot::view_definition`]) and converts the result into the types of the
-//! binder.
+//! [`CatalogSnapshot::view_definition`], [`CatalogSnapshot::indexes_of`]) and converts the result into the types of the binder.
+//! `tests/catalog_view.rs` asks each method of a snapshot taken from a catalogue built by
+//! [`Catalog::bootstrap`](vauban_catalog::Catalog::bootstrap).
 
 use vauban_catalog::{
     CatalogSnapshot, ColumnId, ColumnMeta, ConstraintMeta, IndexMeta, ObjectId, ObjectKind,
@@ -18,7 +19,7 @@ use vauban_catalog::{
 use vauban_parser::ObjectName;
 
 use crate::bound::ColumnBinding;
-use crate::context::{CatalogView, ResolvedTable, ResolvedTableKind};
+use crate::context::{CatalogView, ResolvedTable, ResolvedTableKind, TableReferenceKind};
 
 impl CatalogView for CatalogSnapshot {
     /// Resolves the written name against this snapshot.
@@ -147,7 +148,8 @@ impl CatalogView for CatalogSnapshot {
         key_column_names(meta, pk_index)
     }
 
-    /// Whether `table` declares a `UNIQUE` key exactly on `columns`, in order.
+    /// Whether `table` carries a unique index exactly on `columns`, in order: the index of a
+    /// `UNIQUE` constraint, or one a `CREATE UNIQUE INDEX` built.
     fn unique_key_on(&self, table: ObjectId, columns: &[String]) -> bool {
         let Some(meta) = self.table(table) else {
             return false;
@@ -160,6 +162,21 @@ impl CatalogView for CatalogSnapshot {
                 && index.columns.len() == columns.len()
                 && key_matches_names(meta, index, columns)
         })
+    }
+
+    /// [`ResolvedTableKind::Table`] or [`ResolvedTableKind::View`] behind the name gives
+    /// [`TableReferenceKind::Table`]; nothing gives `Unknown`. A snapshot knows no
+    /// table-valued function.
+    fn classify_table_reference(
+        &self,
+        name: &ObjectName,
+        database: &str,
+        default_schema: &str,
+    ) -> TableReferenceKind {
+        match self.resolve_table(name, database, default_schema) {
+            Some(_) => TableReferenceKind::Table,
+            None => TableReferenceKind::Unknown,
+        }
     }
 }
 

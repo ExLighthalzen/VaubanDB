@@ -250,7 +250,55 @@ fn return_with_value_outside_procedure_is_178() {
 /// puts 208 where a scalar context answers "this form needs a catalogue".
 struct EmptyCatalog;
 
-impl CatalogView for EmptyCatalog {}
+impl CatalogView for EmptyCatalog {
+    fn resolve_table(
+        &self,
+        _name: &vauban_parser::ObjectName,
+        _database: &str,
+        _default_schema: &str,
+    ) -> Option<vauban_binder::ResolvedTable> {
+        None
+    }
+
+    fn view_definition(&self, _object: vauban_catalog::ObjectId) -> Option<&str> {
+        None
+    }
+
+    fn identity_column(
+        &self,
+        _object: vauban_catalog::ObjectId,
+    ) -> Option<vauban_catalog::ColumnId> {
+        None
+    }
+
+    fn computed_columns(&self, _object: vauban_catalog::ObjectId) -> Vec<vauban_catalog::ColumnId> {
+        Vec::new()
+    }
+
+    fn constraint_names_on_table(&self, _table: vauban_catalog::ObjectId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn primary_key_columns(&self, _table: vauban_catalog::ObjectId) -> Option<Vec<String>> {
+        None
+    }
+
+    fn unique_key_on(&self, _table: vauban_catalog::ObjectId, _columns: &[String]) -> bool {
+        false
+    }
+
+    fn classify_table_reference(
+        &self,
+        name: &vauban_parser::ObjectName,
+        database: &str,
+        default_schema: &str,
+    ) -> vauban_binder::TableReferenceKind {
+        match vauban_binder::CatalogView::resolve_table(self, name, database, default_schema) {
+            Some(_) => vauban_binder::TableReferenceKind::Table,
+            None => vauban_binder::TableReferenceKind::Unknown,
+        }
+    }
+}
 
 /// Binds one statement against [`EmptyCatalog`], returning the bound form.
 fn bind_empty(text: &str) -> BoundStatement {
@@ -443,8 +491,43 @@ impl CatalogView for HoldsOneTable {
             })
     }
 
-    fn object_name_taken(&self, name: &str) -> bool {
-        name.eq_ignore_ascii_case("ck1")
+    fn view_definition(&self, _object: vauban_catalog::ObjectId) -> Option<&str> {
+        None
+    }
+
+    fn identity_column(
+        &self,
+        _object: vauban_catalog::ObjectId,
+    ) -> Option<vauban_catalog::ColumnId> {
+        None
+    }
+
+    fn computed_columns(&self, _object: vauban_catalog::ObjectId) -> Vec<vauban_catalog::ColumnId> {
+        Vec::new()
+    }
+
+    fn constraint_names_on_table(&self, _table: vauban_catalog::ObjectId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn primary_key_columns(&self, _table: vauban_catalog::ObjectId) -> Option<Vec<String>> {
+        None
+    }
+
+    fn unique_key_on(&self, _table: vauban_catalog::ObjectId, _columns: &[String]) -> bool {
+        false
+    }
+
+    fn classify_table_reference(
+        &self,
+        name: &vauban_parser::ObjectName,
+        database: &str,
+        default_schema: &str,
+    ) -> vauban_binder::TableReferenceKind {
+        match vauban_binder::CatalogView::resolve_table(self, name, database, default_schema) {
+            Some(_) => vauban_binder::TableReferenceKind::Table,
+            None => vauban_binder::TableReferenceKind::Unknown,
+        }
     }
 }
 
@@ -535,17 +618,13 @@ fn a_branch_whose_select_into_names_a_held_table_binds_deferred() {
     assert_eq!((error.number, error.state), (2714, 6), "{error:?}");
 }
 
-/// `ALTER TABLE … ADD` of a column the table has (2705 state 4) and `ADD CONSTRAINT` of a
-/// name the database holds (2714 state 5) wait the same way.
+/// `ALTER TABLE … ADD` of a column the table has (2705 state 4) waits the same way. The
+/// `ADD CONSTRAINT` of a name the database holds binds, in a branch as at the head of a
+/// batch: its 2714 state 5 is the catalogue's, when the statement runs
+/// (`tests/catalog_view.rs`, `a_taken_constraint_name_binds_and_leaves_2714_to_the_catalogue`).
 #[test]
 fn a_branch_that_alters_a_table_on_a_held_name_binds_deferred() {
     let stmt = bind_holding("IF 1 = 0 ALTER TABLE dbo.t ADD a int");
-    let BoundStatement::If { then_, .. } = &stmt else {
-        panic!("expected If, got {stmt:?}");
-    };
-    assert!(matches!(deferred(then_), Statement::AlterTable(_)));
-
-    let stmt = bind_holding("IF 1 = 0 ALTER TABLE dbo.t ADD CONSTRAINT ck1 CHECK (a > 0)");
     let BoundStatement::If { then_, .. } = &stmt else {
         panic!("expected If, got {stmt:?}");
     };

@@ -376,8 +376,12 @@ fn identity_and_object_ids_hold_across_a_killed_process() {
     server.interrupt();
 }
 
+/// `DROP INDEX` of the unique index a foreign key reads is refused (3723), so the key is
+/// still there after the restart and the foreign key still applies. A foreign key left
+/// without its index on disk is the reopening's to skip (`vauban-catalog`,
+/// `a_foreign_key_whose_index_has_gone_is_left_out`).
 #[test]
-fn a_foreign_key_left_without_its_index_does_not_stop_the_instance() {
+fn a_refused_drop_index_leaves_the_foreign_key_whole_across_a_restart() {
     let dir = TempDir::new("left-out");
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
 
@@ -391,7 +395,6 @@ fn a_foreign_key_left_without_its_index_does_not_stop_the_instance() {
              INSERT dbo.r VALUES (1, 10);
              CREATE TABLE dbo.f (x int CONSTRAINT fk_f REFERENCES dbo.r (k));
              INSERT dbo.f VALUES (10);
-             DROP INDEX ux_r ON dbo.r;
              CREATE TABLE dbo.g (a int NOT NULL);
              INSERT dbo.g VALUES (1);
              CREATE TABLE dbo.w (a int, b int, c int);
@@ -401,6 +404,7 @@ fn a_foreign_key_left_without_its_index_does_not_stop_the_instance() {
              CREATE TABLE dbo.zlast (a int);",
         )
         .await;
+        fails_with(&mut client, "DROP INDEX ux_r ON dbo.r", 3723).await;
         let dropped = ints(&mut client, "SELECT OBJECT_ID('dbo.zlast')").await[0][0];
         ok(&mut client, "DROP TABLE dbo.zlast").await;
         (dropped, largest_object_id(&mut client).await)
@@ -410,7 +414,7 @@ fn a_foreign_key_left_without_its_index_does_not_stop_the_instance() {
     let server = Running::start(52, &dir.data(), &dir.log(2));
     runtime.block_on(async {
         let mut client = connect(server.port).await;
-        // The instance opens, and each table reads, the one left without its key included.
+        // The instance opens, and each table reads.
         assert_eq!(
             ints(&mut client, "SELECT a FROM dbo.g").await,
             vec![vec![1]]
@@ -423,7 +427,9 @@ fn a_foreign_key_left_without_its_index_does_not_stop_the_instance() {
             ints(&mut client, "SELECT x FROM dbo.f").await,
             vec![vec![10]]
         );
-        ok(&mut client, "INSERT dbo.f VALUES (20)").await;
+        // The foreign key still reads its index.
+        fails_with(&mut client, "INSERT dbo.f VALUES (20)", 547).await;
+        ok(&mut client, "INSERT dbo.f VALUES (10)").await;
         // The column added after the restart takes the number after the last one handed out.
         ok(&mut client, "ALTER TABLE dbo.w ADD e int").await;
         assert_eq!(
@@ -442,6 +448,4 @@ fn a_foreign_key_left_without_its_index_does_not_stop_the_instance() {
         assert!(fresh > persisted, "{fresh} is not past {persisted}");
     });
     server.interrupt();
-    let log = fs::read_to_string(dir.log(2)).unwrap_or_default();
-    assert!(log.contains("is left out"), "no warning in the log:\n{log}");
 }
