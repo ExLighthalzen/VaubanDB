@@ -385,7 +385,9 @@ fn plan_holds_external_column(plan: &LogicalPlan, level: u8) -> bool {
                     .is_some_and(|pred| expr_holds_external_column(pred, level))
         }
         LogicalPlan::Scan { .. } | LogicalPlan::OneRow => false,
-        LogicalPlan::SetOp { .. } => false,
+        LogicalPlan::SetOp { left, right, .. } => {
+            plan_holds_external_column(left, level) || plan_holds_external_column(right, level)
+        }
     }
 }
 

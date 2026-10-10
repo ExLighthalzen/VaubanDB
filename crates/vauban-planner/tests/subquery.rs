@@ -1255,3 +1255,66 @@ fn a_declare_carries_the_subplans_of_each_initial_value() {
     assert!(contains_table(&declarations[0].subplans[0].plan, TABLE_A));
     assert!(declarations[1].subplans.is_empty());
 }
+
+/// A set operation whose right operand reads `a.k` one query up, the left one reading `b`
+/// alone.
+fn union_correlated_on_the_right(op: SetOpKind, depth: u8) -> LogicalPlan {
+    let right = LogicalPlan::Filter {
+        input: Box::new(project_scan(scan_b())),
+        predicate: compare(
+            CompareOp::Eq,
+            column(binding_b("k", 11, 0)),
+            column(ColumnBinding {
+                depth,
+                ..binding_a("k", 1, 0)
+            }),
+        ),
+    };
+    LogicalPlan::SetOp {
+        op,
+        all: false,
+        left: Box::new(project_scan(scan_b())),
+        right: Box::new(right),
+        schema: schema(&["k", "c"]),
+    }
+}
+
+/// An `EXISTS` over a set operation with an operand that reads the enclosing query stays
+/// a correlated `SubqueryEval`, not a semi-join; without the outer reference it becomes
+/// the semi-join.
+#[test]
+fn exists_over_a_correlated_set_operation_is_correlated() {
+    for op in [SetOpKind::Union, SetOpKind::Intersect, SetOpKind::Except] {
+        assert_correlated_exists(union_correlated_on_the_right(op, 1));
+        assert_uncorrelated_exists(union_correlated_on_the_right(op, 0));
+    }
+}
+
+/// A scalar subquery over a set operation with an operand that reads the enclosing query
+/// is evaluated per row: `correlated` is true on its subplan.
+#[test]
+fn a_scalar_subquery_over_a_correlated_set_operation_is_not_cached() {
+    let inner = LogicalPlan::Project {
+        input: Box::new(union_correlated_on_the_right(SetOpKind::Intersect, 1)),
+        exprs: vec![BoundProjection {
+            expr: column(binding_b("k", 11, 0)),
+            name: "k".to_owned(),
+        }],
+        schema: schema(&["k"]),
+    };
+    let query = LogicalPlan::Project {
+        input: Box::new(scan_a()),
+        exprs: vec![BoundProjection {
+            expr: scalar(inner),
+            name: "x".to_owned(),
+        }],
+        schema: schema(&["x"]),
+    };
+    let planned = plan_with(&FakeCatalog::new(), query);
+    let subplans = subplans_in(&planned);
+    assert_eq!(subplans.len(), 1);
+    assert!(
+        subplans[0].correlated,
+        "expected correlated: true, got {planned:?}"
+    );
+}

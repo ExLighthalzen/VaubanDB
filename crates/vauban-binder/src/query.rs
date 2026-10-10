@@ -137,7 +137,11 @@ pub(crate) fn bind_select_with_parent(
             let (plan, scope, keys) = bind_query_spec(spec, stmt, ctx, parent)?;
             (plan, Some(scope), keys)
         }
-        QueryBody::SetOp { .. } => (setop::bind_set_op(&stmt.body, stmt, ctx)?, None, None),
+        QueryBody::SetOp { .. } => (
+            setop::bind_set_op(&stmt.body, stmt, ctx, parent)?,
+            None,
+            None,
+        ),
         QueryBody::Nested(..) => {
             return Err(not_yet(
                 "bind_select: a parenthesised query body is not implemented yet",

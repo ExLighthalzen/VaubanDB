@@ -29,6 +29,10 @@ use crate::query::bind_select_with_parent;
 /// from the common type of each pair. A conversion is inserted in the operand whose
 /// column type differs from the common one.
 ///
+/// Each operand is bound under `parent`, the scope of the query that encloses the set
+/// operation, so a branch of a subquery reads the columns of that query
+/// (`tests/bind_subquery.rs`, `each_branch_of_a_set_operation_reads_the_enclosing_query`).
+///
 /// The ORDER BY of the statement is left to `query.rs`, which calls
 /// `sort::bind_order_by` on the result of this function.
 ///
@@ -40,6 +44,7 @@ pub(crate) fn bind_set_op(
     body: &QueryBody,
     stmt: &SelectStatement,
     ctx: &BindContext<'_>,
+    parent: &Scope,
 ) -> SqlResult<LogicalPlan> {
     let (op, all, left_body, right_body, span) = match body {
         QueryBody::SetOp {
@@ -52,8 +57,8 @@ pub(crate) fn bind_set_op(
         _ => unreachable!("bind_set_op called on a non-SetOp body"),
     };
 
-    let left = bind_operand(left_body, ctx)?;
-    let right = bind_operand(right_body, ctx)?;
+    let left = bind_operand(left_body, ctx, parent)?;
+    let right = bind_operand(right_body, ctx, parent)?;
 
     let left_schema = left.schema().clone();
     let right_schema = right.schema().clone();
@@ -203,7 +208,7 @@ fn convert_expr(expr: BoundExpr, target: &TypeInfo) -> BoundExpr {
 ///
 /// A `QueryBody::Select` is bound through `bind_select_with_parent`; a `SetOp` recurses
 /// into [`bind_set_op`].
-fn bind_operand(body: &QueryBody, ctx: &BindContext<'_>) -> SqlResult<LogicalPlan> {
+fn bind_operand(body: &QueryBody, ctx: &BindContext<'_>, parent: &Scope) -> SqlResult<LogicalPlan> {
     let span = span_of(body);
     let synthetic = SelectStatement {
         with: None,
@@ -214,9 +219,9 @@ fn bind_operand(body: &QueryBody, ctx: &BindContext<'_>) -> SqlResult<LogicalPla
         span,
     };
     match body {
-        QueryBody::Select(_) => bind_select_with_parent(&synthetic, ctx, &Scope::empty()),
-        QueryBody::SetOp { .. } => bind_set_op(&synthetic.body, &synthetic, ctx),
-        QueryBody::Nested(inner, _) => bind_operand(inner, ctx),
+        QueryBody::Select(_) => bind_select_with_parent(&synthetic, ctx, parent),
+        QueryBody::SetOp { .. } => bind_set_op(&synthetic.body, &synthetic, ctx, parent),
+        QueryBody::Nested(inner, _) => bind_operand(inner, ctx, parent),
     }
 }
 

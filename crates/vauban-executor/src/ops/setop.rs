@@ -13,7 +13,7 @@ use vauban_binder::{OutputColumn, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::PhysicalPlan;
 
-use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
+use crate::context::{CANCEL_CHECK_ROWS, CorrelationMark, ExecContext};
 use crate::operator::hash_table::{KeyEncoder, KeySet};
 use crate::operator::{Operator, build_operator};
 use crate::row::Row;
@@ -29,6 +29,9 @@ pub(crate) struct UnionAll<'a> {
     schema: OutputSchema,
     current: usize,
     current_open: bool,
+    /// Where the correlation stacks stood when the first operand of this scan was opened:
+    /// what lies under it belongs to the enclosing operators and queries.
+    mark: Option<CorrelationMark>,
 }
 
 impl<'a> UnionAll<'a> {
@@ -38,23 +41,33 @@ impl<'a> UnionAll<'a> {
             schema,
             current: 0,
             current_open: false,
+            mark: None,
+        }
+    }
+
+    /// Drops what an exhausted operand may have left on the correlation stacks.
+    ///
+    /// Each operand owns its own operator tree; when one is exhausted the next one must not
+    /// inherit stale frames from a nested-loop join that closed mid-scan. The stacks are
+    /// brought back to the mark taken before the first operand was opened, so the row of
+    /// an enclosing query and the outer row of an enclosing join stay readable by the next
+    /// operand (`tests/subquery.rs`, `union_all_keeps_the_enclosing_rows_across_operands`).
+    ///
+    /// The mark is taken on the first `next` rather than in `open`: a `SubqueryEval`
+    /// above opens its input before it pushes its own frame, and that frame must survive
+    /// (`tests/subquery.rs`, `a_subquery_eval_over_a_union_all_keeps_its_plans`).
+    fn clear_operand_correlation(&self, ctx: &mut ExecContext<'_>) {
+        if let Some(mark) = self.mark {
+            ctx.unwind_to(mark);
         }
     }
 }
 
-/// Drops the outer rows an operand may have left on the context.
-///
-/// Each operand owns its own operator tree; when one is exhausted the next one must not
-/// inherit stale frames from a nested-loop join that closed mid-scan.
-fn clear_operand_correlation(ctx: &mut ExecContext<'_>) {
-    while ctx.pop_outer().is_some() {}
-}
-
 impl<'a> Operator<'a> for UnionAll<'a> {
-    fn open(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<()> {
+    fn open(&mut self, _ctx: &mut ExecContext<'a>) -> SqlResult<()> {
         self.current = 0;
         self.current_open = false;
-        clear_operand_correlation(ctx);
+        self.mark = None;
         Ok(())
     }
 
@@ -64,6 +77,9 @@ impl<'a> Operator<'a> for UnionAll<'a> {
                 return Ok(None);
             }
             if !self.current_open {
+                if self.mark.is_none() {
+                    self.mark = Some(ctx.correlation_mark());
+                }
                 self.inputs[self.current].open(ctx)?;
                 self.current_open = true;
             }
@@ -71,7 +87,7 @@ impl<'a> Operator<'a> for UnionAll<'a> {
                 Some(row) => return Ok(Some(row)),
                 None => {
                     self.inputs[self.current].close();
-                    clear_operand_correlation(ctx);
+                    self.clear_operand_correlation(ctx);
                     self.current_open = false;
                     self.current += 1;
                 }

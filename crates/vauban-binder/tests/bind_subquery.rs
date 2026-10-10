@@ -261,6 +261,10 @@ fn column_depths(plan: &LogicalPlan) -> Vec<(String, u8)> {
                 from_plan(input, out);
             }
             LogicalPlan::Aggregate { input, .. } => from_plan(input, out),
+            LogicalPlan::SetOp { left, right, .. } => {
+                from_plan(left, out);
+                from_plan(right, out);
+            }
             LogicalPlan::Scan { .. } | LogicalPlan::OneRow => {}
             other => panic!("the walk does not descend into {other:?}"),
         }
@@ -315,6 +319,41 @@ fn an_outer_column_carries_its_scope_depth() {
     };
     assert_eq!((z.column, z.index), (x.column, x.index));
     assert_eq!((z.depth, x.depth), (0, 1));
+}
+
+/// Each operand of a set operation inside a subquery reads the enclosing query: the
+/// reference in either branch resolves one query up, with `depth` 1.
+#[test]
+fn each_branch_of_a_set_operation_reads_the_enclosing_query() {
+    for op in ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"] {
+        let text = format!(
+            "SELECT k FROM a WHERE EXISTS \
+             (SELECT k FROM b WHERE b.k = a.k {op} SELECT k FROM b WHERE b.c = a.c)"
+        );
+        let plan = bind_with(&text).expect("the correlated set operation binds");
+        let depths = column_depths(&plan);
+        assert_eq!(
+            depths,
+            vec![
+                ("k".to_owned(), 0),
+                ("k".to_owned(), 0),
+                ("k".to_owned(), 0),
+                ("k".to_owned(), 1),
+                ("k".to_owned(), 0),
+                ("c".to_owned(), 0),
+                ("c".to_owned(), 1),
+            ],
+            "{op}: {plan:#?}"
+        );
+    }
+}
+
+/// At the top level, a branch of a set operation has no enclosing query: the other
+/// branch's table stays out of its scope.
+#[test]
+fn a_top_level_branch_does_not_see_the_other_branch() {
+    let error = error_of("SELECT k FROM a UNION SELECT k FROM b WHERE b.k = a.k");
+    assert_eq!(error.number, 4104, "{error:?}");
 }
 
 /// Two subqueries down, a column of the outermost query has `depth` 2, one of the middle

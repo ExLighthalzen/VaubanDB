@@ -153,6 +153,20 @@ fn logical_plan_from_physical(plan: &PhysicalPlan) -> vauban_binder::LogicalPlan
             input: Box::new(logical_plan_from_physical(input)),
             predicate: predicate.clone(),
         },
+        PhysicalPlan::Union {
+            inputs,
+            all,
+            schema,
+        } => match inputs.as_slice() {
+            [left, right] => vauban_binder::LogicalPlan::SetOp {
+                op: vauban_binder::SetOpKind::Union,
+                all: *all,
+                left: Box::new(logical_plan_from_physical(left)),
+                right: Box::new(logical_plan_from_physical(right)),
+                schema: schema.clone(),
+            },
+            _ => panic!("unsupported test plan shape"),
+        },
         _ => panic!("unsupported test plan shape"),
     }
 }
@@ -522,6 +536,54 @@ fn correlated_subquery_reads_the_outer_row() {
     let (_outcome, rows) = f.run(plan).expect("correlated scalar");
     assert_eq!(rows[0][0], Value::I32(10));
     assert_eq!(rows[1][0], Value::I32(20));
+}
+
+fn union_all(left: PhysicalPlan, right: PhysicalPlan) -> PhysicalPlan {
+    PhysicalPlan::Union {
+        inputs: vec![left, right],
+        all: true,
+        schema: schema_of(&["c0"], int_ty(true)),
+    }
+}
+
+/// A correlated subquery over `UNION ALL` reads the enclosing row in its second operand,
+/// after the first one is exhausted.
+#[test]
+fn union_all_keeps_the_enclosing_rows_across_operands() {
+    let f = Fixture::new();
+    f.insert(f.outer, &[10, 20, 30]);
+    f.insert(f.inner, &[10]);
+    let inner = union_all(
+        filter(scan(f.inner), eq(col(0), enclosing_col(0))),
+        filter(values_int(&[20]), eq(col(0), enclosing_col(0))),
+    );
+    let sq = subquery_eval(
+        scan(f.outer),
+        scalar(inner.clone()),
+        vec![subplan(inner.clone(), true)],
+    );
+    let plan = project(sq, scalar(inner), "v");
+    let (_outcome, rows) = f.run(plan).expect("correlated scalar over a union");
+    let got: Vec<Value> = rows.iter().map(|row| row[0].clone()).collect();
+    assert_eq!(got, vec![Value::I32(10), Value::I32(20), Value::Null]);
+}
+
+/// A `SubqueryEval` whose input is a `UNION ALL` keeps its plans once the union moves to
+/// its second operand.
+#[test]
+fn a_subquery_eval_over_a_union_all_keeps_its_plans() {
+    let f = Fixture::new();
+    f.insert(f.inner, &[10, 20]);
+    let inner = filter(scan(f.inner), eq(col(0), enclosing_col(0)));
+    let sq = subquery_eval(
+        union_all(values_int(&[10]), values_int(&[20, 30])),
+        scalar(inner.clone()),
+        vec![subplan(inner.clone(), true)],
+    );
+    let plan = project(sq, scalar(inner), "v");
+    let (_outcome, rows) = f.run(plan).expect("correlated scalar above a union");
+    let got: Vec<Value> = rows.iter().map(|row| row[0].clone()).collect();
+    assert_eq!(got, vec![Value::I32(10), Value::I32(20), Value::Null]);
 }
 
 #[test]
