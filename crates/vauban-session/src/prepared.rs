@@ -3,14 +3,18 @@
 
 use std::collections::HashMap;
 
-use vauban_binder::{BatchVariables, BindContext, BoundExprKind, BoundStatement};
+use vauban_binder::{
+    BatchVariables, BindContext, BoundExprKind, BoundStatement, resolve_declared_type,
+};
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_parser::{DataType, ParameterDeclaration, Statement, TypeArg, parse_batch};
+use vauban_parser::{DataType, ParameterDeclaration, Statement, parse_batch};
 use vauban_planner::{PhysicalPlan, PhysicalStatement, PlanContext, StorageIndexes};
 use vauban_tds::RpcParam;
 use vauban_txn::IsolationLevel;
-use vauban_types::{Collation, Len, SqlString, SqlType, TypeInfo, Value};
+use vauban_types::{
+    Collation, Len, SqlString, SqlType, TypeFamily, TypeInfo, Value, convert, implicit_result_type,
+};
 
 use crate::batch::Session;
 use crate::eval_context::SessionEvalContext;
@@ -313,7 +317,7 @@ fn proc_params_to_nested(prepared: &Prepared, params: &[ProcParam]) -> SqlResult
             Ok(NestedParam {
                 name: decl.name.clone(),
                 ty: ty.clone(),
-                value: arg.value.clone(),
+                value: bound_argument(&arg.value, &arg.ty, ty)?,
                 output: decl.output || arg.output,
             })
         })
@@ -835,94 +839,108 @@ fn resolve_declaration_types(declarations: &[ParameterDeclaration]) -> SqlResult
     declarations
         .iter()
         .enumerate()
-        .map(|(index, decl)| declaration_type(&decl.ty, index as u32 + 1))
+        .map(|(index, decl)| resolve_declared_type(&decl.ty, index as u32 + 1))
         .collect()
 }
 
-fn declaration_type(decl: &DataType, position: u32) -> SqlResult<TypeInfo> {
-    resolve_decl_type(decl, position)
-}
-
-fn resolve_decl_type(decl: &DataType, position: u32) -> SqlResult<TypeInfo> {
-    let name = decl.name.to_ascii_lowercase();
-    let sql_type = match name.as_str() {
-        "int" | "integer" => SqlType::Int,
-        "bigint" => SqlType::BigInt,
-        "smallint" => SqlType::SmallInt,
-        "tinyint" => SqlType::TinyInt,
-        "bit" => SqlType::Bit,
-        "nvarchar" | "national char varying" | "national character varying" => {
-            sized_sql_type(decl, SqlType::NVarChar, 4_000, true, position)?
-        }
-        "varchar" | "char varying" | "character varying" => {
-            sized_sql_type(decl, SqlType::VarChar, 8_000, true, position)?
-        }
-        "nchar" | "national char" | "national character" => {
-            sized_sql_type(decl, SqlType::NChar, 4_000, false, position)?
-        }
-        "char" | "character" => sized_sql_type(decl, SqlType::Char, 8_000, false, position)?,
-        "varbinary" | "binary varying" => {
-            sized_sql_type(decl, SqlType::VarBinary, 8_000, true, position)?
-        }
-        "binary" => sized_sql_type(decl, SqlType::Binary, 8_000, false, position)?,
-        "decimal" | "dec" | "numeric" => exact_numeric(decl, position)?,
-        "float" | "double precision" => SqlType::Float,
-        "real" => SqlType::Real,
-        "money" => SqlType::Money,
-        "smallmoney" => SqlType::SmallMoney,
-        "date" => SqlType::Date,
-        "datetime" => SqlType::DateTime,
-        "smalldatetime" => SqlType::SmallDateTime,
-        "datetime2" => SqlType::DateTime2(7),
-        "datetimeoffset" => SqlType::DateTimeOffset(7),
-        "time" => SqlType::Time(7),
-        "uniqueidentifier" => SqlType::UniqueIdentifier,
-        // Plain `sysname` is `nvarchar(128)`; a length is refused in a declaration.
-        "sysname" => {
-            if !decl.args.is_empty() {
-                return Err(SqlError::cannot_find_data_type(position, &decl.name));
-            }
-            SqlType::NVarChar(Len::Fixed(128))
-        }
-        _ => return Err(SqlError::cannot_find_data_type(position, &decl.name)),
-    };
-    Ok(TypeInfo::new(sql_type, true))
-}
-
-fn sized_sql_type(
-    decl: &DataType,
-    make: fn(Len) -> SqlType,
-    max: i64,
-    allow_max: bool,
-    position: u32,
-) -> SqlResult<SqlType> {
-    let len = match decl.args.as_slice() {
-        [] => Len::Fixed(1),
-        [TypeArg::Number(n)] if (1..=max).contains(n) => Len::Fixed(
-            u16::try_from(*n).map_err(|_| SqlError::cannot_find_data_type(position, &decl.name))?,
-        ),
-        [TypeArg::Max] if allow_max => Len::Max,
-        _ => return Err(SqlError::cannot_find_data_type(position, &decl.name)),
-    };
-    Ok(make(len))
-}
-
-fn exact_numeric(decl: &DataType, position: u32) -> SqlResult<SqlType> {
-    let (precision, scale) = match decl.args.as_slice() {
-        [] => (18, 0),
-        [TypeArg::Number(p)] => (*p, 0),
-        [TypeArg::Number(p), TypeArg::Number(s)] => (*p, *s),
-        _ => return Err(SqlError::cannot_find_data_type(position, &decl.name)),
-    };
-    if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
-        return Err(SqlError::cannot_find_data_type(position, &decl.name));
+impl ProcParam {
+    /// The type a declared procedure parameter carries, nullable, or the 2715 or 2716 that
+    /// refuses its declaration; `position` is the 1-based rank in the declaration list.
+    ///
+    /// The resolution itself is the binder's ([`vauban_binder::resolve_declared_type`]); this
+    /// entry point serves the crates that build [`ProcParam`]s without depending on the
+    /// binder.
+    pub fn declared_type(ty: &DataType, position: u32) -> SqlResult<TypeInfo> {
+        resolve_declared_type(ty, position)
     }
-    Ok(SqlType::Decimal {
-        precision: u8::try_from(precision)
-            .map_err(|_| SqlError::cannot_find_data_type(position, &decl.name))?,
-        scale: u8::try_from(scale)
-            .map_err(|_| SqlError::cannot_find_data_type(position, &decl.name))?,
+
+    /// `value`, an argument of type `from`, converted to the `declared` type of the
+    /// parameter it is bound to, the way the parameter receives it in the called text.
+    ///
+    /// # Errors
+    ///
+    /// The refusals [`bound_argument`] lists.
+    pub fn bound_value(value: &Value, from: &TypeInfo, declared: &TypeInfo) -> SqlResult<Value> {
+        bound_argument(value, from, declared)
+    }
+}
+
+/// `value`, of type `from`, converted to the `declared` type of the parameter it is bound
+/// to (`tests::arguments_take_the_declared_type`).
+///
+/// # Errors
+///
+/// - 257, state 3, from `datetime` or `smalldatetime` to a number: the pair has an explicit
+///   conversion only (`tests::a_datetime_argument_to_a_number_is_257`).
+/// - 206, state 2, for a pair with no implicit conversion, the argument's type named first.
+/// - 8114, state 5, when the value does not convert.
+///
+/// A `NULL` converts to `NULL` without its pair being checked.
+pub(crate) fn bound_argument(
+    value: &Value,
+    from: &TypeInfo,
+    declared: &TypeInfo,
+) -> SqlResult<Value> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if from.ty == declared.ty {
+        return Ok(value.clone());
+    }
+    let datetime_source = matches!(from.ty, SqlType::DateTime | SqlType::SmallDateTime);
+    if datetime_source && is_number(&declared.ty) {
+        return Err(SqlError::implicit_conversion_not_allowed(
+            from.ty.name(),
+            declared.ty.name(),
+        ));
+    }
+    if implicit_result_type(from, declared).is_err() {
+        return Err(SqlError::operand_type_clash(
+            from.ty.name(),
+            declared.ty.name(),
+        ));
+    }
+    converted_or_8114(value, from, declared, ARGUMENT_FAILURE_STATE)
+}
+
+/// `value`, the final value of an `OUTPUT` parameter declared `from`, converted to the
+/// type `to` of what receives it (`tests::an_output_takes_the_type_of_its_receiver`).
+///
+/// # Errors
+///
+/// 8114, state 2, when the value does not convert to `to`.
+pub(crate) fn returned_output(value: &Value, from: &TypeInfo, to: &TypeInfo) -> SqlResult<Value> {
+    if matches!(value, Value::Null) || from.ty == to.ty {
+        return Ok(value.clone());
+    }
+    converted_or_8114(value, from, to, OUTPUT_FAILURE_STATE)
+}
+
+/// State of the 8114 an `OUTPUT` value that does not fit its receiver raises.
+const OUTPUT_FAILURE_STATE: u8 = 2;
+
+/// State of the 8114 an argument that does not convert to its parameter raises.
+const ARGUMENT_FAILURE_STATE: u8 = 5;
+
+/// `value` converted from `from` to `to`, or 8114 at `state`, naming the two types.
+fn converted_or_8114(value: &Value, from: &TypeInfo, to: &TypeInfo, state: u8) -> SqlResult<Value> {
+    convert(value, from, to, None).map_err(|_| {
+        let mut err = SqlError::error_converting_data_type(from.ty.name(), to.ty.name());
+        err.state = state;
+        err
     })
+}
+
+/// Whether `ty` is a number: `bit`, an integer, an exact or approximate numeric, money.
+fn is_number(ty: &SqlType) -> bool {
+    matches!(
+        ty.family(),
+        TypeFamily::Bit
+            | TypeFamily::Integer
+            | TypeFamily::ExactNumeric
+            | TypeFamily::ApproxNumeric
+            | TypeFamily::Money
+    )
 }
 
 fn run_nested_tracked(
@@ -1003,8 +1021,13 @@ impl ResultSink for PrepareExecSink<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Prepared, PreparedStatements, parameterized_query};
-    use vauban_parser::parse_parameter_declarations;
+    use super::{
+        Prepared, PreparedStatements, bound_argument, parameterized_query,
+        resolve_declaration_types, returned_output,
+    };
+    use vauban_parser::{ParseOptions, parse_parameter_declarations};
+    use vauban_types::SqlType;
+    use vauban_types::{Len, SqlString, TypeInfo, Value};
 
     #[test]
     fn handles_start_at_one_and_are_not_reused() {
@@ -1039,5 +1062,114 @@ mod tests {
             parameterized_query(&decls, "SELECT @a + @b"),
             "(@a, @b)SELECT @a + @b"
         );
+    }
+
+    #[test]
+    fn declared_types_keep_scale_precision_and_numeric_name() {
+        let decls = parse_parameter_declarations(
+            "@a numeric(5,2), @b datetime2(3), @c float(10)",
+            &ParseOptions::default(),
+        )
+        .expect("declarations parse");
+        let types = resolve_declaration_types(&decls).expect("types resolve");
+        let types: Vec<SqlType> = types.into_iter().map(|t| t.ty).collect();
+        assert_eq!(
+            types,
+            [
+                SqlType::Numeric {
+                    precision: 5,
+                    scale: 2
+                },
+                SqlType::DateTime2(3),
+                SqlType::Real,
+            ]
+        );
+    }
+
+    #[test]
+    fn length_on_int_is_2716_at_its_rank() {
+        let decls = parse_parameter_declarations("@a int, @b int(10)", &ParseOptions::default())
+            .expect("declarations parse");
+        let err = resolve_declaration_types(&decls).unwrap_err();
+        assert_eq!((err.number, err.severity, err.state), (2716, 16, 1));
+        assert!(err.message.contains("#2"), "{}", err.message);
+    }
+
+    fn ty(sql_type: SqlType) -> TypeInfo {
+        TypeInfo::new(sql_type, true)
+    }
+
+    fn varchar(text: &str) -> Value {
+        Value::String(SqlString {
+            text: text.to_owned(),
+        })
+    }
+
+    #[test]
+    fn arguments_take_the_declared_type() {
+        let numeric = ty(SqlType::Numeric {
+            precision: 5,
+            scale: 2,
+        });
+        let value = bound_argument(&Value::I32(2), &ty(SqlType::Int), &numeric).expect("converts");
+        assert!(matches!(value, Value::Decimal(_)), "{value:?}");
+        let value = bound_argument(&Value::F64(0.5), &ty(SqlType::Float), &ty(SqlType::Real))
+            .expect("converts");
+        assert_eq!(value, Value::F32(0.5));
+        let value = bound_argument(
+            &varchar("12"),
+            &ty(SqlType::VarChar(Len::Fixed(2))),
+            &ty(SqlType::Int),
+        )
+        .expect("converts");
+        assert_eq!(value, Value::I32(12));
+        let value = bound_argument(&Value::Null, &ty(SqlType::Int), &ty(SqlType::Date))
+            .expect("NULL converts");
+        assert_eq!(value, Value::Null);
+    }
+
+    #[test]
+    fn an_argument_that_does_not_convert_is_8114_state_5() {
+        let err = bound_argument(
+            &varchar("x"),
+            &ty(SqlType::VarChar(Len::Fixed(1))),
+            &ty(SqlType::Int),
+        )
+        .unwrap_err();
+        assert_eq!((err.number, err.severity, err.state), (8114, 16, 5));
+        assert!(err.message.contains("varchar"), "{}", err.message);
+        let err =
+            bound_argument(&Value::I32(300), &ty(SqlType::Int), &ty(SqlType::TinyInt)).unwrap_err();
+        assert_eq!((err.number, err.state), (8114, 5));
+    }
+
+    #[test]
+    fn a_datetime_argument_to_a_number_is_257() {
+        let err =
+            bound_argument(&Value::I32(0), &ty(SqlType::Date), &ty(SqlType::Int)).unwrap_err();
+        assert_eq!((err.number, err.state), (206, 2));
+        let datetime = vauban_types::DateTime {
+            days: 0,
+            ticks_300th: 0,
+        };
+        for target in [SqlType::Int, SqlType::Float] {
+            let err = bound_argument(
+                &Value::DateTime(datetime),
+                &ty(SqlType::DateTime),
+                &ty(target),
+            )
+            .unwrap_err();
+            assert_eq!((err.number, err.state), (257, 3), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn an_output_takes_the_type_of_its_receiver() {
+        let value = returned_output(&Value::F32(0.5), &ty(SqlType::Real), &ty(SqlType::Float))
+            .expect("converts");
+        assert_eq!(value, Value::F64(0.5));
+        let err = returned_output(&Value::I32(300), &ty(SqlType::Int), &ty(SqlType::TinyInt))
+            .unwrap_err();
+        assert_eq!((err.number, err.state), (8114, 2));
     }
 }

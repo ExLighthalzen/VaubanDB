@@ -8,7 +8,7 @@
 
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{DataType, TypeArg};
-use vauban_types::{Len, SqlType};
+use vauban_types::{Len, SqlType, TypeInfo};
 
 /// Longest non-`max` `char`, `varchar`, `binary` or `varbinary`, in characters or
 /// bytes.
@@ -157,6 +157,20 @@ pub(crate) fn resolve_data_type(ty: &DataType, position: u32) -> SqlResult<SqlTy
         // `dbo.MonType` in one piece, and user types are not resolved.
         _ => Err(unknown(ty, position)),
     }
+}
+
+/// Resolves the declared type of a parameter or variable into the type it carries, nullable.
+///
+/// This is [`resolve_data_type`] for callers outside the binder that read a declaration
+/// list themselves, such as the `@params` of `sp_executesql` and `sp_prepare`. It applies
+/// the declaration defaults (`varchar` is `varchar(1)`, `decimal` is `decimal(18, 0)`,
+/// `datetime2` keeps its written scale) and answers 2715 for an unknown name, 2716 for
+/// `int(10)` (`declared_type_is_the_resolved_type_nullable`). `position` is the 1-based
+/// rank of the declaration in its list, the `#<n>` of those two messages.
+///
+/// A declared parameter or variable accepts `NULL`, hence the nullable [`TypeInfo`].
+pub fn resolve_declared_type(ty: &DataType, position: u32) -> SqlResult<TypeInfo> {
+    resolve_data_type(ty, position).map(|sql_type| TypeInfo::new(sql_type, true))
 }
 
 /// Whether a sized type accepts the `max` argument.

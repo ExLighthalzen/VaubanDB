@@ -1,4 +1,4 @@
-use super::{SYSNAME_LEN, resolve_data_type, resolve_sysname_cast};
+use super::{SYSNAME_LEN, resolve_data_type, resolve_declared_type, resolve_sysname_cast};
 use vauban_parser::{DataType, Span, TypeArg};
 use vauban_types::{Len, SqlType};
 
@@ -224,6 +224,37 @@ fn a_type_with_no_parameter_given_one_is_2716() {
         assert_eq!(err.severity, 16, "{name}");
         assert_eq!(err.state, 1, "{name}");
     }
+}
+
+#[test]
+fn declared_type_is_the_resolved_type_nullable() {
+    let declared = |name: &str, args: &[TypeArg], position: u32| {
+        resolve_declared_type(
+            &DataType {
+                name: name.to_owned(),
+                args: args.to_vec(),
+                span: span(),
+            },
+            position,
+        )
+    };
+    let ty = declared("datetime2", &[TypeArg::Number(3)], 1).expect("resolves");
+    assert_eq!(ty.ty, SqlType::DateTime2(3));
+    assert!(ty.nullable);
+    let ty = declared("NUMERIC", &[TypeArg::Number(5), TypeArg::Number(2)], 1).expect("resolves");
+    assert_eq!(
+        ty.ty,
+        SqlType::Numeric {
+            precision: 5,
+            scale: 2
+        }
+    );
+    let err = declared("int", &[TypeArg::Number(10)], 2).expect_err("refused");
+    assert_eq!((err.number, err.state), (2716, 1));
+    assert!(err.message.contains("#2"), "{}", err.message);
+    let err = declared("notarealtype", &[], 3).expect_err("refused");
+    assert_eq!((err.number, err.state), (2715, 3));
+    assert!(err.message.contains("#3"), "{}", err.message);
 }
 
 #[test]

@@ -39,6 +39,7 @@ use vauban_types::{Len, SqlType, TypeInfo, Value};
 
 use crate::batch::{Level, Session, cancelled};
 use crate::eval_context::apply_exec_session;
+use crate::prepared::returned_output;
 use crate::sink::ResultSink;
 use crate::txn_session;
 
@@ -424,14 +425,28 @@ pub(crate) fn run_batch_procedure(
             let err = SqlError::procedure_not_found(call.name).with_line(call.line);
             Ok(refuse_call(err))
         }
+        Some(Err(err)) if ARGUMENT_CONVERSION_ERRORS.contains(&err.number) => {
+            argument_not_converted(session, at_call_line(err), call.in_proc, sink)
+        }
         Some(Err(err)) => Ok(refuse_call(at_call_line(err))),
         Some(Ok(action)) => {
             let finish = ProcFinish::Batch {
                 in_proc: call.in_proc,
             };
+            let declared = declared_output_types(&action);
             let (end, outcome) = run_action(session, action, database.as_deref(), finish, sink)?;
-            apply_batch_outputs(session, call.args, call.return_into, &outcome);
-            Ok((end, outcome))
+            match apply_batch_outputs(session, call.args, call.return_into, &outcome, &declared) {
+                Ok(()) => Ok((end, outcome)),
+                // A value its receiver cannot hold ends the batch (8114, state 2).
+                Err(err) => {
+                    sink.error(&err)?;
+                    let mut outcome = outcome;
+                    outcome.failed = true;
+                    outcome.error_number = err.number;
+                    session.state_mut().last_error = err.number;
+                    Ok((Ok(ProgramEnd::Aborted(err)), outcome))
+                }
+            }
         }
     }
 }
@@ -489,7 +504,7 @@ fn execute_nested_sql(
     match finish {
         ProcFinish::Rpc { rpc_params } => {
             if !nested.failed {
-                emit_rpc_return_values(sink, rpc_params, &nested)?;
+                emit_rpc_return_values(sink, rpc_params, params, &nested)?;
                 sink.return_status(nested.return_status)?;
             }
             sink.done_proc(None)?;
@@ -608,6 +623,27 @@ fn refuse_call(err: SqlError) -> (CallEnd, BatchProcOutcome) {
     (Err(err), outcome)
 }
 
+/// The numbers an argument that does not convert to the type of its parameter raises.
+const ARGUMENT_CONVERSION_ERRORS: [u32; 3] = [206, 257, 8114];
+
+/// An `EXECUTE` written in a program whose argument `err` refused to convert to the type
+/// of its parameter: the error ends that statement alone, and the program goes on with the
+/// next one, whatever reach the number has elsewhere
+/// (`compat/tests/bound_parameters.rs`, `an_argument_that_does_not_convert_ends_its_statement_alone`).
+fn argument_not_converted(
+    session: &mut Session,
+    err: SqlError,
+    in_proc: bool,
+    sink: &mut dyn ResultSink,
+) -> SqlResult<(CallEnd, BatchProcOutcome)> {
+    session.state_mut().last_error = err.number;
+    sink.error(&err)?;
+    let end = ProgramEnd::LevelAborted(err.clone());
+    let nocount = session.state().options.nocount;
+    close_level(sink, in_proc, nocount, &end)?;
+    Ok((Ok(end), refused_outcome(&err)))
+}
+
 /// What a call refused with `err` leaves to its caller.
 fn refused_outcome(err: &SqlError) -> BatchProcOutcome {
     BatchProcOutcome {
@@ -620,12 +656,32 @@ fn refused_outcome(err: &SqlError) -> BatchProcOutcome {
     }
 }
 
+/// The declared type of each `OUTPUT` parameter `action` binds, by parameter name.
+fn declared_output_types(action: &ProcAction) -> Vec<(String, TypeInfo)> {
+    match action {
+        ProcAction::ExecuteSql { params, .. } | ProcAction::Template { params, .. } => params
+            .iter()
+            .filter(|param| param.output)
+            .map(|param| (param.name.clone(), param.ty.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Copies the final `OUTPUT` values and the return status of a call into the variables of
+/// the program that made it, each value converted from the declared type of its parameter
+/// (`declared`) to the type of its variable.
+///
+/// # Errors
+///
+/// 8114, state 2, for a value its variable cannot hold; the values before it are copied.
 fn apply_batch_outputs(
     session: &mut Session,
     exec_args: &[EvaluatedExecArg],
     return_into: Option<&str>,
     outcome: &BatchProcOutcome,
-) {
+    declared: &[(String, TypeInfo)],
+) -> SqlResult<()> {
     session.state_mut().rowcount = outcome.rowcount;
     session.state_mut().last_error = outcome.error_number;
     if let Some(var) = return_into {
@@ -649,16 +705,31 @@ fn apply_batch_outputs(
             .map(|(_, value)| value.clone())
             .or_else(|| session.exec().variables.get(key).cloned());
         if let Some(value) = value {
+            let from = declared
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                .map(|(_, ty)| ty);
+            // The caller's level is set aside while the call runs: the type of the variable
+            // is the one its value was passed under.
+            let to = arg.value.as_ref().map(|(_, ty)| ty);
+            let value = match (from, to) {
+                (Some(from), Some(to)) => returned_output(&value, from, to)?,
+                _ => value,
+            };
             session.exec_mut().variables.insert(var.clone(), value);
         }
     }
     let exec = session.exec().clone();
     apply_exec_session(session.state_mut(), &exec, true, !outcome.failed);
+    Ok(())
 }
 
+/// Sends the final value of each `OUTPUT` parameter of an RPC, converted from the declared
+/// type of its parameter (`declared`) to the type the RPC gave it.
 fn emit_rpc_return_values(
     sink: &mut dyn ResultSink,
     rpc_params: &[RpcParam],
+    declared: &[ProcParam],
     nested: &NestedOutcome,
 ) -> SqlResult<()> {
     for param in rpc_params {
@@ -675,7 +746,14 @@ fn emit_rpc_return_values(
         else {
             continue;
         };
-        sink.return_value(&param.name, &param.ty, value)?;
+        let value = match declared
+            .iter()
+            .find(|decl| decl.name.eq_ignore_ascii_case(&param.name))
+        {
+            Some(decl) => returned_output(value, &decl.ty, &param.ty)?,
+            None => value.clone(),
+        };
+        sink.return_value(&param.name, &param.ty, &value)?;
     }
     Ok(())
 }
@@ -767,11 +845,21 @@ fn at_line(err: SqlError, line: u32) -> SqlError {
     if line == 0 { err } else { err.with_line(line) }
 }
 
-/// The two numbers a call answers with no line at all: the argument list holds more values
+/// The numbers a call answers without a line. The argument list holds more values
 /// than the procedure takes (8144), or the parameterized text declares no parameter and the
 /// call passed one anyway (8146). Both count arguments instead of pointing at one
 /// (`tests/execute.rs`, `argument_errors_of_a_call_leave_with_the_line_their_number_calls_for`).
-const COUNTED_WITHOUT_A_LINE: [u32; 2] = [8144, 8146];
+///
+/// An argument that does not convert to the type of its parameter leaves with no line
+/// either ([`ARGUMENT_CONVERSION_ERRORS`]; `compat/tests/bound_parameters.rs`,
+/// `argument_conversion_errors_leave_without_a_line`).
+const COUNTED_WITHOUT_A_LINE: [u32; 5] = [
+    8144,
+    8146,
+    ARGUMENT_CONVERSION_ERRORS[0],
+    ARGUMENT_CONVERSION_ERRORS[1],
+    ARGUMENT_CONVERSION_ERRORS[2],
+];
 
 /// First line of the parameterized text a call carries, where an argument error the
 /// resolution raised without a line of its own is read.

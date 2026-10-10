@@ -96,6 +96,7 @@ pub use context::{
     BindContext, CatalogView, NoVariables, ResolvedTable, ResolvedTableKind, SessionOptions,
     TableReferenceKind, VariableScope,
 };
+pub use datatype::resolve_declared_type;
 pub use execute::{BoundExecArg, BoundExecTarget, BoundExecute};
 pub use statement::bind;
 pub use variables::BatchVariables;

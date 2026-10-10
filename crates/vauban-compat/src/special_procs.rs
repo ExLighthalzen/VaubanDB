@@ -1,10 +1,8 @@
 //! Binding arguments of `sp_executesql`, `sp_prepare`, `sp_execute` and related procedures.
 
 use vauban_errors::{SqlError, SqlResult};
-use vauban_parser::{
-    DataType, ParameterDeclaration, ParseOptions, TypeArg, parse_parameter_declarations,
-};
-use vauban_types::{Len, SqlType, TypeInfo, Value};
+use vauban_parser::{ParameterDeclaration, ParseOptions, parse_parameter_declarations};
+use vauban_types::{SqlType, TypeInfo, Value};
 
 use crate::procedures::{ProcAction, ProcParam};
 
@@ -368,97 +366,12 @@ fn make_proc_param(
     arg: &ProcArg<'_>,
     position: u32,
 ) -> SqlResult<ProcParam> {
+    let ty = ProcParam::declared_type(&decl.ty, position)?;
     Ok(ProcParam {
         name: decl.name.clone(),
-        ty: resolve_decl_type(&decl.ty, position)?,
-        value: arg.value.clone(),
+        value: ProcParam::bound_value(arg.value, arg.ty, &ty)?,
+        ty,
         output: decl.output || arg.output,
-    })
-}
-
-/// Resolves a declared parameter type, or refuses it by name instead of falling back to a
-/// silent `int` (message 2715, naming the type; see
-/// `unknown_param_type_is_refused_not_converted_to_int`). `position` is the 1-based rank
-/// among the `@params` declarations.
-fn resolve_decl_type(decl: &DataType, position: u32) -> SqlResult<TypeInfo> {
-    let name = decl.name.to_ascii_lowercase();
-    let sql_type = match name.as_str() {
-        "int" | "integer" => SqlType::Int,
-        "bigint" => SqlType::BigInt,
-        "smallint" => SqlType::SmallInt,
-        "tinyint" => SqlType::TinyInt,
-        "bit" => SqlType::Bit,
-        "nvarchar" | "national char varying" | "national character varying" => {
-            sized_sql_type(decl, SqlType::NVarChar, 4_000, true, position)?
-        }
-        "varchar" | "char varying" | "character varying" => {
-            sized_sql_type(decl, SqlType::VarChar, 8_000, true, position)?
-        }
-        "nchar" | "national char" | "national character" => {
-            sized_sql_type(decl, SqlType::NChar, 4_000, false, position)?
-        }
-        "char" | "character" => sized_sql_type(decl, SqlType::Char, 8_000, false, position)?,
-        "varbinary" | "binary varying" => {
-            sized_sql_type(decl, SqlType::VarBinary, 8_000, true, position)?
-        }
-        "binary" => sized_sql_type(decl, SqlType::Binary, 8_000, false, position)?,
-        "decimal" | "dec" | "numeric" => exact_numeric(decl, position)?,
-        "float" | "double precision" => SqlType::Float,
-        "real" => SqlType::Real,
-        "money" => SqlType::Money,
-        "smallmoney" => SqlType::SmallMoney,
-        "date" => SqlType::Date,
-        "datetime" => SqlType::DateTime,
-        "smalldatetime" => SqlType::SmallDateTime,
-        "datetime2" => SqlType::DateTime2(7),
-        "datetimeoffset" => SqlType::DateTimeOffset(7),
-        "time" => SqlType::Time(7),
-        "uniqueidentifier" => SqlType::UniqueIdentifier,
-        // Plain `sysname` is `nvarchar(128)`; a length is refused in a declaration.
-        "sysname" => {
-            if !decl.args.is_empty() {
-                return Err(SqlError::cannot_find_data_type(position, &decl.name));
-            }
-            SqlType::NVarChar(Len::Fixed(128))
-        }
-        _ => return Err(SqlError::cannot_find_data_type(position, &decl.name)),
-    };
-    Ok(TypeInfo::new(sql_type, true))
-}
-
-fn sized_sql_type(
-    decl: &DataType,
-    make: fn(Len) -> SqlType,
-    max: i64,
-    allow_max: bool,
-    position: u32,
-) -> SqlResult<SqlType> {
-    let len = match decl.args.as_slice() {
-        [] => Len::Fixed(1),
-        [TypeArg::Number(n)] if (1..=max).contains(n) => Len::Fixed(
-            u16::try_from(*n).map_err(|_| SqlError::cannot_find_data_type(position, &decl.name))?,
-        ),
-        [TypeArg::Max] if allow_max => Len::Max,
-        _ => return Err(SqlError::cannot_find_data_type(position, &decl.name)),
-    };
-    Ok(make(len))
-}
-
-fn exact_numeric(decl: &DataType, position: u32) -> SqlResult<SqlType> {
-    let (precision, scale) = match decl.args.as_slice() {
-        [] => (18, 0),
-        [TypeArg::Number(p)] => (*p, 0),
-        [TypeArg::Number(p), TypeArg::Number(s)] => (*p, *s),
-        _ => return Err(SqlError::cannot_find_data_type(position, &decl.name)),
-    };
-    if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
-        return Err(SqlError::cannot_find_data_type(position, &decl.name));
-    }
-    Ok(SqlType::Decimal {
-        precision: u8::try_from(precision)
-            .map_err(|_| SqlError::cannot_find_data_type(position, &decl.name))?,
-        scale: u8::try_from(scale)
-            .map_err(|_| SqlError::cannot_find_data_type(position, &decl.name))?,
     })
 }
 
@@ -528,7 +441,7 @@ fn read_int(value: &Value) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vauban_types::SqlString;
+    use vauban_types::{Len, SqlString};
 
     fn nvarchar(value: &str) -> Value {
         Value::String(SqlString {
@@ -640,6 +553,64 @@ mod tests {
             err.message,
             "Column, parameter or variable #2: unknown data type notarealtype."
         );
+    }
+
+    /// The declared type of one `@p`, as `sp_executesql` binds it to a `NULL`.
+    fn declared(declaration: &str) -> SqlResult<TypeInfo> {
+        let stmt = nvarchar("SELECT @p AS p");
+        let params = nvarchar(declaration);
+        let value = Value::Null;
+        match resolve_sp_executesql(&[
+            arg(None, &nvarchar_ty(), &stmt, false),
+            arg(None, &nvarchar_ty(), &params, false),
+            arg(Some("@p"), &int_ty(), &value, false),
+        ])? {
+            ProcAction::ExecuteSql { params, .. } => Ok(params[0].ty.clone()),
+            other => panic!("expected ExecuteSql, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declared_param_types_keep_their_written_shape() {
+        let shapes = [
+            (
+                "@p numeric(5,2)",
+                SqlType::Numeric {
+                    precision: 5,
+                    scale: 2,
+                },
+            ),
+            (
+                "@p decimal",
+                SqlType::Decimal {
+                    precision: 18,
+                    scale: 0,
+                },
+            ),
+            ("@p float(10)", SqlType::Real),
+            ("@p float(53)", SqlType::Float),
+            ("@p datetime2(3)", SqlType::DateTime2(3)),
+            ("@p time(0)", SqlType::Time(0)),
+            ("@p datetimeoffset(2)", SqlType::DateTimeOffset(2)),
+            ("@p varchar", SqlType::VarChar(Len::Fixed(1))),
+            ("@p nvarchar(max)", SqlType::NVarChar(Len::Max)),
+        ];
+        for (declaration, expected) in shapes {
+            let ty = declared(declaration).expect(declaration);
+            assert_eq!(ty.ty, expected, "{declaration}");
+            assert!(ty.nullable, "{declaration}");
+        }
+    }
+
+    #[test]
+    fn length_on_a_type_without_one_is_2716() {
+        for declaration in ["@p int(10)", "@p sysname(10)"] {
+            let err = declared(declaration).unwrap_err();
+            assert_eq!(err.number, 2716, "{declaration}");
+            assert_eq!(err.severity, 16, "{declaration}");
+        }
+        assert_eq!(declared("@p int(10)").unwrap_err().state, 1);
+        assert_eq!(declared("@p sysname(10)").unwrap_err().state, 3);
     }
 
     #[test]
