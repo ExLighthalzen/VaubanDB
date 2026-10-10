@@ -30,8 +30,14 @@
 //! `a_descending_sort_flips_the_seek_direction`). One key reversed out of two is neither
 //! order, and the `Sort` stays (`tests/aggregate_sort.rs`,
 //! `a_partial_reversal_keeps_the_sort`).
+//!
+//! The `Sort` of an `ORDER BY` sits over the projection that computes its keys. A key on a
+//! column that projection copies from its input is read as a key on that input column
+//! (`through_projection`), so the two rules above look through the projection to the seek
+//! under it (`tests/aggregate_sort.rs`, `a_sort_over_a_projection_of_the_index_is_dropped`);
+//! a key on a computed column keeps the `Sort`.
 
-use vauban_binder::{BoundExpr, BoundExprKind, BoundTop, LogicalPlan, SortKey};
+use vauban_binder::{BoundExpr, BoundExprKind, BoundProjection, BoundTop, LogicalPlan, SortKey};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::{Direction, TableId};
 use vauban_types::Collation;
@@ -68,10 +74,61 @@ pub(crate) fn plan_sort(plan: &LogicalPlan, ctx: &PlanContext<'_>) -> SqlResult<
     if delivered_reversed && seek::flip_direction(&mut input) {
         return Ok(input);
     }
+    if let LogicalPlan::Project {
+        input: projected,
+        exprs,
+        ..
+    } = source.as_ref()
+        && let Some(wanted) = through_projection(keys, exprs)
+        && let PhysicalPlan::Project {
+            input: planned_projected,
+            ..
+        } = &mut input
+    {
+        let (as_asked, reversed) = {
+            let delivered = delivered_order(planned_projected, projected, ctx);
+            (
+                leads(&delivered, &wanted, false),
+                leads(&delivered, &wanted, true),
+            )
+        };
+        if as_asked || (reversed && seek::flip_direction(planned_projected)) {
+            return Ok(input);
+        }
+    }
     Ok(PhysicalPlan::Sort {
         input: Box::new(input),
         keys: keys.clone(),
     })
+}
+
+/// The keys of a `Sort` over a projection, read as keys of the input of that projection.
+///
+/// The binder puts the `Sort` of an `ORDER BY` over the projection that computes its keys,
+/// each key a [`BoundExprKind::ColumnRef`] on a column of that projection. A projection
+/// keeps the order of its input, so when each key designates a column the projection
+/// copies from its input, the order asked for is the order of those input columns, and a
+/// seek under the projection may deliver it. `None` when a key designates a computed
+/// column, or a column of an enclosing query.
+fn through_projection(keys: &[SortKey], exprs: &[BoundProjection]) -> Option<Vec<SortKey>> {
+    keys.iter()
+        .map(|key| {
+            let BoundExprKind::ColumnRef(binding) = &key.expr.kind else {
+                return None;
+            };
+            let copied = &exprs.get(binding.index)?.expr;
+            match &copied.kind {
+                BoundExprKind::ColumnRef(source) if binding.depth == 0 && source.depth == 0 => {
+                    Some(SortKey {
+                        expr: copied.clone(),
+                        desc: key.desc,
+                        collation: key.collation,
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Plans a [`LogicalPlan::Distinct`] into the operator that removes its duplicate rows.

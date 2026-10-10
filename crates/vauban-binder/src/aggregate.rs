@@ -51,11 +51,14 @@
 //!
 //! Where several of those faults are written in one statement, the clauses are checked
 //! in the order `WHERE`, `GROUP BY`, `HAVING`, select list
-//! (`tests/bind_aggregate.rs`, `the_having_is_checked_before_the_select_list`):
+//! (`tests/bind_aggregate.rs`, `the_having_is_checked_before_the_select_list`), and the
+//! `ORDER BY` after the three:
 //!
 //! | written | answer |
 //! |---|---|
 //! | `SELECT k, c FROM dbo.t GROUP BY k HAVING s > 'a'` | 8121 on `s` |
+//! | `SELECT k, c FROM dbo.t GROUP BY k ORDER BY nosuch` | 8120 on `c` |
+//! | `SELECT k FROM dbo.t GROUP BY k HAVING c > 1 ORDER BY nosuch` | 8121 on `c` |
 //! | `SELECT SUM(s) FROM dbo.t GROUP BY k HAVING c > 1` | 8121, not the 8117 of the `SUM` |
 //! | `SELECT k FROM dbo.t WHERE COUNT(*) > 1 GROUP BY nosuch` | 147 |
 //! | `SELECT k FROM dbo.t GROUP BY SUM(c) HAVING c > 1` | 144 |
@@ -89,15 +92,14 @@
 //!
 //! `GROUP BY 1`, `GROUP BY 'a'`, `GROUP BY NULL` and `GROUP BY @v` answer 164 on SQL Server
 //! (a key must hold a column); here the key binds as a constant, which no expression of
-//! the select list is matched against, a deliberate difference. `ORDER BY` over a grouped
-//! query is `sort.rs`'s and is not bound yet. `GROUPING SETS`, `ROLLUP`, `CUBE`, `OVER`
+//! the select list is matched against, a deliberate difference. `GROUPING SETS`, `ROLLUP`, `CUBE`, `OVER`
 //! and the aggregates the registry does not hold (`STRING_AGG`, `STDEV`, `VAR`,
 //! `CHECKSUM_AGG`) are refused by name.
 
 use vauban_catalog::ColumnId;
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{
-    CaseArm, ColumnRef, Expr, Ident, InList, QuerySpec, SelectItem, Span, TableRef,
+    CaseArm, ColumnRef, Expr, Ident, InList, OrderItem, QuerySpec, SelectItem, Span, TableRef,
 };
 use vauban_types::TypeInfo;
 
@@ -111,11 +113,19 @@ use crate::errors::line_of;
 use crate::expr::{Scope, bind_condition, bind_expr};
 use crate::names::alias_of;
 use crate::query::{bug, column_name, dotted, is_aggregate_name, not_implemented};
+use crate::sort::{self, ResolvedKey};
 use crate::star::{self, Lookup, Source};
 
 /// Binds the grouping of a `SELECT` into a [`LogicalPlan::Aggregate`] over `input`, the
 /// `HAVING` into a [`LogicalPlan::Filter`] above it, and the select list into the
 /// [`LogicalPlan::Project`] on top: the plan up to and including its projection.
+///
+/// The keys of the `ORDER BY` of the statement come back with it, resolved by
+/// `sort::resolve_keys` against that projection: a key written as an expression goes
+/// through the extraction as an item of the select list does, so that an aggregate it
+/// holds is computed by the `Aggregate` (`SELECT k FROM dbo.t GROUP BY k ORDER BY
+/// COUNT(*)`), and a column that is neither a key nor aggregated answers **8127**.
+/// `sort.rs` puts the `Sort` over the plan with those keys.
 ///
 /// `scope` is the scope of the `FROM`, against which the keys, the arguments of the
 /// aggregates and the columns of the select list resolve. The `WHERE` has been bound
@@ -125,15 +135,17 @@ use crate::star::{self, Lookup, Source};
 ///
 /// The numbers of the module documentation: 144 for a key holding an aggregate, 8121 and
 /// 8120 for a column of the `HAVING` or of the select list that is neither a key nor
-/// under an aggregate, 130 for an aggregate under an aggregate, 4145 for a `HAVING` that
-/// is not a predicate, and what binding a key, an argument or an expression raises (207,
-/// 209, 4104, 8117, 174, 195…).
+/// under an aggregate, 8127 for such a column in the `ORDER BY`, 130 for an aggregate under
+/// an aggregate, 4145 for a `HAVING` that is not a predicate, the errors of
+/// `sort::resolve_keys` (108, 169, 209, 408, 447), and what binding a key, an argument or
+/// an expression raises (207, 209, 4104, 8117, 174, 195…).
 pub(crate) fn bind_aggregate(
     spec: &QuerySpec,
+    order_by: &[OrderItem],
     input: LogicalPlan,
     scope: &Scope,
     ctx: &BindContext<'_>,
-) -> SqlResult<LogicalPlan> {
+) -> SqlResult<(LogicalPlan, Vec<ResolvedKey>)> {
     let mut grouping = Grouping {
         keys: Vec::new(),
         aggregates: Vec::new(),
@@ -155,7 +167,27 @@ pub(crate) fn bind_aggregate(
         Some(condition) => Some(grouping.bind_having(condition, spec, scope, ctx)?),
         None => None,
     };
-    let projections = projections?;
+    let mut projections = projections?;
+    // The slots are named before the keys of the `ORDER BY` are resolved, so that a key
+    // written as an alias and the same key written as an expression compare alike (169,
+    // 145). The `ORDER BY` appends its own aggregates after those of the select list and
+    // of the `HAVING`: the columns named here keep their position and their name.
+    let named = grouping.schema();
+    for projection in &mut projections {
+        name_slots(&mut projection.expr, &named);
+    }
+    let projected = OutputSchema {
+        columns: projections
+            .iter()
+            .map(|projection| OutputColumn {
+                name: projection.name.clone(),
+                ty: projection.expr.ty.clone(),
+            })
+            .collect(),
+    };
+    let keys = sort::resolve_keys(order_by, &projections, &projected, &mut |written| {
+        grouping.bind_order_key(written, spec, scope, ctx)
+    })?;
 
     let schema = grouping.schema();
     let mut plan = LogicalPlan::Aggregate {
@@ -171,27 +203,12 @@ pub(crate) fn bind_aggregate(
             predicate,
         };
     }
-    let projections: Vec<BoundProjection> = projections
-        .into_iter()
-        .map(|mut projection| {
-            name_slots(&mut projection.expr, &schema);
-            projection
-        })
-        .collect();
-    let projected = OutputSchema {
-        columns: projections
-            .iter()
-            .map(|projection| OutputColumn {
-                name: projection.name.clone(),
-                ty: projection.expr.ty.clone(),
-            })
-            .collect(),
-    };
-    Ok(LogicalPlan::Project {
+    let plan = LogicalPlan::Project {
         input: Box::new(plan),
         exprs: projections,
         schema: projected,
-    })
+    };
+    Ok((plan, keys))
 }
 
 /// Refuses an aggregate written in a `WHERE`: error **147**, severity 15, state 1, on the
@@ -226,6 +243,8 @@ enum Clause {
     SelectList,
     /// The `HAVING`, error 8121.
     Having,
+    /// The `ORDER BY`, error 8127.
+    OrderBy,
 }
 
 /// The keys and the aggregates extracted so far: the columns the `Aggregate` publishes,
@@ -297,6 +316,22 @@ impl Grouping {
     ) -> SqlResult<BoundExpr> {
         let rewritten = self.rewrite(condition, Clause::Having, spec, scope, ctx)?;
         bind_condition(&rewritten, ctx, &self.slot_scope(ctx))
+    }
+
+    /// Binds a key of the `ORDER BY` written as an expression above the `Aggregate`: its
+    /// aggregates extracted, its keys replaced, a column that is neither a key nor aggregated answering 8127,
+    /// and its slots named after the columns of the node.
+    fn bind_order_key(
+        &mut self,
+        written: &Expr,
+        spec: &QuerySpec,
+        scope: &Scope,
+        ctx: &BindContext<'_>,
+    ) -> SqlResult<BoundExpr> {
+        let rewritten = self.rewrite(written, Clause::OrderBy, spec, scope, ctx)?;
+        let mut bound = bind_expr(&rewritten, ctx, &self.slot_scope(ctx))?;
+        name_slots(&mut bound, &self.schema());
+        Ok(bound)
     }
 
     /// One column of an expanded `*`: a reference to the key it is, or error 8120.
@@ -886,8 +921,25 @@ fn column_outside_group_by(
     let error = match clause {
         Clause::SelectList => SqlError::column_invalid_in_select_list(&table, &binding.name),
         Clause::Having => SqlError::column_invalid_in_having(&table, &binding.name),
+        Clause::OrderBy => column_invalid_in_order_by(&table, &binding.name),
     };
     error.with_line(line)
+}
+
+/// Error 8127, severity 16, state 1: a column of the `ORDER BY` of a grouped query that is
+/// neither a key nor under an aggregate. `errors` has no entry for the number, so the error
+/// is built here, as `sort.rs` builds its 108: `SELECT c FROM dbo.t GROUP BY c ORDER BY x`
+/// answers it, the name printed as 8120 prints it (module documentation).
+fn column_invalid_in_order_by(table: &str, column: &str) -> SqlError {
+    SqlError::new(
+        8127,
+        16,
+        1,
+        format!(
+            "Column '{table}.{column}' of the ORDER BY clause is neither aggregated nor part \
+             of GROUP BY."
+        ),
+    )
 }
 
 /// The name, as written in the `FROM`, of the table `binding` is a column of.

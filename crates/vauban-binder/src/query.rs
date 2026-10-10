@@ -132,12 +132,12 @@ pub(crate) fn bind_select_with_parent(
             "bind_select: FOR XML and FOR JSON are not implemented yet",
         ));
     }
-    let (plan, from_scope) = match &stmt.body {
+    let (plan, from_scope, grouped_keys) = match &stmt.body {
         QueryBody::Select(spec) => {
-            let (plan, scope) = bind_query_spec(spec, stmt, ctx, parent)?;
-            (plan, Some(scope))
+            let (plan, scope, keys) = bind_query_spec(spec, stmt, ctx, parent)?;
+            (plan, Some(scope), keys)
         }
-        QueryBody::SetOp { .. } => (setop::bind_set_op(&stmt.body, stmt, ctx)?, None),
+        QueryBody::SetOp { .. } => (setop::bind_set_op(&stmt.body, stmt, ctx)?, None, None),
         QueryBody::Nested(..) => {
             return Err(not_yet(
                 "bind_select: a parenthesised query body is not implemented yet",
@@ -147,7 +147,7 @@ pub(crate) fn bind_select_with_parent(
     if stmt.order_by.is_empty() {
         return Ok(plan);
     }
-    sort::bind_order_by(stmt, plan, ctx, from_scope)
+    sort::bind_order_by(stmt, plan, ctx, from_scope, grouped_keys)
 }
 
 /// Binds one `SELECT … WHERE …` specification, the body of [`bind_select`].
@@ -155,12 +155,15 @@ pub(crate) fn bind_select_with_parent(
 /// `stmt` is the statement the specification belongs to: `TOP … WITH TIES` needs to know
 /// whether an `ORDER BY` was written, and that clause hangs on the statement, not on the
 /// specification.
+///
+/// A grouped query hands back the keys of that `ORDER BY` too, which `aggregate.rs`
+/// resolves above its `Aggregate`; `None` for a query that groups nothing.
 fn bind_query_spec(
     spec: &QuerySpec,
     stmt: &SelectStatement,
     ctx: &BindContext<'_>,
     parent: &Scope,
-) -> SqlResult<(LogicalPlan, Scope)> {
+) -> SqlResult<(LogicalPlan, Scope, Option<Vec<sort::ResolvedKey>>)> {
     for table_ref in &spec.from {
         check_table_arguments(table_ref, line_of(&stmt.span), ctx)?;
     }
@@ -258,16 +261,25 @@ fn bind_query_spec(
         };
     }
 
-    if !spec.group_by.is_empty() || spec.having.is_some() || aggregated_select_list(spec) {
+    if !spec.group_by.is_empty()
+        || spec.having.is_some()
+        || aggregated_select_list(spec)
+        || stmt
+            .order_by
+            .iter()
+            .any(|item| holds_an_aggregate(&item.expr))
+    {
         // `aggregate.rs` builds the `Aggregate` **and** the `Project` above it: the projection
         // of a grouped query names the results of the aggregates by their index in the
         // schema of the `Aggregate` (`bound/mod.rs`), which the loop below knows nothing
         // of. What comes back is therefore the plan up to and including its projection.
         // A select list holding an aggregate comes here with no `GROUP BY` written
         // ([`aggregated_select_list`]): the group is then the whole input, and the
-        // `group_by` of the variant is empty.
-        let grouped = aggregate::bind_aggregate(spec, plan, &scope, ctx)?;
-        return Ok((finish(grouped, spec, stmt, ctx)?, scope));
+        // `group_by` of the variant is empty. An aggregate written in the `ORDER BY` alone
+        // groups the query as well: `SELECT 1 FROM dbo.t ORDER BY COUNT(*)` answers one
+        // row, and `SELECT c FROM dbo.t ORDER BY COUNT(*)` answers 8120 on `c`.
+        let (grouped, keys) = aggregate::bind_aggregate(spec, &stmt.order_by, plan, &scope, ctx)?;
+        return Ok((finish(grouped, spec, stmt, ctx)?, scope, Some(keys)));
     }
 
     let mut projections = Vec::with_capacity(spec.items.len());
@@ -289,7 +301,7 @@ fn bind_query_spec(
         schema,
     };
 
-    Ok((finish(plan, spec, stmt, ctx)?, scope))
+    Ok((finish(plan, spec, stmt, ctx)?, scope, None))
 }
 
 /// Puts the operators that sit **above** the projection on a projected plan: `DISTINCT`,

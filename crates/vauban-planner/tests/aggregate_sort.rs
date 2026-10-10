@@ -9,8 +9,8 @@ use vauban_planner::{
 };
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundStatement, BoundTop, ColumnBinding, CompareOp, LockHints,
-    LogicalPlan, OutputColumn, OutputSchema, SortKey,
+    BoundExpr, BoundExprKind, BoundProjection, BoundStatement, BoundTop, ColumnBinding, CompareOp,
+    LockHints, LogicalPlan, OutputColumn, OutputSchema, SortKey,
 };
 use vauban_catalog::ColumnId;
 use vauban_storage::{Direction, KeyColumn, TableId};
@@ -283,6 +283,115 @@ fn a_sort_the_index_already_delivers_is_dropped() {
         !matches!(&planned, PhysicalPlan::Sort { .. }),
         "expected no Sort node, got {planned:?}"
     );
+}
+
+/// The projection the binder puts under the `Sort` of an `ORDER BY`: `a` and `b` copied, and
+/// `a + 1` computed.
+fn projection_over_a_seek() -> LogicalPlan {
+    let sum = BoundExpr {
+        kind: BoundExprKind::Arith {
+            op: vauban_types::BinaryOp::Add,
+            left: Box::new(column("a")),
+            right: Box::new(literal(1)),
+        },
+        ty: int_type(),
+        line: 1,
+    };
+    LogicalPlan::Project {
+        input: Box::new(LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate: compare(CompareOp::Eq, column("a"), literal(1)),
+        }),
+        exprs: vec![
+            BoundProjection {
+                expr: column("b"),
+                name: "b".to_owned(),
+            },
+            BoundProjection {
+                expr: column("a"),
+                name: "a".to_owned(),
+            },
+            BoundProjection {
+                expr: sum,
+                name: String::new(),
+            },
+        ],
+        schema: schema_of(&["b", "a", ""]),
+    }
+}
+
+/// A key on column `index` of the projection above.
+fn projected_key(index: usize, desc: bool) -> SortKey {
+    SortKey {
+        expr: BoundExpr {
+            kind: BoundExprKind::ColumnRef(ColumnBinding {
+                column: ColumnId(index as i32 + 1),
+                index,
+                name: String::new(),
+                ty: int_type(),
+                depth: 0,
+            }),
+            ty: int_type(),
+            line: 1,
+        },
+        desc,
+        collation: None,
+    }
+}
+
+#[test]
+fn a_sort_over_a_projection_of_the_index_is_dropped() {
+    let catalog = FakeCatalog::new().with_index(TABLE, &ascending(&["a"]), true);
+    // Column 1 of the projection copies `a`, the key of the index.
+    let ascending_sort = LogicalPlan::Sort {
+        input: Box::new(projection_over_a_seek()),
+        keys: vec![projected_key(1, false)],
+    };
+    let planned = plan_with(&catalog, ascending_sort);
+    let PhysicalPlan::Project { input, .. } = &planned else {
+        panic!("expected the Project alone, got {planned:?}")
+    };
+    assert!(
+        matches!(
+            input.as_ref(),
+            PhysicalPlan::IndexSeek {
+                direction: Direction::Forward,
+                ..
+            }
+        ),
+        "got {input:?}"
+    );
+    // Descending: the seek under the projection is read backwards.
+    let descending_sort = LogicalPlan::Sort {
+        input: Box::new(projection_over_a_seek()),
+        keys: vec![projected_key(1, true)],
+    };
+    let planned = plan_with(&catalog, descending_sort);
+    let PhysicalPlan::Project { input, .. } = &planned else {
+        panic!("expected the Project alone, got {planned:?}")
+    };
+    assert!(
+        matches!(
+            input.as_ref(),
+            PhysicalPlan::IndexSeek {
+                direction: Direction::Backward,
+                ..
+            }
+        ),
+        "got {input:?}"
+    );
+    // Counter-proofs: a key on the copy of `b`, and a key on the computed `a + 1`, keep it.
+    for index in [0, 2] {
+        let kept = LogicalPlan::Sort {
+            input: Box::new(projection_over_a_seek()),
+            keys: vec![projected_key(index, false)],
+        };
+        let planned = plan_with(&catalog, kept);
+        assert!(
+            matches!(planned, PhysicalPlan::Sort { .. }),
+            "column {index}: expected a Sort, got {planned:?}"
+        );
+    }
 }
 
 #[test]

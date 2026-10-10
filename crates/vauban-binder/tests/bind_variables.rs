@@ -622,7 +622,10 @@ fn select_assign_with_from_checks_137_before_141() {
 
 /// `SELECT TOP (1) @x = a FROM t WHERE a > 1 ORDER BY b` keeps the `WHERE` and the
 /// `ORDER BY` in `input`: a `Limit` over the `Sort` over the `Filter` over the `Scan`,
-/// the `Sort` keyed on `b`, a column the assignment does not read.
+/// the `Sort` keyed on `b`, a column the assignment does not read. Between the `Sort` and
+/// the `Filter`, the projection computes `a` and adds `b` as a hidden column. A value that
+/// reads a variable is not computed there but over the `Sort`, so that the values are
+/// assigned in the order of the keys.
 #[test]
 fn select_assign_with_from_keeps_where_and_order_by() {
     let bound = binds("DECLARE @x int; SELECT TOP (1) @x = a FROM t WHERE a > 1 ORDER BY b;");
@@ -633,17 +636,38 @@ fn select_assign_with_from_keeps_where_and_order_by() {
     };
     assert!(!top.percent && !top.with_ties, "got {top:?}");
     let LogicalPlan::Sort {
-        input: filtered,
+        input: projected,
         keys,
     } = &**sorted
     else {
         panic!("expected a Sort, got {sorted:?}");
     };
     assert_eq!(keys.len(), 1);
+    let LogicalPlan::Project {
+        input: filtered,
+        exprs,
+        ..
+    } = &**projected
+    else {
+        panic!("expected the projection of the keys, got {projected:?}");
+    };
+    let BoundExprKind::ColumnRef(key) = &keys[0].expr.kind else {
+        panic!("got {:?}", keys[0].expr.kind);
+    };
     assert!(
-        matches!(&keys[0].expr.kind, BoundExprKind::ColumnRef(column) if column.name == "b"),
+        matches!(&exprs[key.index].expr.kind, BoundExprKind::ColumnRef(column) if column.name == "b"),
         "got {:?}",
-        keys[0].expr.kind
+        exprs[key.index].expr.kind
+    );
+    // The value assigned reads the column of `a`.
+    let mut value = &assignments[0].1;
+    while let BoundExprKind::Convert { expr, .. } = &value.kind {
+        value = expr;
+    }
+    assert!(
+        matches!(&value.kind, BoundExprKind::ColumnRef(column) if column.name == "a" && column.index == 0),
+        "got {:?}",
+        value.kind
     );
     let LogicalPlan::Filter {
         input: scanned,
@@ -656,6 +680,38 @@ fn select_assign_with_from_keeps_where_and_order_by() {
     assert!(
         matches!(&**scanned, LogicalPlan::Scan { .. }),
         "got {scanned:?}"
+    );
+
+    // A value that reads the variable it assigns is computed over the `Sort`, against
+    // the row of the scan the projection under the `Sort` passes through first.
+    let bound = binds("DECLARE @x int; SELECT TOP (1) @x = @x + a FROM t ORDER BY b;");
+    let (input, assignments) = select_assign(&bound[1]);
+    let mut value = &assignments[0].1;
+    while let BoundExprKind::Convert { expr, .. } = &value.kind {
+        value = expr;
+    }
+    assert!(
+        matches!(&value.kind, BoundExprKind::Arith { .. }),
+        "the sum is computed over the Sort, got {:?}",
+        value.kind
+    );
+    let LogicalPlan::Limit { input: sorted, .. } = input else {
+        panic!("expected a Limit, got {input:?}");
+    };
+    let LogicalPlan::Sort {
+        input: projected, ..
+    } = &**sorted
+    else {
+        panic!("expected a Sort, got {sorted:?}");
+    };
+    let LogicalPlan::Project { exprs, input, .. } = &**projected else {
+        panic!("expected the projection of the keys, got {projected:?}");
+    };
+    let scanned = input.schema().columns.len();
+    assert_eq!(
+        exprs.len(),
+        scanned + 1,
+        "the row of the scan, then `b`: {exprs:?}"
     );
 
     // Without TOP, the Sort is the root of the input.

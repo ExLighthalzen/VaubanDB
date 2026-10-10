@@ -74,9 +74,11 @@ pub enum BoundStatement {
     /// `NULL`.
     ///
     /// `input` is the plan the same statement would have as a query, with the `Project`
-    /// of its select list taken out: the `Scan`, `Join`, `Filter`, `Sort` and `Limit` of
-    /// the clauses written, so that an `ORDER BY` on a column the list does not carry
-    /// still orders the rows (`tests/bind_variables.rs`,
+    /// at its root taken out: the `Scan`, `Join`, `Filter`, `Sort` and `Limit` of the
+    /// clauses written. With an `ORDER BY`, the `Sort` sits over the projection that
+    /// computes the values and the keys, each value then reading its column of that
+    /// projection, so that an `ORDER BY` on a column the list does not carry still orders
+    /// the rows (`tests/bind_variables.rs`,
     /// `select_assign_with_from_keeps_where_and_order_by`).
     SelectAssign {
         /// The rows to assign from.
@@ -452,8 +454,8 @@ pub enum LogicalPlan {
     /// Orders the rows of `input` (`ORDER BY`)..
     ///
     /// A `Sort` produces the columns it was handed, so [`LogicalPlan::schema`] delegates
-    /// to `input`: a key written on a column the select list drops is `sort.rs`'s business,
-    /// not a column of this node.
+    /// to `input`. A key written on a value the select list drops is a hidden column of the
+    /// `Project` under the `Sort`, which a `Project` over it leaves out (`sort.rs`).
     Sort {
         /// The rows to order.
         input: Box<LogicalPlan>,
@@ -533,8 +535,9 @@ pub struct AggregateCall {
 /// One key of a [`LogicalPlan::Sort`]..
 #[derive(Debug, Clone)]
 pub struct SortKey {
-    /// The expression to order by, already resolved: an `ORDER BY` written as an alias or
-    /// as a position is resolved by the binder, and the plan keeps the expression.
+    /// The expression to order by, already resolved. Over a `Project` or a `Distinct`, the
+    /// binder writes a [`BoundExprKind::ColumnRef`] on the column of that node the key
+    /// designates; over a set operator, the expression the key resolves to.
     pub expr: BoundExpr,
     /// True for `DESC`. `ASC` is the default and is not kept.
     pub desc: bool,

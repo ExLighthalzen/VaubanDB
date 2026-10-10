@@ -8,7 +8,7 @@
 //! pattern matching, an expression by its shape and its `ty`.
 
 use vauban_binder::{
-    BindContext, BoundExprKind, BoundStatement, CatalogView, ColumnBinding, LogicalPlan,
+    BindContext, BoundExpr, BoundExprKind, BoundStatement, CatalogView, ColumnBinding, LogicalPlan,
     NoVariables, ResolvedTable, ResolvedTableKind, SessionOptions, SortKey, bind,
 };
 use vauban_catalog::{ColumnId, ObjectId, TableId};
@@ -124,7 +124,34 @@ fn keys(plan: &LogicalPlan) -> &[SortKey] {
     }
 }
 
-/// The projections of the one `Project` of a plan, as `(name, ty)` pairs.
+/// The expression each key of the one `Sort` of a plan orders on: the column of the
+/// projection under the `Sort` the key designates, or the key itself over a `Distinct`.
+fn ordered_on(plan: &LogicalPlan) -> Vec<BoundExpr> {
+    let mut node = plan;
+    loop {
+        node = match node {
+            LogicalPlan::Sort { input, keys } => {
+                let LogicalPlan::Project { exprs, .. } = input.as_ref() else {
+                    return keys.iter().map(|key| key.expr.clone()).collect();
+                };
+                return keys
+                    .iter()
+                    .map(|key| match &key.expr.kind {
+                        BoundExprKind::ColumnRef(binding) => exprs[binding.index].expr.clone(),
+                        other => panic!("a key over a projection is a column, got {other:?}"),
+                    })
+                    .collect();
+            }
+            LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. } => input,
+            LogicalPlan::Distinct(input) => input,
+            other => panic!("no Sort over {other:?}"),
+        };
+    }
+}
+
+/// The projections of the outermost `Project` of a plan, as `(name, ty)` pairs.
 fn projections(plan: &LogicalPlan) -> Vec<(String, TypeInfo)> {
     let mut node = plan;
     loop {
@@ -148,9 +175,10 @@ fn projections(plan: &LogicalPlan) -> Vec<(String, TypeInfo)> {
 
 /// The two stacks `sort.rs` documents, and nothing in between.
 ///
-/// With `DISTINCT` the `Sort` is over the `Distinct`; without it, under the `Project`, where
-/// a key may still read a column the select list drops. The `Limit` of the `TOP` stays
-/// outermost in both, since `TOP` counts the rows of the ordered result.
+/// With `DISTINCT` the `Sort` is over the `Distinct`; without it, over a projection widened
+/// by the hidden columns of its keys, under a last `Project` that keeps the select list.
+/// The `Limit` of the `TOP` sits directly over the `Sort` in both, since `TOP` counts the
+/// rows of the ordered result.
 #[test]
 fn the_plan_shape_is_the_documented_one() {
     assert_eq!(
@@ -159,11 +187,11 @@ fn the_plan_shape_is_the_documented_one() {
     );
     assert_eq!(
         stack(&plan("SELECT TOP 2 a FROM dbo.t ORDER BY b")),
-        ["Limit", "Project", "Sort", "Scan"]
+        ["Project", "Limit", "Sort", "Project", "Scan"]
     );
     assert_eq!(
         stack(&plan("SELECT a FROM dbo.t WHERE b = 1 ORDER BY b")),
-        ["Project", "Sort", "Filter", "Scan"]
+        ["Project", "Sort", "Project", "Filter", "Scan"]
     );
     assert_eq!(
         stack(&plan("SELECT DISTINCT c FROM dbo.t")),
@@ -181,8 +209,11 @@ fn the_plan_shape_is_the_documented_one() {
 #[test]
 fn the_top_survives_the_sort() {
     let percent = plan("SELECT TOP 50 PERCENT a FROM dbo.t ORDER BY a");
-    let LogicalPlan::Limit { top, .. } = &percent else {
-        panic!("a TOP is a Limit, got {percent:?}")
+    let LogicalPlan::Project { input, .. } = &percent else {
+        panic!("the last Project is outermost, got {percent:?}")
+    };
+    let LogicalPlan::Limit { top, .. } = input.as_ref() else {
+        panic!("a TOP is a Limit, got {input:?}")
     };
     assert!(top.percent, "PERCENT is kept");
     assert!(!top.with_ties);
@@ -210,11 +241,9 @@ fn the_top_survives_the_sort() {
 #[test]
 fn order_by_an_alias_resolves_to_the_select_item() {
     let plan = plan("SELECT c AS x FROM dbo.t ORDER BY x");
-    let [key] = keys(&plan) else {
-        panic!("one key")
-    };
-    let BoundExprKind::ColumnRef(binding) = &key.expr.kind else {
-        panic!("the key is a column, got {:?}", key.expr.kind)
+    let [key] = ordered_on(&plan).try_into().expect("one key");
+    let BoundExprKind::ColumnRef(binding) = &key.kind else {
+        panic!("the key is a column, got {:?}", key.kind)
     };
     assert_eq!((binding.name.as_str(), binding.index), ("c", 2));
     let columns = projections(&plan);
@@ -222,8 +251,8 @@ fn order_by_an_alias_resolves_to_the_select_item() {
         panic!("one projection")
     };
     assert_eq!(name, "x");
-    assert_eq!(ty.ty, key.expr.ty.ty);
-    assert_eq!(ty.nullable, key.expr.ty.nullable);
+    assert_eq!(ty.ty, key.ty.ty);
+    assert_eq!(ty.nullable, key.ty.nullable);
 
     // The alias wins over the column of the table of the same name: `SELECT a AS b …
     // ORDER BY b` orders by `a` on SQL Server, which answers the rows in the order of `a`
@@ -244,11 +273,15 @@ fn order_by_an_alias_resolves_to_the_select_item() {
 
 /// The `(name, index)` of the column the one key of a plan reads.
 fn plan_key_column(text: &str) -> (String, usize) {
-    let plan = plan(text);
-    let [key] = keys(&plan) else {
+    column_read(text, &ordered_on(&plan(text)))
+}
+
+/// The `(name, index)` of the column of the one expression of `keys`.
+fn column_read(text: &str, keys: &[BoundExpr]) -> (String, usize) {
+    let [key] = keys else {
         panic!("{text}: one key")
     };
-    match &key.expr.kind {
+    match &key.kind {
         BoundExprKind::ColumnRef(binding) => (binding.name.clone(), binding.index),
         other => panic!("{text}: the key is a column, got {other:?}"),
     }
@@ -274,10 +307,8 @@ fn order_by_an_ordinal_resolves_to_the_nth_item() {
     );
     // A position that names a constant item is not the 408 of a constant key.
     let plan = plan("SELECT 1 AS x, a FROM dbo.t ORDER BY 1");
-    let [key] = keys(&plan) else {
-        panic!("one key")
-    };
-    assert!(matches!(key.expr.kind, BoundExprKind::Literal(_)));
+    let [key] = ordered_on(&plan).try_into().expect("one key");
+    assert!(matches!(key.kind, BoundExprKind::Literal(_)));
 }
 
 /// A position outside the select list is 108, with the position as written in the message.
@@ -529,12 +560,12 @@ fn offset_fetch_is_refused() {
 }
 
 /// A `SELECT` without a `FROM` orders by a position or by an alias, and the plan keeps the
-/// `Sort` under the `Project` there too.
+/// `Sort` between the two projections there too.
 #[test]
 fn a_select_without_a_from_orders_by_a_position() {
     assert_eq!(
         stack(&plan("SELECT 1 ORDER BY 1")),
-        ["Project", "Sort", "OneRow"]
+        ["Project", "Sort", "Project", "OneRow"]
     );
     assert!(bound("SELECT 1 AS x ORDER BY x").is_ok());
     assert_eq!(err("SELECT 1 ORDER BY 2").number, 108);
@@ -696,7 +727,7 @@ fn a_distinct_without_a_from_still_answers_145() {
     // The plan is the one of a `SELECT` without a `FROM`: `query.rs` puts no `Distinct` on.
     assert_eq!(
         stack(&plan("SELECT DISTINCT 1 ORDER BY 1")),
-        ["Project", "Sort", "OneRow"]
+        ["Project", "Sort", "Project", "OneRow"]
     );
 }
 
@@ -727,32 +758,270 @@ fn a_literal_holding_the_word_line_is_not_the_line_of_a_node() {
     );
 }
 
-/// What the shape of the plan changes: a key written as an alias is bound a second time,
-/// so the plan holds two nodes for it — the one the `Sort` reads and the one the `Project`
-/// publishes.
+/// What the shape of the plan changes: a key written as an alias orders on the column the
+/// projection computes, so the plan holds one node for it, the value published being the
+/// value ordered on. SQL Server answers that form its rows in the order of the published
+/// value.
 #[test]
-fn a_key_written_as_an_alias_is_bound_a_second_time() {
+fn a_key_written_as_an_alias_orders_on_its_column() {
     let text = "SELECT CAST(NEWID() AS varchar(36)) AS x FROM dbo.t ORDER BY x";
-    let plan = plan(text);
-    assert_eq!(stack(&plan), ["Project", "Sort", "Scan"]);
-    let LogicalPlan::Project { exprs, input, .. } = &plan else {
-        panic!("the Project is outermost, got {plan:?}")
+    let alias = plan(text);
+    assert_eq!(stack(&alias), ["Project", "Sort", "Project", "Scan"]);
+    let LogicalPlan::Project { input, .. } = &alias else {
+        panic!("the last Project is outermost, got {alias:?}")
     };
-    let LogicalPlan::Sort { keys, .. } = input.as_ref() else {
+    let LogicalPlan::Sort { keys, input } = input.as_ref() else {
         panic!("the Sort is under it, got {input:?}")
     };
-    // Two `Convert` nodes, each over its own call: nothing has the `Sort` read the value
-    // the `Project` publishes. SQL Server answers that form its rows in the order of the
-    // published value.
+    let LogicalPlan::Project { exprs, .. } = input.as_ref() else {
+        panic!("the projection is under the Sort, got {input:?}")
+    };
+    // One `Convert`, computed once: the key adds no hidden column and reads column 0.
+    assert_eq!(exprs.len(), 1, "no hidden column: {exprs:?}");
+    assert!(matches!(exprs[0].expr.kind, BoundExprKind::Convert { .. }));
     assert!(
-        matches!(exprs[0].expr.kind, BoundExprKind::Convert { .. }),
-        "the projection converts its own call, got {:?}",
+        matches!(&keys[0].expr.kind, BoundExprKind::ColumnRef(binding) if binding.index == 0),
+        "the key reads the column of its item, got {:?}",
+        keys[0].expr.kind
+    );
+    // Counter-proof: the same call written as an expression key is a hidden column of
+    // its own, a second draw.
+    let written = plan("SELECT NEWID() AS x FROM dbo.t ORDER BY NEWID()");
+    let LogicalPlan::Project { input, schema, .. } = &written else {
+        panic!("the last Project is outermost, got {written:?}")
+    };
+    assert_eq!(schema.columns.len(), 1, "the hidden column is not returned");
+    let LogicalPlan::Sort { input, .. } = input.as_ref() else {
+        panic!("the Sort is under it, got {input:?}")
+    };
+    let LogicalPlan::Project { exprs, .. } = input.as_ref() else {
+        panic!("the projection is under the Sort, got {input:?}")
+    };
+    assert_eq!(exprs.len(), 2, "one hidden column: {exprs:?}");
+}
+
+/// A key the select list does not return is a hidden column of the projection under the
+/// `Sort`, which the last `Project` drops: the client sees the columns of the select list.
+#[test]
+fn a_key_outside_the_select_list_is_a_hidden_column() {
+    let hidden = plan("SELECT a FROM dbo.t ORDER BY b DESC, c");
+    let LogicalPlan::Project {
+        exprs,
+        schema,
+        input,
+    } = &hidden
+    else {
+        panic!("the last Project is outermost, got {hidden:?}")
+    };
+    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["a"]);
+    assert!(
+        matches!(&exprs[0].expr.kind, BoundExprKind::ColumnRef(binding) if binding.index == 0),
+        "the last Project reads column 0, got {:?}",
         exprs[0].expr.kind
     );
+    let LogicalPlan::Sort { keys, input } = input.as_ref() else {
+        panic!("the Sort is under it, got {input:?}")
+    };
+    let LogicalPlan::Project { exprs, .. } = input.as_ref() else {
+        panic!("the widened projection is under the Sort, got {input:?}")
+    };
+    let widened: Vec<&str> = exprs
+        .iter()
+        .map(|p| match &p.expr.kind {
+            BoundExprKind::ColumnRef(binding) => binding.name.as_str(),
+            other => panic!("a column, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(widened, ["a", "b", "c"]);
+    let read: Vec<(usize, bool)> = keys
+        .iter()
+        .map(|key| match &key.expr.kind {
+            BoundExprKind::ColumnRef(binding) => (binding.index, key.desc),
+            other => panic!("a column, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(read, [(1, true), (2, false)]);
+}
+
+/// The keys are taken in written order, each one checked against the keys before it
+/// before the next is resolved: 169 on the second `c` comes before the 207 or the 108 of
+/// a third key, and after the 207 of a first one.
+#[test]
+fn keys_are_checked_in_written_order() {
+    assert_eq!(err("SELECT c FROM dbo.t ORDER BY c, c, nosuch").number, 169);
+    assert_eq!(err("SELECT c FROM dbo.t ORDER BY c, c, 5").number, 169);
+    assert_eq!(err("SELECT c FROM dbo.t ORDER BY nosuch, c, c").number, 207);
+    assert_eq!(err("SELECT c FROM dbo.t ORDER BY 5, c, c").number, 108);
+    // Over a grouped query, the 8127 of a key comes in its turn too.
+    assert_eq!(
+        err("SELECT c FROM dbo.t GROUP BY c ORDER BY b, 5").number,
+        8127
+    );
+    assert_eq!(
+        err("SELECT c FROM dbo.t GROUP BY c ORDER BY 5, b").number,
+        108
+    );
+    assert_eq!(
+        err("SELECT c FROM dbo.t GROUP BY c ORDER BY c, c, b").number,
+        169
+    );
+    assert_eq!(
+        err("SELECT c FROM dbo.t GROUP BY c ORDER BY b, c, c").number,
+        8127
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// `ORDER BY` over a grouped query
+// ---------------------------------------------------------------------------------------
+
+/// The `Aggregate` under a grouped `ORDER BY`, and the `Sort` over it.
+fn grouped(plan: &LogicalPlan) -> (&[SortKey], &[vauban_binder::BoundProjection], usize) {
+    let LogicalPlan::Project { input, .. } = plan else {
+        panic!("the last Project is outermost, got {plan:?}")
+    };
+    let mut node = input.as_ref();
+    while let LogicalPlan::Limit { input, .. } = node {
+        node = input;
+    }
+    let LogicalPlan::Sort { keys, input } = node else {
+        panic!("the Sort is under the last Project, got {node:?}")
+    };
+    let LogicalPlan::Project { exprs, input, .. } = input.as_ref() else {
+        panic!("the widened projection is under the Sort, got {input:?}")
+    };
+    let mut node = input.as_ref();
+    while let LogicalPlan::Filter { input, .. } = node {
+        node = input;
+    }
+    let LogicalPlan::Aggregate { aggregates, .. } = node else {
+        panic!("the Aggregate is under the projection, got {node:?}")
+    };
+    (keys, exprs, aggregates.len())
+}
+
+/// `ORDER BY COUNT(*)` over a query that does not return it: the `Aggregate` computes the
+/// call, a hidden column reads it, and the client sees the select list alone.
+#[test]
+fn a_grouped_query_orders_on_an_aggregate_it_does_not_return() {
+    let unreturned = plan("SELECT c FROM dbo.t GROUP BY c ORDER BY COUNT(*)");
+    assert_eq!(unreturned.schema().columns.len(), 1);
+    let (keys, exprs, aggregates) = grouped(&unreturned);
+    assert_eq!(aggregates, 1, "the ORDER BY adds its aggregate to the node");
+    assert_eq!(exprs.len(), 2, "one hidden column");
     assert!(
-        matches!(keys[0].expr.kind, BoundExprKind::Convert { .. }),
-        "the key converts another, got {:?}",
-        keys[0].expr.kind
+        matches!(&exprs[1].expr.kind, BoundExprKind::ColumnRef(binding) if binding.index == 1),
+        "the hidden column reads the aggregate, column 1 of the node, got {:?}",
+        exprs[1].expr.kind
+    );
+    assert!(matches!(&keys[0].expr.kind, BoundExprKind::ColumnRef(binding) if binding.index == 1));
+
+    // An aggregate the select list returns is read through its item, by an alias, a
+    // position or the call written again, and is computed once.
+    for text in [
+        "SELECT c, COUNT(*) AS n FROM dbo.t GROUP BY c ORDER BY n DESC, c",
+        "SELECT c, COUNT(*) AS n FROM dbo.t GROUP BY c ORDER BY 2 DESC, 1",
+    ] {
+        let returned = plan(text);
+        let (keys, exprs, aggregates) = grouped(&returned);
+        assert_eq!(
+            (aggregates, exprs.len()),
+            (1, 2),
+            "{text}: no hidden column"
+        );
+        let read: Vec<(usize, bool)> = keys
+            .iter()
+            .map(|key| match &key.expr.kind {
+                BoundExprKind::ColumnRef(binding) => (binding.index, key.desc),
+                other => panic!("{text}: a column, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(read, [(1, true), (0, false)], "{text}");
+    }
+    let again = plan("SELECT c, COUNT(*) AS n FROM dbo.t GROUP BY c ORDER BY COUNT(*) DESC");
+    let (_, exprs, aggregates) = grouped(&again);
+    assert_eq!(aggregates, 1, "COUNT(*) written twice is one aggregate");
+    assert_eq!(
+        exprs.len(),
+        3,
+        "the call written as an expression is a hidden column"
+    );
+
+    // A key, an expression on a key, a `HAVING` and a `TOP` bind as well.
+    for text in [
+        "SELECT c FROM dbo.t GROUP BY c ORDER BY c",
+        "SELECT c FROM dbo.t GROUP BY c ORDER BY LEN(c) DESC",
+        "SELECT c FROM dbo.t GROUP BY c HAVING COUNT(*) > 1 ORDER BY MAX(b)",
+        "SELECT TOP 1 WITH TIES c FROM dbo.t GROUP BY c ORDER BY COUNT(*) DESC",
+        "SELECT COUNT(*) FROM dbo.t ORDER BY COUNT(*)",
+        "SELECT 1 FROM dbo.t ORDER BY COUNT(*)",
+    ] {
+        assert!(bound(text).is_ok(), "{text} binds: {:?}", bound(text).err());
+    }
+}
+
+/// A column of the `ORDER BY` of a grouped query that is neither a key nor aggregated is
+/// 8127, on the line of the column, naming the table as written.
+#[test]
+fn a_column_outside_the_group_by_in_the_order_by_is_8127() {
+    for text in [
+        "SELECT c FROM dbo.t GROUP BY c ORDER BY b",
+        "SELECT c FROM dbo.t GROUP BY c ORDER BY b + 1",
+        "SELECT c FROM dbo.t AS q GROUP BY c ORDER BY q.b",
+        "SELECT DISTINCT c FROM dbo.t GROUP BY c ORDER BY b",
+    ] {
+        let error = err(text);
+        assert_eq!(error.number, 8127, "{text}: {}", error.message);
+        assert_eq!((error.severity, error.state), (16, 1));
+        assert!(
+            error.message.contains("'dbo.t.b'"),
+            "{text}: {}",
+            error.message
+        );
+    }
+    assert_eq!(err("SELECT c\nFROM dbo.t\nGROUP BY c\nORDER BY\nb").line, 5);
+    // The clauses before it answer first: the select list, the `HAVING`.
+    assert_eq!(
+        err("SELECT c, b FROM dbo.t GROUP BY c ORDER BY nosuch").number,
+        8120
+    );
+    assert_eq!(
+        err("SELECT c FROM dbo.t GROUP BY c HAVING b > 1 ORDER BY nosuch").number,
+        8121
+    );
+    // An aggregate in the `ORDER BY` alone groups the query: 8120 on the select list.
+    assert_eq!(err("SELECT c FROM dbo.t ORDER BY COUNT(*)").number, 8120);
+    // 145 over a `SELECT DISTINCT` whose list does not return the aggregate, where the
+    // list that returns it binds.
+    assert_eq!(
+        err("SELECT DISTINCT c FROM dbo.t GROUP BY c ORDER BY COUNT(*)").number,
+        145
+    );
+    assert!(bound("SELECT DISTINCT c, COUNT(*) FROM dbo.t GROUP BY c ORDER BY COUNT(*)").is_ok());
+    // A key that resolves to nothing, an aggregate of an aggregate and a constant.
+    assert_eq!(
+        err("SELECT c FROM dbo.t GROUP BY c ORDER BY nosuch").number,
+        207
+    );
+    assert_eq!(
+        err("SELECT c FROM dbo.t GROUP BY c ORDER BY SUM(COUNT(*))").number,
+        130
+    );
+    assert_eq!(
+        err("SELECT c FROM dbo.t GROUP BY c ORDER BY 'a'").number,
+        408
+    );
+    assert_eq!(err("SELECT c FROM dbo.t GROUP BY c ORDER BY 3").number, 108);
+    assert_eq!(
+        err("SELECT c, COUNT(*) FROM dbo.t GROUP BY c ORDER BY 2, COUNT(*)").number,
+        169
+    );
+    // A key written as an expression is looked up in the `FROM`, as in a query that
+    // groups nothing.
+    assert_eq!(
+        err("SELECT c AS k FROM dbo.t GROUP BY c ORDER BY k + 1").number,
+        207
     );
 }
 
@@ -889,28 +1158,14 @@ fn err_derived(text: &str) -> SqlError {
     bound_derived(text).expect_err(text)
 }
 
-/// The `(name, index)` of the one key of a join plan.
+/// The `(name, index)` of the column the one key of a join plan reads.
 fn join_key(text: &str) -> (String, usize) {
-    let plan = plan_join(text);
-    let [key] = keys(&plan) else {
-        panic!("{text}: one key")
-    };
-    match &key.expr.kind {
-        BoundExprKind::ColumnRef(binding) => (binding.name.clone(), binding.index),
-        other => panic!("{text}: the key is a column, got {other:?}"),
-    }
+    column_read(text, &ordered_on(&plan_join(text)))
 }
 
-/// The `(name, index)` of the one key of a derived-table plan.
+/// The `(name, index)` of the column the one key of a derived-table plan reads.
 fn derived_key(text: &str) -> (String, usize) {
-    let plan = plan_derived(text);
-    let [key] = keys(&plan) else {
-        panic!("{text}: one key")
-    };
-    match &key.expr.kind {
-        BoundExprKind::ColumnRef(binding) => (binding.name.clone(), binding.index),
-        other => panic!("{text}: the key is a column, got {other:?}"),
-    }
+    column_read(text, &ordered_on(&plan_derived(text)))
 }
 
 /// The operator stack through a `Join` or `Subquery` leaf.
@@ -938,20 +1193,21 @@ fn stack_relational(plan: &LogicalPlan) -> Vec<&'static str> {
     }
 }
 
-/// A join `ORDER BY` keeps the documented stack: `Sort` under the `Project`, over the `Join`.
+/// A join `ORDER BY` keeps the documented stack: `Sort` between the two projections, over
+/// the `Join`.
 #[test]
 fn order_by_over_a_join_keeps_the_documented_stack() {
     assert_eq!(
         stack_relational(&plan_join(
             "SELECT a.k, b.c FROM dbo.a JOIN dbo.b ON a.k = b.k ORDER BY b.c"
         )),
-        ["Project", "Sort", "Join"]
+        ["Project", "Sort", "Project", "Join"]
     );
     assert_eq!(
         stack_relational(&plan_derived(
             "SELECT d.c FROM (SELECT c FROM a) AS d ORDER BY d.c"
         )),
-        ["Project", "Sort", "Subquery"]
+        ["Project", "Sort", "Project", "Subquery"]
     );
 }
 
@@ -993,10 +1249,8 @@ fn order_by_the_right_side_of_a_left_join() {
         ("c".to_owned(), 3)
     );
     let plan = plan_join("SELECT b.c FROM dbo.a LEFT JOIN dbo.b ON a.k = b.k ORDER BY b.c");
-    let [key] = keys(&plan) else {
-        panic!("one key")
-    };
-    assert!(key.expr.ty.nullable, "b.c is nullable under a LEFT JOIN");
+    let [key] = ordered_on(&plan).try_into().expect("one key");
+    assert!(key.ty.nullable, "b.c is nullable under a LEFT JOIN");
 }
 
 /// Three joined tables publish six columns; a sort key may name one of them.
@@ -1048,17 +1302,5 @@ fn order_by_an_ordinal_over_a_join() {
     assert_eq!(
         err_join("SELECT a.k FROM dbo.a JOIN dbo.b ON a.k = b.k ORDER BY 99").number,
         108
-    );
-}
-
-/// A grouped query still answers the internal refusal for its `ORDER BY`.
-#[test]
-fn order_by_over_a_grouped_query_is_still_refused() {
-    let error = err_join("SELECT a.k FROM dbo.a GROUP BY a.k ORDER BY a.c");
-    assert_eq!(error.number, 50000, "{}", error.message);
-    assert!(
-        error.message.contains("the ORDER BY of a grouped query"),
-        "{}",
-        error.message
     );
 }

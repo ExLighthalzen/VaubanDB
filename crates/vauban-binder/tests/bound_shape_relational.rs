@@ -524,15 +524,12 @@ fn an_aggregate_in_a_select_list_reaches_aggregate_rs() {
     let elsewhere = error_of("SELECT c FROM a WHERE SUM(c) = 1");
     assert_eq!(elsewhere.number, 147, "{}", elsewhere.message);
 
-    let elsewhere = error_of("SELECT c FROM a ORDER BY SUM(c)");
-    assert_eq!(elsewhere.number, 50000, "{}", elsewhere.message);
-    assert!(
-        elsewhere
-            .message
-            .contains("outside a select list or a HAVING clause"),
-        "call.rs names the site: {}",
-        elsewhere.message
-    );
+    // An aggregate in the `ORDER BY` groups the query too: the select list then answers
+    // 8120 on its column, where a select list that aggregates binds.
+    let ordered = error_of("SELECT c FROM a ORDER BY SUM(c)");
+    assert_eq!(ordered.number, 8120, "{}", ordered.message);
+    let plan = plan_of("SELECT SUM(c) FROM a ORDER BY SUM(c)");
+    assert_eq!(plan.schema().columns.len(), 1, "{plan:?}");
 }
 
 /// The plan of `text`, bound against the two tables above.

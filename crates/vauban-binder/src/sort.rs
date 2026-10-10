@@ -9,45 +9,41 @@
 //! # Where the `Sort` sits
 //!
 //! `query.rs::finish` hands this file a plan whose `Limit` already sits over the `Distinct`.
-//! Two stacks come out of it, and the rule that picks one is: **the `Sort` goes directly
-//! over the operator that still produces the values of its keys, and under the `Limit`**,
-//! because `TOP` counts the rows of the ordered result.
+//! Two stacks come out of it. In both, the `Sort` sits directly under the `Limit`, because
+//! `TOP` counts the rows of the ordered result, and its keys are
+//! [`BoundExprKind::ColumnRef`]s on the row of the node under it.
 //!
 //! ```text
-//! SELECT TOP 2 a FROM dbo.t ORDER BY b           Limit → Project → Sort → Filter → Scan
+//! SELECT TOP 2 a FROM dbo.t ORDER BY b           Project → Limit → Sort → Project → Scan
 //! SELECT DISTINCT TOP 2 c FROM dbo.t ORDER BY c  Limit → Sort → Distinct → Project → Scan
 //! ```
 //!
-//! - **Without `DISTINCT`**, an `ORDER BY` may name a column the select list drops
-//!   (`SELECT a FROM dbo.t ORDER BY b` answers its rows). That value is gone from the row a
-//!   `Project`
-//!   publishes, and no node of `bound/mod.rs` carries a hidden column, so the `Sort` goes
-//!   **under** the `Project`, with keys bound in the scope of the `FROM`. A `Project` keeps
-//!   one row per input row, so ordering under it orders the result.
-//! - **With `DISTINCT`**, error 145 refuses such a key: each one is then a projected column,
-//!   and the `Sort` goes **over** the `Distinct`, so that the ordered result does not hang on
-//!   the order the deduplication happens to produce. A key is a
-//!   [`BoundExprKind::ColumnRef`] on its position in the row the `Distinct` publishes — the
-//!   way `bound/mod.rs` already has a `Project` designate a column of an `Aggregate` below
-//!   it.
+//! - **Without `DISTINCT`**, an `ORDER BY` may name a value the select list drops
+//!   (`SELECT a FROM dbo.t ORDER BY b` answers its rows). The projection under the `Sort`
+//!   computes the select list **and**, after it, one hidden column per key written as an
+//!   expression; the `Sort` orders on the columns of that row, and a last `Project` on top
+//!   keeps the columns of the select list. A key written as a position or as an output
+//!   name orders on the column of its item. That last `Project` is the root of the plan,
+//!   the shape `variables.rs` detaches the values of a `SELECT @x = …` from; an item that
+//!   reads a variable is computed there, over the ordered rows
+//!   ([`sort_over_the_projection`]).
+//! - **With `DISTINCT`**, error 145 refuses a key outside the select list: each one is
+//!   then a projected column, and the `Sort` goes **over** the `Distinct`, so that the
+//!   ordered result does not hang on the order the deduplication happens to produce.
 //!
-//! The form rejected: one stack with the `Sort` under the `Distinct` in both cases. It
-//! answers the same rows as this one when the deduplication keeps the order of its input,
-//! and that is a contract on a node of the planner and the executor. The two stacks above
-//! hold on their own. `tests/bind_sort.rs`, `the_plan_shape_is_the_documented_one`, pins
-//! both.
+//! A grouped query takes the stack of its `DISTINCT` word, its keys being bound by
+//! `aggregate.rs` above the `Aggregate` ([`bind_order_by`]): the hidden column of
+//! `SELECT c FROM dbo.t GROUP BY c ORDER BY COUNT(*)` reads a column of the `Aggregate`,
+//! as the select list does (`tests/bind_sort.rs`,
+//! `a_grouped_query_orders_on_an_aggregate_it_does_not_return`).
 //!
 //! ## What the shape changes in the answer
 //!
-//! Under the `Project`, a key written as an alias is the expression of the select item
-//! **bound a second time**: the plan holds two nodes for it, the one it sorts on and the
-//! one it publishes. A key that does not give the same value at each evaluation therefore
-//! comes out sorted on one draw and published on another.
-//! `SELECT CAST(NEWID() AS varchar(36)) AS x FROM dbo.t ORDER BY x` answers its rows in
-//! ascending order of the **published** value on SQL Server, an order this stack does not
-//! give that form. The two nodes are pinned by `tests/bind_sort.rs`,
-//! `a_key_written_as_an_alias_is_bound_a_second_time`; executing them is the executor's,
-//! and the note is here because the shape is what causes it.
+//! A key written as an alias is the column the select list computes, evaluated once per
+//! row: `SELECT NEWID() AS g FROM dbo.t ORDER BY g` answers its rows in ascending order of
+//! the **published** value, as SQL Server does (`tests/bind_sort.rs`,
+//! `a_key_written_as_an_alias_orders_on_its_column`, and the session test
+//! `an_alias_key_is_evaluated_once_per_row`).
 //!
 //! # What a key is written as
 //!
@@ -72,10 +68,18 @@
 //! | `SELECT DISTINCT c … ORDER BY c COLLATE X` | **145**, where the same key over `SELECT DISTINCT c COLLATE X` answers the rows and over `SELECT DISTINCT c COLLATE Y` answers 145 |
 //! | `SELECT DISTINCT 1 ORDER BY @@SPID` | **145** without a `FROM`, where `ORDER BY 1` and `ORDER BY x` over `SELECT DISTINCT 1 AS x` answer their row |
 //!
-//! Two orders between those numbers hold too, and this file follows them: a key that does
-//! not resolve raises its own error before 145 (`SELECT DISTINCT a … ORDER BY nosuch`
-//! answers 207, `… ORDER BY 5` answers 108), and 169 comes before 145
-//! (`SELECT DISTINCT a … ORDER BY b, b` answers 169).
+//! Over a grouped query, a key written as an expression is looked at as the select list is
+//! (`aggregate.rs`): `SELECT c … GROUP BY c ORDER BY COUNT(*)` orders on an aggregate the
+//! list does not return, and `SELECT c … GROUP BY c ORDER BY x` answers **8127** on `x`.
+//!
+//! Three orders between those numbers hold too, and this file follows them. The keys are
+//! taken in written order, each one resolved, bound and compared with the keys before it
+//! before the next is looked at: `ORDER BY c, c, nosuch` and `ORDER BY c, c, 5` answer 169,
+//! `ORDER BY nosuch, c, c` answers 207, and over a grouped query `ORDER BY x, 5` answers
+//! 8127 where `ORDER BY 5, x` answers 108. A key that does not resolve raises its own
+//! error before 145 (`SELECT DISTINCT a … ORDER BY nosuch` answers 207, `… ORDER BY 5`
+//! answers 108). And 169 comes before 145 (`SELECT DISTINCT a … ORDER BY b, b` answers
+//! 169). The first two are pinned by `tests/bind_sort.rs`, `keys_are_checked_in_written_order`.
 //!
 //! 145 hangs on the word written in the statement, not on the [`LogicalPlan::Distinct`]
 //! node: `query.rs::finish` puts none on a `SELECT DISTINCT` without a `FROM`, over a
@@ -95,14 +99,14 @@ use vauban_parser::{
 use vauban_types::{Collation, TypeInfo};
 
 use crate::bound::{
-    BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding, LogicalPlan, OutputSchema,
-    SortKey,
+    BoundExpr, BoundExprKind, BoundProjection, BoundTop, ColumnBinding, LogicalPlan, OutputColumn,
+    OutputSchema, SortKey,
 };
 use crate::context::BindContext;
 use crate::errors::line_of;
 use crate::expr::{Scope, bind_expr};
 use crate::names::alias_of;
-use crate::query::{bug, not_implemented};
+use crate::query::bug;
 use crate::star::Source;
 use crate::view;
 
@@ -112,23 +116,30 @@ use crate::view;
 /// and `DISTINCT` included: this function takes that stack apart and puts it back with the
 /// `Sort` at the place the module documentation fixes.
 ///
+/// `grouped_keys` carries the keys of a grouped query, which `aggregate.rs` resolves with
+/// [`resolve_keys`] while the extraction of its aggregates is open; `None` for a query that
+/// groups nothing, whose keys are bound here in the scope of the `FROM`.
+///
 /// # Errors
 ///
 /// - **108** for a position outside the select list, **209** for a name that matches two
 ///   output columns, **408** for a constant key, **169** for two keys that designate the
 ///   same column, **145** for a key outside the select list of a `SELECT DISTINCT`, and the
 ///   447 or 448 of a `COLLATE` written on a key;
-/// - the errors binding a key raises, 207 and 4104 among them;
+/// - the errors binding a key raises, 207, 4104 and the 8127 of a grouped query among them;
 /// - an internal error 50000 naming the form, for an `ORDER BY` over a set operator, over
-///   a grouped query (where SQL Server answers 8127), over a join or over a derived table.
+///   a join or over a derived table.
 pub(crate) fn bind_order_by(
     stmt: &SelectStatement,
     input: LogicalPlan,
     ctx: &BindContext<'_>,
     from_scope: Option<Scope>,
+    grouped_keys: Option<Vec<ResolvedKey>>,
 ) -> SqlResult<LogicalPlan> {
     match &stmt.body {
-        QueryBody::Select(spec) => bind_order_by_select(stmt, input, ctx, spec, from_scope),
+        QueryBody::Select(spec) => {
+            bind_order_by_select(stmt, input, ctx, spec, from_scope, grouped_keys)
+        }
         QueryBody::SetOp { .. } | QueryBody::Nested(..) => bind_order_by_set_op(stmt, input, ctx),
     }
 }
@@ -140,6 +151,7 @@ fn bind_order_by_select(
     ctx: &BindContext<'_>,
     spec: &QuerySpec,
     from_scope: Option<Scope>,
+    grouped_keys: Option<Vec<ResolvedKey>>,
 ) -> SqlResult<LogicalPlan> {
     let (body, top) = strip_limit(input);
     let (deduplicated, projected) = match body {
@@ -157,18 +169,23 @@ fn bind_order_by_select(
         )));
     };
 
-    let scope = match from_scope {
-        Some(scope) => scope,
-        None => scope_of(&source, spec, ctx)?,
+    let keys = match grouped_keys {
+        Some(keys) => keys,
+        None => {
+            if grouped_source(&source) {
+                return Err(bug(
+                    "sort::bind_order_by: a grouped query reached the ORDER BY without its keys",
+                ));
+            }
+            let scope = match from_scope {
+                Some(scope) => scope,
+                None => scope_of(&source, spec, ctx)?,
+            };
+            resolve_keys(&stmt.order_by, &exprs, &schema, &mut |written| {
+                bind_expr(written, ctx, &scope)
+            })?
+        }
     };
-    if grouped_source(&source) {
-        return Err(not_implemented("the ORDER BY of a grouped query"));
-    }
-    let mut keys = Vec::with_capacity(stmt.order_by.len());
-    for (position, item) in stmt.order_by.iter().enumerate() {
-        keys.push(resolve_key(item, position, &exprs, &schema, &scope, ctx)?);
-    }
-    refuse_a_repeated_key(&keys)?;
     // 145 is raised on the word of the statement and not on the `Distinct` of the plan:
     // `SELECT DISTINCT 1 ORDER BY @@SPID` has no node, and answers 145.
     let positions = if spec.distinct {
@@ -177,28 +194,207 @@ fn bind_order_by_select(
         Vec::new()
     };
 
-    let plan = if deduplicated {
-        let keys = project_the_keys(keys, &positions, &schema)?;
-        LogicalPlan::Sort {
-            input: Box::new(LogicalPlan::Distinct(Box::new(LogicalPlan::Project {
-                input: source,
-                exprs,
-                schema,
-            }))),
-            keys,
-        }
-    } else {
-        let keys = keys.into_iter().map(ResolvedKey::into_sort_key).collect();
-        LogicalPlan::Project {
-            input: Box::new(LogicalPlan::Sort {
-                input: source,
-                keys,
-            }),
+    if !deduplicated {
+        return sort_over_the_projection(source, exprs, schema, keys, top);
+    }
+    let keys = project_the_keys(keys, &positions, &schema)?;
+    let plan = LogicalPlan::Sort {
+        input: Box::new(LogicalPlan::Distinct(Box::new(LogicalPlan::Project {
+            input: source,
             exprs,
             schema,
-        }
+        }))),
+        keys,
     };
     Ok(put_the_limit_back(plan, top))
+}
+
+/// The stack of an `ORDER BY` without `DISTINCT`: a projection under the `Sort` that
+/// computes the items and adds the hidden columns, the `Sort` over it, the `Limit` of a
+/// `TOP` over the `Sort`, and a last `Project` that publishes the select list.
+///
+/// An item is computed under the `Sort`, once, so that a key written as its position or
+/// its output name orders on the value the client receives; the last `Project` reads it.
+///
+/// An item that reads a variable is computed by the last `Project` instead, over the
+/// ordered rows: `SELECT @v = @v * 10 + a … ORDER BY a` assigns its values in the order
+/// of the keys, each one reading what the row before stored (`variables.rs` binds that
+/// statement through this stack; session test `an_assignment_accumulates_in_key_order`).
+/// The projection under the `Sort` then begins with the row of `source`, at its
+/// positions, so that such an item, bound against `source`, reads the same columns over
+/// the `Sort`.
+fn sort_over_the_projection(
+    source: Box<LogicalPlan>,
+    exprs: Vec<BoundProjection>,
+    schema: OutputSchema,
+    keys: Vec<ResolvedKey>,
+    top: Option<BoundTop>,
+) -> SqlResult<LogicalPlan> {
+    let above: Vec<bool> = exprs
+        .iter()
+        .map(|projection| {
+            !matches!(projection.expr.kind, BoundExprKind::Literal(_))
+                && reads_a_variable(&projection.expr)
+        })
+        .collect();
+    let mut widened: Vec<BoundProjection> = Vec::new();
+    if above.contains(&true) {
+        widened.extend(
+            view::source_columns(source.schema())
+                .into_iter()
+                .map(|binding| BoundProjection {
+                    name: binding.name.clone(),
+                    expr: BoundExpr {
+                        ty: binding.ty.clone(),
+                        kind: BoundExprKind::ColumnRef(binding),
+                        line: 0,
+                    },
+                }),
+        );
+    }
+    // Where each item computed under the `Sort` sits in `widened`.
+    let mut below: Vec<Option<usize>> = Vec::with_capacity(exprs.len());
+    for (projection, over) in exprs.iter().zip(&above) {
+        if *over {
+            below.push(None);
+        } else {
+            widened.push(projection.clone());
+            below.push(Some(widened.len() - 1));
+        }
+    }
+    let mut positions = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let designated = key
+            .item
+            .and_then(|index| below.get(index).copied().flatten());
+        let position = match (key.item, designated) {
+            (_, Some(position)) => position,
+            (Some(index), None) => {
+                let projection = exprs.get(index).ok_or_else(|| {
+                    bug(format!(
+                        "sort::sort_over_the_projection: no projection {index}"
+                    ))
+                })?;
+                widened.push(BoundProjection {
+                    expr: projection.expr.clone(),
+                    name: String::new(),
+                });
+                widened.len() - 1
+            }
+            (None, None) => {
+                widened.push(BoundProjection {
+                    expr: key.expr.clone(),
+                    name: String::new(),
+                });
+                widened.len() - 1
+            }
+        };
+        positions.push(position);
+    }
+    let widened_schema = OutputSchema {
+        columns: widened
+            .iter()
+            .map(|projection| OutputColumn {
+                name: projection.name.clone(),
+                ty: projection.expr.ty.clone(),
+            })
+            .collect(),
+    };
+    let keys = project_the_keys(keys, &positions, &widened_schema)?;
+    let columns = view::source_columns(&widened_schema);
+    let sorted = LogicalPlan::Sort {
+        input: Box::new(LogicalPlan::Project {
+            input: source,
+            exprs: widened,
+            schema: widened_schema,
+        }),
+        keys,
+    };
+    // A literal item stays the literal itself: `insert.rs` reads a bare `NULL` off the
+    // root projection to exempt it from the type check of its column.
+    let visible = exprs
+        .into_iter()
+        .zip(below)
+        .map(|(projection, below)| match below {
+            Some(position) if !matches!(projection.expr.kind, BoundExprKind::Literal(_)) => {
+                let binding = columns.get(position).cloned().ok_or_else(|| {
+                    bug(format!(
+                        "sort::sort_over_the_projection: no column {position} under the Sort"
+                    ))
+                })?;
+                Ok(BoundProjection {
+                    name: projection.name,
+                    expr: BoundExpr {
+                        ty: binding.ty.clone(),
+                        kind: BoundExprKind::ColumnRef(binding),
+                        line: projection.expr.line,
+                    },
+                })
+            }
+            _ => Ok(projection),
+        })
+        .collect::<SqlResult<Vec<_>>>()?;
+    Ok(LogicalPlan::Project {
+        input: Box::new(put_the_limit_back(sorted, top)),
+        exprs: visible,
+        schema,
+    })
+}
+
+/// Whether `expr` reads a variable, a subquery under it not looked into. A worklist rather
+/// than a recursion, for the reason [`is_constant`] gives.
+fn reads_a_variable(expr: &BoundExpr) -> bool {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match &expr.kind {
+            BoundExprKind::Variable { .. } => return true,
+            BoundExprKind::Literal(_)
+            | BoundExprKind::ColumnRef(_)
+            | BoundExprKind::Exists(_)
+            | BoundExprKind::ScalarSubquery(_) => {}
+            BoundExprKind::Arith { left, right, .. }
+            | BoundExprKind::Compare { left, right, .. }
+            | BoundExprKind::Logical { left, right, .. } => {
+                pending.push(left);
+                pending.push(right);
+            }
+            BoundExprKind::Negate(inner)
+            | BoundExprKind::BitNot(inner)
+            | BoundExprKind::Not(inner)
+            | BoundExprKind::IsNull { expr: inner, .. }
+            | BoundExprKind::Convert { expr: inner, .. }
+            | BoundExprKind::Collate { expr: inner }
+            | BoundExprKind::InSubquery { expr: inner, .. } => pending.push(inner),
+            BoundExprKind::In { expr, list, .. } => {
+                pending.push(expr);
+                pending.extend(list.iter());
+            }
+            BoundExprKind::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                pending.push(expr);
+                pending.push(pattern);
+                pending.extend(escape.as_deref());
+            }
+            BoundExprKind::Case {
+                operand,
+                arms,
+                else_,
+            } => {
+                pending.extend(operand.as_deref());
+                for arm in arms {
+                    pending.push(&arm.when);
+                    pending.push(&arm.then);
+                }
+                pending.extend(else_.as_deref());
+            }
+            BoundExprKind::Function { args, .. } => pending.extend(args.iter()),
+        }
+    }
+    false
 }
 
 /// Binds the ORDER BY of a set operator: `UNION … ORDER BY a`.
@@ -239,19 +435,9 @@ fn bind_order_by_set_op(
         })
         .collect();
 
-    let mut keys = Vec::with_capacity(stmt.order_by.len());
-    for (position, item) in stmt.order_by.iter().enumerate() {
-        keys.push(resolve_key(
-            item,
-            position,
-            &exprs,
-            schema,
-            &Scope::empty(),
-            ctx,
-        )?);
-    }
-    refuse_a_repeated_key(&keys)?;
-
+    let keys = resolve_keys(&stmt.order_by, &exprs, schema, &mut |written| {
+        bind_expr(written, ctx, &Scope::empty())
+    })?;
     let keys = keys.into_iter().map(ResolvedKey::into_sort_key).collect();
     Ok(LogicalPlan::Sort {
         input: Box::new(input),
@@ -288,8 +474,12 @@ pub(crate) fn order_by_invalid_in_a_subquery() -> SqlError {
 }
 
 /// A key, once its position or its name has been resolved and its expression bound.
-struct ResolvedKey {
-    /// The expression to order by, bound in the scope of the `FROM`.
+///
+/// Built by [`resolve_keys`]; `aggregate.rs` holds one between the extraction of a grouped
+/// query and the `Sort` this file puts over it.
+pub(crate) struct ResolvedKey {
+    /// The expression to order by, bound in the scope the select list is bound in: the
+    /// `FROM`, or the columns of the `Aggregate` of a grouped query.
     expr: BoundExpr,
     /// True for `DESC`.
     desc: bool,
@@ -303,7 +493,7 @@ struct ResolvedKey {
 }
 
 impl ResolvedKey {
-    /// The key of a `Sort` placed under the `Project`, which keeps the expression as bound.
+    /// The key of a `Sort` over a set operator, which keeps the expression as bound.
     fn into_sort_key(self) -> SortKey {
         SortKey {
             expr: self.expr,
@@ -313,7 +503,40 @@ impl ResolvedKey {
     }
 }
 
-/// Resolves one `ORDER BY` item into a key bound in the scope of the `FROM`.
+/// Resolves the items of an `ORDER BY` against the select list `exprs` publishes under
+/// `schema`, in written order, and raises **169** on the first key that designates the
+/// column of a key before it.
+///
+/// `bind` binds a key written as an expression: [`bind_expr`] in the scope of the `FROM`
+/// for a query that groups nothing, the extraction of `aggregate.rs` for a grouped one.
+///
+/// A key is resolved, bound and compared with the keys before it before the next one is
+/// looked at, so that `ORDER BY c, c, nosuch` answers 169 and `ORDER BY nosuch, c, c`
+/// answers 207 (module documentation).
+///
+/// `ORDER BY a, a`, `ORDER BY a, dbo.t.a`, `ORDER BY 1, a`, `ORDER BY 1, 1`,
+/// `ORDER BY a + 1, a + 1`, `ORDER BY a ASC, a DESC` and, over `SELECT a AS x, b`,
+/// `ORDER BY x, a` each answer 169, where `ORDER BY a, a + 0` answers the rows. The
+/// direction written on a key is therefore not part of what makes two of them the same.
+pub(crate) fn resolve_keys(
+    order_by: &[OrderItem],
+    exprs: &[BoundProjection],
+    schema: &OutputSchema,
+    bind: &mut dyn FnMut(&Expr) -> SqlResult<BoundExpr>,
+) -> SqlResult<Vec<ResolvedKey>> {
+    let mut keys: Vec<ResolvedKey> = Vec::with_capacity(order_by.len());
+    for (position, item) in order_by.iter().enumerate() {
+        let key = resolve_key(item, position, exprs, schema, bind)?;
+        if keys.iter().any(|seen| seen.print == key.print) {
+            return Err(column_named_twice_in_the_order_by_list().with_line(key.expr.line));
+        }
+        keys.push(key);
+    }
+    Ok(keys)
+}
+
+/// Resolves one `ORDER BY` item into a key, `bind` binding it when it is written as an
+/// expression.
 ///
 /// `position` is 0-based and serves the message of 408, which counts from 1.
 fn resolve_key(
@@ -321,8 +544,7 @@ fn resolve_key(
     position: usize,
     exprs: &[BoundProjection],
     schema: &OutputSchema,
-    scope: &Scope,
-    ctx: &BindContext<'_>,
+    bind: &mut dyn FnMut(&Expr) -> SqlResult<BoundExpr>,
 ) -> SqlResult<ResolvedKey> {
     let written = &item.expr;
     let written_collation = item.collate.as_deref();
@@ -354,7 +576,7 @@ fn resolve_key(
             })?;
             (projection.expr.clone(), Some(index))
         }
-        None => (bind_expr(written, ctx, scope)?, None),
+        None => (bind(written)?, None),
     };
     // The `COLLATE` is applied before 408 is raised: `ORDER BY 2.0 COLLATE
     // Latin1_General_CI_AS` answers 447 where `ORDER BY 'abc' COLLATE Latin1_General_CI_AS`
@@ -534,8 +756,9 @@ fn select_list_positions(keys: &[ResolvedKey], exprs: &[BoundProjection]) -> Sql
         .collect()
 }
 
-/// Turns the keys of a `SELECT DISTINCT` into references to the row the `Distinct`
-/// publishes, at the positions [`select_list_positions`] gave them.
+/// Turns the keys into references to the row of `schema`, at the positions given: those
+/// [`select_list_positions`] gave the keys of a `SELECT DISTINCT`, which the `Distinct`
+/// publishes, or those of the widened projection [`sort_over_the_projection`] builds.
 fn project_the_keys(
     keys: Vec<ResolvedKey>,
     positions: &[usize],
@@ -571,23 +794,6 @@ fn project_the_keys(
         });
     }
     Ok(bound)
-}
-
-/// Raises 169 when two keys designate the same column.
-///
-/// `ORDER BY a, a`, `ORDER BY a, dbo.t.a`, `ORDER BY 1, a`, `ORDER BY 1, 1`,
-/// `ORDER BY a + 1, a + 1`, `ORDER BY a ASC, a DESC` and, over `SELECT a AS x, b`,
-/// `ORDER BY x, a` each answer the number, where `ORDER BY a, a + 0` answers the rows. The
-/// direction written on a key is therefore not part of what makes two of them the same.
-fn refuse_a_repeated_key(keys: &[ResolvedKey]) -> SqlResult<()> {
-    let mut seen: Vec<&str> = Vec::with_capacity(keys.len());
-    for key in keys {
-        if seen.contains(&key.print.as_str()) {
-            return Err(column_named_twice_in_the_order_by_list().with_line(key.expr.line));
-        }
-        seen.push(&key.print);
-    }
-    Ok(())
 }
 
 /// What two expressions share when SQL Server calls them the same column.
@@ -741,9 +947,9 @@ fn scope_of(source: &LogicalPlan, spec: &QuerySpec, ctx: &BindContext<'_>) -> Sq
                 ctx.database,
             )))
         }
-        (LogicalPlan::Aggregate { .. }, _) => {
-            Err(not_implemented("the ORDER BY of a grouped query"))
-        }
+        (LogicalPlan::Aggregate { .. }, _) => Err(bug(
+            "sort::scope_of: the keys of a grouped query are bound by aggregate.rs",
+        )),
         (expanded, Some(reference)) => match reference_alias(reference) {
             Some(alias) => Ok(Scope::over(Source::new(
                 &alias,
