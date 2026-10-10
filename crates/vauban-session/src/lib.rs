@@ -14,6 +14,7 @@
 //! | `sink.rs` | `ResultSink` and its TDS implementation |
 //! | `batch.rs`, `fake_engine.rs` | the program of a batch or of a called level, the `WAITFOR DELAY` fallback |
 //! | `procedures.rs` | calls: system procedures, `EXEC('…')` and `sp_executesql`, each in a level of its own |
+//! | `signature.rs` | arguments of a call bound to the parameters a procedure declares |
 //! | `statements.rs` | span, fragment and line of one statement inside the text it sits in |
 //! | `cancel.rs` | ATTENTION handling |
 //! | `disconnect.rs` | connection teardown and ATTENTION cleanup |
@@ -35,6 +36,7 @@ mod reset;
 mod rpc;
 mod server;
 mod set_options;
+mod signature;
 mod sink;
 mod state;
 mod statements;
@@ -59,6 +61,9 @@ pub use procedures::{NestedOutcome, NestedParam};
 pub use rpc::*;
 #[allow(unused_imports)]
 pub use set_options::*;
+pub use signature::{
+    CallForm, ParamDefault, ProcSignature, SignatureParam, bind_arguments, is_unicode_text,
+};
 #[allow(unused_imports)]
 pub use sink::*;
 #[allow(unused_imports)]

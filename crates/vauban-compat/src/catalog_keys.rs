@@ -1,430 +1,58 @@
 //! Key catalog procedures (`sp_pkeys`, `sp_fkeys`, …).
 
 use vauban_errors::{SqlError, SqlResult};
-use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+use vauban_session::{CallForm, ParamDefault, ProcSignature, SignatureParam, bind_arguments};
+use vauban_types::{Len, SqlType, Value};
 
-use crate::procedures::{ProcAction, ProcParam, SystemProc};
+use crate::procedures::{ProcAction, SystemProc};
 use crate::special_procs::ProcArg;
 
-/// Parameter declaration for a catalog procedure.
-#[derive(Debug, Clone, Copy)]
-struct ParamSpec {
-    canonical: &'static str,
-    aliases: &'static [&'static str],
-    required: bool,
-    unicode: bool,
-    int_param: bool,
-    bit_param: bool,
-    char_param: bool,
-    default_null: bool,
-    default_int: Option<i32>,
-    default_bit: Option<bool>,
-    default_char: Option<char>,
-}
-
-const SP_PKEYS_PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        canonical: "@table_name",
-        aliases: &["@table_name"],
-        required: true,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: false,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@table_owner",
-        aliases: &["@table_owner"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@table_qualifier",
-        aliases: &["@table_qualifier"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
+const SP_PKEYS_PARAMS: &[SignatureParam<'static>] = &[
+    SignatureParam::new("@table_name", SqlType::NVarChar(Len::Max)).required(),
+    SignatureParam::new("@table_owner", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@table_qualifier", SqlType::NVarChar(Len::Max)),
 ];
 
-const SP_FKEYS_PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        canonical: "@pktable_name",
-        aliases: &["@pktable_name"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@pkcolumn_name",
-        aliases: &["@pkcolumn_name"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@fktable_name",
-        aliases: &["@fktable_name"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@fkcolumn_name",
-        aliases: &["@fkcolumn_name"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@pktable_qualifier",
-        aliases: &["@pktable_qualifier"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@fktable_qualifier",
-        aliases: &["@fktable_qualifier"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@pktable_owner",
-        aliases: &["@pktable_owner"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@fktable_owner",
-        aliases: &["@fktable_owner"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
+const SP_FKEYS_PARAMS: &[SignatureParam<'static>] = &[
+    SignatureParam::new("@pktable_name", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@pkcolumn_name", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@fktable_name", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@fkcolumn_name", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@pktable_qualifier", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@fktable_qualifier", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@pktable_owner", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@fktable_owner", SqlType::NVarChar(Len::Max)),
 ];
 
-const SP_STATISTICS_PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        canonical: "@table_name",
-        aliases: &["@table_name"],
-        required: true,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: false,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@table_owner",
-        aliases: &["@table_owner"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@table_qualifier",
-        aliases: &["@table_qualifier"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@index_name",
-        aliases: &["@index_name"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@is_unique",
-        aliases: &["@is_unique"],
-        required: false,
-        unicode: false,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@accuracy",
-        aliases: &["@accuracy"],
-        required: false,
-        unicode: false,
-        int_param: false,
-        bit_param: false,
-        char_param: true,
-        default_null: false,
-        default_int: None,
-        default_bit: None,
-        default_char: Some('Q'),
-    },
+const SP_STATISTICS_PARAMS: &[SignatureParam<'static>] = &[
+    SignatureParam::new("@table_name", SqlType::NVarChar(Len::Max)).required(),
+    SignatureParam::new("@table_owner", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@table_qualifier", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@index_name", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@is_unique", SqlType::VarChar(Len::Fixed(254))),
+    SignatureParam::new("@accuracy", SqlType::VarChar(Len::Fixed(1)))
+        .with_default(ParamDefault::Text("Q")),
 ];
 
-const SP_SPECIAL_COLUMNS_PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        canonical: "@table_name",
-        aliases: &["@table_name"],
-        required: true,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: false,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@table_owner",
-        aliases: &["@table_owner"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@table_qualifier",
-        aliases: &["@table_qualifier"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@col_type",
-        aliases: &["@col_type"],
-        required: false,
-        unicode: false,
-        int_param: false,
-        bit_param: false,
-        char_param: true,
-        default_null: false,
-        default_int: None,
-        default_bit: None,
-        default_char: Some('R'),
-    },
-    ParamSpec {
-        canonical: "@scope",
-        aliases: &["@scope"],
-        required: false,
-        unicode: false,
-        int_param: false,
-        bit_param: false,
-        char_param: true,
-        default_null: false,
-        default_int: None,
-        default_bit: None,
-        default_char: Some('C'),
-    },
-    ParamSpec {
-        canonical: "@nullable",
-        aliases: &["@nullable"],
-        required: false,
-        unicode: false,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@odbcver",
-        aliases: &["@odbcver"],
-        required: false,
-        unicode: false,
-        int_param: true,
-        bit_param: false,
-        char_param: false,
-        default_null: false,
-        default_int: Some(2),
-        default_bit: None,
-        default_char: None,
-    },
+const SP_SPECIAL_COLUMNS_PARAMS: &[SignatureParam<'static>] = &[
+    SignatureParam::new("@table_name", SqlType::NVarChar(Len::Max)).required(),
+    SignatureParam::new("@table_owner", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@table_qualifier", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@col_type", SqlType::VarChar(Len::Fixed(1)))
+        .with_default(ParamDefault::Text("R")),
+    SignatureParam::new("@scope", SqlType::VarChar(Len::Fixed(1)))
+        .with_default(ParamDefault::Text("C")),
+    SignatureParam::new("@nullable", SqlType::VarChar(Len::Fixed(254))),
+    SignatureParam::new("@odbcver", SqlType::Int).with_default(ParamDefault::Int(2)),
 ];
 
-const SP_SPROC_COLUMNS_PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        canonical: "@procedure_name",
-        aliases: &["@procedure_name"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@procedure_owner",
-        aliases: &["@procedure_owner"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@procedure_qualifier",
-        aliases: &["@procedure_qualifier"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@column_name",
-        aliases: &["@column_name"],
-        required: false,
-        unicode: true,
-        int_param: false,
-        bit_param: false,
-        char_param: false,
-        default_null: true,
-        default_int: None,
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@ODBCVer",
-        aliases: &["@ODBCVer"],
-        required: false,
-        unicode: false,
-        int_param: true,
-        bit_param: false,
-        char_param: false,
-        default_null: false,
-        default_int: Some(2),
-        default_bit: None,
-        default_char: None,
-    },
-    ParamSpec {
-        canonical: "@proc_type",
-        aliases: &["@proc_type"],
-        required: false,
-        unicode: false,
-        int_param: true,
-        bit_param: false,
-        char_param: false,
-        default_null: false,
-        default_int: Some(0),
-        default_bit: None,
-        default_char: None,
-    },
+const SP_SPROC_COLUMNS_PARAMS: &[SignatureParam<'static>] = &[
+    SignatureParam::new("@procedure_name", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@procedure_owner", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@procedure_qualifier", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@column_name", SqlType::NVarChar(Len::Max)),
+    SignatureParam::new("@ODBCVer", SqlType::Int).with_default(ParamDefault::Int(2)),
+    SignatureParam::new("@proc_type", SqlType::Int).with_default(ParamDefault::Int(0)),
 ];
 
 pub(crate) const PROCS: &[SystemProc] = &[
@@ -483,7 +111,11 @@ pub(crate) fn resolve(name: &str, args: &[ProcArg<'_>]) -> Option<SqlResult<Proc
 }
 
 fn resolve_sp_fkeys(args: &[ProcArg<'_>]) -> SqlResult<ProcAction> {
-    let params = bind_catalog_params("sp_fkeys", SP_FKEYS_PARAMS, args)?;
+    let signature = ProcSignature {
+        procedure: "sp_fkeys",
+        params: SP_FKEYS_PARAMS,
+    };
+    let params = bind_arguments(&signature, CallForm::Procedure, args)?;
     let pktable = params
         .iter()
         .find(|p| p.name == "@pktable_name")
@@ -510,13 +142,6 @@ fn resolve_sp_fkeys(args: &[ProcArg<'_>]) -> SqlResult<ProcAction> {
 }
 
 fn resolve_sp_special_columns(args: &[ProcArg<'_>]) -> SqlResult<ProcAction> {
-    for arg in args {
-        if let Some(name) = arg.name
-            && name.eq_ignore_ascii_case("@colType")
-        {
-            return Err(SqlError::not_a_parameter(name, "sp_special_columns"));
-        }
-    }
     resolve_template(
         "sp_special_columns",
         SP_SPECIAL_COLUMNS_PARAMS,
@@ -540,139 +165,17 @@ fn resolve_sp_sproc_columns(args: &[ProcArg<'_>], columns_100: bool) -> SqlResul
 }
 
 fn resolve_template(
-    proc: &str,
-    specs: &[ParamSpec],
+    procedure: &str,
+    params: &[SignatureParam<'_>],
     sql: &str,
     args: &[ProcArg<'_>],
 ) -> SqlResult<ProcAction> {
-    let params = bind_catalog_params(proc, specs, args)?;
+    let signature = ProcSignature { procedure, params };
+    let params = bind_arguments(&signature, CallForm::Procedure, args)?;
     Ok(ProcAction::Template {
         sql: sql.to_owned(),
         params,
     })
-}
-
-fn bind_catalog_params(
-    proc: &str,
-    specs: &[ParamSpec],
-    args: &[ProcArg<'_>],
-) -> SqlResult<Vec<ProcParam>> {
-    let mut values = vec![None; specs.len()];
-    let mut positional = 0usize;
-    let mut saw_named = false;
-
-    for (index, arg) in args.iter().enumerate() {
-        if let Some(name) = arg.name {
-            saw_named = true;
-            let Some(slot) = specs.iter().position(|spec| name_matches(spec, name)) else {
-                return Err(SqlError::not_a_parameter(name, proc));
-            };
-            if values[slot].is_some() {
-                return Err(SqlError::too_many_arguments(proc));
-            }
-            values[slot] = Some(bind_one(specs[slot], arg)?);
-        } else if saw_named {
-            return Err(SqlError::positional_after_named((index + 1) as i64));
-        } else if positional >= specs.len() {
-            return Err(SqlError::too_many_arguments(proc));
-        } else {
-            values[positional] = Some(bind_one(specs[positional], arg)?);
-            positional += 1;
-        }
-    }
-
-    let mut out = Vec::with_capacity(specs.len());
-    for (spec, slot) in specs.iter().zip(values) {
-        let param = match slot {
-            Some(param) => param,
-            None if spec.required => {
-                return Err(SqlError::procedure_expects_parameter(proc, spec.canonical));
-            }
-            None => default_param(*spec)?,
-        };
-        out.push(param);
-    }
-    Ok(out)
-}
-
-fn bind_one(spec: ParamSpec, arg: &ProcArg<'_>) -> SqlResult<ProcParam> {
-    // A literal `NULL` carries no type of its own; the checks below skip `arg.ty` for a
-    // `NULL` value, so it binds to a `unicode`, `int_param` or `bit_param` slot without a
-    // type error (`bind_one_accepts_null` below).
-    let is_null = matches!(arg.value, Value::Null);
-    if spec.unicode && !is_null && !is_unicode_text(arg.ty) {
-        return Err(SqlError::procedure_expects_type(
-            spec.canonical,
-            "ntext/nchar/nvarchar",
-        ));
-    }
-    if spec.int_param
-        && !is_null
-        && !matches!(
-            arg.ty.ty,
-            SqlType::Int | SqlType::SmallInt | SqlType::TinyInt
-        )
-    {
-        return Err(SqlError::procedure_expects_type(spec.canonical, "int"));
-    }
-    if spec.bit_param
-        && !is_null
-        && !matches!(arg.ty.ty, SqlType::Bit | SqlType::Int | SqlType::TinyInt)
-    {
-        return Err(SqlError::procedure_expects_type(spec.canonical, "bit"));
-    }
-    Ok(ProcParam {
-        name: spec.canonical.to_owned(),
-        ty: param_type(spec),
-        value: arg.value.clone(),
-        output: false,
-    })
-}
-
-fn default_param(spec: ParamSpec) -> SqlResult<ProcParam> {
-    let value = if spec.default_null {
-        Value::Null
-    } else if let Some(bit) = spec.default_bit {
-        Value::Bit(bit)
-    } else if let Some(int) = spec.default_int {
-        Value::I32(int)
-    } else if let Some(ch) = spec.default_char {
-        Value::String(SqlString {
-            text: ch.to_string(),
-        })
-    } else {
-        Value::Null
-    };
-    Ok(ProcParam {
-        name: spec.canonical.to_owned(),
-        ty: param_type(spec),
-        value,
-        output: false,
-    })
-}
-
-fn param_type(spec: ParamSpec) -> TypeInfo {
-    if spec.bit_param {
-        TypeInfo::new(SqlType::Bit, true)
-    } else if spec.int_param {
-        TypeInfo::new(SqlType::Int, true)
-    } else if spec.char_param {
-        TypeInfo::new(SqlType::VarChar(Len::Fixed(1)), true)
-    } else if spec.unicode {
-        TypeInfo::new(SqlType::NVarChar(Len::Max), true)
-    } else {
-        TypeInfo::new(SqlType::VarChar(Len::Fixed(254)), true)
-    }
-}
-
-fn name_matches(spec: &ParamSpec, name: &str) -> bool {
-    spec.aliases
-        .iter()
-        .any(|alias| alias.eq_ignore_ascii_case(name))
-}
-
-fn is_unicode_text(ty: &TypeInfo) -> bool {
-    matches!(ty.ty, SqlType::NVarChar(_) | SqlType::NChar(_))
 }
 
 const SP_PKEYS: &str = r#####"
@@ -1153,7 +656,7 @@ WHERE 1 = 0;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vauban_types::{Len, SqlType};
+    use vauban_types::{Len, SqlString, SqlType, TypeInfo};
 
     fn nvarchar(value: &str) -> Value {
         Value::String(SqlString {
@@ -1180,42 +683,28 @@ mod tests {
     }
 
     #[test]
-    fn bind_one_accepts_null() {
-        // Each spec is called with a value of `Value::Null` and a mismatched `arg.ty`
-        // (`int_ty()`), to isolate the check that reads the value from the one that reads
-        // the declared type.
+    fn a_null_of_another_type_binds_to_text_and_int_parameters() {
         let null = Value::Null;
+        let name = nvarchar("t");
+        let nv = nvarchar_ty();
         let mismatched = int_ty();
-
-        let unicode_spec = SP_PKEYS_PARAMS[0]; // @table_name: unicode
-        assert_eq!(unicode_spec.canonical, "@table_name");
-        assert!(unicode_spec.unicode);
-        let bound = bind_one(unicode_spec, &arg(None, &mismatched, &null)).unwrap();
-        assert_eq!(bound.value, Value::Null);
-
-        let int_spec = SP_SPECIAL_COLUMNS_PARAMS[6]; // @odbcver: int_param
-        assert_eq!(int_spec.canonical, "@odbcver");
-        assert!(int_spec.int_param);
-        let bound = bind_one(int_spec, &arg(None, &nvarchar_ty(), &null)).unwrap();
-        assert_eq!(bound.value, Value::Null);
-
-        // No `bit_param` parameter is declared anywhere in this file's `const` tables, so
-        // the spec is built directly to cover the third shape `bind_one` checks.
-        let bit_spec = ParamSpec {
-            canonical: "@bit_test",
-            aliases: &["@bit_test"],
-            required: false,
-            unicode: false,
-            int_param: false,
-            bit_param: true,
-            char_param: false,
-            default_null: false,
-            default_int: None,
-            default_bit: Some(false),
-            default_char: None,
+        let action = resolve(
+            "sp_special_columns",
+            &[
+                arg(None, &nv, &name),
+                arg(Some("@table_owner"), &mismatched, &null),
+                arg(Some("@odbcver"), &nv, &null),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        let ProcAction::Template { params, .. } = action else {
+            panic!("expected Template");
         };
-        let bound = bind_one(bit_spec, &arg(None, &nvarchar_ty(), &null)).unwrap();
-        assert_eq!(bound.value, Value::Null);
+        assert_eq!(params[1].name, "@table_owner");
+        assert_eq!(params[1].value, Value::Null);
+        assert_eq!(params[6].name, "@odbcver");
+        assert_eq!(params[6].value, Value::Null);
     }
 
     #[test]

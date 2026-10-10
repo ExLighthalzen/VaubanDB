@@ -1,94 +1,46 @@
 //! Binding arguments of `sp_executesql`, `sp_prepare`, `sp_execute` and related procedures.
 
 use vauban_errors::{SqlError, SqlResult};
-use vauban_parser::{ParameterDeclaration, ParseOptions, parse_parameter_declarations};
-use vauban_types::{SqlType, TypeInfo, Value};
+use vauban_parser::{ParseOptions, parse_parameter_declarations};
+use vauban_session::{
+    CallForm, ParamDefault, ProcSignature, SignatureParam, bind_arguments, is_unicode_text,
+};
+use vauban_types::{Len, SqlType, Value};
 
 use crate::procedures::{ProcAction, ProcParam};
 
 pub use vauban_session::ProcArg;
 
-struct FixedParam {
-    canonical: &'static str,
-    aliases: &'static [&'static str],
-    required: bool,
-    unicode: bool,
-    output: bool,
-    int_handle: bool,
-}
+/// A fixed parameter of these procedures. Its argument is read under the type the caller
+/// gave it, without conversion: an `nvarchar` parameter refuses another type with 214, and
+/// an `int` one reads a handle. A named argument that answers to another name belongs to
+/// the parameter list the call binds next.
+type FixedParam = SignatureParam<'static>;
+
+const TEXT: SqlType = SqlType::NVarChar(Len::Max);
 
 const SP_EXECUTESQL: &[FixedParam] = &[
-    FixedParam {
-        canonical: "@statement",
-        aliases: &["@statement", "@stmt"],
-        required: true,
-        unicode: true,
-        output: false,
-        int_handle: false,
-    },
-    FixedParam {
-        canonical: "@params",
-        aliases: &["@params"],
-        required: false,
-        unicode: true,
-        output: false,
-        int_handle: false,
-    },
+    SignatureParam::new("@statement", TEXT)
+        .required()
+        .with_aliases(&["@stmt"]),
+    SignatureParam::new("@params", TEXT),
 ];
 
 const SP_PREPARE: &[FixedParam] = &[
-    FixedParam {
-        canonical: "@handle",
-        aliases: &["@handle"],
-        required: true,
-        unicode: false,
-        output: true,
-        int_handle: true,
-    },
-    FixedParam {
-        canonical: "@params",
-        aliases: &["@params"],
-        required: true,
-        unicode: true,
-        output: false,
-        int_handle: false,
-    },
-    FixedParam {
-        canonical: "@stmt",
-        aliases: &["@stmt", "@statement"],
-        required: true,
-        unicode: true,
-        output: false,
-        int_handle: false,
-    },
+    SignatureParam::new("@handle", SqlType::Int)
+        .required()
+        .output(),
+    SignatureParam::new("@params", TEXT).required(),
+    SignatureParam::new("@stmt", TEXT)
+        .required()
+        .with_aliases(&["@statement"]),
 ];
 
-const SP_PREPARE_OPTIONS: FixedParam = FixedParam {
-    canonical: "@options",
-    aliases: &["@options"],
-    required: false,
-    unicode: false,
-    output: false,
-    int_handle: false,
-};
+const SP_PREPARE_OPTIONS: FixedParam = SignatureParam::new("@options", SqlType::Int);
 
-const SP_EXECUTE: &[FixedParam] = &[FixedParam {
-    canonical: "@handle",
-    aliases: &["@handle"],
-    required: true,
-    unicode: false,
-    output: false,
-    int_handle: true,
-}];
+const SP_EXECUTE: &[FixedParam] = &[SignatureParam::new("@handle", SqlType::Int).required()];
 
-const SP_UNPREPARE: &[FixedParam] = &[FixedParam {
-    canonical: "@handle",
-    aliases: &["@handle"],
-    required: true,
-    unicode: false,
-    output: false,
-    int_handle: true,
-}];
+const SP_UNPREPARE: &[FixedParam] = &[SignatureParam::new("@handle", SqlType::Int).required()];
 
 struct BoundCall<'a> {
     fixed_values: Vec<FixedValue>,
@@ -112,7 +64,7 @@ pub(crate) fn resolve_sp_executesql(args: &[ProcArg<'_>]) -> SqlResult<ProcActio
         .get(1)
         .and_then(text_value)
         .unwrap_or_default();
-    let dynamic = bind_dynamic_values("sp_executesql", &params_text, &statement, &bound.dynamic)?;
+    let dynamic = bind_dynamic_values(&params_text, &statement, &bound.dynamic)?;
     Ok(ProcAction::ExecuteSql {
         statement,
         params: dynamic,
@@ -132,7 +84,6 @@ pub(crate) fn resolve_sp_prepare(args: &[ProcArg<'_>], execute: bool) -> SqlResu
     let declarations = parse_parameter_declarations(&params_text, &ParseOptions::default())?;
     let execute_with = if execute {
         Some(bind_dynamic_values(
-            proc,
             &params_text,
             &statement,
             &bound.dynamic,
@@ -183,12 +134,12 @@ fn bind_call<'a>(
     for (index, arg) in args.iter().enumerate() {
         if let Some(name) = arg.name {
             saw_named = true;
-            if let Some(slot) = fixed.iter().position(|spec| name_matches(spec, name)) {
+            if let Some(slot) = fixed.iter().position(|spec| spec.answers_to(name)) {
                 assign_fixed(proc, &fixed[slot], index, arg, &mut slots[slot])?;
-                if fixed[slot].output && fixed[slot].int_handle {
+                if fixed[slot].output {
                     handle_arg = Some(index);
                 }
-            } else if allow_options && name_matches(&SP_PREPARE_OPTIONS, name) {
+            } else if allow_options && SP_PREPARE_OPTIONS.answers_to(name) {
                 options = Some((index, arg));
             } else {
                 dynamic.push((index, arg));
@@ -197,7 +148,7 @@ fn bind_call<'a>(
             return Err(SqlError::positional_after_named((index + 1) as i64));
         } else if positional < fixed.len() {
             assign_fixed(proc, &fixed[positional], index, arg, &mut slots[positional])?;
-            if fixed[positional].output && fixed[positional].int_handle {
+            if fixed[positional].output {
                 handle_arg = Some(index);
             }
             positional += 1;
@@ -209,8 +160,9 @@ fn bind_call<'a>(
     }
 
     for (slot_idx, spec) in fixed.iter().enumerate() {
-        if spec.required && matches!(slots[slot_idx], FixedValue::Missing) {
-            return Err(SqlError::procedure_expects_parameter(proc, spec.canonical));
+        if spec.default == ParamDefault::Required && matches!(slots[slot_idx], FixedValue::Missing)
+        {
+            return Err(SqlError::procedure_expects_parameter(proc, spec.name));
         }
     }
 
@@ -253,96 +205,50 @@ fn assign_fixed(
     if !matches!(slot, FixedValue::Missing) {
         return Err(SqlError::too_many_arguments(proc));
     }
-    if spec.unicode {
+    if spec.ty == TEXT {
         if !is_unicode_text(arg.ty) {
             return Err(SqlError::procedure_expects_type(
-                spec.canonical,
+                spec.name,
                 "ntext/nchar/nvarchar",
             ));
         }
         let Some(text) = read_text(arg.value) else {
             return Err(SqlError::procedure_expects_type(
-                spec.canonical,
+                spec.name,
                 "ntext/nchar/nvarchar",
             ));
         };
         *slot = FixedValue::Text(text);
-    } else if spec.int_handle {
+    } else if spec.ty == SqlType::Int {
         if !matches!(arg.ty.ty, SqlType::Int) {
-            return Err(SqlError::procedure_expects_type(spec.canonical, "int"));
+            return Err(SqlError::procedure_expects_type(spec.name, "int"));
         }
         *slot = FixedValue::Int(read_int(arg.value).unwrap_or(0));
     }
     Ok(())
 }
 
+/// Binds the arguments that follow the fixed ones to the declaration list `params_text`,
+/// each value converted to its declared type.
 fn bind_dynamic_values(
-    proc: &str,
     params_text: &str,
     statement: &str,
     dynamic: &[(usize, &ProcArg<'_>)],
 ) -> SqlResult<Vec<ProcParam>> {
     let declarations = parse_parameter_declarations(params_text, &ParseOptions::default())?;
-
-    if dynamic.is_empty() {
-        if let Some(decl) = declarations.first() {
-            let query = parameterized_query(params_text, statement);
-            return Err(SqlError::parameter_not_supplied(&query, &decl.name));
-        }
-        return Ok(Vec::new());
+    let mut params = Vec::with_capacity(declarations.len());
+    for (index, decl) in declarations.iter().enumerate() {
+        let ty = ProcParam::declared_type(&decl.ty, index as u32 + 1)?;
+        let param = SignatureParam::new(&decl.name, ty.ty).required();
+        params.push(if decl.output { param.output() } else { param });
     }
-
-    if declarations.is_empty() {
-        return Err(SqlError::no_parameter_but_arguments(""));
-    }
-
-    let mut bound = vec![None; declarations.len()];
-    let mut positional = 0usize;
-    let mut saw_named = false;
-
-    for (index, arg) in dynamic {
-        if let Some(name) = arg.name {
-            saw_named = true;
-            let Some(decl_idx) = declarations
-                .iter()
-                .position(|decl| eq_ignore_case(&decl.name, name))
-            else {
-                if let Some(decl) = first_unbound(&declarations, &bound) {
-                    let query = parameterized_query(params_text, statement);
-                    return Err(SqlError::parameter_not_supplied(&query, &decl.name));
-                }
-                return Err(SqlError::too_many_arguments(proc));
-            };
-            if bound[decl_idx].is_some() {
-                return Err(SqlError::too_many_arguments(proc));
-            }
-            bound[decl_idx] = Some(make_proc_param(
-                &declarations[decl_idx],
-                arg,
-                decl_idx as u32 + 1,
-            )?);
-        } else if saw_named {
-            return Err(SqlError::positional_after_named((*index + 1) as i64));
-        } else if positional >= declarations.len() {
-            return Err(SqlError::too_many_arguments(proc));
-        } else {
-            bound[positional] = Some(make_proc_param(
-                &declarations[positional],
-                arg,
-                positional as u32 + 1,
-            )?);
-            positional += 1;
-        }
-    }
-
-    for (decl, slot) in declarations.iter().zip(bound.iter()) {
-        if slot.is_none() {
-            let query = parameterized_query(params_text, statement);
-            return Err(SqlError::parameter_not_supplied(&query, &decl.name));
-        }
-    }
-
-    Ok(bound.into_iter().flatten().collect())
+    let signature = ProcSignature {
+        procedure: "",
+        params: &params,
+    };
+    let query = parameterized_query(params_text, statement);
+    let args: Vec<ProcArg<'_>> = dynamic.iter().map(|(_, arg)| **arg).collect();
+    bind_arguments(&signature, CallForm::ParameterizedQuery(&query), &args)
 }
 
 fn bind_execute_params(dynamic: &[(usize, &ProcArg<'_>)]) -> Vec<ProcParam> {
@@ -361,48 +267,12 @@ fn bind_execute_params(dynamic: &[(usize, &ProcArg<'_>)]) -> Vec<ProcParam> {
         .collect()
 }
 
-fn make_proc_param(
-    decl: &ParameterDeclaration,
-    arg: &ProcArg<'_>,
-    position: u32,
-) -> SqlResult<ProcParam> {
-    let ty = ProcParam::declared_type(&decl.ty, position)?;
-    Ok(ProcParam {
-        name: decl.name.clone(),
-        value: ProcParam::bound_value(arg.value, arg.ty, &ty)?,
-        ty,
-        output: decl.output || arg.output,
-    })
-}
-
-fn first_unbound<'a>(
-    declarations: &'a [ParameterDeclaration],
-    bound: &[Option<ProcParam>],
-) -> Option<&'a ParameterDeclaration> {
-    declarations
-        .iter()
-        .zip(bound.iter())
-        .find_map(|(decl, slot)| slot.is_none().then_some(decl))
-}
-
 fn parameterized_query(params_text: &str, statement: &str) -> String {
     if params_text.is_empty() {
         statement.to_owned()
     } else {
         format!("({params_text}){statement}")
     }
-}
-
-fn name_matches(spec: &FixedParam, name: &str) -> bool {
-    spec.aliases.iter().any(|alias| eq_ignore_case(alias, name))
-}
-
-fn eq_ignore_case(left: &str, right: &str) -> bool {
-    left.eq_ignore_ascii_case(right)
-}
-
-fn is_unicode_text(ty: &TypeInfo) -> bool {
-    matches!(ty.ty, SqlType::NVarChar(_) | SqlType::NChar(_))
 }
 
 fn text_value(value: &FixedValue) -> Option<String> {
@@ -441,7 +311,7 @@ fn read_int(value: &Value) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vauban_types::{Len, SqlString};
+    use vauban_types::{SqlString, TypeInfo};
 
     fn nvarchar(value: &str) -> Value {
         Value::String(SqlString {

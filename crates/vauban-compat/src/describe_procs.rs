@@ -29,6 +29,7 @@
 //! browse mode `0`) are accepted, because a driver sends them to reach the argument after.
 
 use vauban_errors::{SqlError, SqlResult};
+use vauban_session::is_unicode_text;
 use vauban_types::{Len, SqlType, TypeInfo, Value};
 
 use crate::procedures::ProcAction;
@@ -290,9 +291,4 @@ fn bind_arguments<'a, 'b>(
         }
     }
     Ok(bound)
-}
-
-/// Whether a type carries Unicode text, which is what the batch slot is read from.
-fn is_unicode_text(ty: &TypeInfo) -> bool {
-    matches!(ty.ty, SqlType::NVarChar(_) | SqlType::NChar(_))
 }

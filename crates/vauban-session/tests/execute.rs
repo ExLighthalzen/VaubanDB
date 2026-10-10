@@ -5,11 +5,11 @@ use std::sync::Arc;
 use vauban_errors::{InfoMessage, SqlError, SqlResult};
 use vauban_session::{
     Engine, ProcAction, ProcArg, ProcParam, ResultSink, Session, SessionState,
-    SystemProcedureResolver,
+    SystemProcedureResolver, is_unicode_text,
 };
 use vauban_storage::MemoryStorage;
 use vauban_tds::{ColumnMeta, EnvChange};
-use vauban_types::{SqlType, TypeInfo, Value};
+use vauban_types::{TypeInfo, Value};
 
 const SPID: i16 = 72;
 
@@ -118,10 +118,6 @@ fn statement_argument<'a>(
 ) -> Option<&'a vauban_session::ProcArg<'a>> {
     args.iter()
         .find(|arg| matches!(arg.name, None | Some("@statement") | Some("@stmt")))
-}
-
-fn is_unicode_text(ty: &TypeInfo) -> bool {
-    matches!(ty.ty, SqlType::NVarChar(_) | SqlType::NChar(_))
 }
 
 /// `sp_tables` stands here for the catalogue procedures, whose text parameters are declared

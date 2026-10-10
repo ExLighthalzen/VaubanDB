@@ -1,9 +1,10 @@
 //! Session listing procedures (`sp_who`, `sp_who2`).
 
-use vauban_errors::{SqlError, SqlResult};
-use vauban_types::{Len, SqlType, TypeInfo, Value};
+use vauban_errors::SqlResult;
+use vauban_session::{CallForm, ProcSignature, SignatureParam, bind_arguments};
+use vauban_types::{Len, SqlType};
 
-use crate::procedures::{ProcAction, ProcParam, SystemProc};
+use crate::procedures::{ProcAction, SystemProc};
 use crate::special_procs::ProcArg;
 
 const SP_WHO: &str = r"
@@ -262,67 +263,28 @@ pub(crate) fn resolve(name: &str, args: &[ProcArg<'_>]) -> Option<SqlResult<Proc
     }
 }
 
-fn resolve_who(proc: &str, sql: &str, args: &[ProcArg<'_>]) -> SqlResult<ProcAction> {
-    let params = bind_loginame(proc, args)?;
+/// The single parameter of `sp_who` and `sp_who2`.
+const LOGINAME: &[SignatureParam<'static>] = &[SignatureParam::new(
+    "@loginame",
+    SqlType::NVarChar(Len::Max),
+)];
+
+fn resolve_who(procedure: &str, sql: &str, args: &[ProcArg<'_>]) -> SqlResult<ProcAction> {
+    let signature = ProcSignature {
+        procedure,
+        params: LOGINAME,
+    };
+    let params = bind_arguments(&signature, CallForm::Procedure, args)?;
     Ok(ProcAction::Template {
         sql: sql.to_owned(),
         params,
     })
 }
 
-fn bind_loginame(proc: &str, args: &[ProcArg<'_>]) -> SqlResult<Vec<ProcParam>> {
-    let nvarchar = TypeInfo::new(SqlType::NVarChar(Len::Max), true);
-    let mut loginame = Value::Null;
-    let mut positional = 0usize;
-    let mut saw_named = false;
-
-    for (index, arg) in args.iter().enumerate() {
-        if let Some(name) = arg.name {
-            saw_named = true;
-            if name.eq_ignore_ascii_case("@loginame") {
-                if loginame != Value::Null {
-                    return Err(SqlError::too_many_arguments(proc));
-                }
-                loginame = bind_loginame_value(arg)?;
-            } else {
-                return Err(SqlError::not_a_parameter(name, proc));
-            }
-        } else if saw_named {
-            return Err(SqlError::positional_after_named((index + 1) as i64));
-        } else if positional == 0 {
-            loginame = bind_loginame_value(arg)?;
-            positional += 1;
-        } else {
-            return Err(SqlError::too_many_arguments(proc));
-        }
-    }
-
-    Ok(vec![ProcParam {
-        name: "@loginame".to_owned(),
-        ty: nvarchar,
-        value: loginame,
-        output: false,
-    }])
-}
-
-fn bind_loginame_value(arg: &ProcArg<'_>) -> SqlResult<Value> {
-    if !is_unicode_text(arg.ty) {
-        return Err(SqlError::procedure_expects_type(
-            "@loginame",
-            "ntext/nchar/nvarchar",
-        ));
-    }
-    Ok(arg.value.clone())
-}
-
-fn is_unicode_text(ty: &TypeInfo) -> bool {
-    matches!(ty.ty, SqlType::NVarChar(_) | SqlType::NChar(_))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vauban_types::{SqlString, SqlType};
+    use vauban_types::{SqlString, SqlType, TypeInfo, Value};
 
     fn nvarchar(value: &str) -> Value {
         Value::String(SqlString {
