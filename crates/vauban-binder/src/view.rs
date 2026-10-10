@@ -27,6 +27,12 @@
 //! views spell `master.dbo.vauban_sys_*` in full, so they do not depend on it; views
 //! installed in a user database will.
 //!
+//! The filter on the database is not a name: the per-database views read `DB_ID()` and
+//! `DB_NAME()`, which answer the session's database. A view named with a database part has
+//! both calls pinned to that database before its text is parsed ([`in_named_database`]), so
+//! `d2.sys.tables` read from `master` answers the tables of `d2` (unit test
+//! `a_view_named_with_a_database_filters_on_that_database`).
+//!
 //! The inner [`BindContext`] carries the definition as its `text` (so that a `near '…'`
 //! slices the text the error was raised in), the same catalogue, the `SET` options of the
 //! session, and **no variable**: a `@x` declared by the batch is not in scope inside a view
@@ -64,6 +70,7 @@
 //! The system views are not recursive, so the guard is a safety net and not a behaviour a
 //! client can reach.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 
 use vauban_catalog::{ColumnId, ObjectId};
@@ -107,6 +114,8 @@ pub(crate) fn expand(
             "view::expand: the definition of '{name}' refers to itself, directly or through another view"
         ))
     })?;
+    let definition = in_named_database(definition, written.database.as_ref());
+    let definition = definition.as_ref();
     let batch = parse_batch(definition, &ParseOptions::default())
         .map_err(|err| failed(&name, "does not parse", &err))?;
     let [Statement::Select(select)] = batch.statements.as_slice() else {
@@ -156,6 +165,36 @@ pub(crate) fn source_columns(schema: &OutputSchema) -> Vec<ColumnBinding> {
 /// documentation).
 fn part<'a>(written: Option<&'a Ident>, default: &'a str) -> &'a str {
     written.map_or(default, |ident| ident.value.as_str())
+}
+
+/// The definition as it reads in the database the view was named in.
+///
+/// The per-database views filter their internal table on `database_id = DB_ID()` and spell
+/// their catalog column as `DB_NAME()`. Both calls answer the database of the session when
+/// the statement runs, which is the database of the view when the name carries no database
+/// part. When it carries one, `d2.sys.tables` read from `master`, the two calls are pinned
+/// to that database: `DB_ID()` becomes `DB_ID(N'd2')`, and `DB_NAME()` becomes the `name`
+/// of that identifier in `master.dbo.vauban_sys_databases`, the spelling the catalogue holds
+/// rather than the one written. `DB_NAME(id)` is not used for the second: the session
+/// answers it for its current database alone. The text is the catalogue's own, so the two
+/// spellings are matched as the definitions write them; a definition without either call is
+/// returned as it is (unit tests `a_view_named_with_a_database_filters_on_that_database`
+/// and `a_view_named_without_a_database_keeps_its_definition`).
+fn in_named_database<'a>(definition: &'a str, database: Option<&Ident>) -> Cow<'a, str> {
+    let Some(database) = database else {
+        return Cow::Borrowed(definition);
+    };
+    if !definition.contains("DB_ID()") && !definition.contains("DB_NAME()") {
+        return Cow::Borrowed(definition);
+    }
+    let id = format!("DB_ID(N'{}')", database.value.replace('\'', "''"));
+    let name =
+        format!("(SELECT name FROM master.dbo.vauban_sys_databases WHERE database_id = {id})");
+    Cow::Owned(
+        definition
+            .replace("DB_NAME()", &name)
+            .replace("DB_ID()", &id),
+    )
 }
 
 /// The bug a definition that will not go through raises: which view, what failed, and the

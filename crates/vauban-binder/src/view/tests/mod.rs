@@ -1,5 +1,7 @@
-use super::{EXPANDING, source_columns};
-use crate::bound::{BoundExprKind, BoundProjection, BoundStatement, ColumnBinding, LogicalPlan};
+use super::{EXPANDING, in_named_database, source_columns};
+use crate::bound::{
+    BoundExpr, BoundExprKind, BoundProjection, BoundStatement, ColumnBinding, LogicalPlan,
+};
 use crate::context::{
     BindContext, CatalogView, NoVariables, ResolvedTable, ResolvedTableKind, SessionOptions,
     VariableScope,
@@ -779,4 +781,95 @@ fn source_columns_are_numbered_by_position() {
     }
     assert_eq!(bindings[0].name, "name");
     assert_eq!(bindings[3].name, "owner_sid");
+}
+
+/// The arguments of each `DB_ID` call of a bound expression, as the texts of their literals,
+/// through the comparisons, the `AND`/`OR` and the conversions a filter is built of.
+fn db_id_arguments(expr: &BoundExpr, found: &mut Vec<Vec<String>>) {
+    match &expr.kind {
+        BoundExprKind::Function { def, args } if def.name == "DB_ID" => {
+            found.push(
+                args.iter()
+                    .map(|arg| match &arg.kind {
+                        BoundExprKind::Literal(vauban_types::Value::String(text)) => {
+                            text.text.clone()
+                        }
+                        other => format!("{other:?}"),
+                    })
+                    .collect(),
+            );
+        }
+        BoundExprKind::Compare { left, right, .. } | BoundExprKind::Logical { left, right, .. } => {
+            db_id_arguments(left, found);
+            db_id_arguments(right, found);
+        }
+        BoundExprKind::Convert { expr, .. } => db_id_arguments(expr, found),
+        _ => {}
+    }
+}
+
+/// The `DB_ID` calls of the filter of an expanded view.
+#[track_caller]
+fn filter_db_ids(plan: &LogicalPlan) -> Vec<Vec<String>> {
+    let LogicalPlan::Project { input: view, .. } = expanded(plan) else {
+        panic!("the expanded view is not a Project: {:?}", expanded(plan));
+    };
+    let LogicalPlan::Filter { predicate, .. } = view.as_ref() else {
+        panic!("the expanded view has no Filter: {view:?}");
+    };
+    let mut found = Vec::new();
+    db_id_arguments(predicate, &mut found);
+    found
+}
+
+/// A view named with a database part filters on that database: `d2.sys.tables` read from
+/// `master` binds `DB_ID(N'd2')`, not the `DB_ID()` that answers the session's database
+/// when the statement runs.
+///
+/// The counter-proof is the same view named without a database, read from `d2`: its filter
+/// keeps the `DB_ID()` without argument, which answers `d2` there.
+#[test]
+fn a_view_named_with_a_database_filters_on_that_database() {
+    let mut fake = Fake::system_views();
+    fake.views
+        .push(("d2", "sys", "tables", TABLES_VIEW, Some(TABLES_DEFINITION)));
+    let named = bind_in("SELECT name FROM d2.sys.tables", &fake, "master", "dbo")
+        .expect("d2.sys.tables expands");
+    assert_eq!(filter_db_ids(&named), vec![vec!["d2".to_owned()]]);
+    let unnamed = bind_in("SELECT name FROM sys.tables", &fake, "d2", "dbo")
+        .expect("sys.tables expands in d2");
+    assert_eq!(filter_db_ids(&unnamed), vec![Vec::<String>::new()]);
+}
+
+/// The text a database part gives a definition: both calls pinned, the name of the database
+/// read from the internal table, and a quote of the written name doubled inside the literal.
+#[test]
+fn the_database_part_pins_db_id_and_db_name() {
+    let database = Ident {
+        value: "it's".to_owned(),
+        ..object_name(&["x"]).name
+    };
+    let text = "SELECT DB_NAME() AS c FROM t WHERE database_id = DB_ID()";
+    assert_eq!(
+        in_named_database(text, Some(&database)),
+        "SELECT (SELECT name FROM master.dbo.vauban_sys_databases WHERE database_id = \
+         DB_ID(N'it''s')) AS c FROM t WHERE database_id = DB_ID(N'it''s')"
+    );
+}
+
+/// Without a database part, or without either call, the definition is the catalogue's text,
+/// returned as a borrow.
+#[test]
+fn a_view_named_without_a_database_keeps_its_definition() {
+    let database = object_name(&["d2", "sys", "tables"])
+        .database
+        .expect("a database part");
+    assert!(matches!(
+        in_named_database(TABLES_DEFINITION, None),
+        std::borrow::Cow::Borrowed(TABLES_DEFINITION)
+    ));
+    assert!(matches!(
+        in_named_database(DATABASES_DEFINITION, Some(&database)),
+        std::borrow::Cow::Borrowed(DATABASES_DEFINITION)
+    ));
 }
