@@ -1,5 +1,5 @@
-//! The program counter: runs the instructions of a [`Program`] (module documentation of
-//! `interp`).
+//! The program counter: runs the instructions of a [`Program`] through a [`Host`] (module
+//! documentation of `interp`).
 
 use vauban_binder::{BoundExpr, DeferredStatement};
 use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
@@ -12,19 +12,10 @@ use crate::control;
 use crate::errors::at;
 use crate::expr::eval_expr;
 use crate::row::ExecOutcome;
-use crate::sink::StatementSink;
 
-use super::compile::{Escape, Instr, Labels, compile};
+use super::compile::{Escape, Instr, Labels, Placement, compile_roots};
 use super::frame::Frame;
-use super::{Call, CallHandler, Program, ProgramEnd};
-
-/// Who runs the program, and so what becomes of an error and of a call.
-pub(crate) enum Host<'h> {
-    /// [`Program::run`]: errors go to the sink, calls to the handler.
-    Calls(&'h mut dyn CallHandler),
-    /// [`super::run_tree`]: errors leave as `Err`, calls as the outcome that names them.
-    Tree,
-}
+use super::{Call, Host, Program, ProgramEnd, Ran, Site};
 
 /// How a run ended.
 #[derive(Debug)]
@@ -38,8 +29,8 @@ pub(crate) enum End {
     Cancelled,
     /// An error ended the program; it is in the sink already.
     Aborted(SqlError),
-    /// A jump or a call left the program: [`Host::Tree`], or a jump a statement bound at
-    /// run time named.
+    /// A jump left a program compiled with [`Labels::Open`]: the enclosing program
+    /// resolves it.
     Escaped(ExecOutcome),
 }
 
@@ -52,57 +43,75 @@ enum Step {
 }
 
 /// Runs `program` from its first instruction.
-pub(crate) fn run<'a>(
-    program: &Program<'_>,
-    ctx: &mut ExecContext<'a>,
-    sink: &mut dyn StatementSink,
-    host: &mut Host<'_>,
-) -> SqlResult<End> {
+pub(crate) fn run(program: &Program<'_>, host: &mut dyn Host) -> SqlResult<End> {
     let mut pc = 0;
     let mut answer = ExecOutcome::NoRows;
     while let Some(instr) = program.code.get(pc) {
         let step = match instr {
             Instr::Run {
                 stmt,
+                site,
                 tail,
                 enclosing,
-            } => match run_statement(stmt, ctx, sink, host) {
-                Ok(Reached::Ended(end)) => Step::Stop(end),
-                Ok(Reached::Outcome(outcome)) => after_statement(
-                    program,
-                    pc,
-                    *enclosing,
-                    outcome,
-                    *tail,
-                    &mut answer,
-                    ctx,
-                    sink,
-                    host,
-                )?,
-                Err(err) => fail(err, pc + 1, ctx, sink, host)?,
-            },
+            } => {
+                let reached = match stmt {
+                    Some(PhysicalStatement::Deferred(deferred)) => {
+                        run_deferred(deferred, *site, host)?
+                    }
+                    _ => run_statement(*stmt, *site, host)?,
+                };
+                match reached {
+                    Reached::Ended(end) => Step::Stop(end),
+                    Reached::Failed(err) => decide(err, pc + 1, host),
+                    Reached::Outcome(outcome) => {
+                        if *tail && matches!(outcome, ExecOutcome::Rows(_) | ExecOutcome::NoRows) {
+                            answer = outcome.clone();
+                        }
+                        after_statement(program, pc, *site, *enclosing, outcome, host)?
+                    }
+                }
+            }
             Instr::Test {
                 condition,
                 otherwise,
                 loop_head,
+                site,
             } => {
-                if *loop_head && ctx.cancelled() {
+                if *loop_head && host.cancelled() {
                     Step::Stop(End::Cancelled)
                 } else {
-                    match eval_expr(condition, None, ctx) {
-                        Ok(Value::Bit(true)) => Step::Go(pc + 1),
-                        Ok(_) => Step::Go(*otherwise),
-                        // An error of the condition counts as a condition that is not true.
-                        Err(err) => fail(condition_error(err), *otherwise, ctx, sink, host)?,
+                    match host.condition(condition, *site)? {
+                        Ok(true) => {
+                            host.control(*site)?;
+                            Step::Go(pc + 1)
+                        }
+                        Ok(false) => {
+                            host.control(*site)?;
+                            Step::Go(*otherwise)
+                        }
+                        // An error of the condition counts as a condition that is not true;
+                        // the host reported it.
+                        Err(err) => decide(err, *otherwise, host),
                     }
                 }
             }
-            Instr::Jump { target } => jump(pc, *target, ctx),
-            Instr::Return(value) => match return_code(*value, ctx) {
-                Ok(code) => Step::Stop(End::Returned(code)),
-                Err(err) => fail(err, pc + 1, ctx, sink, host)?,
+            Instr::Jump { target, stated } => {
+                if let Some(site) = stated {
+                    host.control(*site)?;
+                }
+                jump(pc, *target, host)
+            }
+            Instr::Return { value, site } => match return_code(*value, *site, host) {
+                Ok(code) => {
+                    host.control(*site)?;
+                    Step::Stop(End::Returned(code))
+                }
+                Err(err) => fail(err, pc + 1, *site, host)?,
             },
-            Instr::Escape(escape) => Step::Stop(End::Escaped(escape_outcome(escape))),
+            Instr::Escape { escape, site } => {
+                host.control(*site)?;
+                Step::Stop(End::Escaped(escape_outcome(escape)))
+            }
         };
         match step {
             Step::Go(next) => pc = next,
@@ -114,51 +123,73 @@ pub(crate) fn run<'a>(
 
 /// What running one statement reached.
 enum Reached {
-    /// The statement answered.
+    /// The statement answered; its end is in the sink.
     Outcome(ExecOutcome),
+    /// The statement raised an error the sink holds already.
+    Failed(SqlError),
     /// A program the statement compiled at run time ended the run.
     Ended(End),
 }
 
-/// Runs one statement that holds no other one: through [`crate::execute`] for a program,
-/// as `control.rs` ran a nested statement for the statement tree.
-fn run_statement<'a>(
-    stmt: &PhysicalStatement,
-    ctx: &mut ExecContext<'a>,
-    sink: &mut dyn StatementSink,
-    host: &mut Host<'_>,
+/// Runs one statement that holds no other one through the host, or the program of a
+/// statement the host bound when the program reached it.
+fn run_statement(
+    stmt: Option<&PhysicalStatement>,
+    site: Site,
+    host: &mut dyn Host,
 ) -> SqlResult<Reached> {
-    if let PhysicalStatement::Deferred(deferred) = stmt {
-        return run_deferred(deferred, ctx, sink, host);
-    }
-    // In the statement tree, a statement of the control of flow runs inside the frame of
-    // the statement that holds it.
-    let in_frame = matches!(host, Host::Tree)
-        && matches!(
-            stmt,
-            PhysicalStatement::Declare(_)
-                | PhysicalStatement::SetVariable { .. }
-                | PhysicalStatement::SelectAssign { .. }
-                | PhysicalStatement::Print(_)
-        );
-    let outcome = if in_frame {
-        control::execute(stmt, ctx, sink)?
-    } else {
-        crate::execute(stmt, ctx, sink)?
+    Ok(match host.statement(stmt, site)? {
+        Ran::Outcome(outcome) => Reached::Outcome(outcome),
+        Ran::Failed(err) => Reached::Failed(err),
+        Ran::Stopped(err) => Reached::Ended(End::Aborted(err)),
+        Ran::Holds(statement) => run_held(&statement, site, host)?,
+    })
+}
+
+/// Runs `statement`, which holds others, as a program of its own whose jumps the
+/// enclosing program resolves.
+fn run_held(statement: &PhysicalStatement, site: Site, host: &mut dyn Host) -> SqlResult<Reached> {
+    let roots = [Some(statement)];
+    let program = match compile_roots(&roots, Labels::Open, false, Placement::Within(site.root)) {
+        Ok(program) => program,
+        Err(err) => {
+            host.report(&err, site)?;
+            return Ok(Reached::Failed(err));
+        }
     };
-    Ok(Reached::Outcome(outcome))
+    Ok(match run(&program, host)? {
+        End::Completed(_) => Reached::Outcome(ExecOutcome::NoRows),
+        End::Escaped(outcome) => Reached::Outcome(outcome),
+        end => Reached::Ended(end),
+    })
 }
 
 /// Binds, plans and checks a statement the binder left unbound, then runs what it turned
 /// out to be: a statement of its own, or a program of its own when it holds others.
-fn run_deferred<'a>(
+fn run_deferred(
     deferred: &DeferredStatement,
-    ctx: &mut ExecContext<'a>,
-    sink: &mut dyn StatementSink,
-    host: &mut Host<'_>,
+    site: Site,
+    host: &mut dyn Host,
 ) -> SqlResult<Reached> {
-    let statement = control::bind_and_plan(deferred, ctx)?;
-    compile_checks(&statement, ctx)?;
+    let mut bound = None;
+    let checked = host.within(site, &mut |ctx: &mut ExecContext<'_>| {
+        let statement = control::bind_and_plan(deferred, ctx)?;
+        compile_checks(&statement, ctx)?;
+        bound = Some(statement);
+        Ok(())
+    });
+    let statement = match (checked, bound) {
+        (Ok(()), Some(statement)) => statement,
+        (Err(err), _) => {
+            host.report(&err, site)?;
+            return Ok(Reached::Failed(err));
+        }
+        (Ok(()), None) => return Err(bug("interp: a deferred statement bound to nothing")),
+    };
+    let held = Site {
+        nested: true,
+        ..site
+    };
     match statement {
         PhysicalStatement::If { .. }
         | PhysicalStatement::While { .. }
@@ -168,133 +199,108 @@ fn run_deferred<'a>(
         | PhysicalStatement::Break
         | PhysicalStatement::Continue
         | PhysicalStatement::Return(_)
-        | PhysicalStatement::Deferred(_) => {
-            let tail = matches!(host, Host::Tree);
-            let program = compile(std::slice::from_ref(&statement), Labels::Open, tail)?;
-            Ok(match run(&program, ctx, sink, host)? {
-                End::Completed(outcome) | End::Escaped(outcome) => Reached::Outcome(outcome),
-                end => Reached::Ended(end),
-            })
-        }
-        statement => run_statement(&statement, ctx, sink, host),
+        | PhysicalStatement::Deferred(_) => run_held(&statement, held, host),
+        statement => run_statement(Some(&statement), held, host),
     }
 }
 
-/// Acts on what a statement answered at position `pc`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the state of the program counter, passed rather than bundled for one caller"
-)]
-fn after_statement<'a>(
+/// Acts on what a statement answered at position `pc`; its end is in the sink already.
+fn after_statement(
     program: &Program<'_>,
     pc: usize,
+    site: Site,
     enclosing: Option<usize>,
     outcome: ExecOutcome,
-    tail: bool,
-    answer: &mut ExecOutcome,
-    ctx: &mut ExecContext<'a>,
-    sink: &mut dyn StatementSink,
-    host: &mut Host<'_>,
+    host: &mut dyn Host,
 ) -> SqlResult<Step> {
-    let reports = matches!(host, Host::Calls(_));
     Ok(match outcome {
-        ExecOutcome::Rows(count) => {
-            if reports {
-                let mut nocount = false;
-                if let Some(session) = ctx.session.as_deref_mut() {
-                    session.rowcount = i64::try_from(count).unwrap_or(i64::MAX);
-                    nocount = session.nocount;
-                }
-                sink.done(if nocount { None } else { Some(count) })?;
-            }
-            if tail {
-                *answer = ExecOutcome::Rows(count);
-            }
-            Step::Go(pc + 1)
-        }
-        ExecOutcome::NoRows => {
-            if reports {
-                sink.done(None)?;
-            }
-            if tail {
-                *answer = ExecOutcome::NoRows;
-            }
-            Step::Go(pc + 1)
-        }
+        ExecOutcome::Rows(_) | ExecOutcome::NoRows => Step::Go(pc + 1),
         ExecOutcome::Cancelled => Step::Stop(End::Cancelled),
         ExecOutcome::Return(code) => Step::Stop(End::Returned(code)),
-        ExecOutcome::BatchAbort(err) => match host {
-            Host::Tree => Step::Stop(End::Escaped(ExecOutcome::BatchAbort(err))),
-            Host::Calls(_) => {
-                report(&err, ctx, sink)?;
-                Step::Stop(End::Aborted(err))
-            }
-        },
-        call @ (ExecOutcome::CallProcedure { .. } | ExecOutcome::RunDynamic { .. }) => match host {
-            Host::Tree => Step::Stop(End::Escaped(call)),
-            Host::Calls(handler) => {
-                let Some(call) = Call::from_outcome(call) else {
-                    return Err(bug("interp: a call outcome that names no call"));
-                };
-                let frame = match Frame::enter(ctx) {
-                    Ok(frame) => frame,
-                    Err(err) => return fail(err, pc + 1, ctx, sink, host),
-                };
-                let ended = handler.call(call, ctx, sink);
-                let left = frame.leave(ctx, &mut **handler);
-                match (ended, left) {
-                    (Ok(ProgramEnd::Completed | ProgramEnd::Returned(_)), Ok(())) => {
-                        Step::Go(pc + 1)
-                    }
-                    (Ok(ProgramEnd::Completed | ProgramEnd::Returned(_)), Err(err)) => {
-                        fail(err, pc + 1, ctx, sink, host)?
-                    }
-                    (Err(err), left) => {
-                        let step = fail(err, pc + 1, ctx, sink, host)?;
-                        report_left(left, ctx, sink)?;
-                        step
-                    }
-                    (Ok(ProgramEnd::Cancelled), left) => {
-                        report_left(left, ctx, sink)?;
-                        Step::Stop(End::Cancelled)
-                    }
-                    (Ok(ProgramEnd::Aborted(err)), left) => {
-                        report_left(left, ctx, sink)?;
-                        Step::Stop(End::Aborted(err))
-                    }
-                }
-            }
-        },
+        ExecOutcome::BatchAbort(err) => {
+            host.report(&err, site)?;
+            Step::Stop(End::Aborted(err))
+        }
+        call @ (ExecOutcome::CallProcedure { .. } | ExecOutcome::RunDynamic { .. }) => {
+            let Some(call) = Call::from_outcome(call) else {
+                return Err(bug("interp: a call outcome that names no call"));
+            };
+            run_call(call, pc, site, host)?
+        }
         // A jump a program compiled at run time could not resolve: this program resolves
-        // it if it can, and lets it leave otherwise.
+        // it if it can, and it is an error otherwise.
         ExecOutcome::Break => match enclosing.and_then(|number| program.loops.get(number)) {
             Some(lp) => Step::Go(lp.exit),
-            None => escape(ExecOutcome::Break, pc, ctx, sink, host)?,
+            None => escape(ExecOutcome::Break, pc, site, host)?,
         },
         ExecOutcome::Continue => match enclosing.and_then(|number| program.loops.get(number)) {
-            Some(lp) => jump(pc, lp.head, ctx),
-            None => escape(ExecOutcome::Continue, pc, ctx, sink, host)?,
+            Some(lp) => jump(pc, lp.head, host),
+            None => escape(ExecOutcome::Continue, pc, site, host)?,
         },
         ExecOutcome::Goto(label) => match program.labels.get(&label.to_ascii_lowercase()) {
-            Some(&target) => jump(pc, target, ctx),
-            None => escape(ExecOutcome::Goto(label), pc, ctx, sink, host)?,
+            Some(&target) => jump(pc, target, host),
+            None => escape(ExecOutcome::Goto(label), pc, site, host)?,
         },
     })
 }
 
-/// A jump this program does not resolve either: it leaves the statement tree, and is an
-/// error of a program, which holds the whole body.
-fn escape<'a>(
-    outcome: ExecOutcome,
-    pc: usize,
-    ctx: &mut ExecContext<'a>,
-    sink: &mut dyn StatementSink,
-    host: &mut Host<'_>,
-) -> SqlResult<Step> {
-    match host {
-        Host::Tree => Ok(Step::Stop(End::Escaped(outcome))),
-        Host::Calls(_) => fail(escape_error(&outcome), pc + 1, ctx, sink, host),
+/// Runs `call` in a level of its own: the frame is opened before the host runs it and
+/// closed after, a callee that failed included
+/// (`interp::frame::tests::a_callee_that_fails_still_gives_the_caller_its_state_back`).
+fn run_call(call: Call, pc: usize, site: Site, host: &mut dyn Host) -> SqlResult<Step> {
+    let mut frame = None;
+    let entered = host.within(site, &mut |ctx: &mut ExecContext<'_>| {
+        frame = Some(Frame::enter(ctx)?);
+        Ok(())
+    });
+    let frame = match (entered, frame) {
+        (Ok(()), Some(frame)) => frame,
+        (Err(err), _) => return fail(err, pc + 1, site, host),
+        (Ok(()), None) => return Err(bug("interp: a call level opened nothing")),
+    };
+    let ended = host.call(call, site);
+    let left = leave(frame, site, host);
+    Ok(match (ended, left) {
+        (Ok(ProgramEnd::Completed | ProgramEnd::Returned(_)), Ok(())) => Step::Go(pc + 1),
+        (Ok(ProgramEnd::Completed | ProgramEnd::Returned(_)), Err(err)) => {
+            fail(err, pc + 1, site, host)?
+        }
+        (Err(err), left) => {
+            let step = fail(err, pc + 1, site, host)?;
+            report_left(left, site, host)?;
+            step
+        }
+        (Ok(ProgramEnd::Cancelled), left) => {
+            report_left(left, site, host)?;
+            Step::Stop(End::Cancelled)
+        }
+        (Ok(ProgramEnd::Aborted(err)), left) => {
+            report_left(left, site, host)?;
+            Step::Stop(End::Aborted(err))
+        }
+    })
+}
+
+/// Closes the level of a call: the caller's state back, then its database.
+fn leave(frame: Frame, site: Site, host: &mut dyn Host) -> SqlResult<()> {
+    let mut frame = Some(frame);
+    let mut database = None;
+    host.within(site, &mut |ctx: &mut ExecContext<'_>| {
+        if let Some(frame) = frame.take() {
+            database = Some(frame.leave(ctx)?);
+        }
+        Ok(())
+    })?;
+    match database {
+        Some(database) => host.leave_call(&database),
+        None => Err(bug("interp: a call level closed nothing")),
     }
+}
+
+/// A jump this program does not resolve either: an error of the program, which holds the
+/// whole body.
+fn escape(outcome: ExecOutcome, pc: usize, site: Site, host: &mut dyn Host) -> SqlResult<Step> {
+    fail(escape_error(&outcome), pc + 1, site, host)
 }
 
 /// The error a jump that leaves a whole program answers.
@@ -317,72 +323,58 @@ fn escape_outcome(escape: &Escape) -> ExecOutcome {
 }
 
 /// Goes from `pc` to `target`, reading the token first when the jump goes backward.
-fn jump(pc: usize, target: usize, ctx: &ExecContext<'_>) -> Step {
-    if target <= pc && ctx.cancelled() {
+fn jump(pc: usize, target: usize, host: &dyn Host) -> Step {
+    if target <= pc && host.cancelled() {
         Step::Stop(End::Cancelled)
     } else {
         Step::Go(target)
     }
 }
 
-/// An error a statement, a condition or a call raised (module documentation of `interp`,
-/// "Running it"). In the statement tree it leaves as `Err`; in a program it goes to the
-/// sink, and the program goes to `next` when the error lets it go on.
-fn fail<'a>(
-    err: SqlError,
-    next: usize,
-    ctx: &mut ExecContext<'a>,
-    sink: &mut dyn StatementSink,
-    host: &mut Host<'_>,
-) -> SqlResult<Step> {
-    if matches!(host, Host::Tree) {
-        return Err(err);
-    }
-    report(&err, ctx, sink)?;
-    let xact_abort = ctx
-        .session
-        .as_deref()
-        .is_some_and(|session| session.xact_abort);
-    let goes_on = !xact_abort && err.number != 0 && err.batch_scope() == BatchErrorScope::Statement;
-    Ok(if goes_on {
+/// An error the interpreter raised at `site` (module documentation of `interp`, "Running
+/// it"): the host reports it, and the program goes to `next` when the error lets it go on.
+fn fail(err: SqlError, next: usize, site: Site, host: &mut dyn Host) -> SqlResult<Step> {
+    host.report(&err, site)?;
+    Ok(decide(err, next, host))
+}
+
+/// Whether an error the sink holds lets the program go on at `next`: its scope is the
+/// statement and `SET XACT_ABORT ON` does not hold.
+fn decide(err: SqlError, next: usize, host: &dyn Host) -> Step {
+    let goes_on =
+        !host.xact_abort() && err.number != 0 && err.batch_scope() == BatchErrorScope::Statement;
+    if goes_on {
         Step::Go(next)
     } else {
         Step::Stop(End::Aborted(err))
-    })
+    }
 }
 
-/// Hands the error of [`CallHandler::restore_database`] to the sink when the call already
-/// ended the program or failed itself: the caller does not lose it, and its end stays the
-/// one the call decided.
-fn report_left(
-    left: SqlResult<()>,
-    ctx: &mut ExecContext<'_>,
-    sink: &mut dyn StatementSink,
-) -> SqlResult<()> {
+/// Hands the error of [`Host::leave_call`] to the sink when the call already ended the
+/// program or failed itself: the caller does not lose it, and its end stays the one the
+/// call decided.
+fn report_left(left: SqlResult<()>, site: Site, host: &mut dyn Host) -> SqlResult<()> {
     match left {
         Ok(()) => Ok(()),
-        Err(err) => report(&err, ctx, sink),
+        Err(err) => host.report(&err, site),
     }
-}
-
-/// Hands `err` to the sink and ends its statement; `@@ERROR` takes its number.
-fn report(
-    err: &SqlError,
-    ctx: &mut ExecContext<'_>,
-    sink: &mut dyn StatementSink,
-) -> SqlResult<()> {
-    if let Some(session) = ctx.session.as_deref_mut() {
-        session.last_error = err.number;
-    }
-    sink.error(err)?;
-    sink.done(None)
 }
 
 /// The integer a `RETURN e` returns: `e` converted to `int`, `NULL` counting as 0.
-fn return_code(value: Option<&BoundExpr>, ctx: &mut ExecContext<'_>) -> SqlResult<i32> {
+fn return_code(value: Option<&BoundExpr>, site: Site, host: &mut dyn Host) -> SqlResult<i32> {
     let Some(expr) = value else {
         return Ok(0);
     };
+    let mut code = 0;
+    host.within(site, &mut |ctx: &mut ExecContext<'_>| {
+        code = evaluate_return(expr, ctx)?;
+        Ok(())
+    })?;
+    Ok(code)
+}
+
+/// The value of a `RETURN e`, in the context the host opened for it.
+pub(crate) fn evaluate_return(expr: &BoundExpr, ctx: &mut ExecContext<'_>) -> SqlResult<i32> {
     let value = eval_expr(expr, None, ctx)?;
     let int = TypeInfo::new(SqlType::Int, false);
     let converted = convert(&value, &expr.ty, &int, None).map_err(|err| at(err, expr.line))?;
@@ -393,16 +385,13 @@ fn return_code(value: Option<&BoundExpr>, ctx: &mut ExecContext<'_>) -> SqlResul
 }
 
 /// An error raised while the condition of an `IF` or a `WHILE` is evaluated belongs to
-/// that statement, not to the sub-expression that failed: its line is cleared here, and the
-/// layer that runs the batch puts the statement's own line on it, whether the condition sits
-/// on its own line or is folded onto the line of the first statement held
-/// (`crates/vauban-session/tests/run_batch_pipeline.rs`,
-/// `an_error_of_a_condition_carries_the_line_of_the_statement_that_holds_it`).
-fn condition_error(err: SqlError) -> SqlError {
+/// that statement, not to the sub-expression that failed: its line is cleared here, and
+/// the host puts the line of the statement that holds the condition on it.
+pub(crate) fn condition_error(err: SqlError) -> SqlError {
     err.with_line(0)
 }
 
 /// The internal error 50000 for a broken precondition.
-fn bug(what: &str) -> SqlError {
+pub(crate) fn bug(what: &str) -> SqlError {
     SqlError::from(InternalError::Bug(what.to_owned()))
 }

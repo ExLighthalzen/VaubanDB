@@ -50,23 +50,37 @@
 //! The callee runs in a level of its own: the program sets its own variables and options
 //! aside in a frame before the handler runs, and takes them back after (`frame.rs`).
 //!
-//! # The statement tree
+//! # A host that opens a context per statement
+//!
+//! [`Program::run`] runs the instructions in the one [`ExecContext`] its caller built.
+//! [`Program::run_hosted`] hands each step to a [`Host`] instead: the host runs each
+//! statement that holds no other one in a context, a transaction and a sink of its own,
+//! evaluates each condition, reports each error the interpreter raises, and runs each call.
+//! The interpreter keeps what is common to both: the program counter, the jumps, the
+//! labels, the decision that an error lets the program go on or ends it, and the level a
+//! call opens (`frame.rs`). A body the host prepared itself, statement by statement, is
+//! compiled by [`Program::compile_roots`]: a root the host leaves as `None` is run by the
+//! host from its position.
+//!
+//! # A statement run alone
 //!
 //! `control.rs` runs a single `IF`, `WHILE` or `BEGIN … END` handed to [`crate::execute`]
-//! through the same program, in a mode kept for the callers that still run a batch one
-//! statement at a time: an error leaves as the `Err` of the statement, and a call, a
-//! `GOTO` to a label the statement does not hold, a `BREAK` or a `CONTINUE` outside any
-//! loop it holds leave as the [`ExecOutcome`] that names them. That mode ends with the
-//! last of those callers.
+//! as a closed program of its own (`single.rs`). Each statement it holds reports its own
+//! end; an error that ends the program leaves as the `Err` of the statement, and a call it
+//! holds is refused with the internal error, since nothing there can run it.
 
 mod compile;
 mod frame;
 mod run;
+mod single;
 
 pub(crate) use frame::NameMap;
+pub(crate) use run::evaluate_return;
+pub(crate) use single::run_alone;
 
 use std::collections::HashMap;
 
+use vauban_binder::BoundExpr;
 use vauban_errors::{SqlError, SqlResult};
 use vauban_planner::PhysicalStatement;
 
@@ -74,8 +88,9 @@ use crate::context::ExecContext;
 use crate::row::{EvaluatedExecArg, ExecOutcome};
 use crate::sink::StatementSink;
 
-use compile::{Instr, Labels, Loop};
-use run::{End, Host};
+use compile::{Instr, Labels, Loop, Placement};
+use run::End;
+use single::SingleContext;
 
 /// A body of statements compiled into instructions and jumps (module documentation).
 ///
@@ -103,6 +118,19 @@ impl<'s> Program<'s> {
         compile::compile(statements, Labels::Closed, false)
     }
 
+    /// Compiles a body whose statements the host prepared one by one: a root that is a
+    /// statement is compiled as [`Program::compile`] compiles it, and a root left `None`
+    /// becomes one instruction the [`Host`] runs from its position (module
+    /// documentation, "A host that opens a context per statement").
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Program::compile`], over the labels and the jumps of the roots that are
+    /// statements.
+    pub fn compile_roots(roots: &[Option<&'s PhysicalStatement>]) -> SqlResult<Self> {
+        compile::compile_roots(roots, Labels::Closed, false, Placement::Body)
+    }
+
     /// Runs the program against `ctx`, its results into `sink`, its calls through
     /// `calls` (module documentation).
     ///
@@ -117,16 +145,33 @@ impl<'s> Program<'s> {
         sink: &mut dyn StatementSink,
         calls: &mut dyn CallHandler,
     ) -> SqlResult<ProgramEnd> {
-        let mut host = Host::Calls(calls);
-        Ok(match run::run(self, ctx, sink, &mut host)? {
-            End::Completed(_) => ProgramEnd::Completed,
-            End::Returned(code) => ProgramEnd::Returned(code),
-            End::Cancelled => ProgramEnd::Cancelled,
-            End::Aborted(err) => ProgramEnd::Aborted(err),
-            // A closed program resolves each of its jumps, and a call is handed to
-            // `calls`: what is left is a jump a statement bound at run time named.
-            End::Escaped(outcome) => ProgramEnd::Aborted(run::escape_error(&outcome)),
-        })
+        let mut host = SingleContext::new(ctx, sink, calls);
+        Ok(program_end(run::run(self, &mut host)?))
+    }
+
+    /// Runs the program through `host`, which opens the context of each step (module
+    /// documentation, "A host that opens a context per statement").
+    ///
+    /// # Errors
+    ///
+    /// The errors of the host that end the run at once: a sink that cannot take what it is
+    /// handed, a cancelled request, a broken precondition. The errors the statements raise
+    /// are not among them: the host reports them.
+    pub fn run_hosted(&self, host: &mut dyn Host) -> SqlResult<ProgramEnd> {
+        Ok(program_end(run::run(self, host)?))
+    }
+}
+
+/// What the end of a run is to the caller of a whole program.
+fn program_end(end: End) -> ProgramEnd {
+    match end {
+        End::Completed(_) => ProgramEnd::Completed,
+        End::Returned(code) => ProgramEnd::Returned(code),
+        End::Cancelled => ProgramEnd::Cancelled,
+        End::Aborted(err) => ProgramEnd::Aborted(err),
+        // A closed program resolves each of its jumps: what is left is a jump a statement
+        // bound at run time named.
+        End::Escaped(outcome) => ProgramEnd::Aborted(run::escape_error(&outcome)),
     }
 }
 
@@ -227,25 +272,109 @@ pub trait CallHandler {
     fn restore_database(&mut self, database: &str, ctx: &mut ExecContext<'_>) -> SqlResult<()>;
 }
 
-/// Runs one `IF`, `WHILE`, `BEGIN … END`, `GOTO`, label, `BREAK`, `CONTINUE`, `RETURN` or
-/// statement left unbound, handed to [`crate::execute`] as a statement of its own (module
-/// documentation, "The statement tree").
-///
-/// The answer is the one of the statement the tree ran last when that statement is the
-/// branch of an `IF` (the rows of `IF c SELECT 1`), `NoRows` otherwise, or the outcome
-/// that leaves the tree.
-pub(crate) fn run_tree<'a>(
-    stmt: &PhysicalStatement,
-    ctx: &mut ExecContext<'a>,
-    sink: &mut dyn StatementSink,
-) -> SqlResult<ExecOutcome> {
-    let program = compile::compile(std::slice::from_ref(stmt), Labels::Open, true)?;
-    Ok(match run::run(&program, ctx, sink, &mut Host::Tree)? {
-        End::Completed(outcome) | End::Escaped(outcome) => outcome,
-        End::Returned(code) => ExecOutcome::Return(code),
-        End::Cancelled => ExecOutcome::Cancelled,
-        End::Aborted(err) => ExecOutcome::BatchAbort(err),
-    })
+/// Where a statement of a program sits in the body a [`Host`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Site {
+    /// The position, in the body, of the statement written at its top level that holds
+    /// it, or that it is.
+    pub root: usize,
+    /// The statement is held by that root (a branch, a loop body, a block, or a statement
+    /// the root turned into once bound) rather than being the root itself.
+    pub nested: bool,
+}
+
+/// What a statement a [`Host`] ran answered.
+#[derive(Debug)]
+pub enum Ran {
+    /// It ended with this outcome; its results and its end are in the sink. An outcome
+    /// that names a call, a `RETURN`, a cancellation or an error of the whole batch is the
+    /// program's to act on.
+    Outcome(ExecOutcome),
+    /// It raised this error, which is in the sink already with the end of the statement;
+    /// the scope of the error decides whether the program goes on.
+    Failed(SqlError),
+    /// It ended by an error in the sink already, and the program ends with it, the scope of
+    /// the error left unread.
+    Stopped(SqlError),
+    /// The statement at this position, bound when the program reached it, holds others:
+    /// the program runs it in place, its jumps resolved against the labels of the body.
+    Holds(Box<PhysicalStatement>),
+}
+
+/// What runs the steps of a program for [`Program::run_hosted`] (module documentation, "A
+/// host that opens a context per statement").
+pub trait Host {
+    /// Runs one statement that holds no other one: `stmt`, or the root at `site` when
+    /// `stmt` is `None`. The results, the end of the statement and the error it raises go
+    /// to the host's sink.
+    ///
+    /// # Errors
+    ///
+    /// An error that ends the run at once (module documentation of [`Program::run_hosted`]).
+    fn statement(&mut self, stmt: Option<&PhysicalStatement>, site: Site) -> SqlResult<Ran>;
+
+    /// Evaluates the condition of an `IF` or of a `WHILE` written at `site`: `Ok(true)`
+    /// when it is true, `Ok(false)` when it is false or unknown, `Err` with an error the
+    /// host already reported.
+    ///
+    /// # Errors
+    ///
+    /// An error that ends the run at once.
+    fn condition(&mut self, condition: &BoundExpr, site: Site)
+    -> SqlResult<Result<bool, SqlError>>;
+
+    /// Runs `step` in a context opened for it, then closes that context: the value of a
+    /// `RETURN`, the binding of a statement left unbound, the opening and the closing of
+    /// the level of a call.
+    ///
+    /// # Errors
+    ///
+    /// The error `step` answers, and the error of opening or closing the context.
+    fn within(
+        &mut self,
+        site: Site,
+        step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
+    ) -> SqlResult<()>;
+
+    /// Hands an error the interpreter raised at `site` to the sink, with the end of its
+    /// statement.
+    ///
+    /// # Errors
+    ///
+    /// The error of the sink.
+    fn report(&mut self, err: &SqlError, site: Site) -> SqlResult<()>;
+
+    /// Runs `call`, made at `site`, in the level the interpreter opened for it, as
+    /// [`CallHandler::call`] does.
+    ///
+    /// # Errors
+    ///
+    /// The error of the `EXECUTE` statement itself; the interpreter reports it.
+    fn call(&mut self, call: Call, site: Site) -> SqlResult<ProgramEnd>;
+
+    /// The level of the call is closed and the caller's state is back: makes `database`
+    /// the current database again and writes what the callee hands back to its caller.
+    ///
+    /// # Errors
+    ///
+    /// The error of the change of database; the interpreter reports it.
+    fn leave_call(&mut self, database: &str) -> SqlResult<()>;
+
+    /// A statement of the control of flow written at `site` ended: the test of an `IF` or
+    /// of a `WHILE` that was evaluated, a `GOTO`, a `BREAK`, a `CONTINUE` or a `RETURN`.
+    /// A label and the bounds of a `BEGIN … END` are not statements that end.
+    ///
+    /// # Errors
+    ///
+    /// The error of the sink.
+    fn control(&mut self, site: Site) -> SqlResult<()>;
+
+    /// Whether the caller raised the cancellation token.
+    fn cancelled(&self) -> bool;
+
+    /// Whether `SET XACT_ABORT ON` holds, under which an error of statement scope ends the
+    /// program too (`interp::tests::a_duplicate_key_under_xact_abort_ends_the_program`).
+    fn xact_abort(&self) -> bool;
 }
 
 #[cfg(test)]

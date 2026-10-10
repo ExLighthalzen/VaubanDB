@@ -816,18 +816,32 @@ fn a_deferred_statement_reads_a_variable_declared_before_it() {
 #[test]
 fn a_deferred_statement_gets_the_compile_time_checks() {
     let mut session = new_session();
-    let error = run_err(
+    let numbers = error_numbers(
         &mut session,
         &if_over(true, deferred("PRINT SUBSTRING('abc', 1, 0 - 1);")),
     );
-    assert_eq!(error.number, 536, "{error:?}");
+    assert_eq!(numbers, [536]);
 
     let mut session = new_session();
-    let error = run_err(
+    let numbers = error_numbers(
         &mut session,
         &if_over(true, deferred("SELECT TOP (0 - 1) 1;")),
     );
-    assert_eq!(error.number, 127, "{error:?}");
+    assert_eq!(numbers, [127]);
+}
+
+/// The numbers of the errors `stmt` raised: those its program handed to the sink, then the
+/// one it ended by, when it ended by one.
+fn error_numbers(session: &mut ExecSession, stmt: &PhysicalStatement) -> Vec<u32> {
+    let eval = StaticContext::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_session(session);
+    let mut sink = CollectSink::new();
+    let ended = execute(stmt, &mut ctx, &mut sink);
+    let mut numbers: Vec<u32> = sink.errors().iter().map(|error| error.number).collect();
+    if let Err(error) = ended {
+        numbers.push(error.number);
+    }
+    numbers
 }
 
 // ---------------------------------------------------------------------------------------
@@ -952,83 +966,46 @@ fn a_goto_answers_the_label_it_names_and_a_label_runs_nothing() {
     assert!(sink.columns.is_none(), "a label announces no column");
 }
 
-/// A `BEGIN … END` stops at the `GOTO` it holds and hands its label up: the statement
-/// written after the `GOTO` in the same block does not run.
+/// A `GOTO` held by a `BEGIN … END` or a `WHILE` run as a statement of its own names a
+/// label that statement does not hold: 133, before anything it holds runs. The jump does
+/// not leave the statement as an outcome, since no list here holds the label.
 #[test]
-fn a_goto_in_a_block_stops_the_block() {
-    let mut session = new_session();
-    run(
-        &mut session,
-        &PhysicalStatement::Declare(vec![PhysicalDeclaration {
-            name: "@i".to_owned(),
-            ty: int_ty(),
-            value: Some(int_lit(0)),
-            subplans: Vec::new(),
-        }]),
-    );
-    let block = PhysicalStatement::Block(vec![
-        PhysicalStatement::SetVariable {
-            name: "@i".to_owned(),
-            value: int_lit(1),
-            subplans: Vec::new(),
-        },
-        PhysicalStatement::Goto {
-            label: "after".to_owned(),
-        },
-        PhysicalStatement::SetVariable {
-            name: "@i".to_owned(),
-            value: int_lit(99),
-            subplans: Vec::new(),
-        },
-    ]);
-    let (outcome, _) = run(&mut session, &block);
-    assert!(
-        matches!(&outcome, ExecOutcome::Goto(label) if label == "after"),
-        "{outcome:?}"
-    );
-    assert_eq!(
-        session.variables.get("@i"),
-        Some(&Value::I32(1)),
-        "the assignment written after the GOTO did not run"
-    );
-}
-
-/// A `WHILE` passes a `Goto` up as it passes a `RETURN` up: the loop ends there, without
-/// evaluating its condition again, where a `CONTINUE` would have started another turn.
-#[test]
-fn a_goto_in_a_while_body_leaves_the_loop() {
-    let mut session = new_session();
-    run(
-        &mut session,
-        &PhysicalStatement::Declare(vec![PhysicalDeclaration {
-            name: "@i".to_owned(),
-            ty: int_ty(),
-            value: Some(int_lit(0)),
-            subplans: Vec::new(),
-        }]),
-    );
-    let body = PhysicalStatement::Block(vec![
-        PhysicalStatement::SetVariable {
-            name: "@i".to_owned(),
-            value: add(var_ref("@i"), int_lit(1)),
-            subplans: Vec::new(),
-        },
-        PhysicalStatement::Goto {
-            label: "out".to_owned(),
-        },
-    ]);
-    let while_stmt = PhysicalStatement::While {
-        condition: lt(var_ref("@i"), int_lit(5)),
-        body: Box::new(body),
+fn a_goto_out_of_a_statement_run_alone_is_133_before_anything_runs() {
+    let set = |value: BoundExpr| PhysicalStatement::SetVariable {
+        name: "@i".to_owned(),
+        value,
+        subplans: Vec::new(),
     };
-    let (outcome, _) = run(&mut session, &while_stmt);
-    assert!(
-        matches!(&outcome, ExecOutcome::Goto(label) if label == "out"),
-        "{outcome:?}"
-    );
-    assert_eq!(
-        session.variables.get("@i"),
-        Some(&Value::I32(1)),
-        "the body ran once and the loop stopped at the GOTO"
-    );
+    let goto = || PhysicalStatement::Goto {
+        label: "after".to_owned(),
+    };
+    let shapes = [
+        PhysicalStatement::Block(vec![set(int_lit(1)), goto(), set(int_lit(99))]),
+        PhysicalStatement::While {
+            condition: lt(var_ref("@i"), int_lit(5)),
+            body: Box::new(PhysicalStatement::Block(vec![
+                set(add(var_ref("@i"), int_lit(1))),
+                goto(),
+            ])),
+        },
+    ];
+    for shape in &shapes {
+        let mut session = new_session();
+        run(
+            &mut session,
+            &PhysicalStatement::Declare(vec![PhysicalDeclaration {
+                name: "@i".to_owned(),
+                ty: int_ty(),
+                value: Some(int_lit(0)),
+                subplans: Vec::new(),
+            }]),
+        );
+        let error = run_err(&mut session, shape);
+        assert_eq!(error.number, 133, "{shape:?}");
+        assert_eq!(
+            session.variables.get("@i"),
+            Some(&Value::I32(0)),
+            "nothing the statement holds ran: {shape:?}"
+        );
+    }
 }

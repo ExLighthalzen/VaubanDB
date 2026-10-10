@@ -10,18 +10,22 @@ use vauban_binder::BoundExpr;
 use vauban_errors::{SqlError, SqlResult};
 use vauban_planner::PhysicalStatement;
 
-use super::Program;
+use super::{Program, Site};
 
 /// One instruction of a [`Program`].
 #[derive(Debug)]
 pub(crate) enum Instr<'s> {
     /// Runs one statement that holds no other statement, or one the binder left unbound.
     Run {
-        /// The statement.
-        stmt: &'s PhysicalStatement,
-        /// What it answers is what the whole statement tree answers (`super::run_tree`):
-        /// it is reached from the root through branches of `IF`s, and through no block
-        /// and no loop (`compile::tests::the_tail_is_what_the_branches_of_an_if_hold`).
+        /// The statement, or `None` for a statement of the body the host prepared itself
+        /// and runs by its position ([`super::Program::compile_roots`]).
+        stmt: Option<&'s PhysicalStatement>,
+        /// Where the statement sits in the body.
+        site: Site,
+        /// What it answers is what a single statement run alone answers
+        /// (`single.rs`, `run_alone`): it is reached from the root through branches of
+        /// `IF`s, and through no block and no loop
+        /// (`compile::tests::the_tail_is_what_the_branches_of_an_if_hold`).
         tail: bool,
         /// The innermost `WHILE` that holds it, by loop number: where a `BREAK` or a
         /// `CONTINUE` that a statement bound at run time answers goes.
@@ -36,18 +40,44 @@ pub(crate) enum Instr<'s> {
         otherwise: usize,
         /// The test heads a loop: the cancellation token is read before it.
         loop_head: bool,
+        /// Where the `IF` or the `WHILE` sits in the body.
+        site: Site,
     },
     /// Goes to `target`; a jump backward reads the cancellation token first.
     Jump {
         /// The position the program counter takes.
         target: usize,
+        /// Where the `GOTO`, the `BREAK` or the `CONTINUE` this jump is sits in the body,
+        /// `None` for a jump the control of flow implies (over an `ELSE`, back to the head
+        /// of a loop): a jump written as a statement ends with the end of a statement.
+        stated: Option<Site>,
     },
     /// `RETURN`, with its value.
-    Return(Option<&'s BoundExpr>),
+    Return {
+        /// The value, `None` for a bare `RETURN`.
+        value: Option<&'s BoundExpr>,
+        /// Where the `RETURN` sits in the body.
+        site: Site,
+    },
     /// Leaves the program with this jump, which the program does not resolve: a program
     /// compiled with [`Labels::Open`]
     /// (`compile::tests::an_open_program_lets_a_jump_it_cannot_resolve_leave`).
-    Escape(Escape),
+    Escape {
+        /// The jump.
+        escape: Escape,
+        /// Where the statement that wrote it sits in the body.
+        site: Site,
+    },
+}
+
+/// Where the statements a pass compiles sit in the body the host runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// They are the statements of the body: each is the root of its own site.
+    Body,
+    /// They are held by this statement of an enclosing body, bound when the program
+    /// reached it.
+    Within(usize),
 }
 
 /// A jump that leaves a program compiled with [`Labels::Open`].
@@ -75,7 +105,8 @@ pub(crate) struct Loop {
 pub(crate) enum Labels {
     /// An error: 133, 135 or 136. The body is the whole of what runs.
     Closed,
-    /// An [`Instr::Escape`]: the body is a statement of a list held by someone else.
+    /// An [`Instr::Escape`]: the body is a statement bound when an enclosing program
+    /// reached it, and that program resolves the jump.
     Open,
 }
 
@@ -88,12 +119,24 @@ enum Fixup {
 }
 
 /// Compiles `statements` into a program (module documentation). `tail` marks the root
-/// statements as the ones whose answer is the answer of the tree.
+/// statements as the ones whose answer is the answer of a statement run alone.
 pub(crate) fn compile(
     statements: &[PhysicalStatement],
     labels: Labels,
     tail: bool,
 ) -> SqlResult<Program<'_>> {
+    let roots: Vec<Option<&PhysicalStatement>> = statements.iter().map(Some).collect();
+    compile_roots(&roots, labels, tail, Placement::Body)
+}
+
+/// Compiles `roots` into a program: a statement where the root is one the program walks,
+/// and an instruction the host runs by its position where the root is `None`.
+pub(crate) fn compile_roots<'s>(
+    roots: &[Option<&'s PhysicalStatement>],
+    labels: Labels,
+    tail: bool,
+    placement: Placement,
+) -> SqlResult<Program<'s>> {
     let mut compiler = Compiler {
         code: Vec::new(),
         labels: HashMap::new(),
@@ -102,8 +145,25 @@ pub(crate) fn compile(
         open: Vec::new(),
         mode: labels,
     };
-    for statement in statements {
-        compiler.statement(statement, tail)?;
+    for (index, root) in roots.iter().enumerate() {
+        let site = match placement {
+            Placement::Body => Site {
+                root: index,
+                nested: false,
+            },
+            Placement::Within(root) => Site { root, nested: true },
+        };
+        match root {
+            Some(statement) => compiler.statement(statement, tail, site)?,
+            None => {
+                compiler.emit(Instr::Run {
+                    stmt: None,
+                    site,
+                    tail,
+                    enclosing: None,
+                });
+            }
+        }
     }
     compiler.finish()
 }
@@ -119,7 +179,11 @@ struct Compiler<'s> {
 }
 
 impl<'s> Compiler<'s> {
-    fn statement(&mut self, stmt: &'s PhysicalStatement, tail: bool) -> SqlResult<()> {
+    fn statement(&mut self, stmt: &'s PhysicalStatement, tail: bool, site: Site) -> SqlResult<()> {
+        let held = Site {
+            nested: true,
+            ..site
+        };
         match stmt {
             PhysicalStatement::If {
                 condition,
@@ -130,14 +194,18 @@ impl<'s> Compiler<'s> {
                     condition,
                     otherwise: 0,
                     loop_head: false,
+                    site,
                 });
-                self.statement(then_, tail)?;
+                self.statement(then_, tail, held)?;
                 match else_ {
                     None => self.patch_test(test, self.code.len()),
                     Some(else_) => {
-                        let skip = self.emit(Instr::Jump { target: 0 });
+                        let skip = self.emit(Instr::Jump {
+                            target: 0,
+                            stated: None,
+                        });
                         self.patch_test(test, self.code.len());
-                        self.statement(else_, tail)?;
+                        self.statement(else_, tail, held)?;
                         self.patch_jump(skip, self.code.len());
                     }
                 }
@@ -150,18 +218,22 @@ impl<'s> Compiler<'s> {
                     condition,
                     otherwise: 0,
                     loop_head: true,
+                    site,
                 });
                 self.open.push(number);
-                self.statement(body, false)?;
+                self.statement(body, false, held)?;
                 self.open.pop();
-                self.emit(Instr::Jump { target: head });
+                self.emit(Instr::Jump {
+                    target: head,
+                    stated: None,
+                });
                 let exit = self.code.len();
                 self.loops[number].exit = exit;
                 self.patch_test(head, exit);
             }
             PhysicalStatement::Block(statements) => {
                 for statement in statements {
-                    self.statement(statement, false)?;
+                    self.statement(statement, false, held)?;
                 }
             }
             PhysicalStatement::Label { name } => {
@@ -171,25 +243,37 @@ impl<'s> Compiler<'s> {
                     .or_insert(position);
             }
             PhysicalStatement::Goto { label } => {
-                let at = self.emit(Instr::Jump { target: 0 });
+                let at = self.emit(Instr::Jump {
+                    target: 0,
+                    stated: Some(site),
+                });
                 self.fixups.push((at, Fixup::Label(label.clone())));
             }
             PhysicalStatement::Break => match self.open.last() {
                 Some(&number) => {
-                    let at = self.emit(Instr::Jump { target: 0 });
+                    let at = self.emit(Instr::Jump {
+                        target: 0,
+                        stated: Some(site),
+                    });
                     self.fixups.push((at, Fixup::Exit(number)));
                 }
-                None => self.unresolved(Escape::Break)?,
+                None => self.unresolved(Escape::Break, site)?,
             },
             PhysicalStatement::Continue => match self.open.last() {
                 Some(&number) => {
                     let head = self.loops[number].head;
-                    self.emit(Instr::Jump { target: head });
+                    self.emit(Instr::Jump {
+                        target: head,
+                        stated: Some(site),
+                    });
                 }
-                None => self.unresolved(Escape::Continue)?,
+                None => self.unresolved(Escape::Continue, site)?,
             },
             PhysicalStatement::Return(value) => {
-                self.emit(Instr::Return(value.as_ref()));
+                self.emit(Instr::Return {
+                    value: value.as_ref(),
+                    site,
+                });
             }
             PhysicalStatement::Query(_)
             | PhysicalStatement::Ddl(_)
@@ -207,7 +291,8 @@ impl<'s> Compiler<'s> {
             | PhysicalStatement::Deferred(_) => {
                 let enclosing = self.open.last().copied();
                 self.emit(Instr::Run {
-                    stmt,
+                    stmt: Some(stmt),
+                    site,
                     tail,
                     enclosing,
                 });
@@ -228,16 +313,16 @@ impl<'s> Compiler<'s> {
     }
 
     fn patch_jump(&mut self, at: usize, position: usize) {
-        if let Some(Instr::Jump { target }) = self.code.get_mut(at) {
+        if let Some(Instr::Jump { target, .. }) = self.code.get_mut(at) {
             *target = position;
         }
     }
 
     /// A `BREAK` or a `CONTINUE` outside any loop of the program.
-    fn unresolved(&mut self, escape: Escape) -> SqlResult<()> {
+    fn unresolved(&mut self, escape: Escape, site: Site) -> SqlResult<()> {
         match (self.mode, &escape) {
             (Labels::Open, _) => {
-                self.emit(Instr::Escape(escape));
+                self.emit(Instr::Escape { escape, site });
                 Ok(())
             }
             (Labels::Closed, Escape::Continue) => Err(SqlError::continue_without_while()),
@@ -255,7 +340,19 @@ impl<'s> Compiler<'s> {
                 Fixup::Label(name) => match self.labels.get(&name.to_ascii_lowercase()) {
                     Some(&position) => self.patch_jump(at, position),
                     None if self.mode == Labels::Open => {
-                        self.code[at] = Instr::Escape(Escape::Goto(name));
+                        let site = match self.code.get(at) {
+                            Some(Instr::Jump {
+                                stated: Some(site), ..
+                            }) => *site,
+                            _ => Site {
+                                root: 0,
+                                nested: true,
+                            },
+                        };
+                        self.code[at] = Instr::Escape {
+                            escape: Escape::Goto(name),
+                            site,
+                        };
                     }
                     None => return Err(SqlError::goto_label_not_declared(&name)),
                 },

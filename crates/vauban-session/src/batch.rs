@@ -10,8 +10,26 @@
 //! execution into `ResultSink` calls: the executor collects the rows of a statement and
 //! this layer sends them through the adapter of `executor::StatementSink`. A
 //! statement the binder refuses with 208 is the exception: it is kept as text and goes
-//! through the same three steps when the batch reaches it (`PreparedStatement::Deferred`,
-//! `Session::run_deferred`).
+//! through the same three steps when the program reaches it (`PreparedStatement::Deferred`,
+//! `BatchHost::run_deferred`).
+//!
+//! # One program for the batch
+//!
+//! The prepared statements are compiled into one `vauban_executor::Program` and run by
+//! the interpreter of the executor, which holds the program counter: the `IF`, the
+//! `WHILE`, the `BEGIN … END`, the jumps and the labels at any depth, and the decision that
+//! an error lets the batch go on. This layer is the `vauban_executor::Host` of that program
+//! ([`BatchHost`]): it runs each statement that holds no other one in a transaction of its
+//! own and closes it with its DONE, evaluates each condition, puts the line of its
+//! statement on each error, and runs each call, `EXEC` of a procedure or of a dynamic text,
+//! where it is written, so an `EXEC` in the body of a `WHILE` runs once per turn
+//! (`tests/run_batch_pipeline.rs`, `a_loop_runs_its_dynamic_text_on_each_turn`). A batch
+//! that holds an `ALTER TABLE` is bound one statement at a time, when the program reaches
+//! each ([`bind_limit_for`]).
+//!
+//! Whether a DONE carries `MORE` depends on what follows it in the response, which a jump
+//! decides: the DONE is held back until the next token, and the last one goes out without
+//! it ([`HeldDone`]).
 //!
 //! # What is left of the fake engine
 //!
@@ -79,7 +97,7 @@
 //! **Between compilation and execution**, which is what decides whether a failing
 //! statement shows the client a result set at all. `prepare_batch` calls
 //! `executor::compile` for the statements it binds, deferred ones excepted; once they have
-//! succeeded, `run_prepared` sends COLMETADATA and calls `executor::execute`. A compilation
+//! succeeded, `BatchHost::run_bound` sends COLMETADATA and calls `executor::execute`. A compilation
 //! error reaches the client with **no** result set (`a_bind_error_sends_no_metadata_at_all`),
 //! a run-time error with a result set that carries the columns and no row. A deferred
 //! statement whose binding fails when it runs has no columns to send, so its error comes
@@ -100,8 +118,8 @@
 //! The line is the one the failing **statement** starts on, not the line of the
 //! sub-expression that raised, as on SQL Server. `executor` cannot know it: a line lives
 //! on `binder::BoundExpr` and there alone, and `PhysicalStatement::Query` holds a bare
-//! `PhysicalPlan`. So it answers the line of the failing sub-expression, and `run_prepared`
-//! puts the statement's over it. This is the layer that holds the datum: the `&Statement`
+//! `PhysicalPlan`. So it answers the line of the failing sub-expression, and
+//! `BatchHost::place` puts the statement's over it. This is the layer that holds the datum: the `&Statement`
 //! and its `Span`.
 //!
 //! The rule holds across error families (8134, 245, 220, 8115, 536:
@@ -151,23 +169,28 @@ use crate::server::Engine;
 use crate::set_options::{SetOutcome, apply_set_statement};
 use crate::sink::{ResultSink, StatementSinkAdapter};
 use crate::state::SessionState;
+pub(crate) use crate::statements::Flow;
 use crate::statements::{
-    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, batch_labels, declare_variables_of,
-    first_held_statement_line, first_undeclared_goto, last_line, next_rowcount,
-    statement_clears_last_error, statement_fragment, statement_line, statement_span,
+    INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, declare_variables_held_by,
+    first_held_statement_line, first_undeclared_goto, labels_at_any_depth, last_line,
+    next_rowcount, statement_clears_last_error, statement_fragment, statement_line, statement_span,
     statement_text, use_name_line,
 };
 use crate::txn_session::{self, StatementTxn};
 use vauban_binder::{
-    BatchVariables, BindContext, BoundExecute, BoundStatement, DdlStatement, OutputSchema,
+    BatchVariables, BindContext, BoundExecute, BoundExpr, BoundStatement, OutputSchema,
 };
 use vauban_catalog::CatalogSnapshot;
-use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
-use vauban_executor::{EnvironmentChange, ExecContext, ExecOutcome, ExecSession, StatementSink};
+use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
+use vauban_executor::{
+    Call, EnvironmentChange, ExecContext, ExecOutcome, ExecSession, Host, Program, ProgramEnd, Ran,
+    Site, StatementSink, eval_expr,
+};
 use vauban_parser::{Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
-use vauban_tds::{ColumnFlags, ColumnMeta};
+use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
 use vauban_txn::IsolationLevel;
+use vauban_types::{TypeInfo, Value};
 
 /// Default schema of a login, `dbo` until `catalog` knows better.
 const DEFAULT_SCHEMA: &str = "dbo";
@@ -181,6 +204,9 @@ const CREATE_INDEX_MISSING_TABLE: u32 = 1088;
 /// (`errors`, `SqlError::cannot_find_object_to_alter_table`). Deferred the same way as
 /// [`INVALID_OBJECT_NAME`].
 const ALTER_TABLE_MISSING_TABLE: u32 = 4902;
+
+/// Number of the error a `GOTO` answers when no label of the text carries its name.
+const GOTO_LABEL_NOT_DECLARED: u32 = 133;
 
 /// The numbers a batch defers instead of treating as a compilation error: a table the
 /// catalogue does not hold yet may be created by an earlier statement of the batch, in
@@ -236,16 +262,6 @@ impl Session {
     }
 }
 
-/// What one statement of a batch decided about the rest of it.
-pub(crate) enum Flow {
-    /// Go on with the next statement.
-    Continue,
-    /// Stop the batch here; the DONE has been sent.
-    Stop,
-    /// Go on at the label of this name, which a `GOTO` just named; the DONE has been sent.
-    Jump(String),
-}
-
 /// One statement after every compilation-stage check has succeeded for the whole batch.
 enum PreparedStatement {
     /// A `SET` is replayed only during execution; preparation applies it to a cloned state.
@@ -259,15 +275,7 @@ enum PreparedStatement {
     Fallback { text: String, error: SqlError },
     /// A bound, planned and compile-checked statement, ready to execute without another
     /// compilation pass.
-    Bound {
-        statement: PhysicalStatement,
-        line: u32,
-        /// Line the first statement held by an `IF`, a `WHILE` or a `BEGIN … END` starts
-        /// on, and `None` for the other statements
-        /// ([`first_held_statement_line`]). Read by [`Session::run_prepared`] to tell an
-        /// error raised by a held statement from one raised by the condition.
-        held_from: Option<u32>,
-    },
+    Bound { statement: PhysicalStatement },
     /// A `USE` whose target was **found** in the catalogue while the batch was bound: a
     /// name that is not there raises 911 at that moment and no statement of the batch
     /// runs, which is where SQL Server raises it too ([`Session::bind_batch`]).
@@ -277,15 +285,14 @@ enum PreparedStatement {
         /// ENVCHANGE and the INFO 5701 carry (unit test
         /// `use_existing_database_changes_state_and_sends_5701`).
         database: String,
-        line: u32,
     },
     /// A bound `EXECUTE`, evaluated at run time without going through the planner.
     Execute { stmt: BoundExecute, line: u32 },
     /// A statement whose binding answered one of [`DEFERRED_UNTIL_EXECUTION`] while the
     /// batch was prepared: the table it names may be created by a statement before it, in
     /// this batch or in a nested one, so it is bound, planned and compile-checked again
-    /// when the batch reaches it, against the catalogue of that moment
-    /// ([`Session::run_deferred`]).
+    /// when the program reaches it, against the catalogue of that moment
+    /// ([`BatchHost::run_deferred`]).
     Deferred {
         /// The fragment of the statement, padded with newlines up to its line of the batch,
         /// the text [`Session::bind_one`] reparses.
@@ -295,6 +302,19 @@ enum PreparedStatement {
         /// The batch variables declared before the statement, and those alone.
         variables: BatchVariables,
     },
+}
+
+/// What the batch holds at one position of its text.
+enum Slot {
+    /// Not bound yet: a batch that holds an `ALTER TABLE` binds each statement when the
+    /// program reaches it ([`bind_limit_for`]).
+    Unbound,
+    /// Bound, planned and checked, run by the host when the program reaches it.
+    Ready(Box<PreparedStatement>),
+    /// Compiled into the program itself: a statement that holds others, or a jump.
+    InProgram,
+    /// Taken out while the host runs it.
+    Running,
 }
 
 impl Session {
@@ -348,98 +368,141 @@ impl Session {
             // (blank text, comments only): without it the client would wait forever.
             return sink.done(None, false);
         }
-        // Where a `GOTO` lands is read from the statements of this text, so a name none of
-        // its labels declares is known before the first statement runs: 133 is a
-        // compilation error, and the batch produces no result set at all
+        // Where a `GOTO` lands is read from the statements of this text, at any depth, so a
+        // name that no label of the text declares is known before the first statement runs:
+        // 133 is a compilation error, and the batch produces no result set
         // (`tests/run_batch_pipeline.rs`, `a_goto_to_an_unknown_label_is_133_and_stops_the_batch`).
-        let labels = batch_labels(&batch.statements);
-        if let Some(label) = first_undeclared_goto(&batch.statements, &labels) {
+        let statements = batch.statements.as_slice();
+        let labels = labels_at_any_depth(statements);
+        if let Some(label) = first_undeclared_goto(statements, &labels) {
             let err = SqlError::goto_label_not_declared(label).with_line(last_line(text));
             return self.fail(&err, sink);
         }
-        let (mut prepared, mut bind_state, mut batch_variables) =
-            match self.prepare_batch(text, &batch.statements) {
-                Ok(prepared) => prepared,
+        let (slots, bind_state, batch_variables) = if bind_limit_for(statements).is_some() {
+            let slots = statements.iter().map(|_| Slot::Unbound).collect();
+            (slots, self.state.clone(), BatchVariables::new())
+        } else {
+            match self.prepare_batch(text, statements) {
+                Ok((prepared, state, variables)) => (
+                    prepared
+                        .into_iter()
+                        .map(|prepared| Slot::Ready(Box::new(prepared)))
+                        .collect(),
+                    state,
+                    variables,
+                ),
                 Err(err) if self.cancel.is_cancelled() => return Err(err),
                 Err(err) => return self.fail(&err, sink),
-            };
-        let mut index = 0;
-        while index < prepared.len() {
-            // Between two statements, as `fake_engine` did before its own work: an
-            // ATTENTION that arrived during the previous one stops the batch here. A
-            // `GOTO` that jumps backwards comes through this check on every turn, so a
-            // batch that loops over itself answers the ATTENTION instead of running on
-            // (`tests/run_batch_pipeline.rs`, `a_batch_that_loops_on_a_goto_answers_the_cancellation`).
-            self.cancel.check()?;
-            let more = index + 1 < prepared.len();
-            let current = &prepared[index];
-            let flow = self.run_prepared(current, more, sink)?;
-            if let Flow::Stop = flow {
-                break;
             }
-            let tail_start = index + 1;
-            if should_reprepare_tail(
-                tail_start,
-                prepared.len(),
-                batch.statements.len(),
-                catalog_changed(current, &batch.statements[tail_start..]),
-            ) {
-                let tail = self.reprepare_tail(
-                    text,
-                    &batch.statements[tail_start..],
-                    &mut bind_state,
-                    &mut batch_variables,
-                )?;
-                prepared.truncate(tail_start);
-                prepared.extend(tail);
-            }
-            let was = index;
-            index = match flow {
-                Flow::Jump(label) => match labels.get(&label.to_ascii_lowercase()) {
-                    Some(target) => *target,
-                    // Each `GOTO` of the text was checked against this table before the
-                    // batch ran, so a name missing here is a broken precondition.
-                    None => {
-                        let err = SqlError::from(InternalError::Bug(format!(
-                            "run_batch: no label {label} to jump to"
-                        )));
-                        self.fail(&err, sink)?;
-                        break;
-                    }
-                },
-                _ => index + 1,
-            };
-            // A jump forward may land past what has been bound so far, since a batch that
-            // holds an `ALTER TABLE` is bound one statement at a time (`bind_limit_for`).
-            while index >= prepared.len() && prepared.len() < batch.statements.len() {
-                let from = prepared.len();
-                let tail = self.reprepare_tail(
-                    text,
-                    &batch.statements[from..],
-                    &mut bind_state,
-                    &mut batch_variables,
-                )?;
-                if tail.is_empty() {
-                    break;
-                }
-                prepared.extend(tail);
-            }
-            // A variable belongs to the whole batch, so the `DECLARE` a jump stepped over
-            // still enters its names, with no value ([`declare_variables_of`]) — once the
-            // statements up to the target are bound, which the loop above guarantees when
-            // the target lay past them (`tests/run_batch_pipeline.rs`,
-            // `a_goto_over_a_declare_in_a_batch_with_an_alter_table_still_declares_it`).
-            let bound_up_to = index.min(prepared.len());
-            for stepped in prepared.get(was + 1..bound_up_to).unwrap_or_default() {
-                if let PreparedStatement::Bound { statement, .. } = stepped {
-                    declare_variables_of(statement, &mut self.exec);
-                }
-            }
+        };
+        let mut held = HeldDone::new(sink);
+        let batch = PreparedBatch {
+            text,
+            statements,
+            slots,
+            bind_state,
+            batch_variables,
+        };
+        if let Err(err) = self.run_program(batch, &mut held) {
+            held.release(true)?;
+            return Err(err);
         }
         // A batch may end with a transaction still open; what the end of a batch does with
         // it is `txn_session::end_of_batch`'s decision.
-        txn_session::end_of_batch(&self.state, sink)?;
-        Ok(())
+        txn_session::end_of_batch(&self.state, &mut held)?;
+        held.finish()
+    }
+
+    /// Compiles the statements of the batch into one program and runs it through a
+    /// [`BatchHost`] (module documentation, "One program for the batch").
+    fn run_program(
+        &mut self,
+        batch: PreparedBatch<'_>,
+        sink: &mut dyn ResultSink,
+    ) -> SqlResult<()> {
+        let PreparedBatch {
+            text,
+            statements,
+            mut slots,
+            bind_state,
+            batch_variables,
+        } = batch;
+        let lazy = slots.iter().any(|slot| matches!(slot, Slot::Unbound));
+        let mut in_program: Vec<Option<PhysicalStatement>> = Vec::with_capacity(slots.len());
+        for (slot, statement) in slots.iter_mut().zip(statements) {
+            let mut in_place = false;
+            if let Slot::Ready(prepared) = &*slot
+                && let PreparedStatement::Bound { statement } = prepared.as_ref()
+            {
+                declare_variables_held_by(statement, &mut self.exec);
+                in_place = compiled_in_place(statement);
+            }
+            let compiled = if in_place {
+                match std::mem::replace(slot, Slot::InProgram) {
+                    Slot::Ready(prepared) => match *prepared {
+                        PreparedStatement::Bound { statement } => Some(statement),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            } else {
+                match (&*slot, statement) {
+                    (Slot::Unbound, Statement::Label { name, .. }) => {
+                        *slot = Slot::InProgram;
+                        Some(PhysicalStatement::Label {
+                            name: name.value.clone(),
+                        })
+                    }
+                    (Slot::Unbound, Statement::Goto { label, .. }) => {
+                        *slot = Slot::InProgram;
+                        Some(PhysicalStatement::Goto {
+                            label: label.value.clone(),
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            in_program.push(compiled);
+        }
+        let roots: Vec<Option<&PhysicalStatement>> =
+            in_program.iter().map(Option::as_ref).collect();
+        let program = match Program::compile_roots(&roots) {
+            Ok(program) => program,
+            Err(err) => {
+                let err = if err.number == GOTO_LABEL_NOT_DECLARED {
+                    err.with_line(last_line(text))
+                } else {
+                    err
+                };
+                return self.fail(&err, sink);
+            }
+        };
+        let bound = if lazy { 0 } else { slots.len() };
+        let end = {
+            let mut host = BatchHost {
+                session: self,
+                sink: &mut *sink,
+                text,
+                statements,
+                slots,
+                bound,
+                bind_state,
+                batch_variables,
+                outputs: Vec::new(),
+            };
+            program.run_hosted(&mut host)?
+        };
+        match end {
+            // A `RETURN` ends the batch and counts no row; its DONE is already out.
+            ProgramEnd::Returned(_) => {
+                self.state.rowcount = 0;
+                Ok(())
+            }
+            ProgramEnd::Cancelled => Err(SqlError::from(InternalError::Bug(
+                crate::cancel::CANCELLED.to_owned(),
+            ))),
+            ProgramEnd::Completed | ProgramEnd::Aborted(_) => Ok(()),
+        }
     }
 
     /// Parses, binds and compile-checks every statement without changing live session state.
@@ -458,7 +521,7 @@ impl Session {
             &snapshot,
             &mut state,
             &mut batch_variables,
-            bind_limit_for(statements),
+            None,
         );
         let closed = self.engine.txn.commit(binding);
         match (prepared, closed) {
@@ -468,7 +531,9 @@ impl Session {
         }
     }
 
-    /// Re-binds the tail of a batch after a catalogue-changing statement ran.
+    /// Binds the statements of a batch that holds an `ALTER TABLE` from the first of
+    /// `statements`, against the catalogue of this moment, up to the first one that is not
+    /// a `SET` ([`bind_limit_for`]).
     fn reprepare_tail(
         &self,
         text: &str,
@@ -522,7 +587,7 @@ impl Session {
             let one = match self.bind_one(&padded, raw, snapshot, state, batch_variables) {
                 Ok(one) => one,
                 // A table the catalogue does not hold yet is not a compilation error: the
-                // statement is kept as text and bound when the batch reaches it.
+                // statement is kept as text and bound when the program reaches it.
                 Err(error) if DEFERRED_UNTIL_EXECUTION.contains(&error.number) => {
                     PreparedStatement::Deferred {
                         padded,
@@ -623,19 +688,17 @@ impl Session {
             return Ok(PreparedStatement::Use {
                 statement: physical,
                 database: found,
-                line,
             });
         }
 
         Ok(PreparedStatement::Bound {
             statement: physical,
-            line,
-            held_from: first_held_statement_line(statement),
         })
     }
 
-    /// Binds a deferred statement against the catalogue as it stands when the batch
-    /// reaches it, then runs it like the statement it turned out to be.
+    /// Binds a deferred statement against the catalogue as it stands when the program
+    /// reaches it: a snapshot of the catalogue of this moment, a clone of the live state
+    /// and of the variables the statement can see.
     ///
     /// The catalogue is read through the session transaction when one is open, so a
     /// `CREATE TABLE` of that transaction is seen before its `COMMIT`
@@ -643,42 +706,6 @@ impl Session {
     /// transaction of its own otherwise, closed before the statement runs. The live
     /// session state is the one bound against: the `SET` options before the statement
     /// have been applied to it by then.
-    ///
-    /// A binding that fails now is a run-time error of the statement: what came before it
-    /// has produced its results, and the catalogued [`BatchErrorScope`] of the number
-    /// decides whether the batch goes on. 208, 207, 1088 and 4902 are batch-scoped, so
-    /// `SELECT 1; SELECT * FROM dbo.t; CREATE TABLE dbo.t (a int); SELECT 2;` answers the
-    /// row of the first `SELECT`, then 208 on the line of the second, and no `2`
-    /// (`tests/run_batch_pipeline.rs`, `a_select_before_the_create_is_208_at_run_time`).
-    fn run_deferred(
-        &mut self,
-        padded: &str,
-        raw: &str,
-        variables: &BatchVariables,
-        more: bool,
-        sink: &mut dyn ResultSink,
-    ) -> SqlResult<Flow> {
-        match self.bind_deferred(padded, raw, variables) {
-            Ok(prepared) => self.run_prepared(&prepared, more, sink),
-            Err(err) if self.cancel.is_cancelled() => Err(err),
-            Err(err) => {
-                self.state.last_error = err.number;
-                sink.error(&err)?;
-                let continues = more
-                    && !self.state.options.xact_abort
-                    && err.batch_scope() == BatchErrorScope::Statement;
-                sink.done(None, continues)?;
-                Ok(if continues {
-                    Flow::Continue
-                } else {
-                    Flow::Stop
-                })
-            }
-        }
-    }
-
-    /// The binding half of [`Session::run_deferred`]: a snapshot of the catalogue of this
-    /// moment, a clone of the live state and of the variables the statement can see.
     fn bind_deferred(
         &self,
         padded: &str,
@@ -708,344 +735,6 @@ impl Session {
         );
         self.engine.txn.commit(binding)?;
         prepared
-    }
-
-    /// Executes one already compiled statement and says whether the batch goes on.
-    fn run_prepared(
-        &mut self,
-        prepared: &PreparedStatement,
-        more: bool,
-        sink: &mut dyn ResultSink,
-    ) -> SqlResult<Flow> {
-        if let PreparedStatement::Set { text, line } = prepared {
-            let snapshot = if let Some(session_txn) = &self.state.txn {
-                self.engine.catalog.snapshot(&session_txn.handle)
-            } else {
-                let binding = crate::set_options::begin_autocommit_txn(
-                    &self.state,
-                    &self.engine.storage,
-                    &self.engine.txn,
-                )?;
-                let snap = self.engine.catalog.snapshot(&binding);
-                self.engine.txn.commit(binding)?;
-                snap
-            };
-            match apply_set_statement(&mut self.state, text, Some(&snapshot)) {
-                SetOutcome::Applied | SetOutcome::Ignored(_) => {}
-                SetOutcome::Failed(err) => {
-                    let err = at_statement(err, *line);
-                    return self.fail(&err, sink).map(|()| Flow::Stop);
-                }
-            }
-            // A `SET` carries no row count, under both values of `NOCOUNT`: its DONE is
-            // `0x0001` (MORE) before a statement and `0x0000` last, without `DONE_COUNT`.
-            sink.done(None, more)?;
-            // A `SET` puts `@@ROWCOUNT` back to 0: `SELECT 1; SET NOCOUNT OFF; SELECT
-            // @@ROWCOUNT;` answers 1 then **0**, where `SELECT 1; SELECT @@ROWCOUNT;`
-            // answers 1 then 1, the vector that tells "a `SET` resets the count" from "a
-            // `SET` leaves it alone" (`tests/run_batch_pipeline.rs`,
-            // `a_set_puts_the_row_count_back_to_zero`).
-            self.state.rowcount = 0;
-            apply_exec_session(&mut self.state, &self.exec, true, true);
-            self.exec.identity_updated = false;
-            return Ok(Flow::Continue);
-        }
-
-        if let PreparedStatement::Fallback { text, error } = prepared {
-            return self.fall_back(text, error, more, sink);
-        }
-
-        if let PreparedStatement::Deferred {
-            padded,
-            raw,
-            variables,
-        } = prepared
-        {
-            return self.run_deferred(padded, raw, variables, more, sink);
-        }
-
-        if let PreparedStatement::Execute { stmt, line } = prepared {
-            self.exec.identity_updated = false;
-            self.exec.rowcount = 0;
-            let mut adapter = StatementSinkAdapter::new(sink);
-            let (result, txn) = self.execute_bound_in_a_transaction(stmt, &mut adapter);
-            let succeeded = result.is_ok();
-            txn_session::finish_statement(
-                &mut self.state,
-                &self.engine,
-                &mut self.exec,
-                txn,
-                txn_session::TxnKind::Other,
-                succeeded,
-                adapter.tds(),
-            )?;
-            return match result {
-                Ok(ExecOutcome::CallProcedure {
-                    name,
-                    database,
-                    args,
-                    return_into,
-                    line: exec_line,
-                }) => {
-                    let (flow, outcome) = crate::procedures::run_batch_procedure(
-                        self,
-                        &name,
-                        database.as_deref(),
-                        &args,
-                        return_into.as_deref(),
-                        exec_line,
-                        more,
-                        adapter.tds(),
-                    )?;
-                    if !outcome.failed {
-                        self.state.rowcount = outcome.rowcount;
-                    }
-                    Ok(flow)
-                }
-                Ok(ExecOutcome::RunDynamic {
-                    text,
-                    line: exec_line,
-                }) => {
-                    let (flow, outcome) = crate::procedures::run_batch_dynamic(
-                        self,
-                        &text,
-                        exec_line,
-                        more,
-                        adapter.tds(),
-                    )?;
-                    if !outcome.failed {
-                        self.state.rowcount = outcome.rowcount;
-                    }
-                    Ok(flow)
-                }
-                Err(err) => {
-                    let err = at_statement(err, *line);
-                    self.state.last_error = err.number;
-                    adapter.error(&err)?;
-                    let continues = more
-                        && !self.state.options.xact_abort
-                        && err.number != 0
-                        && err.batch_scope() == BatchErrorScope::Statement;
-                    adapter.set_more(continues);
-                    adapter.done(None)?;
-                    self.state.rowcount = self.exec.rowcount;
-                    apply_exec_session(&mut self.state, &self.exec, true, false);
-                    self.exec.identity_updated = false;
-                    Ok(if continues {
-                        Flow::Continue
-                    } else {
-                        Flow::Stop
-                    })
-                }
-                Ok(outcome) => {
-                    let err = SqlError::from(InternalError::Bug(format!(
-                        "run_prepared: execute_bound answered {outcome:?}, which this layer does \
-                         not handle"
-                    )));
-                    self.fail(&err, adapter.tds()).map(|()| Flow::Stop)
-                }
-            };
-        }
-
-        // A `USE` is a `Bound` statement with one thing more: the name its ENVCHANGE and its
-        // INFO 5701 carry, resolved against the catalogue while the batch was bound.
-        let (bound, line, held_from, target) = match prepared {
-            PreparedStatement::Bound {
-                statement,
-                line,
-                held_from,
-            } => (statement, *line, *held_from, None),
-            PreparedStatement::Use {
-                statement,
-                database,
-                line,
-            } => (statement, *line, None, Some(database.as_str())),
-            PreparedStatement::Set { .. }
-            | PreparedStatement::Fallback { .. }
-            | PreparedStatement::Deferred { .. }
-            | PreparedStatement::Execute { .. } => {
-                unreachable!("SET, fallback, deferred and EXECUTE were handled above")
-            }
-        };
-
-        // The adapter wraps the caller's sink: the executor calls
-        // `StatementSink::columns` during execution, which the adapter converts to
-        // `ResultSink::columns`, so COLMETADATA goes out when the statement starts to
-        // run, not while it is prepared. The end of the statement and its error go
-        // through the adapter too, with the `more` this layer computes.
-        self.exec.identity_updated = false;
-        self.exec.rowcount = 0;
-        let mut adapter = StatementSinkAdapter::new(sink);
-        adapter.set_more(more);
-        let (result, txn) = self.execute_in_a_transaction(bound, &mut adapter);
-        let succeeded = result.is_ok();
-        // The ENVCHANGE of an opening or a closing transaction goes out before the DONE of
-        // the statement that caused it.
-        txn_session::finish_statement(
-            &mut self.state,
-            &self.engine,
-            &mut self.exec,
-            txn,
-            txn_session::kind_of(bound),
-            succeeded,
-            adapter.tds(),
-        )?;
-        match result {
-            Ok(ExecOutcome::Rows(count)) => {
-                // The metadata was already sent through the adapter during execution.
-                // `SET NOCOUNT ON` clears `DONE_COUNT` on the DONE of a `SELECT`
-                // ([MS-TDS] 2.2.7.6): `SET NOCOUNT ON; SELECT 1;` answers a DONE with
-                // status `0x0000` where `SET NOCOUNT OFF; SELECT 1;` answers `0x0010`, and
-                // the `SET` reaches the `SELECT` of its own batch in both directions (`SET
-                // NOCOUNT ON; SELECT 1; SET NOCOUNT OFF; SELECT 2;` answers `0x0001` then
-                // `0x0010`), which reading the option here, after `apply_set_statement`
-                // ran for the statements before, gives for free
-                // (`tests/set_options_effects.rs`). SQL Server still writes the count in
-                // `DoneRowCount` with the flag clear; the spec says the field is then not
-                // valid, the sink has no way to write it, and a client following [MS-TDS]
-                // does not read it, so `None` it is.
-                let reported = if self.state.options.nocount {
-                    None
-                } else {
-                    Some(count)
-                };
-                adapter.done(reported)?;
-                // `@@ROWCOUNT` is posted **after** the statement and read by the next one:
-                // `SELECT 1; SELECT @@ROWCOUNT` answers 1, and so it does under `NOCOUNT
-                // ON`: the option touches the DONE, not the variable.
-                self.state.rowcount = count as i64;
-                apply_exec_session(&mut self.state, &self.exec, true, true);
-                self.exec.identity_updated = false;
-                Ok(Flow::Continue)
-            }
-            // The DDL and `USE` answer `NoRows` (`executor`, `ddl.rs`); a `SELECT`
-            // answers `Rows`. A `NoRows` sent no COLMETADATA (the executor does not call
-            // `StatementSink::columns` for these), so the DONE closes a statement with no result
-            // set, and it carries no row count, the shape of `CREATE TABLE`, `DROP TABLE`
-            // and `USE`. `NOCOUNT` is not read here: those DONEs carry no count under `SET
-            // NOCOUNT OFF` either.
-            Ok(ExecOutcome::NoRows) => {
-                if let Some(database) = target {
-                    self.switch_database(database, line, &mut adapter)?;
-                }
-                adapter.done(None)?;
-                // A top-level `DECLARE` or `WHILE` sets `@@ROWCOUNT` by its own rule, over
-                // what nested execution left in `self.exec.rowcount` (`next_rowcount`).
-                self.state.rowcount = next_rowcount(bound, self.state.rowcount, self.exec.rowcount);
-                apply_exec_session(
-                    &mut self.state,
-                    &self.exec,
-                    true,
-                    statement_clears_last_error(bound),
-                );
-                self.exec.identity_updated = false;
-                Ok(Flow::Continue)
-            }
-            // The token handed to the executor cannot be raised, and the outcomes of the
-            // control of flow have no statement to produce them yet: each is reported as
-            // an internal error rather than mapped to a DONE this layer cannot justify.
-            Ok(ExecOutcome::Return(_)) => {
-                adapter.set_more(false);
-                adapter.done(None)?;
-                self.state.rowcount = 0;
-                Ok(Flow::Stop)
-            }
-            Ok(ExecOutcome::Cancelled) => Err(SqlError::from(InternalError::Bug(
-                crate::cancel::CANCELLED.to_owned(),
-            ))),
-            Ok(ExecOutcome::CallProcedure {
-                name,
-                database,
-                args,
-                return_into,
-                line,
-            }) => {
-                let (flow, outcome) = crate::procedures::run_batch_procedure(
-                    self,
-                    &name,
-                    database.as_deref(),
-                    &args,
-                    return_into.as_deref(),
-                    line,
-                    more,
-                    adapter.tds(),
-                )?;
-                if !outcome.failed {
-                    self.state.rowcount = outcome.rowcount;
-                }
-                Ok(flow)
-            }
-            Ok(ExecOutcome::RunDynamic { text, line }) => {
-                let (flow, outcome) =
-                    crate::procedures::run_batch_dynamic(self, &text, line, more, adapter.tds())?;
-                if !outcome.failed {
-                    self.state.rowcount = outcome.rowcount;
-                }
-                Ok(flow)
-            }
-            // A `GOTO` ends its statement and hands the name it wrote to the loop of
-            // `run_batch`, which holds the labels of the text. The DONE goes out with
-            // MORE set whatever the position of the `GOTO` in the text: the statement at
-            // the label runs after it, so this is not the last DONE of the response
-            // (`tests/run_batch_pipeline.rs`, `a_goto_written_last_still_leaves_more_on_its_done`).
-            Ok(ExecOutcome::Goto(label)) => {
-                adapter.set_more(true);
-                adapter.done(None)?;
-                self.state.rowcount = next_rowcount(bound, self.state.rowcount, self.exec.rowcount);
-                apply_exec_session(
-                    &mut self.state,
-                    &self.exec,
-                    true,
-                    statement_clears_last_error(bound),
-                );
-                self.exec.identity_updated = false;
-                Ok(Flow::Jump(label))
-            }
-            Ok(outcome @ (ExecOutcome::Break | ExecOutcome::Continue)) => {
-                let err = SqlError::from(InternalError::Bug(format!(
-                    "run_prepared: the executor answered {outcome:?}, which this layer does \
-                     not handle"
-                )));
-                self.fail(&err, adapter.tds()).map(|()| Flow::Stop)
-            }
-            // A batch-scoped error: sent like a run-time error, and the batch stops.
-            Ok(ExecOutcome::BatchAbort(err)) => {
-                let err = at_statement(err, line);
-                self.state.last_error = err.number;
-                adapter.error(&err)?;
-                adapter.set_more(false);
-                adapter.done(None)?;
-                Ok(Flow::Stop)
-            }
-            // A run-time error stops its statement. Its catalogued scope and XACT_ABORT decide
-            // whether the rest of the batch runs. It is not handed to the fake engine
-            // even when it is internal: a cancelled request raises one, and running it again
-            // would ignore the ATTENTION. The line the executor put on it is the failing
-            // sub-expression's; SQL Server answers the statement's, and this layer knows it
-            // — except past `held_from`, where the error was raised by a statement the
-            // `IF`, the `WHILE` or the `BEGIN … END` holds and the executor's line is the
-            // one to keep. An error of the condition reaches this layer with no line (the
-            // executor clears it), so it falls back to the line of the statement the batch
-            // is running ([`first_held_statement_line`]).
-            Err(err) => {
-                let err = match held_from {
-                    Some(first) if err.line >= first => err,
-                    _ => at_statement(err, line),
-                };
-                self.state.last_error = err.number;
-                adapter.error(&err)?;
-                let continues = more
-                    && !self.state.options.xact_abort
-                    && err.batch_scope() == BatchErrorScope::Statement;
-                adapter.set_more(continues);
-                adapter.done(None)?;
-                Ok(if continues {
-                    Flow::Continue
-                } else {
-                    Flow::Stop
-                })
-            }
-        }
     }
 
     /// Moves the session to `database` and tells the client, which is what a `USE` does.
@@ -1126,6 +815,24 @@ impl Session {
         )
     }
 
+    /// Runs `step` in a context opened like the one of a statement, in the transaction of
+    /// the session when one is open and in one of its own otherwise, then closes it.
+    fn within_a_transaction(
+        &mut self,
+        step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
+        sink: &mut dyn ResultSink,
+    ) -> SqlResult<()> {
+        let engine = Arc::clone(&self.engine);
+        within_a_transaction(
+            &mut self.state,
+            &engine,
+            &mut self.exec,
+            &self.cancel,
+            step,
+            sink,
+        )
+    }
+
     /// Runs one bound `EXECUTE` in a transaction, like [`execute_in_a_transaction`] but
     /// without going through the planner.
     fn execute_bound_in_a_transaction(
@@ -1173,27 +880,674 @@ impl Session {
     /// Sends `err` and the DONE that closes the batch, and records `@@ERROR`.
     ///
     /// The DONE carries no row count and no `MORE`. Run-time execution errors take the
-    /// catalogued path above instead; this helper closes preparation, fallback and RPC errors.
+    /// path of the program instead; this helper closes preparation and RPC errors.
     fn fail(&mut self, err: &SqlError, sink: &mut dyn ResultSink) -> SqlResult<()> {
         self.state.last_error = err.number;
         sink.error(err)?;
         sink.done(None, false)
     }
+}
 
-    /// Last resort for a statement the binder does not bind: the fake engine, then the internal
-    /// error itself when the fake engine does not know it either.
-    fn fall_back(
-        &mut self,
-        stmt: &str,
-        err: &SqlError,
-        more: bool,
-        sink: &mut dyn ResultSink,
-    ) -> SqlResult<Flow> {
-        match fake_engine::answer(&self.cancel, stmt, more, sink)? {
-            Some(true) => Ok(Flow::Continue),
-            Some(false) => Ok(Flow::Stop),
-            None => self.fail(err, sink).map(|()| Flow::Stop),
+/// Runs `step` in a context opened for `state` like the one of a statement, in the
+/// transaction of the session when one is open and in one of its own otherwise, then
+/// closes it. Shared by the batch and by a nested text, which runs on a state of its own.
+pub(crate) fn within_a_transaction(
+    state: &mut SessionState,
+    engine: &Arc<Engine>,
+    exec: &mut ExecSession,
+    cancel: &CancelHandle,
+    step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
+    sink: &mut dyn ResultSink,
+) -> SqlResult<()> {
+    let txn = txn_session::statement_txn(state, engine, exec)?;
+    let handle = match &txn {
+        StatementTxn::Explicit => state
+            .txn
+            .as_ref()
+            .map(|session_txn| session_txn.handle.clone()),
+        StatementTxn::Autocommit(handle) => Some(handle.clone()),
+        StatementTxn::Skipped => None,
+    };
+    let Some(handle) = handle else {
+        return Err(SqlError::from(InternalError::Bug(
+            "within_a_transaction: the session transaction has no handle".to_owned(),
+        )));
+    };
+    let result = {
+        let snap = engine.txn.statement_snapshot(&handle);
+        let eval = SessionEvalContext::deferred(state, &engine.catalog, &handle);
+        let token = cancel.token();
+        let mut ctx = ExecContext::scalar(&eval, state.options.to_binder())
+            .with_engine(engine.storage.as_ref(), &engine.txn, &snap)
+            .with_catalog(&engine.catalog)
+            .with_handle(&handle)
+            .with_cancel(&token)
+            .with_session(exec);
+        step(&mut ctx)
+    };
+    txn_session::finish_statement(
+        state,
+        engine,
+        exec,
+        txn,
+        txn_session::TxnKind::Other,
+        result.is_ok(),
+        sink,
+    )?;
+    result
+}
+
+/// The statements of a batch once prepared, handed to [`Session::run_program`].
+struct PreparedBatch<'b> {
+    text: &'b str,
+    statements: &'b [Statement],
+    slots: Vec<Slot>,
+    /// The session state the binding has reached, read by a statement bound when the
+    /// program reaches it.
+    bind_state: SessionState,
+    /// The variables the binding has declared, read the same way.
+    batch_variables: BatchVariables,
+}
+
+/// Whether the program of the batch holds `statement` itself rather than handing it to the
+/// host: the statements that hold others, and the jumps.
+pub(crate) fn compiled_in_place(statement: &PhysicalStatement) -> bool {
+    matches!(
+        statement,
+        PhysicalStatement::If { .. }
+            | PhysicalStatement::While { .. }
+            | PhysicalStatement::Block(_)
+            | PhysicalStatement::Goto { .. }
+            | PhysicalStatement::Label { .. }
+            | PhysicalStatement::Return(_)
+            | PhysicalStatement::Break
+            | PhysicalStatement::Continue
+    )
+}
+
+/// The [`Host`] of the program of a batch (module documentation, "One program for the
+/// batch"): each statement runs in a transaction of its own and ends with its DONE, each
+/// error goes to the client on the line of its statement, and each call goes through the
+/// dispatch of `procedures.rs`.
+struct BatchHost<'h> {
+    session: &'h mut Session,
+    sink: &'h mut dyn ResultSink,
+    text: &'h str,
+    statements: &'h [Statement],
+    slots: Vec<Slot>,
+    /// How many statements, from the first, are bound: the length of the text, except in a
+    /// batch that holds an `ALTER TABLE`.
+    bound: usize,
+    bind_state: SessionState,
+    batch_variables: BatchVariables,
+    /// The values a call wrote for its caller, written into the caller's level once the
+    /// level of the call is closed ([`Host::leave_call`]).
+    outputs: Vec<(String, Value)>,
+}
+
+impl Host for BatchHost<'_> {
+    fn statement(&mut self, stmt: Option<&PhysicalStatement>, site: Site) -> SqlResult<Ran> {
+        // Between two statements: an ATTENTION that arrived during the previous one stops
+        // the batch here. A `GOTO` that jumps backwards comes through this check on every
+        // turn, so a batch that loops over itself answers the ATTENTION instead of running
+        // on (`tests/run_batch_pipeline.rs`, `a_batch_that_loops_on_a_goto_answers_the_cancellation`).
+        self.session.cancel.check()?;
+        match stmt {
+            Some(stmt) => self.run_bound(stmt, site, None),
+            None => self.run_root(site),
         }
+    }
+
+    fn condition(
+        &mut self,
+        condition: &BoundExpr,
+        site: Site,
+    ) -> SqlResult<Result<bool, SqlError>> {
+        let mut value = None;
+        let opened = self.session.within_a_transaction(
+            &mut |ctx: &mut ExecContext<'_>| {
+                value = Some(eval_expr(condition, None, ctx));
+                Ok(())
+            },
+            &mut *self.sink,
+        );
+        let evaluated = match (opened, value) {
+            (Ok(()), Some(value)) => value,
+            (Err(err), _) => Err(err),
+            (Ok(()), None) => Err(SqlError::from(InternalError::Bug(
+                "condition: nothing was evaluated".to_owned(),
+            ))),
+        };
+        match evaluated {
+            // The condition is a statement of its own: it leaves `@@ROWCOUNT` and `@@ERROR`
+            // at 0 (`tests/run_batch_pipeline.rs`,
+            // `a_condition_puts_the_row_count_and_the_last_error_back_to_zero`).
+            Ok(value) => {
+                self.session.state.rowcount = 0;
+                self.session.state.last_error = 0;
+                Ok(Ok(matches!(value, Value::Bit(true))))
+            }
+            // An error of the condition belongs to the statement that holds it, not to the
+            // sub-expression that failed (`statements.rs`, `first_held_statement_line`).
+            Err(err) => {
+                let err = err.with_line(0);
+                self.report(&err, site)?;
+                Ok(Err(self.place(err, site)))
+            }
+        }
+    }
+
+    fn within(
+        &mut self,
+        _site: Site,
+        step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
+    ) -> SqlResult<()> {
+        self.session.within_a_transaction(step, &mut *self.sink)
+    }
+
+    fn report(&mut self, err: &SqlError, site: Site) -> SqlResult<()> {
+        let err = self.place(err.clone(), site);
+        self.session.state.last_error = err.number;
+        self.sink.error(&err)?;
+        self.sink.done(None, true)
+    }
+
+    fn call(&mut self, call: Call, _site: Site) -> SqlResult<ProgramEnd> {
+        let (flow, outcome) = match call {
+            Call::Procedure {
+                name,
+                database,
+                args,
+                return_into,
+                line,
+            } => crate::procedures::run_batch_procedure(
+                self.session,
+                &name,
+                database.as_deref(),
+                &args,
+                return_into.as_deref(),
+                line,
+                true,
+                &mut *self.sink,
+            )?,
+            Call::Dynamic { text, line } => crate::procedures::run_batch_dynamic(
+                self.session,
+                &text,
+                line,
+                true,
+                &mut *self.sink,
+            )?,
+        };
+        if !outcome.failed {
+            self.session.state.rowcount = outcome.rowcount;
+        }
+        // What the dispatch wrote for the caller (`@rc =`, `OUTPUT`) went into the level
+        // of the call, which is closed before the caller reads it.
+        self.outputs = self
+            .session
+            .exec
+            .variables
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        Ok(match flow {
+            Flow::Continue => ProgramEnd::Completed,
+            Flow::Stop => ProgramEnd::Aborted(SqlError::new(
+                outcome.error_number,
+                16,
+                1,
+                "the call ended the batch",
+            )),
+        })
+    }
+
+    fn leave_call(&mut self, database: &str) -> SqlResult<()> {
+        database.clone_into(&mut self.session.state.database);
+        for (name, value) in std::mem::take(&mut self.outputs) {
+            self.session.exec.variables.insert(name, value);
+        }
+        Ok(())
+    }
+
+    // The test of an `IF` or a `WHILE`, a `GOTO`, a `BREAK`, a `CONTINUE` and a `RETURN`
+    // each end with a DONE that carries no count (`tests/run_batch_pipeline.rs`,
+    // `a_statement_of_the_control_of_flow_ends_with_a_done`).
+    fn control(&mut self, _site: Site) -> SqlResult<()> {
+        self.sink.done(None, true)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.session.cancel.is_cancelled()
+    }
+
+    fn xact_abort(&self) -> bool {
+        self.session.state.options.xact_abort
+    }
+}
+
+impl BatchHost<'_> {
+    /// The error `err` raised at `site`, on the line the client reads it at.
+    ///
+    /// A statement written at the top level answers its own line ([`at_statement`]). A
+    /// statement an `IF`, a `WHILE` or a `BEGIN … END` holds keeps the line the executor
+    /// gave it when that line is at or past the first statement held, and answers the line
+    /// of the statement written at the top level otherwise: an error of a condition comes
+    /// with no line of its own ([`first_held_statement_line`]).
+    fn place(&self, err: SqlError, site: Site) -> SqlError {
+        let Some(root) = self.statements.get(site.root) else {
+            return err;
+        };
+        if site.nested
+            && let Some(first) = first_held_statement_line(root)
+            && err.line >= first
+        {
+            return err;
+        }
+        at_statement(err, statement_line(root))
+    }
+
+    /// The line the statement written at `site` starts on.
+    fn line_of(&self, site: Site) -> u32 {
+        self.statements.get(site.root).map_or(0, statement_line)
+    }
+
+    /// Runs the statement written at the top level at `site`, bound now when the batch is
+    /// bound one statement at a time.
+    fn run_root(&mut self, site: Site) -> SqlResult<Ran> {
+        let index = site.root;
+        if let Err(err) = self.bind_up_to(index)? {
+            self.session.state.last_error = err.number;
+            self.sink.error(&err)?;
+            self.sink.done(None, true)?;
+            return Ok(Ran::Stopped(err));
+        }
+        let Some(slot) = self.slots.get_mut(index) else {
+            return Err(SqlError::from(InternalError::Bug(format!(
+                "run_root: the batch holds no statement {index}"
+            ))));
+        };
+        let slot = std::mem::replace(slot, Slot::Running);
+        let ran = match &slot {
+            Slot::Ready(prepared) => self.run_prepared(prepared, site),
+            Slot::Unbound | Slot::InProgram | Slot::Running => Err(SqlError::from(
+                InternalError::Bug(format!("run_root: statement {index} is not ready")),
+            )),
+        };
+        self.slots[index] = slot;
+        ran
+    }
+
+    /// Binds the statements up to `index` that are not bound yet, in the order of the
+    /// text, against the catalogue of this moment. A `DECLARE` among them enters its names,
+    /// whether the program runs it or jumps over it. The inner `Err` is a binding error.
+    fn bind_up_to(&mut self, index: usize) -> SqlResult<Result<(), SqlError>> {
+        while self.bound <= index {
+            let from = self.bound;
+            let tail = match self.session.reprepare_tail(
+                self.text,
+                &self.statements[from..],
+                &mut self.bind_state,
+                &mut self.batch_variables,
+            ) {
+                Ok(tail) => tail,
+                Err(err) if self.session.cancel.is_cancelled() => return Err(err),
+                Err(err) => return Ok(Err(err)),
+            };
+            if tail.is_empty() {
+                break;
+            }
+            for prepared in tail {
+                if let PreparedStatement::Bound { statement } = &prepared {
+                    declare_variables_held_by(statement, &mut self.session.exec);
+                }
+                if let Some(slot) = self.slots.get_mut(self.bound)
+                    && !matches!(slot, Slot::InProgram)
+                {
+                    *slot = Slot::Ready(Box::new(prepared));
+                }
+                self.bound += 1;
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    /// Runs one prepared statement written at the top level.
+    fn run_prepared(&mut self, prepared: &PreparedStatement, site: Site) -> SqlResult<Ran> {
+        match prepared {
+            PreparedStatement::Set { text, line } => self.run_set(text, *line),
+            PreparedStatement::Fallback { text, error } => self.run_fallback(text, error),
+            PreparedStatement::Deferred {
+                padded,
+                raw,
+                variables,
+            } => self.run_deferred(padded, raw, variables, site),
+            // A `USE` is a bound statement with one thing more: the name its ENVCHANGE and
+            // its INFO 5701 carry, resolved against the catalogue while the batch was bound.
+            PreparedStatement::Use {
+                statement,
+                database,
+            } => self.run_bound(statement, site, Some(database)),
+            PreparedStatement::Execute { stmt, line } => self.run_execute(stmt, *line),
+            PreparedStatement::Bound { statement } if compiled_in_place(statement) => {
+                Ok(Ran::Holds(Box::new(statement.clone())))
+            }
+            PreparedStatement::Bound { statement } => self.run_bound(statement, site, None),
+        }
+    }
+
+    /// A `SET` applied to the live state. A `SET` that is refused ends the batch.
+    fn run_set(&mut self, text: &str, line: u32) -> SqlResult<Ran> {
+        let session = &mut *self.session;
+        let snapshot = if let Some(session_txn) = &session.state.txn {
+            session.engine.catalog.snapshot(&session_txn.handle)
+        } else {
+            let binding = crate::set_options::begin_autocommit_txn(
+                &session.state,
+                &session.engine.storage,
+                &session.engine.txn,
+            )?;
+            let snap = session.engine.catalog.snapshot(&binding);
+            session.engine.txn.commit(binding)?;
+            snap
+        };
+        match apply_set_statement(&mut session.state, text, Some(&snapshot)) {
+            SetOutcome::Applied | SetOutcome::Ignored(_) => {}
+            SetOutcome::Failed(err) => {
+                let err = at_statement(err, line);
+                session.state.last_error = err.number;
+                self.sink.error(&err)?;
+                self.sink.done(None, true)?;
+                return Ok(Ran::Stopped(err));
+            }
+        }
+        // A `SET` carries no row count, under both values of `NOCOUNT`: its DONE is
+        // `0x0001` (MORE) before a statement and `0x0000` last, without `DONE_COUNT`.
+        self.sink.done(None, true)?;
+        // A `SET` puts `@@ROWCOUNT` back to 0: `SELECT 1; SET NOCOUNT OFF; SELECT
+        // @@ROWCOUNT;` answers 1 then **0**, where `SELECT 1; SELECT @@ROWCOUNT;`
+        // answers 1 then 1, the vector that tells "a `SET` resets the count" from "a
+        // `SET` leaves it alone" (`tests/run_batch_pipeline.rs`,
+        // `a_set_puts_the_row_count_back_to_zero`).
+        let session = &mut *self.session;
+        session.state.rowcount = 0;
+        apply_exec_session(&mut session.state, &session.exec, true, true);
+        session.exec.identity_updated = false;
+        Ok(Ran::Outcome(ExecOutcome::NoRows))
+    }
+
+    /// Last resort for a statement the binder does not bind: the fake engine, then the
+    /// internal error itself when the fake engine does not know it either. Either error
+    /// ends the batch.
+    fn run_fallback(&mut self, text: &str, error: &SqlError) -> SqlResult<Ran> {
+        match fake_engine::answer(&self.session.cancel, text, true, &mut *self.sink)? {
+            Some(true) => Ok(Ran::Outcome(ExecOutcome::NoRows)),
+            Some(false) => Ok(Ran::Stopped(SqlError::from(InternalError::Bug(
+                "the fallback answered an error".to_owned(),
+            )))),
+            None => {
+                self.session.state.last_error = error.number;
+                self.sink.error(error)?;
+                self.sink.done(None, true)?;
+                Ok(Ran::Stopped(error.clone()))
+            }
+        }
+    }
+
+    /// Binds a deferred statement against the catalogue as it stands when the program
+    /// reaches it, then runs it like the statement it turned out to be.
+    ///
+    /// A binding that fails now is a run-time error of the statement: what came before it
+    /// has produced its results, and the catalogued scope of the number decides whether
+    /// the batch goes on. 208, 207, 1088 and 4902 are batch-scoped, so
+    /// `SELECT 1; SELECT * FROM dbo.t; CREATE TABLE dbo.t (a int); SELECT 2;` answers the
+    /// row of the first `SELECT`, then 208 on the line of the second, and no `2`
+    /// (`tests/run_batch_pipeline.rs`, `a_select_before_the_create_is_208_at_run_time`).
+    fn run_deferred(
+        &mut self,
+        padded: &str,
+        raw: &str,
+        variables: &BatchVariables,
+        site: Site,
+    ) -> SqlResult<Ran> {
+        match self.session.bind_deferred(padded, raw, variables) {
+            Ok(PreparedStatement::Bound { statement }) if compiled_in_place(&statement) => {
+                Ok(Ran::Holds(Box::new(statement)))
+            }
+            Ok(prepared) => self.run_prepared(&prepared, site),
+            Err(err) if self.session.cancel.is_cancelled() => Err(err),
+            Err(err) => {
+                self.session.state.last_error = err.number;
+                self.sink.error(&err)?;
+                self.sink.done(None, true)?;
+                Ok(Ran::Failed(err))
+            }
+        }
+    }
+
+    /// Runs a bound `EXECUTE` written at the top level: what it answers is the call the
+    /// program runs in place.
+    fn run_execute(&mut self, stmt: &BoundExecute, line: u32) -> SqlResult<Ran> {
+        let session = &mut *self.session;
+        session.exec.identity_updated = false;
+        session.exec.rowcount = 0;
+        let mut adapter = StatementSinkAdapter::new(&mut *self.sink);
+        adapter.set_more(true);
+        let (result, txn) = session.execute_bound_in_a_transaction(stmt, &mut adapter);
+        let succeeded = result.is_ok();
+        txn_session::finish_statement(
+            &mut session.state,
+            &session.engine,
+            &mut session.exec,
+            txn,
+            txn_session::TxnKind::Other,
+            succeeded,
+            adapter.tds(),
+        )?;
+        match result {
+            Ok(outcome) => Ok(Ran::Outcome(outcome)),
+            Err(err) => {
+                let err = at_statement(err, line);
+                session.state.last_error = err.number;
+                adapter.error(&err)?;
+                adapter.done(None)?;
+                session.state.rowcount = session.exec.rowcount;
+                apply_exec_session(&mut session.state, &session.exec, true, false);
+                session.exec.identity_updated = false;
+                Ok(Ran::Failed(err))
+            }
+        }
+    }
+
+    /// Runs one bound statement that holds no other one, written at the top level or held
+    /// by a statement of the program, and closes it with its DONE. `target` is the database
+    /// of a `USE`.
+    fn run_bound(
+        &mut self,
+        bound: &PhysicalStatement,
+        site: Site,
+        target: Option<&str>,
+    ) -> SqlResult<Ran> {
+        let line = self.line_of(site);
+        // The adapter wraps the caller's sink: the executor calls
+        // `StatementSink::columns` during execution, which the adapter converts to
+        // `ResultSink::columns`, so COLMETADATA goes out when the statement starts to
+        // run, not while it is prepared.
+        let session = &mut *self.session;
+        session.exec.identity_updated = false;
+        session.exec.rowcount = 0;
+        let mut adapter = StatementSinkAdapter::new(&mut *self.sink);
+        adapter.set_more(true);
+        let (result, txn) = session.execute_in_a_transaction(bound, &mut adapter);
+        let succeeded = result.is_ok();
+        // The ENVCHANGE of an opening or a closing transaction goes out before the DONE of
+        // the statement that caused it.
+        txn_session::finish_statement(
+            &mut session.state,
+            &session.engine,
+            &mut session.exec,
+            txn,
+            txn_session::kind_of(bound),
+            succeeded,
+            adapter.tds(),
+        )?;
+        match result {
+            Ok(ExecOutcome::Rows(count)) => {
+                // The metadata was already sent through the adapter during execution.
+                // `SET NOCOUNT ON` clears `DONE_COUNT` on the DONE of a `SELECT`
+                // ([MS-TDS] 2.2.7.6): `SET NOCOUNT ON; SELECT 1;` answers a DONE with
+                // status `0x0000` where `SET NOCOUNT OFF; SELECT 1;` answers `0x0010`, and
+                // the `SET` reaches the `SELECT` of its own batch in both directions
+                // (`tests/set_options_effects.rs`). SQL Server still writes the count in
+                // `DoneRowCount` with the flag clear; the spec says the field is then not
+                // valid, the sink has no way to write it, and a client following [MS-TDS]
+                // does not read it, so `None` it is.
+                let reported = if session.state.options.nocount {
+                    None
+                } else {
+                    Some(count)
+                };
+                adapter.done(reported)?;
+                // `@@ROWCOUNT` is posted **after** the statement and read by the next one:
+                // `SELECT 1; SELECT @@ROWCOUNT` answers 1, and so it does under `NOCOUNT
+                // ON`: the option touches the DONE, not the variable.
+                session.state.rowcount = i64::try_from(count).unwrap_or(i64::MAX);
+                apply_exec_session(&mut session.state, &session.exec, true, true);
+                session.exec.identity_updated = false;
+                Ok(Ran::Outcome(ExecOutcome::Rows(count)))
+            }
+            // The DDL and `USE` answer `NoRows` (`executor`, `ddl.rs`); a `SELECT`
+            // answers `Rows`. A `NoRows` sent no COLMETADATA, so the DONE closes a
+            // statement with no result set, and it carries no row count, the shape of
+            // `CREATE TABLE`, `DROP TABLE` and `USE`.
+            Ok(ExecOutcome::NoRows) => {
+                if let Some(database) = target {
+                    session.switch_database(database, line, &mut adapter)?;
+                }
+                adapter.done(None)?;
+                // A `DECLARE` sets `@@ROWCOUNT` by its own rule, over what the statement
+                // left in `exec.rowcount` (`next_rowcount`).
+                session.state.rowcount =
+                    next_rowcount(bound, session.state.rowcount, session.exec.rowcount);
+                apply_exec_session(
+                    &mut session.state,
+                    &session.exec,
+                    true,
+                    statement_clears_last_error(bound),
+                );
+                session.exec.identity_updated = false;
+                Ok(Ran::Outcome(ExecOutcome::NoRows))
+            }
+            // A call, a cancellation, an error of the whole batch: the program acts on it.
+            Ok(outcome) => Ok(Ran::Outcome(outcome)),
+            // A run-time error stops its statement; its catalogued scope and XACT_ABORT
+            // decide whether the program goes on. It is not handed to the fake engine even
+            // when it is internal: a cancelled request raises one, and running it again
+            // would ignore the ATTENTION.
+            Err(err) => {
+                let err = self.place(err, site);
+                self.session.state.last_error = err.number;
+                self.sink.error(&err)?;
+                self.sink.done(None, true)?;
+                Ok(Ran::Failed(err))
+            }
+        }
+    }
+}
+
+/// A [`ResultSink`] that holds the last DONE back until the next token, so the DONE
+/// carries `MORE` exactly when something follows it in the response, wherever the program
+/// jumps: the last DONE of the response goes out without it ([`HeldDone::finish`]).
+struct HeldDone<'s> {
+    sink: &'s mut dyn ResultSink,
+    /// The row count of the DONE held back.
+    held: Option<Option<u64>>,
+    /// A DONE went out.
+    sent: bool,
+}
+
+impl<'s> HeldDone<'s> {
+    fn new(sink: &'s mut dyn ResultSink) -> Self {
+        Self {
+            sink,
+            held: None,
+            sent: false,
+        }
+    }
+
+    /// Sends the DONE held back, with `more`.
+    fn release(&mut self, more: bool) -> SqlResult<()> {
+        match self.held.take() {
+            Some(rowcount) => {
+                self.sent = true;
+                self.sink.done(rowcount, more)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Closes the response: the DONE held back goes out without `MORE`, and a response
+    /// that sent no DONE gets one, without which the client would wait for ever.
+    fn finish(mut self) -> SqlResult<()> {
+        if self.held.is_some() {
+            self.release(false)
+        } else if self.sent {
+            Ok(())
+        } else {
+            self.sink.done(None, false)
+        }
+    }
+}
+
+impl ResultSink for HeldDone<'_> {
+    fn columns(&mut self, cols: &[ColumnMeta]) -> SqlResult<()> {
+        self.release(true)?;
+        self.sink.columns(cols)
+    }
+
+    fn row(&mut self, row: &[Value]) -> SqlResult<()> {
+        self.release(true)?;
+        self.sink.row(row)
+    }
+
+    fn done(&mut self, rowcount: Option<u64>, _more: bool) -> SqlResult<()> {
+        self.release(true)?;
+        self.held = Some(rowcount);
+        Ok(())
+    }
+
+    fn info(&mut self, msg: &InfoMessage) -> SqlResult<()> {
+        self.release(true)?;
+        self.sink.info(msg)
+    }
+
+    fn error(&mut self, err: &SqlError) -> SqlResult<()> {
+        self.release(true)?;
+        self.sink.error(err)
+    }
+
+    fn env_change(&mut self, change: &EnvChange) -> SqlResult<()> {
+        self.release(true)?;
+        self.sink.env_change(change)
+    }
+
+    fn return_value(&mut self, name: &str, ty: &TypeInfo, value: &Value) -> SqlResult<()> {
+        self.release(true)?;
+        self.sink.return_value(name, ty, value)
+    }
+
+    fn return_status(&mut self, status: i32) -> SqlResult<()> {
+        self.release(true)?;
+        self.sink.return_status(status)
+    }
+
+    fn done_in_proc(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
+        self.release(true)?;
+        self.sink.done_in_proc(rowcount, more)
+    }
+
+    fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
+        self.release(true)?;
+        self.sink.done_proc(rowcount)
     }
 }
 
@@ -1238,45 +1592,6 @@ pub(crate) fn bind_limit_for(statements: &[Statement]) -> Option<usize> {
     batch_has_alter_table(statements).then_some(1)
 }
 
-/// Whether binding should resume on the statements after index `tail_start`.
-///
-/// The bind limit says how many statements to bind at once; it does not decide whether
-/// binding continues when fewer were prepared than remain in the text.
-pub(crate) fn should_reprepare_tail(
-    tail_start: usize,
-    prepared_len: usize,
-    statements_len: usize,
-    catalog_changed: bool,
-) -> bool {
-    tail_start < statements_len && (catalog_changed || tail_start >= prepared_len)
-}
-
-/// Whether the batch tail must be rebound after this statement ran.
-///
-/// The whole batch binds against one catalogue snapshot. A statement that names a table
-/// the snapshot does not hold is deferred rather than refused
-/// (`PreparedStatement::Deferred`), which is how `CREATE TABLE` followed by a `SELECT` on
-/// the new name in the same batch reads it
-/// (`create_table_then_select_in_the_same_batch_reads_the_new_table`). An `ALTER TABLE`
-/// that changes the shape bound by following statements is the case the deferral does
-/// not cover, since those statements bound: the tail is rebound after it commits so a
-/// `SELECT` in the same batch reads the new columns. A `CREATE TABLE` before an
-/// `ALTER TABLE` in one batch is bound one statement at a time so the `ALTER` sees tables
-/// the earlier statements created.
-fn catalog_changed(prepared: &PreparedStatement, tail: &[Statement]) -> bool {
-    match prepared {
-        PreparedStatement::Bound {
-            statement: PhysicalStatement::Ddl(DdlStatement::AlterTable { .. }),
-            ..
-        } => true,
-        PreparedStatement::Bound {
-            statement: PhysicalStatement::Ddl(DdlStatement::CreateTable { .. }),
-            ..
-        } => batch_has_alter_table(tail),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1289,7 +1604,7 @@ mod tests {
     ///
     /// `columns` holds one entry per COLMETADATA, so an empty vector means the statement
     /// sent no metadata, the shape of `CREATE TABLE`, `DROP TABLE` and `USE`
-    /// (comment of the `match` in [`Session::run_prepared`]).
+    /// (comment of the `match` in [`BatchHost::run_bound`]).
     #[derive(Debug, Default)]
     struct Received {
         columns: Vec<Vec<(String, SqlType)>>,
@@ -1575,13 +1890,14 @@ mod tests {
 
     /// When a late statement of a batch fails to bind, the statements before it still run:
     /// two `CREATE TABLE`, an `ALTER TABLE … FOREIGN KEY`, then a `SELECT` on a missing
-    /// column stops the batch with 207 after the DDL committed.
+    /// column stops the batch with 207 after the DDL committed, the error sent to the
+    /// client like any other.
     #[test]
     fn create_alter_foreign_key_then_bad_select_in_one_batch() {
         let engine = engine();
         let mut session = session(&engine);
         let mut sink = Received::default();
-        let err = session
+        session
             .run_batch(
                 "CREATE TABLE dbo.s16g_p (id int NOT NULL PRIMARY KEY);\
                  CREATE TABLE dbo.s16g_c (id int NOT NULL, pid int);\
@@ -1590,8 +1906,10 @@ mod tests {
                  SELECT nosuch FROM dbo.s16g_c;",
                 &mut sink,
             )
-            .expect_err("a bind error on the tail stops the batch");
-        assert_eq!(err.number, 207);
+            .expect("a bind error on the tail reaches the client, not the connection");
+        let numbers: Vec<u32> = sink.errors.iter().map(|err| err.number).collect();
+        assert_eq!(numbers, [207]);
+        assert!(sink.columns.is_empty(), "the SELECT did not run");
         let handle = engine.txn.begin(IsolationLevel::ReadCommitted);
         let snapshot = engine.catalog.snapshot(&handle);
         assert!(

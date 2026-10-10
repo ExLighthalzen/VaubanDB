@@ -21,8 +21,9 @@
 //! The parameters of a callee are the first variables its handler enters.
 //!
 //! When the callee returns, however it ended, [`Frame::leave`] puts the variables and the
-//! options of the caller back and hands the caller's current database to
-//! [`CallHandler::restore_database`]. A `SET` option the callee changed is thus back at
+//! options of the caller back, and the interpreter hands the caller's current database to
+//! [`CallHandler::restore_database`](super::CallHandler::restore_database), or to
+//! [`Host::leave_call`](super::Host::leave_call) for a program run through a host. A `SET` option the callee changed is thus back at
 //! the value of its caller (`interp::frame::tests::nocount_set_by_a_callee_is_restored_on_return`,
 //! `interp::frame::tests::the_options_a_callee_changes_are_restored_on_return`). The
 //! options the session holds itself (`QUOTED_IDENTIFIER`, `DATEFORMAT`, `LANGUAGE`,
@@ -41,8 +42,6 @@ use vauban_txn::{IsolationLevel, LockTimeout};
 use vauban_types::{TypeInfo, Value};
 
 use crate::context::ExecContext;
-
-use super::CallHandler;
 
 /// Values keyed by variable name, each at the position its name took when it was entered.
 ///
@@ -233,18 +232,14 @@ impl Frame {
     }
 
     /// Closes the level of the callee and gives the caller its state back (module
-    /// documentation, "A call").
+    /// documentation, "A call"). Answers the current database of the caller, which the
+    /// interpreter hands to the host to make current again.
     ///
     /// # Errors
     ///
-    /// The internal error 50000 when the session state is missing, and the error of
-    /// [`CallHandler::restore_database`]; the variables and the options are back either
-    /// way.
-    pub(crate) fn leave(
-        self,
-        ctx: &mut ExecContext<'_>,
-        calls: &mut dyn CallHandler,
-    ) -> SqlResult<()> {
+    /// The internal error 50000 when the session state is missing; the options are back
+    /// then.
+    pub(crate) fn leave(self, ctx: &mut ExecContext<'_>) -> SqlResult<String> {
         ctx.options = self.options;
         let session = ctx.session()?;
         session.variables = self.variables;
@@ -254,7 +249,7 @@ impl Frame {
         session.lock_timeout = self.lock_timeout;
         session.nocount = self.nocount;
         session.nest_level = session.nest_level.saturating_sub(1);
-        calls.restore_database(&self.database, ctx)
+        Ok(self.database)
     }
 }
 

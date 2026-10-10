@@ -102,7 +102,7 @@ pub mod txn_exec;
 pub use compile::compile;
 pub use context::{CancelToken, ExecContext, ExecSession};
 pub use expr::eval_expr;
-pub use interp::{Call, CallHandler, Program, ProgramEnd};
+pub use interp::{Call, CallHandler, Host, Program, ProgramEnd, Ran, Site};
 pub use operator::{Operator, bucket_hash, build_operator, keys_equal};
 pub use row::{EvaluatedExecArg, ExecOutcome, Row, RowSet};
 pub use sink::{CollectSink, EnvironmentChange, ResultColumn, SinkEvent, StatementSink};

@@ -336,30 +336,76 @@ pub(crate) fn declare_variables_of(stmt: &PhysicalStatement, exec: &mut ExecSess
     }
 }
 
-/// The labels `statements` declares, from the name folded to lower case to the index of
-/// the `label:` statement itself.
-///
-/// The index is the label's own, not the one of the statement after it: a jump that lands
-/// on a label runs it, which does nothing, and the loop that runs the batch goes on with
-/// the next statement.
-///
-/// A label written **inside** an `IF`, a `WHILE` or a `BEGIN … END` is not in the table.
-/// The loop steps over the statements of this list and holds no position inside one of
-/// them, so a `GOTO` that names such a label is answered 133 (`tests/run_batch_pipeline.rs`,
-/// `a_goto_to_a_label_inside_a_block_is_133`).
-///
-/// A name declared twice keeps the first declaration (`tests/run_batch_pipeline.rs`,
-/// `a_label_declared_twice_keeps_the_first_declaration`).
-pub(crate) fn batch_labels(statements: &[Statement]) -> HashMap<String, usize> {
+/// [`declare_variables_of`] for `stmt` and for each statement it holds: the `DECLARE`s a
+/// branch, a loop body or a block writes belong to the whole text as well, whether the
+/// program reaches them or jumps over them.
+pub(crate) fn declare_variables_held_by(stmt: &PhysicalStatement, exec: &mut ExecSession) {
+    match stmt {
+        PhysicalStatement::If { then_, else_, .. } => {
+            declare_variables_held_by(then_, exec);
+            if let Some(branch) = else_ {
+                declare_variables_held_by(branch, exec);
+            }
+        }
+        PhysicalStatement::While { body, .. } => declare_variables_held_by(body, exec),
+        PhysicalStatement::Block(statements) => {
+            for held in statements {
+                declare_variables_held_by(held, exec);
+            }
+        }
+        other => declare_variables_of(other, exec),
+    }
+}
+
+/// What the dispatch of an `EXEC` written in a batch decided about the rest of it
+/// (`procedures.rs`): go on with the next statement, or stop.
+pub(crate) enum Flow {
+    /// Go on with the next statement.
+    Continue,
+    /// Stop the batch here; the end of the call is in the sink.
+    Stop,
+}
+
+/// The labels `statements` declares at any depth, from the name folded to lower case to the
+/// index of the statement of the list that declares it or holds it: the labels a `GOTO` of
+/// the batch may land on, since the program that runs the batch holds a position inside
+/// an `IF`, a `WHILE` and a `BEGIN … END` (`tests/run_batch_pipeline.rs`,
+/// `a_goto_into_a_block_of_the_batch_runs_the_block_from_the_label`).
+pub(crate) fn labels_at_any_depth(statements: &[Statement]) -> HashMap<String, usize> {
     let mut labels = HashMap::new();
     for (index, stmt) in statements.iter().enumerate() {
-        if let Statement::Label { name, .. } = stmt {
+        enter_labels(stmt, index, &mut labels);
+    }
+    labels
+}
+
+/// [`labels_at_any_depth`] for one statement and the statements it holds.
+fn enter_labels(stmt: &Statement, index: usize, labels: &mut HashMap<String, usize>) {
+    match stmt {
+        Statement::Label { name, .. } => {
             labels
                 .entry(name.value.to_ascii_lowercase())
                 .or_insert(index);
         }
+        Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            enter_labels(then_branch, index, labels);
+            if let Some(branch) = else_branch {
+                enter_labels(branch, index, labels);
+            }
+        }
+        Statement::While { body, .. } => enter_labels(body, index, labels),
+        Statement::Block { statements, .. } => {
+            for held in statements {
+                enter_labels(held, index, labels);
+            }
+        }
+        // The other statements hold no statement, so they declare no label either.
+        _ => {}
     }
-    labels
 }
 
 /// The name written by the first `GOTO` of `statements` that names a label `labels` does

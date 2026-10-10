@@ -387,3 +387,74 @@ fn a_catalogue_procedure_still_reads_a_varchar_argument() {
     assert_eq!(errors(&variable), Vec::new());
     assert_eq!(rows(&variable), vec![vec![Value::I32(4)]]);
 }
+
+/// The values of the rows a batch sent, in order.
+fn row_values(events: &Recording) -> Vec<Vec<Value>> {
+    events
+        .0
+        .iter()
+        .filter_map(|event| match event {
+            Event::Row(values) => Some(values.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A procedure called inside a `BEGIN … END` runs where it is written, and the block goes
+/// on with the statement after the call: two result sets.
+#[test]
+fn a_procedure_called_in_a_block_lets_the_block_go_on() {
+    let events = run("BEGIN EXEC sp_tables; SELECT 2 AS two; END");
+    assert_eq!(
+        row_values(&events),
+        vec![vec![Value::I32(4)], vec![Value::I32(2)]],
+        "{:?}",
+        events.0
+    );
+    assert!(
+        !events
+            .0
+            .iter()
+            .any(|event| matches!(event, Event::Error(..))),
+        "{:?}",
+        events.0
+    );
+}
+
+/// The `OUTPUT` value of a call written in a branch reaches the caller's variable once the
+/// level of the call is closed, and so does each call of a loop.
+#[test]
+fn an_output_parameter_written_by_a_call_in_a_branch_reaches_the_caller() {
+    let events = run(
+        "DECLARE @v int; IF 1 = 1 EXEC sp_executesql N'SET @o = @a + 1', N'@a int, @o int OUTPUT', @a = 6, @o = @v OUTPUT; SELECT @v AS n;",
+    );
+    assert_eq!(
+        row_values(&events).last(),
+        Some(&vec![Value::I32(7)]),
+        "{:?}",
+        events.0
+    );
+
+    let events = run(
+        "DECLARE @v int = 0, @i int = 0; WHILE @i < 3 BEGIN EXEC sp_executesql N'SET @o = @a + 1', N'@a int, @o int OUTPUT', @a = @v, @o = @v OUTPUT; SET @i += 1 END; SELECT @v AS n;",
+    );
+    assert_eq!(
+        row_values(&events).last(),
+        Some(&vec![Value::I32(3)]),
+        "{:?}",
+        events.0
+    );
+}
+
+/// A procedure called by a branch of a dynamic text runs there, and the block of the branch
+/// goes on: the result set of the call, then the one after it.
+#[test]
+fn a_procedure_called_in_a_branch_of_a_dynamic_text_lets_the_branch_go_on() {
+    let events = run("EXEC('IF 1 = 1 BEGIN EXEC sp_tables; SELECT 2 AS two END');");
+    assert_eq!(
+        row_values(&events),
+        vec![vec![Value::I32(4)], vec![Value::I32(2)]],
+        "{:?}",
+        events.0
+    );
+}

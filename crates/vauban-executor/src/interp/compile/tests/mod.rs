@@ -22,9 +22,9 @@ fn shape(program: &Program<'_>) -> Vec<String> {
                 loop_head: true,
                 ..
             } => format!("loop ->{otherwise}"),
-            Instr::Jump { target } => format!("jump ->{target}"),
-            Instr::Return(_) => "return".to_owned(),
-            Instr::Escape(escape) => format!("escape {escape:?}"),
+            Instr::Jump { target, .. } => format!("jump ->{target}"),
+            Instr::Return { .. } => "return".to_owned(),
+            Instr::Escape { escape, .. } => format!("escape {escape:?}"),
         })
         .collect()
 }

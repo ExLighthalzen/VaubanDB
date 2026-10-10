@@ -3,11 +3,12 @@
 
 use std::sync::Arc;
 
-use vauban_binder::{BatchVariables, BindContext, BoundStatement, DdlStatement};
+use vauban_binder::{BatchVariables, BindContext, BoundExpr, BoundStatement};
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
 use vauban_executor::{
-    EnvironmentChange, EvaluatedExecArg, ExecContext, ExecOutcome, ExecSession, StatementSink,
+    Call, EnvironmentChange, EvaluatedExecArg, ExecContext, ExecOutcome, ExecSession, Host,
+    Program, ProgramEnd, Ran, Site, StatementSink, eval_expr,
 };
 use vauban_parser::{Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
@@ -15,7 +16,7 @@ use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
 use vauban_txn::IsolationLevel;
 use vauban_types::{TypeInfo, Value};
 
-use crate::batch::{DEFERRED_UNTIL_EXECUTION, Session};
+use crate::batch::{DEFERRED_UNTIL_EXECUTION, Session, compiled_in_place, within_a_transaction};
 use crate::eval_context::{SessionEvalContext, apply_exec_session};
 use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
@@ -25,9 +26,9 @@ use crate::set_options::{SetOutcome, apply_set_statement, sync_exec_session};
 use crate::sink::{ResultSink, StatementSinkAdapter};
 use crate::state::SessionState;
 use crate::statements::{
-    INTERNAL_ERROR, at_statement, batch_labels, declare_variables_of, first_undeclared_goto,
-    last_line, next_rowcount, statement_clears_last_error, statement_fragment, statement_line,
-    statement_span, statement_text, use_name_line,
+    INTERNAL_ERROR, at_statement, declare_variables_held_by, first_undeclared_goto,
+    labels_at_any_depth, last_line, next_rowcount, statement_clears_last_error, statement_fragment,
+    statement_line, statement_span, statement_text, use_name_line,
 };
 use crate::txn_session::{self, StatementTxn};
 
@@ -228,88 +229,119 @@ impl Session {
         // The labels of a nested text are its own, and so is the 133 of a `GOTO` that
         // names none of them: it is raised before the first statement of the text runs,
         // and the caller reads it as the error of the call (`tests/run_batch_pipeline.rs`,
-        // `a_goto_to_an_unknown_label_of_a_dynamic_text_is_133`).
-        let labels = batch_labels(&batch.statements);
-        if let Some(label) = first_undeclared_goto(&batch.statements, &labels) {
+        // `a_goto_to_an_unknown_label_of_a_dynamic_text_is_133`). A label is read at any
+        // depth, since the program that runs the text holds a position inside a block.
+        let statements = batch.statements.as_slice();
+        let labels = labels_at_any_depth(statements);
+        if let Some(label) = first_undeclared_goto(statements, &labels) {
             let err = SqlError::goto_label_not_declared(label).with_line(last_line(text));
             return self.fail_nested(&err, sink, outcome);
         }
 
-        let (mut prepared, mut bind_state, mut batch_variables) =
-            match self.prepare_nested(text, &batch.statements, params, nested_state) {
-                Ok(prepared) => prepared,
+        let lazy = crate::batch::bind_limit_for(statements).is_some();
+        let (mut slots, bind_state, batch_variables) = if lazy {
+            let mut variables = BatchVariables::new();
+            seed_batch_variables(params, &mut variables)?;
+            let slots: Vec<Slot> = statements.iter().map(|_| Slot::Unbound).collect();
+            (slots, nested_state.clone(), variables)
+        } else {
+            match self.prepare_nested(text, statements, params, nested_state) {
+                Ok((prepared, state, variables)) => (
+                    prepared
+                        .into_iter()
+                        .map(|prepared| Slot::Ready(Box::new(prepared)))
+                        .collect(),
+                    state,
+                    variables,
+                ),
                 Err(err) if self.cancel_handle().is_cancelled() => return Err(err),
                 Err(err) => return self.fail_nested(&err, sink, outcome),
-            };
+            }
+        };
 
-        let mut index = 0;
-        while index < prepared.len() {
-            self.cancel_handle().check()?;
-            let more = index + 1 < prepared.len();
-            let current = &prepared[index];
-            let flow = self.run_nested_prepared(current, more, nested_state, sink, outcome)?;
-            if let Flow::Stop = flow {
-                break;
+        // The text runs as one program, as the batch does (`batch.rs`, "One program for the
+        // batch"): the statements that hold others and the jumps are compiled into the
+        // program, the others are run by [`NestedHost`] from their position.
+        let mut in_program: Vec<Option<PhysicalStatement>> = Vec::with_capacity(slots.len());
+        for (slot, statement) in slots.iter_mut().zip(statements) {
+            let mut in_place = false;
+            if let Slot::Ready(prepared) = &*slot
+                && let PreparedStatement::Bound { statement, .. } = prepared.as_ref()
+            {
+                declare_variables_held_by(statement, self.exec_mut());
+                in_place = compiled_in_place(statement);
             }
-            let tail_start = index + 1;
-            if crate::batch::should_reprepare_tail(
-                tail_start,
-                prepared.len(),
-                batch.statements.len(),
-                catalog_changed(current, &batch.statements[tail_start..]),
-            ) {
-                let tail = self.reprepare_nested_tail(
-                    text,
-                    &batch.statements[tail_start..],
-                    params,
-                    &mut bind_state,
-                    &mut batch_variables,
-                )?;
-                prepared.truncate(tail_start);
-                prepared.extend(tail);
-            }
-            let was = index;
-            index = match flow {
-                // The jump of a nested text lands in that text: the labels of the caller
-                // are not in this table, and a name this table does not hold was answered
-                // 133 before the first statement ran.
-                Flow::Jump(label) => match labels.get(&label.to_ascii_lowercase()) {
-                    Some(target) => *target,
-                    None => {
-                        let err = SqlError::from(InternalError::Bug(format!(
-                            "run_nested_body: no label {label} to jump to"
-                        )));
-                        return self.fail_nested_statement(&err, sink, outcome);
+            let compiled = if in_place {
+                match std::mem::replace(slot, Slot::InProgram) {
+                    Slot::Ready(prepared) => match *prepared {
+                        PreparedStatement::Bound { statement, .. } => Some(statement),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            } else {
+                match (&*slot, statement) {
+                    (Slot::Unbound, Statement::Label { name, .. }) => {
+                        *slot = Slot::InProgram;
+                        Some(PhysicalStatement::Label {
+                            name: name.value.clone(),
+                        })
                     }
-                },
-                _ => index + 1,
+                    (Slot::Unbound, Statement::Goto { label, .. }) => {
+                        *slot = Slot::InProgram;
+                        Some(PhysicalStatement::Goto {
+                            label: label.value.clone(),
+                        })
+                    }
+                    _ => None,
+                }
             };
-            while index >= prepared.len() && prepared.len() < batch.statements.len() {
-                let from = prepared.len();
-                let tail = self.reprepare_nested_tail(
-                    text,
-                    &batch.statements[from..],
-                    params,
-                    &mut bind_state,
-                    &mut batch_variables,
-                )?;
-                if tail.is_empty() {
-                    break;
-                }
-                prepared.extend(tail);
-            }
-            // As in the top-level batch: the `DECLARE` a jump stepped over still enters its
-            // names, with no value (`statements.rs`, `declare_variables_of`), once the
-            // statements up to the target are bound (`tests/run_batch_pipeline.rs`,
-            // `a_goto_over_a_declare_in_a_batch_with_an_alter_table_still_declares_it`).
-            let bound_up_to = index.min(prepared.len());
-            for stepped in prepared.get(was + 1..bound_up_to).unwrap_or_default() {
-                if let PreparedStatement::Bound { statement, .. } = stepped {
-                    declare_variables_of(statement, self.exec_mut());
-                }
-            }
+            in_program.push(compiled);
         }
-        Ok(())
+        let roots: Vec<Option<&PhysicalStatement>> =
+            in_program.iter().map(Option::as_ref).collect();
+        let program = match Program::compile_roots(&roots) {
+            Ok(program) => program,
+            Err(err) => {
+                let err = if err.number == GOTO_LABEL_NOT_DECLARED {
+                    err.with_line(last_line(text))
+                } else {
+                    err
+                };
+                return self.fail_nested(&err, sink, outcome);
+            }
+        };
+        let bound = if lazy { 0 } else { slots.len() };
+        let end = {
+            let mut host = NestedHost {
+                session: self,
+                nested_state: &mut *nested_state,
+                sink: &mut *sink,
+                outcome: &mut *outcome,
+                text,
+                statements,
+                params,
+                slots,
+                bound,
+                bind_state,
+                batch_variables,
+            };
+            program.run_hosted(&mut host)?
+        };
+        match end {
+            ProgramEnd::Returned(code) => {
+                outcome.return_status = code;
+                // `RETURN` is the last statement that ran, and it counts no row: `@@ROWCOUNT`
+                // leaves the text at 0 whatever the statement before it counted
+                // (`tests/nested.rs`, `rowcount_is_zero_after_a_text_that_ends_with_return`).
+                nested_state.rowcount = 0;
+                Ok(())
+            }
+            ProgramEnd::Cancelled => Err(SqlError::from(InternalError::Bug(
+                crate::cancel::CANCELLED.to_owned(),
+            ))),
+            ProgramEnd::Completed | ProgramEnd::Aborted(_) => Ok(()),
+        }
     }
 
     fn prepare_nested(
@@ -582,21 +614,7 @@ impl Session {
             return match self.bind_nested_deferred(padded, raw, variables, nested_state) {
                 Ok(bound) => self.run_nested_prepared(&bound, more, nested_state, sink, outcome),
                 Err(err) if self.cancel_handle().is_cancelled() => Err(err),
-                Err(err) => {
-                    nested_state.last_error = err.number;
-                    sink.error(&err)?;
-                    outcome.failed = true;
-                    let continues = more
-                        && !nested_state.options.xact_abort
-                        && err.batch_scope() == BatchErrorScope::Statement;
-                    if continues {
-                        sink.done_in_proc(None, true)?;
-                        Ok(Flow::Continue)
-                    } else {
-                        outcome.return_status = err.number as i32;
-                        Ok(Flow::Stop)
-                    }
-                }
+                Err(err) => nested_failure(&err, more, nested_state, sink, outcome),
             };
         }
 
@@ -613,7 +631,22 @@ impl Session {
                 unreachable!("SET, fallback and deferred were handled above")
             }
         };
+        self.run_nested_bound(bound, line, target, more, nested_state, sink, outcome)
+    }
 
+    /// Runs one bound statement of a nested text that holds no other one, written at the top
+    /// level of the text on `line` or held by the statement written there.
+    #[allow(clippy::too_many_arguments)]
+    fn run_nested_bound(
+        &mut self,
+        bound: &PhysicalStatement,
+        line: u32,
+        target: Option<&str>,
+        more: bool,
+        nested_state: &mut SessionState,
+        sink: &mut dyn ResultSink,
+        outcome: &mut NestedOutcome,
+    ) -> SqlResult<Flow> {
         self.exec_mut().identity_updated = false;
         self.exec_mut().rowcount = 0;
         let mut adapter = StatementSinkAdapter::in_proc(sink);
@@ -1102,6 +1135,289 @@ impl Session {
     }
 }
 
+/// Hands `err`, raised by a statement of a nested text, to the sink, and says whether the
+/// text goes on: the end of the statement goes out with it when it does, and the number
+/// becomes the status of the text when it does not.
+fn nested_failure(
+    err: &SqlError,
+    more: bool,
+    nested_state: &mut SessionState,
+    sink: &mut dyn ResultSink,
+    outcome: &mut NestedOutcome,
+) -> SqlResult<Flow> {
+    nested_state.last_error = err.number;
+    sink.error(err)?;
+    outcome.failed = true;
+    let continues =
+        more && !nested_state.options.xact_abort && err.batch_scope() == BatchErrorScope::Statement;
+    if continues {
+        sink.done_in_proc(None, true)?;
+        Ok(Flow::Continue)
+    } else {
+        outcome.return_status = err.number as i32;
+        Ok(Flow::Stop)
+    }
+}
+
+/// Number of the error a `GOTO` answers when no label of the text carries its name.
+const GOTO_LABEL_NOT_DECLARED: u32 = 133;
+
+/// What a nested text holds at one position (`batch.rs`, `Slot`, for the rule).
+enum Slot {
+    /// Not bound yet: a text that holds an `ALTER TABLE` binds each statement when the
+    /// program reaches it.
+    Unbound,
+    /// Bound, planned and checked.
+    Ready(Box<PreparedStatement>),
+    /// Compiled into the program itself.
+    InProgram,
+    /// Taken out while the host runs it.
+    Running,
+}
+
+/// The [`Host`] of the program of a nested text: each statement runs as the loop of this
+/// file ran it, its end a DONEINPROC, and the program holds the control of flow.
+struct NestedHost<'h> {
+    session: &'h mut Session,
+    nested_state: &'h mut SessionState,
+    sink: &'h mut dyn ResultSink,
+    outcome: &'h mut NestedOutcome,
+    text: &'h str,
+    statements: &'h [Statement],
+    params: &'h [NestedParam],
+    slots: Vec<Slot>,
+    bound: usize,
+    bind_state: SessionState,
+    batch_variables: BatchVariables,
+}
+
+impl NestedHost<'_> {
+    /// Whether a statement of the text follows the one written at `site`.
+    fn more(&self, site: Site) -> bool {
+        site.root + 1 < self.statements.len()
+    }
+
+    /// The line the statement written at `site` starts on.
+    fn line_of(&self, site: Site) -> u32 {
+        self.statements.get(site.root).map_or(0, statement_line)
+    }
+
+    /// What a [`Flow`] of this file is to the program.
+    fn ran(flow: Flow) -> Ran {
+        match flow {
+            Flow::Continue => Ran::Outcome(ExecOutcome::NoRows),
+            Flow::Jump(label) => Ran::Outcome(ExecOutcome::Goto(label)),
+            Flow::Stop => Ran::Stopped(SqlError::from(InternalError::Bug(
+                "the nested text stopped".to_owned(),
+            ))),
+        }
+    }
+
+    /// Binds the statements up to `index` that are not bound yet (`batch.rs`,
+    /// `BatchHost::bind_up_to`). The inner `Err` is a binding error.
+    fn bind_up_to(&mut self, index: usize) -> SqlResult<Result<(), SqlError>> {
+        while self.bound <= index {
+            let from = self.bound;
+            let tail = match self.session.reprepare_nested_tail(
+                self.text,
+                &self.statements[from..],
+                self.params,
+                &mut self.bind_state,
+                &mut self.batch_variables,
+            ) {
+                Ok(tail) => tail,
+                Err(err) if self.session.cancel_handle().is_cancelled() => return Err(err),
+                Err(err) => return Ok(Err(err)),
+            };
+            if tail.is_empty() {
+                break;
+            }
+            for prepared in tail {
+                if let PreparedStatement::Bound { statement, .. } = &prepared {
+                    declare_variables_held_by(statement, self.session.exec_mut());
+                }
+                if let Some(slot) = self.slots.get_mut(self.bound)
+                    && !matches!(slot, Slot::InProgram)
+                {
+                    *slot = Slot::Ready(Box::new(prepared));
+                }
+                self.bound += 1;
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    /// Runs one prepared statement written at the top level of the text.
+    fn run_root(&mut self, prepared: &PreparedStatement, site: Site) -> SqlResult<Ran> {
+        let more = self.more(site);
+        match prepared {
+            PreparedStatement::Bound { statement, .. } if compiled_in_place(statement) => {
+                Ok(Ran::Holds(Box::new(statement.clone())))
+            }
+            PreparedStatement::Deferred {
+                padded,
+                raw,
+                variables,
+            } => match self
+                .session
+                .bind_nested_deferred(padded, raw, variables, self.nested_state)
+            {
+                Ok(PreparedStatement::Bound { statement, .. }) if compiled_in_place(&statement) => {
+                    Ok(Ran::Holds(Box::new(statement)))
+                }
+                Ok(bound) => self.run_root(&bound, site),
+                Err(err) if self.session.cancel_handle().is_cancelled() => Err(err),
+                Err(err) => Ok(Self::ran(nested_failure(
+                    &err,
+                    more,
+                    self.nested_state,
+                    self.sink,
+                    self.outcome,
+                )?)),
+            },
+            prepared => Ok(Self::ran(self.session.run_nested_prepared(
+                prepared,
+                more,
+                self.nested_state,
+                self.sink,
+                self.outcome,
+            )?)),
+        }
+    }
+}
+
+impl Host for NestedHost<'_> {
+    fn statement(&mut self, stmt: Option<&PhysicalStatement>, site: Site) -> SqlResult<Ran> {
+        self.session.cancel_handle().check()?;
+        if let Some(stmt) = stmt {
+            // A statement held by a block, a branch or a loop body has the rest of the
+            // program after it, the statement that holds it being last or not
+            // (`tests/run_batch_pipeline.rs`, `a_dynamic_text_runs_its_calls_and_its_jumps_in_place`).
+            let (line, more) = (self.line_of(site), true);
+            let flow = self.session.run_nested_bound(
+                stmt,
+                line,
+                None,
+                more,
+                self.nested_state,
+                self.sink,
+                self.outcome,
+            )?;
+            return Ok(Self::ran(flow));
+        }
+        let index = site.root;
+        if let Err(err) = self.bind_up_to(index)? {
+            let flow = nested_failure(&err, false, self.nested_state, self.sink, self.outcome)?;
+            return Ok(Self::ran(flow));
+        }
+        let Some(slot) = self.slots.get_mut(index) else {
+            return Err(SqlError::from(InternalError::Bug(format!(
+                "nested text: no statement {index}"
+            ))));
+        };
+        let slot = std::mem::replace(slot, Slot::Running);
+        let ran = match &slot {
+            Slot::Ready(prepared) => self.run_root(prepared, site),
+            Slot::Unbound | Slot::InProgram | Slot::Running => Err(SqlError::from(
+                InternalError::Bug(format!("nested text: statement {index} is not ready")),
+            )),
+        };
+        self.slots[index] = slot;
+        ran
+    }
+
+    fn condition(
+        &mut self,
+        condition: &BoundExpr,
+        site: Site,
+    ) -> SqlResult<Result<bool, SqlError>> {
+        let mut value = None;
+        let engine = Arc::clone(self.session.engine());
+        let cancel = self.session.cancel_handle();
+        let opened = within_a_transaction(
+            self.nested_state,
+            &engine,
+            self.session.exec_mut(),
+            &cancel,
+            &mut |ctx: &mut ExecContext<'_>| {
+                value = Some(eval_expr(condition, None, ctx));
+                Ok(())
+            },
+            self.sink,
+        );
+        let evaluated = match (opened, value) {
+            (Ok(()), Some(value)) => value,
+            (Err(err), _) => Err(err),
+            (Ok(()), None) => Err(SqlError::from(InternalError::Bug(
+                "condition: nothing was evaluated".to_owned(),
+            ))),
+        };
+        match evaluated {
+            Ok(value) => {
+                self.nested_state.rowcount = 0;
+                self.nested_state.last_error = 0;
+                Ok(Ok(matches!(value, Value::Bit(true))))
+            }
+            Err(err) => {
+                let err = at_statement(err.with_line(0), self.line_of(site));
+                self.report(&err, site)?;
+                Ok(Err(err))
+            }
+        }
+    }
+
+    fn within(
+        &mut self,
+        _site: Site,
+        step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
+    ) -> SqlResult<()> {
+        let engine = Arc::clone(self.session.engine());
+        let cancel = self.session.cancel_handle();
+        within_a_transaction(
+            self.nested_state,
+            &engine,
+            self.session.exec_mut(),
+            &cancel,
+            step,
+            self.sink,
+        )
+    }
+
+    fn report(&mut self, err: &SqlError, site: Site) -> SqlResult<()> {
+        let err = at_statement(err.clone(), self.line_of(site));
+        self.nested_state.rowcount = 0;
+        let continues = !self.nested_state.options.xact_abort
+            && err.number != 0
+            && err.batch_scope() == BatchErrorScope::Statement;
+        nested_failure(&err, continues, self.nested_state, self.sink, self.outcome)?;
+        Ok(())
+    }
+
+    // A statement of a nested text makes its calls itself (`run_nested_bound`): no call
+    // reaches the program.
+    fn call(&mut self, _call: Call, _site: Site) -> SqlResult<ProgramEnd> {
+        Err(SqlError::from(InternalError::Bug(
+            "nested text: a call reached the program".to_owned(),
+        )))
+    }
+
+    fn leave_call(&mut self, _database: &str) -> SqlResult<()> {
+        Ok(())
+    }
+
+    fn control(&mut self, _site: Site) -> SqlResult<()> {
+        self.sink.done_in_proc(None, true)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.session.cancel_handle().is_cancelled()
+    }
+
+    fn xact_abort(&self) -> bool {
+        self.nested_state.options.xact_abort
+    }
+}
+
 fn proc_params_to_nested(params: &[ProcParam]) -> Vec<NestedParam> {
     params
         .iter()
@@ -1281,20 +1597,6 @@ fn collect_outputs(params: &[NestedParam], exec: &ExecSession) -> Vec<(String, V
                 .map(|(name, value)| (name.clone(), value.clone()))
         })
         .collect()
-}
-
-fn catalog_changed(prepared: &PreparedStatement, tail: &[Statement]) -> bool {
-    match prepared {
-        PreparedStatement::Bound {
-            statement: PhysicalStatement::Ddl(DdlStatement::AlterTable { .. }),
-            ..
-        } => true,
-        PreparedStatement::Bound {
-            statement: PhysicalStatement::Ddl(DdlStatement::CreateTable { .. }),
-            ..
-        } => crate::batch::batch_has_alter_table(tail),
-        _ => false,
-    }
 }
 
 #[cfg(test)]

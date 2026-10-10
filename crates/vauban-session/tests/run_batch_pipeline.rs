@@ -1809,15 +1809,146 @@ fn a_goto_to_an_unknown_label_of_a_dynamic_text_is_133() {
     assert_eq!(rows(&events), vec![vec![Value::I32(2)]]);
 }
 
-/// A label written inside a `BEGIN … END` is not a label of the batch: the loop that runs
-/// the batch steps over the block as one statement and holds no position inside it, so a
-/// `GOTO` that names it answers 133. SQL Server runs the block from that label instead.
+/// A label written inside a `BEGIN … END` is a label of the batch: the program that runs
+/// the batch holds a position inside the block, so a `GOTO` written before the block runs
+/// it from the label, and the statements between the `GOTO` and the label do not run.
 #[test]
-fn a_goto_to_a_label_inside_a_block_is_133() {
-    let events = run("GOTO inside;\nBEGIN inside: SELECT 1; END");
+fn a_goto_into_a_block_of_the_batch_runs_the_block_from_the_label() {
+    let events = run(
+        "GOTO inside;\nSELECT 'skipped';\nBEGIN SELECT 'block-start'; inside: SELECT 'at-label'; END\nSELECT 'after';",
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "{events:#?}"
+    );
+    assert_eq!(
+        rows(&events),
+        vec![vec![text("at-label")], vec![text("after")]],
+        "{events:#?}"
+    );
+}
+
+/// The numbers of the errors `events` holds, in order.
+fn error_numbers(events: &[Event]) -> Vec<u32> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Error(err) => Some(err.number),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An `EXEC` in the body of a `WHILE` runs once per turn, and the statement after the loop
+/// runs too: three result sets of the dynamic text, then the counter at 3.
+#[test]
+fn a_loop_runs_its_dynamic_text_on_each_turn() {
+    let events =
+        run("DECLARE @i int = 0; WHILE @i < 3 BEGIN EXEC('SELECT 1'); SET @i += 1 END; SELECT @i;");
+    assert!(error_numbers(&events).is_empty(), "{events:#?}");
+    assert_eq!(
+        rows(&events),
+        vec![
+            vec![Value::I32(1)],
+            vec![Value::I32(1)],
+            vec![Value::I32(1)],
+            vec![Value::I32(3)],
+        ],
+        "{events:#?}"
+    );
+    let result_sets = events
+        .iter()
+        .filter(|event| matches!(event, Event::Columns(_)))
+        .count();
+    assert_eq!(result_sets, 4, "{events:#?}");
+}
+
+/// The condition of an `IF` is a statement of its own: it reads `@@ERROR` and
+/// `@@ROWCOUNT` as the statement before left them, then leaves both at 0 for the branch.
+/// The counter-proof is the same read without the `IF`, which answers the number and the
+/// count.
+#[test]
+fn a_condition_puts_the_row_count_and_the_last_error_back_to_zero() {
+    let events = run("SELECT 1 / 0;\nIF @@ERROR <> 0 SELECT @@ERROR;");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(0)]),
+        "{events:#?}"
+    );
+    let events = run("SELECT 1 / 0;\nSELECT @@ERROR;");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(8134)]),
+        "{events:#?}"
+    );
+
+    let events = run("SELECT 1 UNION ALL SELECT 2;\nIF 1 = 1 SELECT @@ROWCOUNT;");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(0)]),
+        "{events:#?}"
+    );
+    let events = run("SELECT 1 UNION ALL SELECT 2;\nIF 1 = 0 SELECT 0;\nSELECT @@ROWCOUNT;");
+    assert_eq!(
+        rows(&events).last(),
+        Some(&vec![Value::I32(0)]),
+        "{events:#?}"
+    );
+}
+
+/// A statement held by a block that succeeds puts `@@ERROR` back to 0, and a statement
+/// that fails in a loop lets the loop go on when its error is of statement scope: each
+/// turn reads the number of its own failure.
+#[test]
+fn a_statement_held_by_a_block_sets_the_last_error_for_the_next_one() {
+    let events = run("BEGIN SELECT 1 / 0; SELECT 1; SELECT @@ERROR; END");
+    assert_eq!(error_numbers(&events), [8134], "{events:#?}");
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(1)], vec![Value::I32(0)]],
+        "{events:#?}"
+    );
+
+    let events = run(
+        "DECLARE @i int = 0; WHILE @i < 2 BEGIN SELECT 1 / 0; SELECT @@ERROR; SET @i += 1 END; SELECT @i;",
+    );
+    assert_eq!(error_numbers(&events), [8134, 8134], "{events:#?}");
+    assert_eq!(
+        rows(&events),
+        vec![
+            vec![Value::I32(8134)],
+            vec![Value::I32(8134)],
+            vec![Value::I32(2)]
+        ],
+        "{events:#?}"
+    );
+}
+
+/// An error raised by the condition of an `IF` counts as a condition that is not true: the
+/// `ELSE` runs, then the rest of the batch, and the error carries the line of the `IF`.
+#[test]
+fn an_error_of_a_condition_takes_the_else_branch() {
+    let events = run("SELECT 0;\nIF 1 / 0 = 1 SELECT 'then' ELSE SELECT 'else';\nSELECT 'next';");
     let err = only_error(&events);
-    assert_eq!(err.number, 133);
-    assert!(rows(&events).is_empty(), "{events:#?}");
+    assert_eq!((err.number, err.line), (8134, 2), "{events:#?}");
+    assert_eq!(
+        rows(&events),
+        vec![vec![Value::I32(0)], vec![text("else")], vec![text("next")]],
+        "{events:#?}"
+    );
+}
+
+/// The DONE of a statement carries MORE when another token follows it in the response,
+/// whatever the loop does: the last DONE of a loop that calls is the only one without it.
+#[test]
+fn only_the_last_done_of_a_loop_that_calls_closes_the_response() {
+    let events = run("DECLARE @i int = 0; WHILE @i < 2 BEGIN EXEC('SELECT 1'); SET @i += 1 END;");
+    let closing: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(at, event)| matches!(event, Event::Done(_, false)).then_some(at))
+        .collect();
+    assert_eq!(closing, [events.len() - 1], "{events:#?}");
 }
 
 /// `@@ROWCOUNT` crosses a `GOTO` and a label: neither counts a row, so the count the
@@ -1958,4 +2089,80 @@ fn a_dynamic_text_keeps_the_count_the_error_and_the_jumped_declare() {
         "{events:#?}"
     );
     assert_eq!(rows(&events), vec![vec![Value::Null]]);
+}
+
+/// The test of an `IF` or a `WHILE`, a `GOTO`, a `BREAK` and a `RETURN` each end with a
+/// DONE that carries no count, whether the test takes a branch or not; a label ends with
+/// nothing.
+#[test]
+fn a_statement_of_the_control_of_flow_ends_with_a_done() {
+    for (text, expected) in [
+        (
+            "SELECT 1; IF 1 = 0 SELECT 2;",
+            vec![(Some(1), true), (None, false)],
+        ),
+        (
+            "SELECT 1; IF 1 = 1 SELECT 2;",
+            vec![(Some(1), true), (None, true), (Some(1), false)],
+        ),
+        (
+            "SELECT 1; IF 1 = 0 SELECT 2; SELECT 3;",
+            vec![(Some(1), true), (None, true), (Some(1), false)],
+        ),
+        (
+            "WHILE 1 = 0 SELECT 1; SELECT 2;",
+            vec![(None, true), (Some(1), false)],
+        ),
+        (
+            "SELECT 1; GOTO l; SELECT 2; l: SELECT 3;",
+            vec![(Some(1), true), (None, true), (Some(1), false)],
+        ),
+        (
+            "SELECT 1; l: SELECT 2;",
+            vec![(Some(1), true), (Some(1), false)],
+        ),
+        (
+            "WHILE 1 = 1 BEGIN SELECT 1; BREAK END",
+            vec![(None, true), (Some(1), true), (None, false)],
+        ),
+        ("SELECT 1; RETURN;", vec![(Some(1), true), (None, false)]),
+    ] {
+        assert_eq!(dones(&run(text)), expected, "{text}");
+    }
+}
+
+/// A dynamic text runs its control of flow through the same program as the batch: a call
+/// held by a branch, a block or a loop runs where it is written and the text goes on after
+/// it, and a `GOTO` lands on a label of the text from inside a block or a loop.
+#[test]
+fn a_dynamic_text_runs_its_calls_and_its_jumps_in_place() {
+    for (text, expected) in [
+        ("EXEC('IF 1=1 EXEC(''SELECT 1'')'); SELECT 2;", vec![1, 2]),
+        (
+            "EXEC('BEGIN EXEC(''SELECT 1''); SELECT 2 END');",
+            vec![1, 2],
+        ),
+        (
+            "EXEC('WHILE 1=1 BEGIN EXEC(''SELECT 1''); BREAK END'); SELECT 2;",
+            vec![1, 2],
+        ),
+        (
+            "EXEC('DECLARE @i int=0; WHILE @i<2 BEGIN EXEC(''SELECT 1''); SET @i+=1 END');",
+            vec![1, 1],
+        ),
+        (
+            "EXEC('DECLARE @i int=0; l: SET @i+=1; IF @i<3 GOTO l; SELECT @i');",
+            vec![3],
+        ),
+        ("EXEC('WHILE 1=1 BEGIN GOTO o END; o: SELECT 9');", vec![9]),
+        (
+            "EXEC('BEGIN SELECT 1; GOTO z; SELECT 2 END z: SELECT 3');",
+            vec![1, 3],
+        ),
+    ] {
+        let events = run(text);
+        assert!(error_numbers(&events).is_empty(), "{text}: {events:#?}");
+        let values: Vec<Vec<Value>> = expected.into_iter().map(|n| vec![Value::I32(n)]).collect();
+        assert_eq!(rows(&events), values, "{text}");
+    }
 }

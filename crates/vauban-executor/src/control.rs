@@ -4,14 +4,16 @@
 //!
 //! # What one statement answers
 //!
-//! `DECLARE`, `SET` and `PRINT` answer [`ExecOutcome::NoRows`]. A statement that holds
-//! others runs through [`crate::interp`] in the mode of the statement tree: a `WHILE` and a
-//! `BEGIN … END` answer `NoRows`, an `IF` answers what the statement of the branch it took
-//! answered when that statement holds no other, and a `RETURN`, a call, a `GOTO` to a label
-//! the statement does not hold, a `BREAK` or a `CONTINUE` outside any loop it holds leave
-//! it as the outcome that names them (`tests/control.rs`,
-//! `a_goto_in_a_block_stops_the_block`, `a_goto_in_a_while_body_leaves_the_loop`). An
-//! error a held statement raises ends the statement that holds it, as the `Err` it is.
+//! `DECLARE`, `SET` and `PRINT` answer [`ExecOutcome::NoRows`]. A `GOTO` answers
+//! [`ExecOutcome::Goto`] for the caller that holds the list it is written in, a label
+//! answers `NoRows`, and a `RETURN` answers [`ExecOutcome::Return`]. A statement that holds
+//! others runs through [`crate::interp`] as a closed program of its own: each statement it
+//! holds is closed in the sink, a `WHILE` and a `BEGIN … END` answer `NoRows` or the row
+//! count of the statement closed last, an `IF` answers what the statement of the branch it
+//! took answered (`tests/control.rs`). A `GOTO` to a label the statement does not hold is
+//! 133, and a call it holds is refused with the internal error: neither leaves the
+//! statement as an outcome. An error that ends the program ends the statement, as the
+//! `Err` it is.
 //!
 //! A `WHILE` reads the cancellation token once per iteration, so an infinite loop ends by
 //! [`ExecOutcome::Cancelled`] and not by waiting.
@@ -151,12 +153,17 @@ pub(crate) fn execute<'a>(
         PhysicalStatement::If { .. }
         | PhysicalStatement::While { .. }
         | PhysicalStatement::Block(_)
-        | PhysicalStatement::Break
-        | PhysicalStatement::Continue
-        | PhysicalStatement::Goto { .. }
-        | PhysicalStatement::Label { .. }
-        | PhysicalStatement::Return(_)
-        | PhysicalStatement::Deferred(_) => crate::interp::run_tree(stmt, ctx, sink),
+        | PhysicalStatement::Deferred(_) => crate::interp::run_alone(stmt, ctx, sink),
+        // A jump written as a statement of a list the caller runs: the caller holds the
+        // labels of that list.
+        PhysicalStatement::Goto { label } => Ok(ExecOutcome::Goto(label.clone())),
+        PhysicalStatement::Label { .. } => Ok(ExecOutcome::NoRows),
+        PhysicalStatement::Break => Err(SqlError::break_without_while()),
+        PhysicalStatement::Continue => Err(SqlError::continue_without_while()),
+        PhysicalStatement::Return(value) => Ok(ExecOutcome::Return(match value {
+            Some(value) => crate::interp::evaluate_return(value, ctx)?,
+            None => 0,
+        })),
         _ => Err(bug("control::execute: not a control-of-flow statement")),
     }
 }
