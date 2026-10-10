@@ -2084,3 +2084,197 @@ fn a_table_of_an_unknown_database_is_refused() {
     assert!(err.message.contains("column 3"), "{}", err.message);
     drop(dir);
 }
+
+// ---- clustered key update across a reopen -----------------------------------------------
+
+/// A snapshot that settles every transaction below `xmax`, reading as `own`.
+fn settled_below(xmax: u64, own: u64) -> Snapshot {
+    Snapshot {
+        xmin: TxnId(xmax),
+        xmax: TxnId(xmax),
+        active: Vec::new(),
+        own: TxnId(own),
+    }
+}
+
+/// The rows `snap` sees in `table`, in scan order.
+fn scanned(storage: &dyn Storage, snap: &Snapshot, table: TableId) -> Vec<Row> {
+    storage
+        .scan(snap, table)
+        .expect("scan")
+        .map(|r| r.map(|(_, row)| row))
+        .collect::<SqlResult<Vec<_>>>()
+        .expect("rows of the scan")
+}
+
+/// One committed row `(16, 0)` of a clustered table, then `second` on it, then a reopen,
+/// a checkpoint first when `checkpoint` says so; answers what a scan reads afterwards.
+fn clustered_after_reopen(
+    label: &str,
+    checkpoint: bool,
+    second: impl FnOnce(&DiskStorage, TableId, RowId),
+) -> Vec<Row> {
+    let dir = TempDir::created(label);
+    let table = {
+        let storage = reopen(&dir);
+        let db = storage.create_database("a").expect("db");
+        let table = storage.create_table(db, &two_ints(true)).expect("table");
+        storage.create_index(table, &index_on(1)).expect("index");
+        let id = storage
+            .insert(TxnId(10), table, &pair(16, 0))
+            .expect("insert");
+        storage.commit(TxnId(10)).expect("commit");
+        second(&storage, table, id);
+        if checkpoint {
+            storage.checkpoint().expect("checkpoint");
+        }
+        table
+    };
+    let storage = reopen(&dir);
+    scanned(&storage, &settled_below(50, 50), table)
+}
+
+#[test]
+fn a_committed_clustered_key_update_reads_back_once_after_a_reopen() {
+    let update = |s: &DiskStorage, t: TableId, id: RowId| {
+        s.update(TxnId(11), t, id, &pair(2, 0)).expect("update");
+        s.commit(TxnId(11)).expect("commit");
+    };
+    for checkpoint in [false, true] {
+        let rows = clustered_after_reopen(&format!("cl-key-upd-{checkpoint}"), checkpoint, update);
+        assert_eq!(rows, vec![pair(2, 0)], "checkpoint {checkpoint}");
+    }
+}
+
+#[test]
+fn clustered_delete_and_rollbacks_read_back_after_a_reopen() {
+    let delete = |s: &DiskStorage, t: TableId, id: RowId| {
+        s.delete(TxnId(11), t, id).expect("delete");
+        s.commit(TxnId(11)).expect("commit");
+    };
+    let undone_update = |s: &DiskStorage, t: TableId, id: RowId| {
+        s.update(TxnId(11), t, id, &pair(2, 0)).expect("update");
+        s.rollback(TxnId(11)).expect("rollback");
+    };
+    let undone_insert = |s: &DiskStorage, t: TableId, _: RowId| {
+        s.insert(TxnId(11), t, &pair(3, 0)).expect("insert");
+        s.rollback(TxnId(11)).expect("rollback");
+    };
+    let chain = |s: &DiskStorage, t: TableId, id: RowId| {
+        s.update(TxnId(11), t, id, &pair(2, 0)).expect("update");
+        s.update(TxnId(11), t, id, &pair(40, 1)).expect("update");
+        s.commit(TxnId(11)).expect("commit");
+        s.update(TxnId(12), t, id, &pair(7, 2)).expect("update");
+        s.commit(TxnId(12)).expect("commit");
+        s.delete(TxnId(13), t, id).expect("delete");
+        s.commit(TxnId(13)).expect("commit");
+        s.insert(TxnId(14), t, &pair(16, 3)).expect("insert");
+        s.commit(TxnId(14)).expect("commit");
+    };
+    for checkpoint in [false, true] {
+        let c = checkpoint;
+        assert_eq!(
+            clustered_after_reopen(&format!("cl-del-{c}"), c, delete),
+            vec![]
+        );
+        let undone = clustered_after_reopen(&format!("cl-undo-upd-{c}"), c, undone_update);
+        assert_eq!(undone, vec![pair(16, 0)], "checkpoint {c}");
+        let undone = clustered_after_reopen(&format!("cl-undo-ins-{c}"), c, undone_insert);
+        assert_eq!(undone, vec![pair(16, 0)], "checkpoint {c}");
+        let chained = clustered_after_reopen(&format!("cl-chain-{c}"), c, chain);
+        assert_eq!(chained, vec![pair(16, 3)], "checkpoint {c}");
+    }
+}
+
+#[test]
+fn a_clustered_table_whose_writes_all_rolled_back_reopens() {
+    let dir = TempDir::created("cl-all-rolled-back");
+    let table = {
+        let storage = reopen(&dir);
+        let db = storage.create_database("a").expect("db");
+        let table = storage.create_table(db, &two_ints(true)).expect("table");
+        storage.create_index(table, &index_on(1)).expect("index");
+        storage
+            .insert(TxnId(10), table, &pair(1, 2))
+            .expect("insert");
+        storage.rollback(TxnId(10)).expect("rollback");
+        table
+    };
+    for round in 0..2u64 {
+        let storage = reopen(&dir);
+        assert_eq!(
+            scanned(&storage, &settled_below(50, 50), table),
+            vec![],
+            "round {round}"
+        );
+    }
+}
+
+/// The root of the tree of the versions of `table`, as the catalogue holds it.
+fn tree_root_of(storage: &DiskStorage, table: TableId) -> Option<PageId> {
+    let catalogue = storage.lock_catalogue().expect("the catalogue");
+    catalogue.table(table).expect("the table").tree_root
+}
+
+/// Three hundred committed rows of a clustered table, enough to split its root, then a
+/// checkpoint when `checkpoint` says so, then two rounds of reopen, one more insert, a read
+/// of each row and a checkpoint. The root a round finds is the one the round before left.
+fn clustered_split_then_reopen(label: &str, checkpoint: bool) {
+    let dir = TempDir::created(label);
+    let (table, ids, mut root) = {
+        let storage = reopen(&dir);
+        let db = storage.create_database("a").expect("db");
+        let table = storage.create_table(db, &two_ints(true)).expect("table");
+        let before = tree_root_of(&storage, table);
+        let ids: Vec<RowId> = (0..300)
+            .map(|i| {
+                storage
+                    .insert(TxnId(10), table, &pair(i, i % 6))
+                    .expect("insert")
+            })
+            .collect();
+        storage.commit(TxnId(10)).expect("commit");
+        let after = tree_root_of(&storage, table);
+        assert_ne!(after, before, "three hundred rows split the root");
+        if checkpoint {
+            storage.checkpoint().expect("checkpoint");
+        }
+        (table, ids, checkpoint.then_some(after).flatten())
+    };
+    for round in 0..2u64 {
+        let storage = reopen(&dir);
+        let found = tree_root_of(&storage, table);
+        if let Some(root) = root {
+            assert_eq!(found, Some(root), "round {round}");
+        }
+        root = found;
+        let snap = settled_below(50, 50);
+        let extra = storage.insert(TxnId(20 + round), table, &pair(-1, 0));
+        let extra = extra.expect("one more insert");
+        storage.commit(TxnId(20 + round)).expect("commit");
+        for (i, id) in ids.iter().enumerate() {
+            let read = storage.get(&snap, table, *id).expect("get");
+            assert_eq!(
+                read,
+                Some(pair(i as i32, i as i32 % 6)),
+                "round {round} row {i}"
+            );
+        }
+        assert_eq!(
+            storage.get(&snap, table, extra).expect("get"),
+            Some(pair(-1, 0))
+        );
+        assert_eq!(scanned(&storage, &snap, table).len(), 301 + round as usize);
+        storage.checkpoint().expect("checkpoint");
+    }
+}
+
+#[test]
+fn a_clustered_root_moved_by_a_split_survives_a_checkpointed_reopen() {
+    clustered_split_then_reopen("cl-split-ckpt", true);
+}
+
+#[test]
+fn a_clustered_root_moved_by_the_redo_survives_the_next_reopen() {
+    clustered_split_then_reopen("cl-split-redo", false);
+}

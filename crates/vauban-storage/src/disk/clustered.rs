@@ -1626,6 +1626,61 @@ impl<'storage> ClusteredTable<'storage> {
         Ok(true)
     }
 
+    /// Sets `xmax = txn` on the version of `id` an update record of serial `seq` replaces,
+    /// at recovery, and answers whether it wrote.
+    ///
+    /// That version is the first one below `seq` on the chain the directory starts, whether
+    /// the replay has already put the version `seq` in the tree or not. A version that carries
+    /// `txn` already — its page reached `data` after the update — is left as it stands, and so
+    /// is a row the tree holds no older version of, its insert belonging to a transaction that
+    /// is no winner or its older versions taken away by a `vacuum`.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Corruption`] for a link whose `seq` is not below the one of the version
+    /// carrying it; those of [`BTree::seek`], [`BTree::delete`] and [`BTree::insert`]
+    /// otherwise.
+    pub(crate) fn replay_hide_previous(
+        &mut self,
+        id: RowId,
+        seq: u64,
+        txn: TxnId,
+    ) -> Result<bool, InternalError> {
+        let Some(head) = self.directory_entry(id)? else {
+            return Ok(false);
+        };
+        let mut stored = self.entry_at(&head, id)?;
+        loop {
+            if stored.header.seq < seq {
+                if stored.header.xmax == Some(txn) {
+                    return Ok(false);
+                }
+                self.set_xmax(&stored, Some(txn))?;
+                return Ok(true);
+            }
+            let payload = stored.parsed()?;
+            if payload.prev.is_empty() {
+                return Ok(false);
+            }
+            if seq_of(&payload.prev)? >= stored.header.seq {
+                return corruption(format!(
+                    "version {} of row {id} of table {} links back to a version that is not \
+                     older than it",
+                    stored.header.seq, self.table
+                ));
+            }
+            // A link the tree no longer holds is the old end of a chain a `vacuum` took away,
+            // as [`ClusteredTable::chain`] reads it: nothing older is left to hide.
+            let found = self
+                .tree
+                .seek(&KeyRange::Point(payload.prev), Direction::Forward)?;
+            let Some(entry) = found.into_iter().next() else {
+                return Ok(false);
+            };
+            stored = StoredVersion::read(entry)?;
+        }
+    }
+
     /// The key of the entry of the version `(id, seq)` of this table, `None` when the tree
     /// holds this version.
     ///

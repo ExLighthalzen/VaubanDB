@@ -70,8 +70,9 @@
 //! [`TableId`], and the table it names has to exist before its rows go anywhere. The DDL
 //! records carry the identifiers and the shapes the statement used, so a reopen rebuilds the
 //! very entries the instance had rather than new ones
-//! (`super::tests::ddl_survives_reopen_without_checkpoint`), and replaying them over a
-//! catalogue the meta pages already carry changes nothing ([`super::meta::Catalogue::apply_ddl`]).
+//! (`super::tests::ddl_survives_reopen_without_checkpoint`). Replaying them over a catalogue
+//! the meta pages already carry keeps the roots and the row counter those pages hold, which a
+//! split or the writes moved since the statement ([`keep_the_roots_the_meta_pages_held`]).
 //!
 //! A table the journal drops leaves the catalogue, so the row records of a dropped table have
 //! no heap to go to: they are counted in [`Recovery::unplaced`] and skipped, as are the row
@@ -90,7 +91,7 @@ use vauban_errors::InternalError;
 use super::DiskStorage;
 use super::clustered::ClusteredTable;
 use super::heap::{Heap, Rid};
-use super::meta::TableEntry;
+use super::meta::{Catalogue, IndexEntry, TableEntry};
 use super::page::{Lsn, PageId, PageKind};
 use super::version::{VERSION_PREFIX_LEN, VersionHeader};
 use super::wal::{WalRecord, WalRecordKind};
@@ -191,9 +192,16 @@ fn redo_ddl(
     records: &[WalRecord],
 ) -> Result<BTreeMap<TableId, PageId>, InternalError> {
     let mut catalogue = storage.lock_catalogue()?;
+    let loaded_tables: Vec<TableEntry> = catalogue
+        .heap_heads()
+        .keys()
+        .filter_map(|table| catalogue.table(*table).cloned())
+        .collect();
+    let loaded_indexes: Vec<IndexEntry> = catalogue.all_indexes().into_iter().cloned().collect();
     for record in records {
         catalogue.apply_ddl(record)?;
     }
+    keep_the_roots_the_meta_pages_held(&mut catalogue, loaded_tables, loaded_indexes);
     let (db, table, index) = catalogue.largest_ids();
     let mut control = storage.lock_control()?;
     let mut updated = *control;
@@ -205,6 +213,52 @@ fn redo_ddl(
         *control = updated;
     }
     Ok(catalogue.heap_heads())
+}
+
+/// Puts back, over what the DDL records of the journal wrote, the roots and the row counter
+/// the meta pages held for a table or an index that the journal leaves in place.
+///
+/// A `CreateTable` or `CreateIndex` record carries the entry as the statement created it: the
+/// roots it allocated then and a row counter at 1. The meta pages carry the entry as the last
+/// commit before the reopen left it, with the root a split moved
+/// (`a_clustered_root_moved_by_a_split_survives_a_checkpointed_reopen`). Replaying the record
+/// over it would hand the tree back its first root, which a split turned into one page among
+/// others. The entry of the meta pages is kept when the table still starts at the same
+/// `first_page`, which is what tells the same table from another one of the same identifier,
+/// and when the index is still on the same table.
+fn keep_the_roots_the_meta_pages_held(
+    catalogue: &mut Catalogue,
+    tables: Vec<TableEntry>,
+    indexes: Vec<IndexEntry>,
+) {
+    for loaded in tables {
+        let Some(now) = catalogue.table(loaded.table) else {
+            continue;
+        };
+        if now.first_page != loaded.first_page || *now == loaded {
+            continue;
+        }
+        let kept = TableEntry {
+            tree_root: loaded.tree_root,
+            directory_root: loaded.directory_root,
+            next_row_id: now.next_row_id.max(loaded.next_row_id),
+            ..now.clone()
+        };
+        catalogue.add_table(kept);
+    }
+    for loaded in indexes {
+        let Some(now) = catalogue.index(loaded.index) else {
+            continue;
+        };
+        if now.table != loaded.table || *now == loaded {
+            continue;
+        }
+        let kept = IndexEntry {
+            root: loaded.root,
+            ..now.clone()
+        };
+        catalogue.add_index(kept);
+    }
 }
 
 /// Appends the [`WalRecordKind::CreateTable`] record that tells the recovery where the heap of
@@ -405,7 +459,7 @@ fn redo(
             heaps.insert(table, RedoHeap::over(storage, table, first_page)?);
         }
     }
-    let mut clustered_changes: BTreeMap<TableId, Vec<RowChange>> = BTreeMap::new();
+    let mut clustered_changes: BTreeMap<TableId, Vec<(WalRecordKind, RowChange)>> = BTreeMap::new();
     for record in records {
         let kind = record.kind;
         if !matches!(
@@ -421,7 +475,7 @@ fn redo(
             clustered_changes
                 .entry(change.table)
                 .or_default()
-                .push(change);
+                .push((kind, change));
             continue;
         }
         let Some(redo) = heaps.get_mut(&change.table) else {
@@ -446,8 +500,13 @@ fn redo(
     // Apply clustered records: each winner version is inserted into the tree. The roots may
     // hold free pages when the pages a split or an insert left dirty stayed in the pool of the
     // instance that crashed: [`ClusteredTable::redo_open`] formats them before the replay, as
-    // [`RedoHeap::over`] does for the head page of a heap.
-    for (&table, changes) in &clustered_changes {
+    // [`RedoHeap::over`] does for the head page of a heap. Each clustered table goes through
+    // it, a table no winner wrote in included, so that its roots read back as the empty
+    // leaves they were rather than as free pages
+    // (`a_clustered_table_whose_writes_all_rolled_back_reopens`).
+    let no_change = Vec::new();
+    for &table in &clustered_tables {
+        let changes = clustered_changes.get(&table).unwrap_or(&no_change);
         let Some(&first_page) = recovery.tables.get(&table) else {
             continue;
         };
@@ -465,12 +524,36 @@ fn redo(
             (tree, directory),
             entry.shape.clone(),
         )?;
-        for change in changes {
-            if clustered.replay_one(change)? {
+        for (kind, change) in changes {
+            // The record of an update names the version it creates; the version it replaces
+            // takes its `xmax` first, as [`RedoHeap::hide_previous`] does on a heap, so that a
+            // key the update moved does not leave its old entry alive beside the new one
+            // (`a_committed_clustered_key_update_reads_back_once_after_a_reopen`).
+            let hidden = *kind == WalRecordKind::Update
+                && clustered.replay_hide_previous(
+                    change.header.row,
+                    change.header.seq,
+                    change.header.xmin,
+                )?;
+            let created = clustered.replay_one(change)?;
+            if hidden || created {
                 recovery.applied += 1;
             } else {
                 recovery.skipped += 1;
             }
+        }
+        // A split the replay caused moves a root; the catalogue takes it, and the meta pages
+        // take the catalogue at the next commit.
+        let roots = (
+            Some(clustered.tree_root()),
+            Some(clustered.directory_root()),
+        );
+        if roots != (entry.tree_root, entry.directory_root) {
+            storage.lock_catalogue()?.add_table(TableEntry {
+                tree_root: roots.0,
+                directory_root: roots.1,
+                ..entry
+            });
         }
     }
     Ok(())
