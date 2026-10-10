@@ -238,7 +238,9 @@ impl DiskStorage {
     /// complete it.
     ///
     /// The journal is opened by [`wal::Wal::open`], which scans its records and truncates a
-    /// tail an unfinished append left behind.
+    /// tail an unfinished append left behind. A `data` that holds more pages than the
+    /// `next_page_id` of `vauban.ctl` has those pages counted as handed out
+    /// ([`alloc::count_the_pages_of_data`]), before the catalogue is read.
     ///
     /// # Recovery
     ///
@@ -294,6 +296,7 @@ impl DiskStorage {
         } else {
             Self::create(dir, opts, instance, &control_path, &data_path, &wal_path)?
         };
+        alloc::count_the_pages_of_data(&storage)?;
         let root = storage.control()?.meta_root;
         storage.catalogue = Mutex::new(meta::load(&storage, root)?);
         storage.recovery = recover::recover(&storage)?;

@@ -294,8 +294,15 @@ fn a_page_written_through_the_instance_survives_a_reopen() {
     let read = reopened.data.read_page(PageId(0)).expect("read page 0");
     assert_eq!(read, page);
     assert_eq!(read.lsn(), Lsn(5));
-    // The control file was not rewritten by the page write.
-    assert_eq!(control_of(&reopened), Control::default());
+    // The page write left the control file alone; the reopen counts the page `data` holds
+    // past `next_page_id` as handed out, and moves nothing else.
+    assert_eq!(
+        control_of(&reopened),
+        Control {
+            next_page_id: PageId(1),
+            ..Control::default()
+        }
+    );
 }
 
 #[test]

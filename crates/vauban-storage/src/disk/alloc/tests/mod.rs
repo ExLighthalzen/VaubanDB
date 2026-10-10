@@ -391,3 +391,66 @@ fn the_link_of_a_free_page_sits_at_bytes_32_to_40() {
     // The bytes after the link are left alone by the two helpers.
     assert!(page.0[40..].iter().all(|&byte| byte == 0));
 }
+
+/// A `data` holding two pages past the counter of the ctl reopens to an allocator that grows
+/// the file beyond them.
+///
+/// The state is the one a stopped process leaves when `data` grew and `vauban.ctl` did not
+/// follow: here the ctl is put back to the copy taken at two pages, after two more were
+/// allocated. Without the count at the open, the next `allocate` asks `data` to shrink from
+/// four pages to three and is refused, and so is each one after it.
+#[test]
+fn a_reopen_counts_the_pages_data_holds_past_the_counter() {
+    let dir = TempDir::created("pages-past-counter");
+    let behind = {
+        let storage =
+            DiskStorage::open(dir.path(), DiskOptions::default()).expect("create an instance");
+        allocate(&storage).expect("allocate page 0");
+        allocate(&storage).expect("allocate page 1");
+        let behind = control_of(&storage);
+        allocate(&storage).expect("allocate page 2");
+        allocate(&storage).expect("allocate page 3");
+        behind
+    };
+    behind
+        .write(&dir.child(CONTROL_FILE_NAME))
+        .expect("put back the ctl of two pages");
+    assert_eq!(data_len(&dir), 4 * 8192, "data kept its four pages");
+
+    let reopened = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+    assert_eq!(control_of(&reopened).next_page_id, PageId(4));
+    assert_eq!(
+        Control::read(&dir.child(CONTROL_FILE_NAME))
+            .expect("read the ctl")
+            .next_page_id,
+        PageId(4),
+        "the counted pages reached the ctl"
+    );
+    assert_eq!(
+        allocate(&reopened).expect("allocate after the reopen"),
+        PageId(4),
+        "the allocator grows the file past the pages it holds"
+    );
+    assert_eq!(data_len(&dir), 5 * 8192);
+    assert_eq!(
+        free_list(&reopened).expect("walk the free list"),
+        Vec::new()
+    );
+}
+
+/// A counter ahead of `data` is left where the ctl puts it: the count only raises it.
+#[test]
+fn a_reopen_leaves_a_counter_ahead_of_data_alone() {
+    let dir = TempDir::created("counter-ahead");
+    drop(DiskStorage::open(dir.path(), DiskOptions::default()).expect("create an instance"));
+    Control {
+        next_page_id: PageId(3),
+        ..Control::default()
+    }
+    .write(&dir.child(CONTROL_FILE_NAME))
+    .expect("forge a ctl three pages ahead of an empty data");
+
+    let reopened = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+    assert_eq!(control_of(&reopened).next_page_id, PageId(3));
+    assert_eq!(data_len(&dir), 0);
+}

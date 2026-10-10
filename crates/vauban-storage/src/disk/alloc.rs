@@ -39,10 +39,15 @@
 //! (`free_clears_in_progress_so_the_link_reaches_data`).
 //!
 //! A crash between the growth of `data` and the write of the control file leaves a page in the
-//! file that `next_page_id` does not count: the next [`allocate`] hands out that identifier
-//! once more and writes the page over it. Losing a page in flight this way is accepted: the
-//! journal does not cover allocations, and a page allocated but not yet linked to a table is
-//! an orphan of the DDL protocol.
+//! file that `next_page_id` does not count. [`super::DiskStorage::open`] calls
+//! [`count_the_pages_of_data`], which raises `next_page_id` to the size of `data`, so the next
+//! [`allocate`] grows the file past those pages rather than asking it to shrink
+//! (`a_reopen_counts_the_pages_data_holds_past_the_counter`). The pages it counts are left
+//! out of use, neither handed out nor listed as free: one of them may be named by a structure
+//! whose allocation the control file missed, and handing it out again would give it two
+//! owners. Losing a page in flight this way is accepted: the journal does not cover
+//! allocations, and a page allocated but not yet linked to a table is an orphan of the DDL
+//! protocol.
 //!
 //! # Locking
 //!
@@ -107,6 +112,32 @@ pub(crate) fn allocate(storage: &DiskStorage) -> Result<PageId, InternalError> {
     updated.write(&storage.control_path())?;
     *control = updated;
     Ok(id)
+}
+
+/// Raises `next_page_id` to the number of pages `data` holds, when the file holds more.
+///
+/// A control file whose counter is behind `data` would make the next [`allocate`] ask
+/// [`super::file::DataFile::extend_to`] for a smaller file, which it refuses: each later
+/// allocation would fail the same way. The pages past the counter are counted as handed out
+/// and left as they are; the control file is rewritten when the counter moves, and a
+/// counter at or past the size of `data` is left alone.
+///
+/// # Errors
+///
+/// [`InternalError::Io`] for a failure reported by the operating system while the size of
+/// `data` is read or `vauban.ctl` is written; [`InternalError::Corruption`] for a lock a
+/// panicking thread left poisoned.
+pub(crate) fn count_the_pages_of_data(storage: &DiskStorage) -> Result<(), InternalError> {
+    let pages = storage.data.page_count()?;
+    let mut control = storage.lock_control()?;
+    if pages <= control.next_page_id.0 {
+        return Ok(());
+    }
+    let mut updated = *control;
+    updated.next_page_id = PageId(pages);
+    updated.write(&storage.control_path())?;
+    *control = updated;
+    Ok(())
 }
 
 /// Puts the page `id` back in the free list, at its head.
