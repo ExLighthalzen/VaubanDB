@@ -1,7 +1,8 @@
 //! A `vauban serve --data` instance stopped and started again on the same directory keeps
 //! its tables: their rows, their keys, their constraints, their defaults and their identity.
 //! Two ways of stopping are covered: the SIGINT shutdown, and a `SIGKILL`, which the process
-//! cannot catch.
+//! cannot catch. A directory whose catalogue carries another shape version is refused at
+//! start-up, before the port is bound.
 //!
 //! Everything runs on `127.0.0.1` through a real TDS client (`tiberius`).
 //!
@@ -23,6 +24,8 @@ use tiberius::error::Error;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio::net::TcpStream as AsyncTcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use vauban_storage::{DiskOptions, DiskStorage, Row, Snapshot, Storage, TxnId};
+use vauban_types::{SqlString, Value};
 
 /// How long the port has to accept a connection after the start, and the process to exit
 /// after a SIGINT.
@@ -448,4 +451,120 @@ fn a_refused_drop_index_leaves_the_foreign_key_whole_across_a_restart() {
         assert!(fresh > persisted, "{fresh} is not past {persisted}");
     });
     server.interrupt();
+}
+
+/// The name of the row of the registry of internal tables that carries the shape version of
+/// the catalogue, and the version written in its place by the test below.
+const SHAPE_VERSION_ENTRY: &str = "vauban_catalog_shape_version";
+const FOREIGN_SHAPE_VERSION: i64 = 999;
+
+/// Rewrites the shape version the catalogue of `data` carries, through `storage` directly:
+/// the registry is the first table of `master`, a row `(name, table_id)`.
+fn rewrite_shape_version(data: &Path, version: i64) {
+    let storage = DiskStorage::open(data, DiskOptions::default()).expect("open the directory");
+    let (master, _) = storage
+        .databases()
+        .expect("databases")
+        .into_iter()
+        .find(|(_, name)| name.eq_ignore_ascii_case("master"))
+        .expect("master");
+    let (registry, _) = storage
+        .tables(master)
+        .expect("tables")
+        .into_iter()
+        .next()
+        .expect("the registry");
+    let committed = Snapshot {
+        xmin: TxnId(u64::MAX),
+        xmax: TxnId(u64::MAX),
+        active: Vec::new(),
+        own: TxnId(0),
+    };
+    let target = storage
+        .scan(&committed, registry)
+        .expect("scan")
+        .map(|row| row.expect("row"))
+        .find(|(_, row)| {
+            matches!(row.0.first(), Some(Value::String(name)) if name.text == SHAPE_VERSION_ENTRY)
+        })
+        .map(|(id, _)| id)
+        .expect("the row of the shape version");
+    let txn = TxnId(
+        storage
+            .next_txn_id()
+            .max(storage.committed_txn_high_water() + 1),
+    );
+    let row = Row(vec![
+        Value::String(SqlString {
+            text: SHAPE_VERSION_ENTRY.to_owned(),
+        }),
+        Value::I64(version),
+    ]);
+    storage.update(txn, registry, target, &row).expect("update");
+    storage.commit(txn).expect("commit");
+    storage.checkpoint().expect("checkpoint");
+}
+
+#[test]
+fn a_directory_of_another_catalogue_shape_is_refused_before_listening() {
+    let dir = TempDir::new("shape");
+
+    // The directory this binary creates opens again.
+    let server = Running::start(53, &dir.data(), &dir.log(1));
+    server.interrupt();
+    let server = Running::start(53, &dir.data(), &dir.log(2));
+    server.interrupt();
+
+    rewrite_shape_version(&dir.data(), FOREIGN_SHAPE_VERSION);
+
+    let port = port(53);
+    let log = dir.log(3);
+    let out = fs::File::create(&log).expect("log file");
+    let err = out.try_clone().expect("log file");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vauban"))
+        .env_remove("VAUBAN_SA_PASSWORD")
+        .env_remove("RUST_LOG")
+        .current_dir(env!("CARGO_TARGET_TMPDIR"))
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .args(["serve", "--data"])
+        .arg(dir.data())
+        .args([
+            "--no-auth",
+            "--encrypt",
+            "off",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .spawn()
+        .expect("spawn the server");
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if started.elapsed() > WAIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the server did not exit within {WAIT:?}\n{}",
+                fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        sleep(Duration::from_millis(50));
+    };
+    let output = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !status.success(),
+        "the server exited with {status}\n{output}"
+    );
+    assert!(
+        output.contains(&format!("shape version {FOREIGN_SHAPE_VERSION}"))
+            && output.contains("this binary expects version"),
+        "{output}"
+    );
+    assert!(!output.contains("vauban listening"), "{output}");
 }

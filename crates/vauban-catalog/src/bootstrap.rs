@@ -94,6 +94,8 @@ use crate::meta::{QualifiedName, SnapshotIsolationState};
 use crate::snapshot::{INTERNAL_TABLE_SCHEMA, system_object_id};
 use crate::views;
 
+mod shape;
+
 /// The system databases, in the order the bootstrap creates them.
 ///
 /// That order is the one of `sys.databases.database_id`: `master` 1, `tempdb` 2, `model` 3,
@@ -345,6 +347,9 @@ fn open(
             }
         }
     };
+    if !fresh {
+        shape::check(stored_shape_version(&catalog)?)?;
+    }
     let databases = system_databases(&catalog)?;
     if fresh {
         catalog
@@ -418,6 +423,14 @@ fn install_missing(
             catalog
                 .storage
                 .insert(txn.id, registry, &registry_row(REGISTRY_TABLE, registry))
+                .map_err(internal)?;
+            catalog
+                .storage
+                .insert(
+                    txn.id,
+                    registry,
+                    &shape_version_row(shape::CATALOG_SHAPE_VERSION),
+                )
                 .map_err(internal)?;
         }
         let filled: Vec<InternalTableDef> = declared(databases, &instant)?
@@ -927,6 +940,39 @@ pub(crate) fn registry_row(name: &str, table: TableId) -> Row {
     Row(row)
 }
 
+/// The row of [`REGISTRY_TABLE`] that carries the shape version `version` ([`shape`]).
+fn shape_version_row(version: i64) -> Row {
+    let mut row = vec![Value::Null; registry_columns::WIDTH];
+    row[registry_columns::NAME] = text(shape::SHAPE_VERSION_ENTRY);
+    row[registry_columns::TABLE_ID] = Value::I64(version);
+    Row(row)
+}
+
+/// The shape version the committed rows of the registry carry, `None` without that row.
+fn stored_shape_version(catalog: &Catalog) -> Result<Option<i64>, InternalError> {
+    let Some(registry) = registry_table(catalog)? else {
+        return Ok(None);
+    };
+    let snapshot = registry_snapshot(catalog, TxnId(0));
+    for row in catalog
+        .storage
+        .scan(&snapshot, registry)
+        .map_err(internal)?
+    {
+        let (_, values) = row.map_err(internal)?;
+        let Some(Value::String(name)) = values.0.get(registry_columns::NAME) else {
+            continue;
+        };
+        if !name.text.eq_ignore_ascii_case(shape::SHAPE_VERSION_ENTRY) {
+            continue;
+        }
+        if let Some(&Value::I64(version)) = values.0.get(registry_columns::TABLE_ID) {
+            return Ok(Some(version));
+        }
+    }
+    Ok(None)
+}
+
 /// The registry among the tables of `master`: the first one, when it has the shape of
 /// [`registry_shape`].
 fn registry_table_of(tables: &[(TableId, TableShape)]) -> Option<TableId> {
@@ -976,7 +1022,7 @@ pub(crate) fn registry_snapshot(catalog: &Catalog, own: TxnId) -> Snapshot {
 /// order of the scan.
 ///
 /// A row whose name is not a string or whose `table_id` does not fit a [`TableId`] is skipped
-/// rather than read as another table.
+/// rather than read as another table, and so is the row of the shape version ([`shape`]).
 fn registry_rows(
     catalog: &Catalog,
     registry: TableId,
@@ -988,6 +1034,9 @@ fn registry_rows(
         let Some(Value::String(name)) = values.0.get(registry_columns::NAME) else {
             continue;
         };
+        if name.text.eq_ignore_ascii_case(shape::SHAPE_VERSION_ENTRY) {
+            continue;
+        }
         let Some(&Value::I64(id)) = values.0.get(registry_columns::TABLE_ID) else {
             continue;
         };

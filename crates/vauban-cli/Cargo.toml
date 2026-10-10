@@ -34,6 +34,8 @@ vauban-errors.workspace = true
 serde_json.workspace = true
 # `tests/tls.rs` logs in through a real TDS client, without and with TLS.
 tiberius.workspace = true
+# `tests/restart.rs` writes a row of the catalogue into a `--data` directory.
+vauban-types.workspace = true
 
 [lints]
 workspace = true
