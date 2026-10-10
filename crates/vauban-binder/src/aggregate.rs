@@ -1,7 +1,7 @@
 //! `GROUP BY`, `HAVING` and the aggregate calls of a select list: the
 //! [`LogicalPlan::Aggregate`] node, the [`AggregateCall`]s it computes, and the errors of
 //! a column or an aggregate written where the grouping does not allow it (8120, 8121, 130,
-//! 144, 147).
+//! 144, 147, 164, 8124).
 //!
 //! # The shape of the plan
 //!
@@ -88,6 +88,32 @@
 //! with `b.c` prints `dbo.e.c`). Stated on those shapes
 //! (`tests/bind_aggregate.rs`, `a_column_outside_group_by_is_8120`).
 //!
+//! # An aggregate of a column of an enclosing query
+//!
+//! Over `dbo.o (id, k, v)` and `dbo.b (w)`, an aggregate whose argument reads columns of
+//! an enclosing query and none of its own query belongs to that enclosing query
+//! ([`outer_level`]): `SELECT (SELECT MAX(v) FROM dbo.b WHERE w = 1) FROM dbo.o` computes
+//! `MAX(v)` over `dbo.o`, which makes that query one group and answers one row, and the
+//! subquery reads the result one level up (`tests/bind_aggregate.rs`,
+//! `an_aggregate_of_an_outer_column_is_computed_by_the_outer_query`).
+//!
+//! | written | answer |
+//! |---|---|
+//! | `SELECT id, (SELECT MAX(v) FROM dbo.b) FROM dbo.o` | 8120 on `id`: the query is grouped |
+//! | `SELECT (SELECT SUM(w + v) FROM dbo.b) FROM dbo.o` | **8124**, on the line of the call |
+//! | `SELECT (SELECT SUM(v + k) FROM dbo.b WHERE w = 1) FROM dbo.o` | the plan: two columns of one enclosing query |
+//! | `SELECT id FROM dbo.o WHERE EXISTS (SELECT 1 FROM dbo.b GROUP BY w HAVING SUM(v) > 1)` | **147**, on the line of the call |
+//! | `SELECT k FROM dbo.o GROUP BY k HAVING EXISTS (SELECT 1 FROM dbo.b WHERE w = MAX(v))` | the plan: the `HAVING` takes it |
+//! | `SELECT id FROM dbo.o WHERE EXISTS (SELECT 1 FROM dbo.b GROUP BY v)` | **164**, on the line of the key |
+//! | `SELECT k, (SELECT COUNT(*) FROM dbo.b WHERE w <= k) FROM dbo.o GROUP BY k` | the plan: the subquery reads the key |
+//! | `SELECT k, (SELECT COUNT(*) FROM dbo.b WHERE w = v) FROM dbo.o GROUP BY k` | 8120 on `v` |
+//!
+//! Stated on those shapes (`tests/bind_aggregate.rs`,
+//! `an_aggregate_mixing_an_outer_column_with_another_is_8124`,
+//! `an_outer_aggregate_in_a_where_is_147`, `a_key_that_reads_outer_columns_alone_is_164`,
+//! `a_subquery_of_a_grouped_query_reads_its_keys`). An `ON` and the `SET` of an `UPDATE`
+//! collect no such aggregate and answer 147 where SQL Server answers 1015 and 157.
+//!
 //! # What is not bound here
 //!
 //! `GROUP BY 1`, `GROUP BY 'a'`, `GROUP BY NULL` and `GROUP BY @v` answer 164 on SQL Server
@@ -110,7 +136,7 @@ use crate::bound::{
 use crate::call::{bind_aggregate_call, star_under_another_name};
 use crate::context::BindContext;
 use crate::errors::line_of;
-use crate::expr::{Scope, bind_condition, bind_expr};
+use crate::expr::{OuterAggregate, OuterAggregates, Scope, bind_condition, bind_expr};
 use crate::names::alias_of;
 use crate::query::{bug, column_name, dotted, is_aggregate_name, not_implemented};
 use crate::sort::{self, ResolvedKey};
@@ -133,7 +159,8 @@ use crate::star::{self, Lookup, Source};
 ///
 /// # Errors
 ///
-/// The numbers of the module documentation: 144 for a key holding an aggregate, 8121 and
+/// The numbers of the module documentation: 144 for a key holding an aggregate, 164 for a
+/// key that reads columns of an enclosing query alone, 8121 and
 /// 8120 for a column of the `HAVING` or of the select list that is neither a key nor
 /// under an aggregate, 8127 for such a column in the `ORDER BY`, 130 for an aggregate under
 /// an aggregate, 4145 for a `HAVING` that is not a predicate, the errors of
@@ -156,7 +183,13 @@ pub(crate) fn bind_aggregate(
             refuse_star(call, ctx)?;
             return Err(SqlError::aggregate_in_group_by().with_line(line_of(&span_of(call))));
         }
-        grouping.keys.push(bind_expr(key, ctx, scope)?);
+        let handed_before = handed_count(scope);
+        let bound = bind_expr(key, ctx, scope)?;
+        if handed_count(scope) != handed_before {
+            return Err(SqlError::aggregate_in_group_by().with_line(bound.line));
+        }
+        refuse_outer_key(&bound)?;
+        grouping.keys.push(bound);
     }
 
     // The select list is extracted first, so that its aggregates come first in the node,
@@ -167,48 +200,113 @@ pub(crate) fn bind_aggregate(
         Some(condition) => Some(grouping.bind_having(condition, spec, scope, ctx)?),
         None => None,
     };
-    let mut projections = projections?;
-    // The slots are named before the keys of the `ORDER BY` are resolved, so that a key
-    // written as an alias and the same key written as an expression compare alike (169,
-    // 145). The `ORDER BY` appends its own aggregates after those of the select list and
-    // of the `HAVING`: the columns named here keep their position and their name.
-    let named = grouping.schema();
-    for projection in &mut projections {
-        name_slots(&mut projection.expr, &named);
-    }
-    let projected = OutputSchema {
-        columns: projections
-            .iter()
-            .map(|projection| OutputColumn {
-                name: projection.name.clone(),
-                ty: projection.expr.ty.clone(),
-            })
-            .collect(),
-    };
-    let keys = sort::resolve_keys(order_by, &projections, &projected, &mut |written| {
-        grouping.bind_order_key(written, spec, scope, ctx)
-    })?;
+    let projections = projections?;
+    grouping.finish(projections, having, order_by, input, spec, scope, ctx)
+}
 
-    let schema = grouping.schema();
-    let mut plan = LogicalPlan::Aggregate {
-        input: Box::new(input),
-        group_by: grouping.keys,
-        aggregates: grouping.aggregates,
-        schema: schema.clone(),
+/// Groups a query whose select list was bound as the list of a query that groups nothing,
+/// when a nested query of that list handed an aggregate over to it
+/// ([`bind_outer_aggregate`]): `SELECT (SELECT MAX(v) FROM dbo.b) FROM dbo.o`. The query
+/// writes no `GROUP BY`, `HAVING` nor aggregate of its own, so the `Aggregate` has no key
+/// and computes the aggregates handed over; [`Grouping::resolve_expr`] turns the bound
+/// list into references to it, and answers 8120 on a column of the `FROM`.
+///
+/// The list is not bound a second time, nor the nested queries in it: binding each level
+/// of `SELECT (SELECT MAX(t0.c) FROM dbo.e) + (SELECT (SELECT MAX(t1.c) FROM dbo.e) + …
+/// FROM dbo.t AS t1) FROM dbo.t AS t0` twice would bind the innermost level two to the
+/// power of the depth times (`tests/bind_aggregate.rs`,
+/// `the_binding_time_of_nested_outer_aggregates_grows_with_the_depth_alone`).
+///
+/// # Errors
+///
+/// 8120 for a column of the `FROM` read by the list, and what [`bind_aggregate`] raises
+/// on the `ORDER BY`.
+pub(crate) fn group_bound_select_list(
+    spec: &QuerySpec,
+    order_by: &[OrderItem],
+    input: LogicalPlan,
+    mut projections: Vec<BoundProjection>,
+    scope: &Scope,
+    ctx: &BindContext<'_>,
+) -> SqlResult<(LogicalPlan, Vec<ResolvedKey>)> {
+    let mut grouping = Grouping {
+        keys: Vec::new(),
+        aggregates: Vec::new(),
+        aggregate_types: Vec::new(),
     };
-    if let Some(mut predicate) = having {
-        name_slots(&mut predicate, &schema);
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate,
-        };
+    let handed: Vec<OuterAggregate> = scope
+        .outer_aggregates()
+        .map(|handed| handed.borrow().clone())
+        .unwrap_or_default();
+    let mut resolution = Resolution {
+        clause: Clause::SelectList,
+        handed: &handed,
+        slots: vec![None; handed.len()],
+    };
+    for projection in &mut projections {
+        grouping.resolve_expr(&mut projection.expr, 0, &mut resolution, spec, scope, ctx)?;
     }
-    let plan = LogicalPlan::Project {
-        input: Box::new(plan),
-        exprs: projections,
-        schema: projected,
-    };
-    Ok((plan, keys))
+    grouping.finish(projections, None, order_by, input, spec, scope, ctx)
+}
+
+impl Grouping {
+    /// The plan of a grouped query once its select list and its `HAVING` are bound above
+    /// the `Aggregate`: the keys of the `ORDER BY` resolved, then the `Aggregate`, the
+    /// `Filter` of the `HAVING` and the `Project`.
+    #[allow(clippy::too_many_arguments)] // the parts of the query the plan is built from
+    fn finish(
+        self,
+        mut projections: Vec<BoundProjection>,
+        having: Option<BoundExpr>,
+        order_by: &[OrderItem],
+        input: LogicalPlan,
+        spec: &QuerySpec,
+        scope: &Scope,
+        ctx: &BindContext<'_>,
+    ) -> SqlResult<(LogicalPlan, Vec<ResolvedKey>)> {
+        let mut grouping = self;
+        // The slots are named before the keys of the `ORDER BY` are resolved, so that a key
+        // written as an alias and the same key written as an expression compare alike (169,
+        // 145). The `ORDER BY` appends its own aggregates after those of the select list and
+        // of the `HAVING`: the columns named here keep their position and their name.
+        let named = grouping.schema();
+        for projection in &mut projections {
+            name_slots(&mut projection.expr, &named);
+        }
+        let projected = OutputSchema {
+            columns: projections
+                .iter()
+                .map(|projection| OutputColumn {
+                    name: projection.name.clone(),
+                    ty: projection.expr.ty.clone(),
+                })
+                .collect(),
+        };
+        let keys = sort::resolve_keys(order_by, &projections, &projected, &mut |written| {
+            grouping.bind_order_key(written, spec, scope, ctx)
+        })?;
+
+        let schema = grouping.schema();
+        let mut plan = LogicalPlan::Aggregate {
+            input: Box::new(input),
+            group_by: grouping.keys,
+            aggregates: grouping.aggregates,
+            schema: schema.clone(),
+        };
+        if let Some(mut predicate) = having {
+            name_slots(&mut predicate, &schema);
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate,
+            };
+        }
+        let plan = LogicalPlan::Project {
+            input: Box::new(plan),
+            exprs: projections,
+            schema: projected,
+        };
+        Ok((plan, keys))
+    }
 }
 
 /// Refuses an aggregate written in a `WHERE`: error **147**, severity 15, state 1, on the
@@ -221,12 +319,21 @@ pub(crate) fn bind_aggregate(
 /// under a name that is not a counting aggregate is the 102 of
 /// [`star_under_another_name`] in a `WHERE` as in a select list
 /// (`tests/bind_aggregate.rs`, `the_errors_of_the_call_itself`).
+///
+/// An aggregate over the columns of an enclosing query alone ([`outer_level`]) is no
+/// aggregate of this `WHERE`: `SELECT k FROM dbo.o GROUP BY k HAVING EXISTS (SELECT 1
+/// FROM dbo.b WHERE w = MAX(v))` is computed by the enclosing query, whose `HAVING` takes
+/// it. `scope` is the scope the clause binds against.
 pub(crate) fn refuse_in_where(
     condition: &Expr,
     statement_line: u32,
     ctx: &BindContext<'_>,
+    scope: &Scope,
 ) -> SqlResult<()> {
-    match find_aggregate(condition) {
+    let own = nodes_where(condition, is_aggregate_call, false)
+        .into_iter()
+        .find(|call| !matches!(outer_level(call, ctx, scope), Ok(Some(_))));
+    match own {
         Some(call) => {
             refuse_star(call, ctx)?;
             Err(SqlError::aggregate_in_where().with_line(statement_line))
@@ -295,7 +402,8 @@ impl Grouping {
                 }
                 SelectItem::Expr { expr, alias, .. } => {
                     let rewritten = self.rewrite(expr, Clause::SelectList, spec, scope, ctx)?;
-                    let bound = bind_expr(&rewritten, ctx, &self.slot_scope(ctx, scope))?;
+                    let bound =
+                        self.bind_above(&rewritten, Clause::SelectList, false, spec, scope, ctx)?;
                     let name = column_name(expr, &bound, alias.as_ref());
                     projections.push(BoundProjection { expr: bound, name });
                 }
@@ -315,7 +423,7 @@ impl Grouping {
         ctx: &BindContext<'_>,
     ) -> SqlResult<BoundExpr> {
         let rewritten = self.rewrite(condition, Clause::Having, spec, scope, ctx)?;
-        bind_condition(&rewritten, ctx, &self.slot_scope(ctx, scope))
+        self.bind_above(&rewritten, Clause::Having, true, spec, scope, ctx)
     }
 
     /// Binds a key of the `ORDER BY` written as an expression above the `Aggregate`: its
@@ -329,7 +437,7 @@ impl Grouping {
         ctx: &BindContext<'_>,
     ) -> SqlResult<BoundExpr> {
         let rewritten = self.rewrite(written, Clause::OrderBy, spec, scope, ctx)?;
-        let mut bound = bind_expr(&rewritten, ctx, &self.slot_scope(ctx, scope))?;
+        let mut bound = self.bind_above(&rewritten, Clause::OrderBy, false, spec, scope, ctx)?;
         name_slots(&mut bound, &self.schema());
         Ok(bound)
     }
@@ -389,12 +497,21 @@ impl Grouping {
                     refuse_star(inner, ctx)?;
                     return Err(SqlError::nested_aggregate().with_line(line_of(&span_of(inner))));
                 }
+                // An aggregate over the columns of an enclosing query alone is that
+                // query's: it stays in place, and binding hands it over (`outer_level`).
+                if outer_level(e, ctx, scope)?.is_some() {
+                    return Ok(e.clone());
+                }
                 let (call, ty) = bind_aggregate_call(e, ctx, scope)?;
                 let index = self.keys.len() + self.aggregate_index(call, ty);
                 Ok(slot_column(index, *span))
             }
             Expr::Literal(..) | Expr::Variable { .. } => Ok(e.clone()),
-            _ if find_aggregate(e).is_none() => {
+            // A node that holds a subquery is no key (a subquery is the same as nothing,
+            // [`same_expression`]) nor a column: its children are looked at without
+            // binding it, which would bind the subquery once more than
+            // [`Grouping::bind_above`] does.
+            _ if find_aggregate(e).is_none() && nodes_where(e, is_subquery, true).is_empty() => {
                 let bound = bind_expr(e, ctx, scope)?;
                 if let Some(index) = self.key_index(&bound) {
                     return Ok(slot_column(index, span_of(e)));
@@ -663,16 +780,227 @@ impl Grouping {
                 depth: 0,
             })
             .collect();
-        let slots = Scope::over(Source::new(
+        // The sources of the `FROM` stay visible next to the slots, for a nested query
+        // that reads a column of this one: [`Grouping::resolve_expr`] turns what it read
+        // into a key or refuses it. The extracted expression itself reads them through
+        // its slots, [`Grouping::rewrite`] having replaced or refused each of its columns.
+        let mut sources = vec![Source::new(
             "",
             None,
             &columns,
             ctx.default_schema,
             ctx.database,
-        ));
+        )];
+        sources.extend(scope.sources().iter().cloned());
+        let slots = Scope::over_all(sources);
         match scope.parent() {
             Some(parent) => slots.inside(parent.clone()),
             None => slots,
+        }
+    }
+
+    /// Binds an extracted expression against [`Grouping::slot_scope`], then turns what
+    /// the nested queries it holds read of this query into columns of the `Aggregate`
+    /// ([`Grouping::resolve_expr`]). `condition` binds a `HAVING`, which must be a
+    /// predicate.
+    fn bind_above(
+        &mut self,
+        rewritten: &Expr,
+        clause: Clause,
+        condition: bool,
+        spec: &QuerySpec,
+        scope: &Scope,
+        ctx: &BindContext<'_>,
+    ) -> SqlResult<BoundExpr> {
+        let handed = OuterAggregates::default();
+        let slots = self.slot_scope(ctx, scope).collecting(handed.clone());
+        let mut bound = if condition {
+            bind_condition(rewritten, ctx, &slots)?
+        } else {
+            bind_expr(rewritten, ctx, &slots)?
+        };
+        let handed = handed.borrow().clone();
+        let mut resolution = Resolution {
+            clause,
+            handed: &handed,
+            slots: vec![None; handed.len()],
+        };
+        self.resolve_expr(&mut bound, 0, &mut resolution, spec, scope, ctx)?;
+        Ok(bound)
+    }
+
+    /// Rewrites, in `e` and in the plans of the subqueries it holds, each column reference
+    /// on this query — `nesting` queries up from where it was bound — into a reference to a
+    /// column of the `Aggregate`: a column of the `FROM` that is a key becomes that key, an
+    /// aggregate a nested query handed over becomes the aggregate this node computes, and
+    /// a column of the `FROM` that is neither answers 8120, 8121 or 8127 as it would
+    /// written in the clause itself. `SELECT k, (SELECT COUNT(*) FROM dbo.b WHERE w <= k)
+    /// FROM dbo.o GROUP BY k` reads the key `k`; `SELECT (SELECT MAX(v) FROM dbo.b) FROM
+    /// dbo.o` computes `MAX(v)` over `dbo.o` (`tests/bind_aggregate.rs`,
+    /// `an_aggregate_of_an_outer_column_is_computed_by_the_outer_query`).
+    fn resolve_expr(
+        &mut self,
+        e: &mut BoundExpr,
+        nesting: u8,
+        resolution: &mut Resolution<'_>,
+        spec: &QuerySpec,
+        scope: &Scope,
+        ctx: &BindContext<'_>,
+    ) -> SqlResult<()> {
+        let line = e.line;
+        match &mut e.kind {
+            BoundExprKind::ColumnRef(binding) if binding.depth == nesting => {
+                let (slot, ty) =
+                    self.resolve_column(binding, line, resolution, spec, scope, ctx)?;
+                *binding = ColumnBinding {
+                    column: SLOT_COLUMN_ID,
+                    index: slot,
+                    name: slot_name(slot),
+                    ty,
+                    depth: nesting,
+                };
+            }
+            BoundExprKind::Exists(subquery) | BoundExprKind::ScalarSubquery(subquery) => {
+                self.resolve_plan(
+                    &mut subquery.plan,
+                    nesting + 1,
+                    resolution,
+                    spec,
+                    scope,
+                    ctx,
+                )?;
+            }
+            BoundExprKind::InSubquery { plan, .. } => {
+                self.resolve_plan(&mut plan.plan, nesting + 1, resolution, spec, scope, ctx)?;
+            }
+            _ => {}
+        }
+        for child in children_mut(e) {
+            self.resolve_expr(child, nesting, resolution, spec, scope, ctx)?;
+        }
+        Ok(())
+    }
+
+    /// [`Grouping::resolve_expr`] over each expression of a plan of a nested query. A
+    /// derived table is left alone: VaubanDB binds no column of an enclosing query in a
+    /// derived table (`subquery::bind_derived`).
+    fn resolve_plan(
+        &mut self,
+        plan: &mut LogicalPlan,
+        nesting: u8,
+        resolution: &mut Resolution<'_>,
+        spec: &QuerySpec,
+        scope: &Scope,
+        ctx: &BindContext<'_>,
+    ) -> SqlResult<()> {
+        let mut exprs: Vec<&mut BoundExpr> = Vec::new();
+        let mut inputs: Vec<&mut LogicalPlan> = Vec::new();
+        match plan {
+            LogicalPlan::OneRow | LogicalPlan::Scan { .. } | LogicalPlan::Subquery { .. } => {}
+            LogicalPlan::Values { rows, .. } => exprs.extend(rows.iter_mut().flatten()),
+            LogicalPlan::Filter { input, predicate } => {
+                exprs.push(predicate);
+                inputs.push(input);
+            }
+            LogicalPlan::Project {
+                input, exprs: list, ..
+            } => {
+                exprs.extend(list.iter_mut().map(|projection| &mut projection.expr));
+                inputs.push(input);
+            }
+            LogicalPlan::Limit { input, top } => {
+                exprs.push(&mut top.expr);
+                inputs.push(input);
+            }
+            LogicalPlan::Join {
+                left, right, on, ..
+            } => {
+                exprs.extend(on.as_mut());
+                inputs.push(left);
+                inputs.push(right);
+            }
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+                ..
+            } => {
+                exprs.extend(group_by.iter_mut());
+                exprs.extend(aggregates.iter_mut().filter_map(|call| call.arg.as_mut()));
+                inputs.push(input);
+            }
+            LogicalPlan::Sort { input, keys } => {
+                exprs.extend(keys.iter_mut().map(|key| &mut key.expr));
+                inputs.push(input);
+            }
+            LogicalPlan::Distinct(input) => inputs.push(input),
+            LogicalPlan::SetOp { left, right, .. } => {
+                inputs.push(left);
+                inputs.push(right);
+            }
+        }
+        for e in exprs {
+            self.resolve_expr(e, nesting, resolution, spec, scope, ctx)?;
+        }
+        for input in inputs {
+            self.resolve_plan(input, nesting, resolution, spec, scope, ctx)?;
+        }
+        Ok(())
+    }
+
+    /// The column of the `Aggregate`, and its type, that a reference on this query stands
+    /// for ([`Grouping::resolve_expr`]).
+    fn resolve_column(
+        &mut self,
+        binding: &ColumnBinding,
+        line: u32,
+        resolution: &mut Resolution<'_>,
+        spec: &QuerySpec,
+        scope: &Scope,
+        ctx: &BindContext<'_>,
+    ) -> SqlResult<(usize, TypeInfo)> {
+        if binding.column == OUTER_AGGREGATE_COLUMN_ID {
+            let slot = match resolution.slots.get(binding.index).copied().flatten() {
+                Some(slot) => slot,
+                None => {
+                    let handed = resolution.handed.get(binding.index).ok_or_else(|| {
+                        bug("bind_aggregate: a handed aggregate is not in the list")
+                    })?;
+                    let (call, ty) = bind_aggregate_call(&handed.call, ctx, scope)?;
+                    let slot = self.keys.len() + self.aggregate_index(call, ty);
+                    if let Some(entry) = resolution.slots.get_mut(binding.index) {
+                        *entry = Some(slot);
+                    }
+                    slot
+                }
+            };
+            return Ok((slot, self.schema().columns[slot].ty.clone()));
+        }
+        if binding.column == SLOT_COLUMN_ID && binding.name.starts_with('\u{0}') {
+            return Ok((binding.index, binding.ty.clone()));
+        }
+        let column = BoundExpr {
+            kind: BoundExprKind::ColumnRef(ColumnBinding {
+                depth: 0,
+                ..binding.clone()
+            }),
+            ty: binding.ty.clone(),
+            line,
+        };
+        match self.key_index(&column) {
+            Some(slot) => Ok((slot, binding.ty.clone())),
+            None => {
+                let BoundExprKind::ColumnRef(at_level) = &column.kind else {
+                    return Err(bug("bind_aggregate: a column reference changed variant"));
+                };
+                Err(column_outside_group_by(
+                    at_level,
+                    line,
+                    resolution.clause,
+                    spec,
+                    scope,
+                ))
+            }
         }
     }
 
@@ -692,6 +1020,204 @@ impl Grouping {
             line,
         }
     }
+}
+
+/// What [`Grouping::bind_above`] resolves the references of one extracted expression
+/// with.
+struct Resolution<'a> {
+    /// The clause the expression was written in, which numbers the error of a column that
+    /// is neither a key nor aggregated.
+    clause: Clause,
+    /// The aggregates the nested queries handed over while the expression was bound.
+    handed: &'a [OuterAggregate],
+    /// The column of the `Aggregate` each of `handed` became, once resolved.
+    slots: Vec<Option<usize>>,
+}
+
+/// The `column` of the reference a nested query binds an aggregate of an enclosing query
+/// to: no column of the catalogue (its identifiers start at 1) nor of a derived table
+/// (from 0). Its `index` is the position of the aggregate in the [`OuterAggregates`] of
+/// the enclosing scope, until [`Grouping::resolve_expr`] makes it a column of the
+/// `Aggregate`.
+const OUTER_AGGREGATE_COLUMN_ID: ColumnId = ColumnId(-1);
+
+/// The query an aggregate call belongs to, counted in queries up from `scope`: `None` for
+/// the query of `scope` itself, `Some(n)` when the argument reads columns of the query `n`
+/// levels up and of no other. `SELECT (SELECT MAX(v) FROM dbo.b) FROM dbo.o`, `v` a column
+/// of `dbo.o`, is `Some(1)` for `MAX(v)`; `COUNT(*)`, `MAX(w)` and `MAX(1)` are `None`.
+///
+/// A call that is no aggregate, written with a star or an `OVER`, or whose argument holds
+/// an aggregate or a subquery, is `None`, as is an argument that does not bind: the query
+/// of `scope` then raises what it raises on it.
+///
+/// # Errors
+///
+/// **8124**, severity 16, state 1, on the line of the call, for an argument that reads
+/// columns of an enclosing query and of another query: `SUM(w + v)`, `w` read in `scope`
+/// (`tests/bind_aggregate.rs`, `an_aggregate_mixing_an_outer_column_with_another_is_8124`).
+pub(crate) fn outer_level(e: &Expr, ctx: &BindContext<'_>, scope: &Scope) -> SqlResult<Option<u8>> {
+    let Expr::Function {
+        args,
+        star,
+        over,
+        span,
+        ..
+    } = e
+    else {
+        return Ok(None);
+    };
+    if !is_aggregate_call(e) || *star || over.is_some() {
+        return Ok(None);
+    }
+    if args.iter().any(|arg| {
+        !nodes_where(
+            arg,
+            |node| is_aggregate_call(node) || is_subquery(node),
+            true,
+        )
+        .is_empty()
+    }) {
+        return Ok(None);
+    }
+    let mut depths = Vec::new();
+    for arg in args {
+        let Ok(mut bound) = bind_expr(arg, ctx, scope) else {
+            return Ok(None);
+        };
+        column_depths(&mut bound, &mut depths);
+    }
+    match depths.iter().max() {
+        None | Some(0) => Ok(None),
+        Some(&level) if depths.iter().all(|depth| *depth == level) => Ok(Some(level)),
+        Some(_) => Err(multiple_columns_with_outer_reference().with_line(line_of(span))),
+    }
+}
+
+/// Binds an aggregate call that [`outer_level`] found to belong to the query `level`
+/// queries up: the call is handed over to the [`OuterAggregates`] of that query's scope,
+/// and what comes back is a reference to the value that query computes, which
+/// [`Grouping::resolve_expr`] makes a column of its `Aggregate`.
+///
+/// # Errors
+///
+/// The errors of the call itself (`call::bind_aggregate_call`), and **147** on the line of
+/// the call when the query `level` up takes no aggregate where the nested query was
+/// written: a `WHERE` (`SELECT id FROM dbo.o WHERE EXISTS (SELECT 1 FROM dbo.b GROUP BY w
+/// HAVING SUM(v) > 1)`), or a scope that collects none, an `ON` or an `UPDATE` among them.
+pub(crate) fn bind_outer_aggregate(
+    e: &Expr,
+    level: u8,
+    ctx: &BindContext<'_>,
+    scope: &Scope,
+) -> SqlResult<BoundExpr> {
+    let (_, ty) = bind_aggregate_call(e, ctx, scope)?;
+    let line = line_of(&span_of(e));
+    let mut target = Some(scope);
+    for _ in 0..level {
+        target = target.and_then(Scope::parent);
+    }
+    let Some(aggregates) = target.and_then(Scope::outer_aggregates) else {
+        return Err(SqlError::aggregate_in_where().with_line(line));
+    };
+    let mut handed = aggregates.borrow_mut();
+    handed.push(OuterAggregate {
+        call: e.clone(),
+        line,
+    });
+    Ok(BoundExpr {
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            column: OUTER_AGGREGATE_COLUMN_ID,
+            index: handed.len() - 1,
+            name: String::new(),
+            ty: ty.clone(),
+            depth: level,
+        }),
+        ty,
+        line,
+    })
+}
+
+/// Whether `e` holds an aggregate call of the query of `scope` itself, a subquery not
+/// walked into: what groups that query. An aggregate of an enclosing query
+/// ([`outer_level`]) does not; one whose level does not resolve does, so that the
+/// grouped path raises what it raises on it.
+pub(crate) fn holds_own_aggregate(e: &Expr, ctx: &BindContext<'_>, scope: &Scope) -> bool {
+    nodes_where(e, is_aggregate_call, false)
+        .into_iter()
+        .any(|call| !matches!(outer_level(call, ctx, scope), Ok(Some(_))))
+}
+
+/// How many aggregates nested queries handed over to the query of `scope` so far, `0`
+/// for a scope that does not collect them.
+pub(crate) fn handed_count(scope: &Scope) -> usize {
+    scope
+        .outer_aggregates()
+        .map_or(0, |aggregates| aggregates.borrow().len())
+}
+
+/// The line of the first aggregate handed over to the query of `scope`, `None` while the
+/// list is empty.
+pub(crate) fn first_handed_line(scope: &Scope) -> Option<u32> {
+    scope
+        .outer_aggregates()
+        .and_then(|aggregates| aggregates.borrow().first().map(|handed| handed.line))
+}
+
+/// Refuses a `GROUP BY` key that reads columns of an enclosing query without a column of
+/// its own query: **164**, severity 15, state 1, on the line of the key (`SELECT id FROM
+/// dbo.o WHERE EXISTS (SELECT 1 FROM dbo.b GROUP BY v)`, `v` a column of `dbo.o`;
+/// `tests/bind_aggregate.rs`, `a_key_that_reads_outer_columns_alone_is_164`). A key that
+/// reads no column is left to the constant case of the module documentation.
+fn refuse_outer_key(key: &BoundExpr) -> SqlResult<()> {
+    let mut depths = Vec::new();
+    column_depths(&mut key.clone(), &mut depths);
+    if depths.iter().any(|depth| *depth > 0) && !depths.contains(&0) {
+        return Err(SqlError::new(
+            164,
+            15,
+            1,
+            "A GROUP BY expression must read at least one column that is not an outer \
+             reference.",
+        )
+        .with_line(key.line));
+    }
+    Ok(())
+}
+
+/// Error 8124, severity 16, state 1: an aggregated expression reads a column of an
+/// enclosing query and another column.
+fn multiple_columns_with_outer_reference() -> SqlError {
+    SqlError::new(
+        8124,
+        16,
+        1,
+        "An aggregated expression that reads an outer reference may read no other column.",
+    )
+}
+
+/// The depth of each column reference of `e`, the plans under it not walked.
+fn column_depths(e: &mut BoundExpr, out: &mut Vec<u8>) {
+    if let BoundExprKind::ColumnRef(binding) = &e.kind {
+        out.push(binding.depth);
+    }
+    for child in children_mut(e) {
+        column_depths(child, out);
+    }
+}
+
+/// Whether `e` is a subquery: `EXISTS`, a scalar subquery, `IN (SELECT …)`, or a quantified
+/// comparison.
+fn is_subquery(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Exists(..)
+            | Expr::Subquery(..)
+            | Expr::Quantified { .. }
+            | Expr::In {
+                list: InList::Subquery(_),
+                ..
+            }
+    )
 }
 
 /// The `column` of a [`ColumnBinding`] that designates a column of an `Aggregate` rather
@@ -1029,13 +1555,25 @@ fn is_aggregate_call(e: &Expr) -> bool {
 }
 
 /// The first aggregate call `e` holds, in written order, itself included, or `None`. A
-/// subquery is not walked into. A worklist rather than a recursion, for the reason
-/// `query::holds_an_aggregate` gives.
+/// subquery is not walked into.
 fn find_aggregate(e: &Expr) -> Option<&Expr> {
+    nodes_where(e, is_aggregate_call, true).into_iter().next()
+}
+
+/// The nodes of `e` that answer `wanted`, in written order, itself included, the nodes
+/// under one of them left out; the first one alone when `first_only`. A subquery is not
+/// walked into. A worklist rather than a recursion: the depth of an expression is the
+/// client's to choose.
+fn nodes_where(e: &Expr, wanted: fn(&Expr) -> bool, first_only: bool) -> Vec<&Expr> {
+    let mut found = Vec::new();
     let mut pending = vec![e];
     while let Some(e) = pending.pop() {
-        if is_aggregate_call(e) {
-            return Some(e);
+        if wanted(e) {
+            found.push(e);
+            if first_only {
+                break;
+            }
+            continue;
         }
         let mut children: Vec<&Expr> = Vec::new();
         match e {
@@ -1103,7 +1641,7 @@ fn find_aggregate(e: &Expr) -> Option<&Expr> {
         // Pushed last to first, so that the leftmost child is popped first.
         pending.extend(children.into_iter().rev());
     }
-    None
+    found
 }
 
 /// The error of a call that is spelled as an aggregate under a name that is none, raised

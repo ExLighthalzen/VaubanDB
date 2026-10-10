@@ -52,8 +52,8 @@
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{
-    ColumnRef, Expr, Ident, InList, ObjectName, QueryBody, QuerySpec, SelectItem, SelectStatement,
-    Span, TableHint, TableRef, Top, UnaryOp,
+    ColumnRef, Expr, Ident, ObjectName, QueryBody, QuerySpec, SelectItem, SelectStatement, Span,
+    TableHint, TableRef, Top, UnaryOp,
 };
 use vauban_sysfn::{FunctionKind, lookup};
 use vauban_types::{SqlType, TypeFamily, TypeInfo, Value};
@@ -151,7 +151,20 @@ pub(crate) fn bind_select_with_parent(
     if stmt.order_by.is_empty() {
         return Ok(plan);
     }
-    sort::bind_order_by(stmt, plan, ctx, from_scope, grouped_keys)
+    let handed = from_scope
+        .as_ref()
+        .and_then(|scope| scope.outer_aggregates().cloned());
+    let before = handed.as_ref().map_or(0, |handed| handed.borrow().len());
+    let plan = sort::bind_order_by(stmt, plan, ctx, from_scope, grouped_keys)?;
+    // The `ORDER BY` of a query that groups nothing is bound after its select list: an
+    // aggregate a nested query of it hands over would group the query too late.
+    if handed.is_some_and(|handed| handed.borrow().len() > before) {
+        return Err(not_implemented(
+            "an aggregate of an outer column in a subquery of the ORDER BY of a query that \
+             groups nothing",
+        ));
+    }
+    Ok(plan)
 }
 
 /// Binds one `SELECT … WHERE …` specification, the body of [`bind_select`].
@@ -254,24 +267,34 @@ fn bind_query_spec(
     // enclosing query. The parent arrives wrapped in an empty scope (`subquery.rs`); the
     // wrapper is dropped so that each link of the chain is one query, the unit
     // `ColumnBinding::depth` counts.
-    let scope = scope.inside(parent.unwrapped().clone());
+    // The scope collects the aggregates nested queries write over its columns alone
+    // (`aggregate::outer_level`): such an aggregate is computed here, and groups the query.
+    let scope = scope
+        .inside(parent.unwrapped().clone())
+        .collecting(Default::default());
     if let Some(condition) = &spec.where_ {
         // An aggregate in a `WHERE` is error 147, before the clause is bound: `aggregate.rs`
         // owns the rule and the line it is reported on.
-        aggregate::refuse_in_where(condition, line_of(&stmt.span), ctx)?;
+        aggregate::refuse_in_where(condition, line_of(&stmt.span), ctx, &scope)?;
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate: bind_condition(condition, ctx, &scope)?,
         };
+        // A nested query of the `WHERE` that aggregates a column of this query alone:
+        // 147 too, on the line of that call.
+        if let Some(line) = aggregate::first_handed_line(&scope) {
+            return Err(SqlError::aggregate_in_where().with_line(line));
+        }
     }
 
+    let own_aggregate = |expr: &Expr| aggregate::holds_own_aggregate(expr, ctx, &scope);
     if !spec.group_by.is_empty()
         || spec.having.is_some()
-        || aggregated_select_list(spec)
-        || stmt
-            .order_by
-            .iter()
-            .any(|item| holds_an_aggregate(&item.expr))
+        || spec.items.iter().any(|item| match item {
+            SelectItem::Expr { expr, .. } => own_aggregate(expr),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_) => false,
+        })
+        || stmt.order_by.iter().any(|item| own_aggregate(&item.expr))
     {
         // `aggregate.rs` builds the `Aggregate` **and** the `Project` above it: the projection
         // of a grouped query names the results of the aggregates by their index in the
@@ -289,6 +312,34 @@ fn bind_query_spec(
     let mut projections = Vec::with_capacity(spec.items.len());
     for item in &spec.items {
         projections.extend(bind_select_item(item, &scope, ctx)?);
+    }
+    // A nested query of the select list aggregated a column of this query alone:
+    // `SELECT (SELECT MAX(v) FROM dbo.b) FROM dbo.o` computes `MAX(v)` over `dbo.o`, one
+    // row, as a select list holding `MAX(v)` itself would. The bound list is grouped as
+    // it stands, without binding it again.
+    if aggregate::handed_count(&scope) > 0 {
+        if spec.items.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Expr {
+                    expr: Expr::Assign { .. },
+                    ..
+                }
+            )
+        }) {
+            return Err(not_implemented(
+                "an assignment in the select list of a grouped query",
+            ));
+        }
+        let (grouped, keys) = aggregate::group_bound_select_list(
+            spec,
+            &stmt.order_by,
+            plan,
+            projections,
+            &scope,
+            ctx,
+        )?;
+        return Ok((finish(grouped, spec, stmt, ctx)?, scope, Some(keys)));
     }
     let schema = OutputSchema {
         columns: projections
@@ -340,118 +391,6 @@ fn finish(
         };
     }
     Ok(plan)
-}
-
-/// Whether the select list of `spec` holds an aggregate call, which sends the query to
-/// `aggregate.rs` even when no `GROUP BY` is written.
-///
-/// `SELECT COUNT(*) FROM dbo.t` aggregates the whole input into one row: the plan is an
-/// [`LogicalPlan::Aggregate`] whose `group_by` is empty, so the routing cannot hang on the
-/// `GROUP BY` clause alone.
-///
-/// The `HAVING` and the `GROUP BY` keys are not walked: the caller already sends a query
-/// that writes either of them to `aggregate.rs`. Nor is the `WHERE`, where an aggregate is
-/// refused rather than grouped, which is `aggregate.rs`'s business.
-fn aggregated_select_list(spec: &QuerySpec) -> bool {
-    spec.items.iter().any(|item| match item {
-        SelectItem::Expr { expr, .. } => holds_an_aggregate(expr),
-        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_) => false,
-    })
-}
-
-/// Whether `expr` holds an aggregate call, the sub-expressions below included.
-///
-/// Three spellings count: a call the `sysfn` registry answers for with
-/// [`FunctionKind::Aggregate`], a call written with a star — `COUNT(*)` and
-/// `COUNT_BIG(*)`, which take no argument and are therefore not entries of that registry
-/// (`vauban-sysfn`, `builtins/aggregates.rs`) — and a call written with `DISTINCT`, which
-/// `aggregate.rs` refuses by 195 when the name is no aggregate (`LEN(DISTINCT s)`). A
-/// name written with a qualifier is left alone, as [`call.rs`](crate::call) leaves it:
-/// `dbo.SUM(1)` is error 4121 there.
-///
-/// A subquery is not walked into: the aggregate of `SELECT (SELECT SUM(c) FROM dbo.u)`
-/// groups the inner query, not the outer one. The walk is a worklist rather than a
-/// recursion, for the reason `expr.rs`'s `contains_invalid_niladic` gives: the depth of an
-/// expression is the client's to choose.
-fn holds_an_aggregate(expr: &Expr) -> bool {
-    let mut pending = vec![expr];
-    while let Some(expr) = pending.pop() {
-        match expr {
-            Expr::Function {
-                name,
-                args,
-                star,
-                distinct,
-                ..
-            } => {
-                if *star || *distinct || is_aggregate_name(name) {
-                    return true;
-                }
-                pending.extend(args);
-            }
-            Expr::Nested(inner, _)
-            | Expr::Unary { expr: inner, .. }
-            | Expr::Cast { expr: inner, .. }
-            | Expr::IsNull { expr: inner, .. }
-            | Expr::Collate { expr: inner, .. }
-            | Expr::Assign { value: inner, .. } => pending.push(inner),
-            Expr::Binary { left, right, .. } => {
-                pending.push(left);
-                pending.push(right);
-            }
-            Expr::Convert { expr, style, .. } => {
-                pending.push(expr);
-                if let Some(style) = style {
-                    pending.push(style);
-                }
-            }
-            Expr::Case {
-                operand,
-                arms,
-                else_,
-                ..
-            } => {
-                if let Some(operand) = operand {
-                    pending.push(operand);
-                }
-                for arm in arms {
-                    pending.push(&arm.when);
-                    pending.push(&arm.then);
-                }
-                if let Some(otherwise) = else_ {
-                    pending.push(otherwise);
-                }
-            }
-            Expr::Like {
-                expr,
-                pattern,
-                escape,
-                ..
-            } => {
-                pending.push(expr);
-                pending.push(pattern);
-                if let Some(escape) = escape {
-                    pending.push(escape);
-                }
-            }
-            Expr::Between {
-                expr, low, high, ..
-            } => {
-                pending.push(expr);
-                pending.push(low);
-                pending.push(high);
-            }
-            Expr::In { expr, list, .. } => {
-                pending.push(expr);
-                if let InList::Exprs(items) = list {
-                    pending.extend(items);
-                }
-            }
-            Expr::Quantified { expr, .. } => pending.push(expr),
-            _ => {}
-        }
-    }
-    false
 }
 
 /// Whether an unqualified function name is that of an aggregate of the registry.

@@ -56,6 +56,9 @@
 //! `call::bind_niladic` — the last one *before* error 207 is raised, see [`bind_column`] —
 //! and do nothing else. Not one rule of `call.rs` lives here.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{
     BinaryOp as AstBinaryOp, CaseArm, ColumnRef, Expr, Ident, InList, ObjectName, Span, UnaryOp,
@@ -65,6 +68,7 @@ use vauban_types::{
     implicit_result_type,
 };
 
+use crate::aggregate;
 use crate::bound::{BoundCaseArm, BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LogicalOp};
 use crate::call::{
     bind_cast, bind_convert, bind_function, bind_niladic, bind_variable_function, is_untyped_null,
@@ -112,6 +116,25 @@ pub(crate) struct Scope {
     sources: Vec<Source>,
     /// The scope of the enclosing query, for a correlated subquery; `None` at the top.
     parent: Option<Box<Scope>>,
+    /// Where an aggregate a nested query writes over the columns of this query alone is
+    /// handed over, to be computed by this query (`aggregate.rs`, [`OuterAggregates`]).
+    /// `None` for a scope no such aggregate may reach, an `ON` or an `UPDATE` among them.
+    outer_aggregates: Option<OuterAggregates>,
+}
+
+/// The aggregates nested queries handed over to the query of one scope: shared by the
+/// clones of that scope, which is how the parent link of a nested scope reaches it.
+pub(crate) type OuterAggregates = Rc<RefCell<Vec<OuterAggregate>>>;
+
+/// One aggregate written in a nested query whose argument reads the columns of an
+/// enclosing query alone: `MAX(v)` in `SELECT (SELECT MAX(v) FROM dbo.b) FROM dbo.o`,
+/// where `v` is a column of `dbo.o`.
+#[derive(Debug, Clone)]
+pub(crate) struct OuterAggregate {
+    /// The call as written, bound again against the scope of the query that computes it.
+    pub(crate) call: Expr,
+    /// The line of the call.
+    pub(crate) line: u32,
 }
 
 impl Scope {
@@ -126,6 +149,7 @@ impl Scope {
         Scope {
             sources: vec![source],
             parent: None,
+            outer_aggregates: None,
         }
     }
 
@@ -134,6 +158,7 @@ impl Scope {
         Scope {
             sources,
             parent: None,
+            outer_aggregates: None,
         }
     }
 
@@ -143,7 +168,23 @@ impl Scope {
         Scope {
             sources: self.sources,
             parent: Some(Box::new(parent)),
+            outer_aggregates: self.outer_aggregates,
         }
+    }
+
+    /// The same scope, receiving the aggregates nested queries write over its columns
+    /// alone into `aggregates`.
+    pub(crate) fn collecting(self, aggregates: OuterAggregates) -> Self {
+        Scope {
+            outer_aggregates: Some(aggregates),
+            ..self
+        }
+    }
+
+    /// Where the aggregates nested queries write over the columns of this scope alone are
+    /// handed over, `None` where no such aggregate is allowed.
+    pub(crate) fn outer_aggregates(&self) -> Option<&OuterAggregates> {
+        self.outer_aggregates.as_ref()
     }
 
     /// The sources in scope, in written order: what `star.rs` resolves a column against
@@ -259,6 +300,11 @@ pub(crate) fn bind_expr(e: &Expr, ctx: &BindContext<'_>, scope: &Scope) -> SqlRe
         Expr::Cast { .. } => bind_cast(e, ctx, scope),
         Expr::Convert { .. } => bind_convert(e, ctx, scope),
         Expr::Function { args, .. } => {
+            // An aggregate over the columns of an enclosing query alone is computed by
+            // that query: here it is a reference to the value that query hands over.
+            if let Some(level) = aggregate::outer_level(e, ctx, scope)? {
+                return aggregate::bind_outer_aggregate(e, level, ctx, scope);
+            }
             // A niladic syntax diagnostic is reached through the arguments before
             // resolving the enclosing function, preserving earlier variables.
             if args.iter().any(contains_invalid_niladic) {

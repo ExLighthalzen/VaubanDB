@@ -893,3 +893,231 @@ fn a_reference_above_the_aggregate_names_its_column() {
     };
     assert_eq!((arg.index, arg.column), (1, ColumnId(2)));
 }
+
+// ---------------------------------------------------------------------------------------
+// An aggregate of a column of an enclosing query
+// ---------------------------------------------------------------------------------------
+
+/// The plan of the scalar subquery projected in column `at` of `plan`, a `Project`.
+fn scalar_subquery_at(plan: &LogicalPlan, at: usize) -> &LogicalPlan {
+    let LogicalPlan::Project { exprs, .. } = plan else {
+        panic!("the root is not a Project: {plan:?}");
+    };
+    match &exprs[at].expr.kind {
+        BoundExprKind::ScalarSubquery(subquery) => &subquery.plan,
+        other => panic!("column {at} is not a scalar subquery: {other:?}"),
+    }
+}
+
+/// The column references the projections of `plan`, a `Project`, read: index and depth.
+fn projected_references(plan: &LogicalPlan) -> Vec<(usize, u8)> {
+    let LogicalPlan::Project { exprs, .. } = plan else {
+        panic!("not a Project: {plan:?}");
+    };
+    exprs
+        .iter()
+        .filter_map(|projection| match &projection.expr.kind {
+            BoundExprKind::ColumnRef(binding) => Some((binding.index, binding.depth)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An aggregate whose argument reads columns of the enclosing query alone is computed by
+/// that query: the enclosing query becomes one group, and the subquery reads the result as
+/// a column of the enclosing `Aggregate`, one level up.
+#[test]
+fn an_aggregate_of_an_outer_column_is_computed_by_the_outer_query() {
+    for text in [
+        "SELECT (SELECT MAX(s) FROM dbo.e WHERE k = 1) AS n FROM dbo.t",
+        "SELECT (SELECT MAX(t.s) FROM dbo.e WHERE k = 1) AS n FROM dbo.t",
+        "SELECT (SELECT MAX(x.s) FROM dbo.e WHERE k = 1) AS n FROM dbo.t AS x",
+    ] {
+        let plan = plan_of(text);
+        let (keys, aggregates, _) = parts_of(&plan);
+        assert!(keys.is_empty(), "{text}");
+        assert_eq!(aggregates.len(), 1, "{text}");
+        assert_eq!(aggregates[0].def.name, "MAX", "{text}");
+        match &aggregates[0].arg.as_ref().expect("an argument").kind {
+            BoundExprKind::ColumnRef(binding) => {
+                assert_eq!((binding.index, binding.depth), (2, 0), "{text}");
+            }
+            other => panic!("{text}: the argument is not a column: {other:?}"),
+        }
+        let inner = scalar_subquery_at(&plan, 0);
+        assert_eq!(projected_references(inner), vec![(0, 1)], "{text}");
+        // The subquery groups nothing: its `Project` sits on its `WHERE`.
+        assert!(
+            matches!(inner, LogicalPlan::Project { input, .. }
+                if matches!(**input, LogicalPlan::Filter { .. })),
+            "{text}: {inner:?}"
+        );
+    }
+
+    // Under a `GROUP BY`, the aggregate comes after the key; two levels up, the reference
+    // is two levels deep.
+    let plan = plan_of("SELECT k, (SELECT MAX(s) FROM dbo.e) AS n FROM dbo.t GROUP BY k");
+    let (keys, aggregates, _) = parts_of(&plan);
+    assert_eq!((keys.len(), aggregates.len()), (1, 1));
+    assert_eq!(
+        projected_references(scalar_subquery_at(&plan, 1)),
+        vec![(1, 1)]
+    );
+    let plan =
+        plan_of("SELECT (SELECT (SELECT MAX(s) FROM dbo.e) FROM dbo.e AS m) AS n FROM dbo.t");
+    assert_eq!(parts_of(&plan).1.len(), 1);
+    let middle = scalar_subquery_at(&plan, 0);
+    assert_eq!(
+        projected_references(scalar_subquery_at(middle, 0)),
+        vec![(0, 2)]
+    );
+
+    // Counter-proof: an aggregate of a column of the subquery groups the subquery, and the
+    // enclosing query keeps one row per row.
+    let plan = plan_of("SELECT (SELECT MAX(c) FROM dbo.e) AS n FROM dbo.t");
+    assert!(
+        matches!(&plan, LogicalPlan::Project { input, .. }
+            if matches!(**input, LogicalPlan::Scan { .. })),
+        "{plan:?}"
+    );
+    assert!(matches!(
+        scalar_subquery_at(&plan, 0),
+        LogicalPlan::Project { input, .. } if matches!(**input, LogicalPlan::Aggregate { .. })
+    ));
+}
+
+/// Once the enclosing query is grouped by an aggregate of its column, a column of its
+/// select list that is no key is 8120, as with the aggregate written in the list itself.
+#[test]
+fn an_outer_aggregate_groups_the_select_list_of_the_outer_query() {
+    let error = error_of("SELECT k, (SELECT MAX(s) FROM dbo.e) AS n FROM dbo.t");
+    assert_eq!(error.number, 8120);
+    // The same column under an aggregate of its own query binds.
+    plan_of("SELECT COUNT(k), (SELECT MAX(s) FROM dbo.e) AS n FROM dbo.t");
+}
+
+/// An aggregated expression that reads a column of an enclosing query and another column
+/// is 8124, severity 16, state 1, on the line of the call; two columns of the same
+/// enclosing query bind.
+#[test]
+fn an_aggregate_mixing_an_outer_column_with_another_is_8124() {
+    let error = error_of("SELECT\n(SELECT\nSUM(e.c + t.c)\nFROM dbo.e) AS n FROM dbo.t");
+    assert_eq!(
+        (error.number, error.severity, error.state, error.line),
+        (8124, 16, 1, 3)
+    );
+    for text in [
+        "SELECT (SELECT COUNT(DISTINCT e.c + t.c) FROM dbo.e) AS n FROM dbo.t",
+        "SELECT t.k FROM dbo.t WHERE EXISTS (SELECT 1 FROM dbo.e GROUP BY e.k HAVING SUM(e.c + t.c) > 4)",
+        "SELECT (SELECT (SELECT MAX(m.c + t.c) FROM dbo.e) FROM dbo.e AS m) AS n FROM dbo.t",
+    ] {
+        assert_eq!(error_of(text).number, 8124, "{text}");
+    }
+    plan_of("SELECT (SELECT SUM(t.c + t.k) FROM dbo.e) AS n FROM dbo.t");
+    plan_of("SELECT (SELECT SUM(t.c + 1) FROM dbo.e) AS n FROM dbo.t");
+}
+
+/// A subquery of a `WHERE` that aggregates a column of the query of that `WHERE` is 147,
+/// on the line of the call; the same subquery in a `HAVING` binds.
+#[test]
+fn an_outer_aggregate_in_a_where_is_147() {
+    let error = error_of(
+        "SELECT t.k\nFROM dbo.t\nWHERE EXISTS (SELECT 1 FROM dbo.e\nGROUP BY e.k\nHAVING SUM(t.c) > 1)",
+    );
+    assert_eq!(
+        (error.number, error.severity, error.state, error.line),
+        (147, 15, 1, 5)
+    );
+    plan_of(
+        "SELECT t.k FROM dbo.t GROUP BY t.k HAVING EXISTS (SELECT 1 FROM dbo.e WHERE e.c = MAX(t.c))",
+    );
+    plan_of(
+        "SELECT t.k FROM dbo.t GROUP BY t.k HAVING (SELECT COUNT(*) FROM dbo.e WHERE e.c <= MAX(t.c)) > 1",
+    );
+}
+
+/// A `GROUP BY` key of a subquery that reads columns of the enclosing query alone is 164,
+/// severity 15, state 1, on the line of the key; a key that reads a column of its own
+/// query besides binds.
+#[test]
+fn a_key_that_reads_outer_columns_alone_is_164() {
+    let error = error_of("SELECT t.k FROM dbo.t\nWHERE EXISTS (SELECT 1\nFROM dbo.e\nGROUP BY\ns)");
+    assert_eq!(
+        (error.number, error.severity, error.state, error.line),
+        (164, 15, 1, 5)
+    );
+    assert_eq!(
+        error_of("SELECT t.k FROM dbo.t WHERE EXISTS (SELECT 1 FROM dbo.e GROUP BY e.k, t.c)")
+            .number,
+        164
+    );
+    plan_of("SELECT t.k FROM dbo.t WHERE EXISTS (SELECT 1 FROM dbo.e GROUP BY e.k + t.c)");
+}
+
+/// A subquery of a grouped query reads a key of it as the column of the `Aggregate`, and a
+/// column that is no key answers the number of the clause it was written in.
+#[test]
+fn a_subquery_of_a_grouped_query_reads_its_keys() {
+    let plan = plan_of(
+        "SELECT k, (SELECT COUNT(*) FROM dbo.e WHERE e.c <= t.k) AS n FROM dbo.t GROUP BY k",
+    );
+    let inner = scalar_subquery_at(&plan, 1);
+    let LogicalPlan::Project { input, .. } = inner else {
+        panic!("{inner:?}");
+    };
+    let LogicalPlan::Aggregate { input, .. } = &**input else {
+        panic!("{input:?}");
+    };
+    let LogicalPlan::Filter { predicate, .. } = &**input else {
+        panic!("{input:?}");
+    };
+    let BoundExprKind::Compare { right, .. } = &predicate.kind else {
+        panic!("{predicate:?}");
+    };
+    match &right.kind {
+        BoundExprKind::ColumnRef(binding) => {
+            assert_eq!(
+                (binding.index, binding.depth, binding.column),
+                (0, 1, ColumnId(0))
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let text = "SELECT k, (SELECT COUNT(*) FROM dbo.e WHERE e.c = t.c) AS n FROM dbo.t GROUP BY k";
+    assert_eq!(error_of(text).number, 8120);
+    let text = "SELECT k FROM dbo.t GROUP BY k HAVING EXISTS (SELECT 1 FROM dbo.e WHERE e.c = t.c)";
+    assert_eq!(error_of(text).number, 8121);
+}
+
+/// Each level of a nest of queries holds a subquery that aggregates a column of that
+/// level, or groups and reads the level above: the binding binds each level a bounded
+/// number of times, so twelve levels bind in a moment rather than in an hour. The bound
+/// is wide (ten seconds for both shapes, an unoptimised build included); binding each
+/// level twice per enclosing level puts the first shape past it from about ten levels.
+#[test]
+fn the_binding_time_of_nested_outer_aggregates_grows_with_the_depth_alone() {
+    const DEPTH: usize = 12;
+    let mut handed = format!("SELECT MAX(t{DEPTH}.c) FROM dbo.t AS t{DEPTH}");
+    for level in (0..DEPTH).rev() {
+        handed = format!(
+            "SELECT (SELECT MAX(t{level}.c) FROM dbo.e AS x{level}) + ({handed}) \
+             FROM dbo.t AS t{level}"
+        );
+    }
+    let mut grouped = format!(
+        "SELECT COUNT(*) FROM dbo.t AS t{DEPTH} WHERE t{DEPTH}.c = t{}.c",
+        DEPTH - 1
+    );
+    for level in (0..DEPTH).rev() {
+        grouped = format!("SELECT ({grouped}) AS n FROM dbo.t AS t{level} GROUP BY t{level}.c");
+    }
+    let started = std::time::Instant::now();
+    let plan = plan_of(&handed);
+    assert_eq!(parts_of(&plan).1.len(), 1);
+    plan_of(&grouped);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "{DEPTH} levels bound in {elapsed:?}"
+    );
+}
