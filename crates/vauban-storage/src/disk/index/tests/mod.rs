@@ -1027,3 +1027,83 @@ fn point_seek_on_100000_rows_reads_at_most_height_plus_two_pages() {
         usize::try_from(ROWS).expect("row count")
     );
 }
+
+/// The uniqueness of an index that shares the tree of a clustered table seeks its key: on a
+/// table of 20 000 rows attached on a cold pool, refusing a duplicate and accepting a fresh key
+/// each read at most the height of the tree plus two pages, where a walk of the versions of
+/// the table reads several times as many.
+#[test]
+fn shared_tree_uniqueness_reads_a_bounded_number_of_pages() {
+    use super::super::clustered::ClusteredTable;
+    const ROWS: i32 = 20_000;
+    const BATCH: i32 = 5_000;
+    let dir = TempDir::created("index-shared-tree-pages");
+    let opts = DiskOptions { buffer_pages: 8192 };
+    let shape = TableShape {
+        columns: vec![
+            TypeInfo::new(SqlType::Int, true),
+            TypeInfo::new(SqlType::Int, true),
+        ],
+        clustered_key: Some(vec![KeyColumn {
+            column: 0,
+            descending: false,
+        }]),
+    };
+    let unique = index_shape(&[(0, false)], true);
+    let (head, roots) = {
+        let storage = DiskStorage::open(dir.path(), opts).expect("create an instance");
+        let head = alloc::allocate(&storage).expect("allocate the head page");
+        let mut table =
+            ClusteredTable::create(&storage, TABLE, head, shape.clone()).expect("create");
+        let mut txn = 10;
+        for value in 0..ROWS {
+            table
+                .insert(TxnId(txn), &row(&[value, value]))
+                .expect("insert");
+            if (value + 1) % BATCH == 0 {
+                table.commit(TxnId(txn)).expect("commit");
+                txn += 1;
+            }
+        }
+        storage.checkpoint().expect("checkpoint");
+        (head, (table.tree_root(), table.directory_root()))
+    };
+
+    let storage = DiskStorage::open(dir.path(), opts).expect("reopen the instance");
+    let height = tree_height(&storage, roots.0);
+    assert!(height >= 2, "a tree of 20 000 entries has internal pages");
+    let bound = height + 2;
+    let table = ClusteredTable::open(&storage, TABLE, head, roots, shape).expect("attach");
+    let before = resident_pages(&storage);
+    let refused =
+        check_duplicate_without_tree(&table, INDEX, &unique, TxnId(20), &row(&[12_345, 0]), None);
+    let duplicate = resident_pages(&storage) - before;
+    assert_eq!(refused.expect_err("a duplicate").number, 2601);
+    let before = resident_pages(&storage);
+    check_duplicate_without_tree(
+        &table,
+        INDEX,
+        &unique,
+        TxnId(20),
+        &row(&[ROWS + 1, 0]),
+        None,
+    )
+    .expect("a fresh key");
+    let fresh = resident_pages(&storage) - before;
+    let before = resident_pages(&storage);
+    let all = table.versions(None).expect("versions");
+    let walk = resident_pages(&storage) - before;
+    assert_eq!(all.len(), usize::try_from(ROWS).expect("row count"));
+    assert!(
+        duplicate <= bound,
+        "refusing a duplicate read {duplicate} pages, the tree has {height} levels"
+    );
+    assert!(
+        fresh <= bound,
+        "accepting a fresh key read {fresh} pages, the tree has {height} levels"
+    );
+    assert!(
+        walk > 4 * bound,
+        "a walk of the versions read {walk} pages, too few for the bound to tell it apart"
+    );
+}

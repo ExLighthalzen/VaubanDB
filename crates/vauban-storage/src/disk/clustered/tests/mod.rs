@@ -821,3 +821,66 @@ fn a_payload_cut_short_of_its_body_is_corruption() {
         );
     }
 }
+
+/// A table of one nullable `nvarchar(10)` column under the default collation, clustered on
+/// it, and one nullable `int` column.
+fn text_shape() -> TableShape {
+    TableShape {
+        columns: vec![
+            TypeInfo::new(SqlType::NVarChar(Len::Fixed(10)), true),
+            TypeInfo::new(SqlType::Int, true),
+        ],
+        clustered_key: Some(first_column()),
+    }
+}
+
+/// A row of [`text_shape`].
+fn text_pair(text: &str, n: i32) -> Row {
+    Row(vec![
+        Value::String(SqlString {
+            text: text.to_owned(),
+        }),
+        Value::I32(n),
+    ])
+}
+
+#[test]
+fn versions_of_key_compares_under_collation() {
+    let (_dir, storage) = instance("clustered-versions-of-key");
+    let mut table = table_of(&storage, text_shape());
+    let a = table.insert(TxnId(1), &text_pair("a", 1)).expect("a");
+    table.insert(TxnId(1), &text_pair("b", 2)).expect("b");
+    let padded = table.insert(TxnId(1), &text_pair("A ", 3)).expect("A ");
+    table
+        .insert(TxnId(1), &text_pair("\u{e1}", 4))
+        .expect("a acute");
+    table.commit(TxnId(1)).expect("commit");
+    table
+        .update(TxnId(2), a, &text_pair("A", 5))
+        .expect("update a");
+    table.commit(TxnId(2)).expect("commit the update");
+
+    let found = table
+        .versions_of_key(&text_pair("a", 0).0[..1])
+        .expect("versions of 'a'");
+    let mut rows: Vec<(RowId, Option<TxnId>)> = found
+        .iter()
+        .map(|version| (version.row, version.xmax))
+        .collect();
+    rows.sort();
+    // Both versions of the first row, the old one replaced by 2, and the padded row; `b`
+    // and the accented row are other keys.
+    assert_eq!(rows, vec![(a, None), (a, Some(TxnId(2))), (padded, None)]);
+    assert!(
+        table
+            .versions_of_key(&text_pair("c", 0).0[..1])
+            .expect("versions of 'c'")
+            .is_empty()
+    );
+    let message = bug_message(
+        table
+            .versions_of_key(&text_pair("a", 0).0)
+            .expect_err("two values for one clustered column"),
+    );
+    assert!(message.contains("clustered columns"), "{message}");
+}

@@ -82,6 +82,10 @@
 //! - `vacuum_during_pending_update_then_rollback_restores_committed_version`: a vacuum run
 //!   while an update is pending removes only the versions below the horizon; the rollback of
 //!   that update restores the committed version and the row becomes writable again.
+//! - `unique_key_compared_under_collation`: on a clustered table whose unique index is its
+//!   clustered key and on a heap, an `nvarchar` key is compared under the collation of its
+//!   column: `'a'`/`'A'`, `'a'`/`'a '` and `'é'`/`'É'` are 2601 on `insert`, on `update` and
+//!   on `create_index`, while `'e'` beside `'é'` passes.
 
 mod cases;
 
@@ -260,6 +264,7 @@ macro_rules! storage_contract_suite {
             concurrent_writers_on_distinct_tables => case_concurrent_writers_on_distinct_tables,
             vacuum_during_pending_update_then_rollback_restores_committed_version
                 => case_vacuum_during_pending_update_then_rollback_restores_committed_version,
+            unique_key_compared_under_collation => case_unique_key_compared_under_collation,
         );
     };
     (@each $make:expr; $($test:ident => $case:ident),* $(,)?) => {

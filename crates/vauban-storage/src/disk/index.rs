@@ -137,19 +137,25 @@ fn payload_corruption(len: usize) -> InternalError {
 }
 
 /// Answers 2601 when a live version of another logical row already holds the key `row` gives
-/// the shape `def`, reading the versions rather than a tree.
+/// the shape `def`, seeking that key in the tree of the clustered table.
 ///
 /// This is the uniqueness of an index that **shares** the tree of a clustered table
-/// ([`super::DiskStorage::create_index`]): such an index has no tree of its own, so there is
-/// no entry to seek. The walk is over the versions of the table, which is what
-/// [`DiskIndex::check_duplicate`] avoids by seeking one key; it is the price of an index that
-/// takes no page. `replacing` is the row an `update` supersedes, left out of the comparison
-/// for the reason [`DiskIndex::check_duplicate`] gives.
+/// ([`super::DiskStorage::create_index`]): such an index has no tree of its own, and its
+/// columns are the clustered key, so the versions that hold the key are the entries of the
+/// tree of the table under that prefix ([`VersionSource::versions_of_key`]). The seek
+/// compares the values in the order of the tree, under the collation of each column: `'a'`
+/// and `'A'` of an `nvarchar` key under the default collation are one key
+/// (`case_unique_key_compared_under_collation` of the generic suite). One descent of the
+/// tree, then the versions of the key, whatever the size of the table
+/// (`tests::shared_tree_uniqueness_reads_a_bounded_number_of_pages`). `replacing` is the row
+/// an `update` supersedes, left out of the comparison for the reason
+/// [`DiskIndex::check_duplicate`] gives.
 ///
 /// # Errors
 ///
 /// [`SqlError`] 2601 naming the table, the index and the key, with the decimal identifiers in
-/// place of names; the errors of the store otherwise.
+/// place of names; [`InternalError::Bug`] when the columns of `def` are not the clustered key
+/// of the table or the table keeps no tree ordered by them; the errors of the store otherwise.
 pub(crate) fn check_duplicate_without_tree(
     table: &dyn VersionSource,
     index: IndexId,
@@ -161,19 +167,31 @@ pub(crate) fn check_duplicate_without_tree(
     if !def.unique {
         return Ok(());
     }
+    if table.shape().clustered_key.as_deref() != Some(def.columns.as_slice()) {
+        return Err(InternalError::Bug(format!(
+            "index {index} of table {} carries no tree and its columns are not the clustered key",
+            table.table()
+        ))
+        .into());
+    }
     let key = key_of(row, def, index)?;
+    let Some(versions) = table.versions_of_key(&key)? else {
+        return Err(InternalError::Bug(format!(
+            "index {index} carries no tree and table {} keeps no tree ordered by its key",
+            table.table()
+        ))
+        .into());
+    };
     let status = |t| table.status(t);
-    for version in table.versions(None)? {
-        if Some(version.row) == replacing || !is_live(&version, Some(txn), &status) {
+    for version in &versions {
+        if Some(version.row) == replacing || !is_live(version, Some(txn), &status) {
             continue;
         }
-        if key_of(&version.data, def, index)? == key {
-            return Err(SqlError::duplicate_key_index(
-                &table.table().to_string(),
-                &index.to_string(),
-                &key_text(&key),
-            ));
-        }
+        return Err(SqlError::duplicate_key_index(
+            &table.table().to_string(),
+            &index.to_string(),
+            &key_text(&key),
+        ));
     }
     Ok(())
 }
@@ -311,6 +329,19 @@ pub(crate) trait VersionSource {
     ///
     /// Those of the store the version is read from.
     fn version(&self, row: RowId, seq: u64) -> Result<Option<VersionView>, InternalError>;
+    /// The versions whose clustered key is `key`, read by one seek of the tree the store keeps
+    /// in the order of that key, `None` for a store that keeps no such tree (a heap).
+    ///
+    /// The values of `key` are compared in the order of the tree, under the collation of each
+    /// column. This is what [`check_duplicate_without_tree`] reads.
+    ///
+    /// # Errors
+    ///
+    /// Those of the store the versions are read from.
+    fn versions_of_key(&self, key: &[Value]) -> Result<Option<Vec<VersionView>>, InternalError> {
+        let _ = key;
+        Ok(None)
+    }
     /// The status of `t` as [`Snapshot::is_visible`] must see it.
     fn status(&self, t: TxnId) -> TxnStatus;
 }

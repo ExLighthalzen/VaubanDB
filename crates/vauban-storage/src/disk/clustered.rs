@@ -918,6 +918,36 @@ impl<'storage> ClusteredTable<'storage> {
         Ok(versions)
     }
 
+    /// The versions of the tree whose clustered columns are `key`, in the order of the tree.
+    ///
+    /// `key` is a prefix of the key of the tree (the clustered columns without the two tie
+    /// columns), so this is one point seek of [`BTree::seek`], which compares under the
+    /// collation of each column: under the default collation, `'A'` finds the versions of
+    /// `'a'` (`versions_of_key_compares_under_collation`).
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Bug`] for a `key` of more values than the clustered key has columns;
+    /// the errors of [`BTree::seek`] and of [`decode_row`] otherwise.
+    pub(crate) fn versions_of_key(&self, key: &[Value]) -> Result<Vec<VersionView>, InternalError> {
+        if key.len() != self.key_columns.len() {
+            return bug(format!(
+                "a key of {} values for the {} clustered columns of table {}",
+                key.len(),
+                self.key_columns.len(),
+                self.table
+            ));
+        }
+        let mut versions = Vec::new();
+        for (_, payload) in self
+            .tree
+            .seek(&KeyRange::Point(key.to_vec()), Direction::Forward)?
+        {
+            versions.push(self.view_of(&VersionPayload::decode(&payload)?)?);
+        }
+        Ok(versions)
+    }
+
     /// The version `seq` of the row `id`, `None` when its chain does not hold it.
     ///
     /// The chain is followed from the version the directory names back to `seq`: one seek of
@@ -1783,6 +1813,10 @@ impl super::index::VersionSource for ClusteredTable<'_> {
 
     fn version(&self, row: RowId, seq: u64) -> Result<Option<VersionView>, InternalError> {
         ClusteredTable::version(self, row, seq)
+    }
+
+    fn versions_of_key(&self, key: &[Value]) -> Result<Option<Vec<VersionView>>, InternalError> {
+        ClusteredTable::versions_of_key(self, key).map(Some)
     }
 
     fn status(&self, t: TxnId) -> TxnStatus {

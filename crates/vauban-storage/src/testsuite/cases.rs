@@ -16,6 +16,7 @@ use crate::{
     DbId, Direction, IndexId, IndexShape, KeyRange, Row, RowId, SavepointId, Snapshot, Storage,
     TableId, TableShape, TxnId,
 };
+use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
 // ------------------------------------------------------------------ helpers
 
@@ -1423,4 +1424,88 @@ pub fn case_vacuum_during_pending_update_then_rollback_restores_committed_versio
     assert_eq!(get(&*s, &snap(6, &[]), t, id), None);
     s.rollback(TxnId(6)).expect("rollback 6");
     assert_eq!(get(&*s, &snap(7, &[]), t, id), Some(row(&[5])));
+}
+
+/// A table of one nullable `nvarchar(10)` column under the default collation and one nullable
+/// `int` column, clustered on the text column when `clustered`.
+fn text_table_shape(clustered: bool) -> TableShape {
+    TableShape {
+        columns: vec![
+            TypeInfo::new(SqlType::NVarChar(Len::Fixed(10)), true),
+            TypeInfo::new(SqlType::Int, true),
+        ],
+        clustered_key: clustered.then(|| key_columns(&[(0, false)])),
+    }
+}
+
+/// A row of [`text_table_shape`]: the text, then the number.
+fn text_row(text: &str, n: i32) -> Row {
+    Row(vec![
+        Value::String(SqlString {
+            text: text.to_owned(),
+        }),
+        Value::I32(n),
+    ])
+}
+
+/// See [`crate::testsuite`]: `unique_key_compared_under_collation`.
+pub fn case_unique_key_compared_under_collation(make: &dyn Fn() -> Box<dyn Storage>) {
+    // Each pair is one key under a case-insensitive, accent-sensitive collation that pads
+    // with spaces; `e` and `é` differ by an accent and stay two keys.
+    let equal = [("a", "A"), ("a", "a "), ("\u{e9}", "\u{c9}")];
+    let s = make();
+    let db = s.create_database("db").expect("create_database");
+    let mut txn = 1;
+    for clustered in [true, false] {
+        for (first, second) in equal {
+            let t = s
+                .create_table(db, &text_table_shape(clustered))
+                .expect("create_table");
+            let u = s
+                .create_index(t, &index_shape(&[(0, false)], true))
+                .expect("unique index");
+            let a = s.insert(TxnId(txn), t, &text_row(first, 1)).expect("first");
+            s.commit(TxnId(txn)).expect("commit first");
+            txn += 1;
+            // A committed row blocks the key spelt another way.
+            assert_duplicate_key(s.insert(TxnId(txn), t, &text_row(second, 2)), t, u);
+            // So does a pending insert of another transaction.
+            let b = s.insert(TxnId(txn), t, &text_row("z", 3)).expect("z");
+            assert_duplicate_key(s.insert(TxnId(txn + 1), t, &text_row("Z ", 4)), t, u);
+            // An update to the other spelling is refused, the row is left as it was.
+            assert_duplicate_key(s.update(TxnId(txn), t, b, &text_row(second, 3)), t, u);
+            // An update of the row itself to the other spelling of its own key passes.
+            s.update(TxnId(txn), t, a, &text_row(second, 1))
+                .expect("update a to its own key spelt another way");
+            s.commit(TxnId(txn)).expect("commit");
+            txn += 2;
+            // A different key passes: `e` beside `é`, `b` beside `a`.
+            s.insert(TxnId(txn), t, &text_row("e", 5)).expect("e");
+            s.insert(TxnId(txn), t, &text_row("b", 6)).expect("b");
+            s.commit(TxnId(txn)).expect("commit different keys");
+            txn += 1;
+            assert_eq!(
+                seek_rows(
+                    &*s,
+                    &snap(txn, &[]),
+                    u,
+                    &KeyRange::Point(text_row(first, 0).0[..1].to_vec()),
+                    Direction::Forward
+                ),
+                vec![(a, text_row(second, 1))]
+            );
+            // `create_index` over rows already holding both spellings is refused.
+            let t2 = s
+                .create_table(db, &text_table_shape(clustered))
+                .expect("create_table t2");
+            insert_all(&*s, txn, t2, &[text_row(first, 1), text_row(second, 2)]);
+            s.commit(TxnId(txn)).expect("commit t2");
+            txn += 1;
+            let err = s
+                .create_index(t2, &index_shape(&[(0, false)], true))
+                .expect_err("create_index over two spellings of one key");
+            assert_eq!(err.number, 2601, "unexpected error: {}", err.message);
+            assert_eq!(s.indexes(t2).expect("indexes"), vec![]);
+        }
+    }
 }
