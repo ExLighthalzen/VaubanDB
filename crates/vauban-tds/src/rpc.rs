@@ -13,8 +13,8 @@
 //! ParamMetaData = B_VARCHAR StatusFlags TYPE_INFO
 //! StatusFlags   = BYTE     ; fByRefValue 0x01, fDefaultValue 0x02, fEncrypted 0x08
 //! ParamLenData  = TYPE_VARBYTE
-//! BatchFlag     = %x80     ; TDS 7.2 and later
-//! NoExecFlag    = %xFF     ; TDS 7.2 and later
+//! BatchFlag     = %xFF     ; TDS 7.2 and later (%x80 before, a version the login refuses)
+//! NoExecFlag    = %xFE     ; TDS 7.2 and later
 //! ```
 //!
 //! `ProcName` is a US_VARCHAR: two bytes with the number of UTF-16 code units, then the
@@ -39,11 +39,20 @@
 //!
 //! - `fEncrypted` (Always Encrypted): `Unsupported("encrypted RPC parameter")`;
 //! - a second RPC in the same message (`BatchFlag` or `NoExecFlag` after the last parameter,
-//!   used by `SqlDataAdapter` batch updates): `Unsupported("RPC batch")`. Any byte left after
-//!   the last parameter is treated as such a separator, since a parameter name of 128
-//!   (`0x80`) or 255 (`0xFF`) characters is not a valid identifier;
+//!   used by `SqlDataAdapter` batch updates): `Unsupported("RPC batch")`. A byte `0xFE`
+//!   or `0xFF` where the next parameter would start is read as such a separator, since a
+//!   parameter name of 254 or 255 characters is longer than an identifier may be (128). A
+//!   byte `0x80` there is the length of a 128-character name, as sessions are TDS 7.2 or
+//!   later (unit test `decode_param_name_of_128_characters`). A
+//!   batch is refused as a whole rather than run one RPC at a time: each RPC but the last
+//!   would need its DONEPROC to carry `DONE_MORE`;
 //! - table-valued, `xml`, `sql_variant` and legacy `text` / `ntext` / `image` parameters:
 //!   `Unsupported` from `types::decode`.
+//!
+//! `Unsupported` is told apart from `Malformed` by `message::decode_client_message`, which
+//! turns the first into `ClientMessage::Refused`: the session answers it with an error and
+//! keeps the connection, while a `Malformed` stream closes it. The message reaches the
+//! decoder whole, so a refusal leaves no byte of it on the socket.
 //!
 //! # Response to an RPC (for `compat` and `session`)
 //!
@@ -60,10 +69,10 @@ use crate::types::{NULLTYPE, decode_type_info, decode_value};
 
 /// `ProcIDSwitch` ([MS-TDS] 2.2.6.6): the `ProcName` length that announces a `ProcID`.
 const PROC_ID_SWITCH: u16 = 0xFFFF;
-/// `BatchFlag` ([MS-TDS] 2.2.6.6): another RPC follows in the same message (TDS 7.2+).
-const BATCH_FLAG: u8 = 0x80;
+/// `BatchFlag` ([MS-TDS] 2.2.6.6) from TDS 7.2 on: another RPC follows in the same message.
+const BATCH_FLAG: u8 = 0xFF;
 /// `NoExecFlag` ([MS-TDS] 2.2.6.6): another RPC follows and this one is not executed.
-const NO_EXEC_FLAG: u8 = 0xFF;
+const NO_EXEC_FLAG: u8 = 0xFE;
 /// `StatusFlags.fByRefValue` ([MS-TDS] 2.2.6.6): the parameter is OUTPUT.
 const STATUS_BY_REF_VALUE: u8 = 0x01;
 /// `StatusFlags.fDefaultValue` ([MS-TDS] 2.2.6.6): use the procedure's default value.
@@ -194,7 +203,7 @@ pub(crate) fn decode(payload: &[u8]) -> Result<Rpc, TdsError> {
 
     let mut params = Vec::new();
     while let Some(&first) = input.first() {
-        if first == BATCH_FLAG || first == NO_EXEC_FLAG {
+        if matches!(first, BATCH_FLAG | NO_EXEC_FLAG) {
             return Err(TdsError::Unsupported("RPC batch"));
         }
         params.push(decode_param(input)?);

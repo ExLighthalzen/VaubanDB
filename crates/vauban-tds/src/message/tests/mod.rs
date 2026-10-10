@@ -12,7 +12,14 @@ fn dispatch_attention_and_unsupported() {
     ));
     assert!(matches!(
         decode_client_message(PacketType::from_u8(0x07), &[], ResetConnection::None),
-        Ok(ClientMessage::Unsupported(0x07))
+        Ok(ClientMessage::Refused {
+            packet_type: 0x07,
+            reason: "bulk copy of rows"
+        })
+    ));
+    assert!(matches!(
+        decode_client_message(PacketType::FedAuthToken, &[], ResetConnection::None),
+        Ok(ClientMessage::Unsupported(0x08))
     ));
     assert!(matches!(
         decode_client_message(PacketType::PreLogin, &[], ResetConnection::None),
@@ -47,6 +54,66 @@ fn debug_prints_unsupported_kind_in_hex() {
         "Unsupported(0x07)"
     );
     assert_eq!(format!("{:?}", ClientMessage::Attention), "Attention");
+    assert_eq!(
+        format!(
+            "{:?}",
+            ClientMessage::Refused {
+                packet_type: 3,
+                reason: "RPC batch"
+            }
+        ),
+        "Refused(0x03, RPC batch)"
+    );
+}
+
+/// ALL_HEADERS (Transaction Descriptor alone), then `sp_executesql` by ProcID with no
+/// option flag, then `params` as the parameter data.
+fn rpc_payload(params: &[u8]) -> Vec<u8> {
+    let mut payload = vec![
+        0x16, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    ];
+    payload.extend_from_slice(&[0xFF, 0xFF, 0x0A, 0x00, 0x00, 0x00]);
+    payload.extend_from_slice(params);
+    payload
+}
+
+#[test]
+fn rpc_content_this_version_does_not_handle_is_refused_not_failed() {
+    // Unnamed parameter, no status flag, then a TYPE_INFO token the decoder refuses:
+    // xml, text, ntext, image, sql_variant, CLR UDT, table-valued.
+    for token in [0xF1u8, 0x23, 0x63, 0x22, 0x62, 0xF0, 0xF3] {
+        let payload = rpc_payload(&[0x00, 0x00, token, 0x00, 0x00, 0x00, 0x00]);
+        match decode_client_message(PacketType::Rpc, &payload, ResetConnection::Full) {
+            Ok(ClientMessage::Refused {
+                packet_type: 0x03,
+                reason,
+            }) => assert!(!reason.is_empty()),
+            other => panic!("type token 0x{token:02X}: expected Refused, got {other:?}"),
+        }
+    }
+    // A batch of two RPCs, behind the BatchFlag of TDS 7.2 and later.
+    let mut payload = rpc_payload(&[]);
+    payload.push(0xFF);
+    payload.extend_from_slice(&[0xFF, 0xFF, 0x0A, 0x00, 0x00, 0x00]);
+    assert!(matches!(
+        decode_client_message(PacketType::Rpc, &payload, ResetConnection::None),
+        Ok(ClientMessage::Refused {
+            packet_type: 0x03,
+            reason: "RPC batch"
+        })
+    ));
+}
+
+#[test]
+fn malformed_rpc_stays_an_error() {
+    // An unknown TYPE_INFO token, and a parameter cut in its name.
+    for params in [&[0x00, 0x00, 0x99][..], &[0x02, 0x40]] {
+        assert!(matches!(
+            decode_client_message(PacketType::Rpc, &rpc_payload(params), ResetConnection::None),
+            Err(TdsError::Malformed(_))
+        ));
+    }
 }
 
 #[test]

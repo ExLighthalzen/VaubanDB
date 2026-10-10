@@ -58,6 +58,16 @@
 //! next request. The COLMETADATA and the rows already written stay where they are, the
 //! error coming after them ([MS-TDS] 2.2.7.9).
 //!
+//! # A message this version does not handle is not a broken stream
+//!
+//! The reader hands over a message once its last packet is in, so a message whose content
+//! the codec refuses (`ClientMessage::Refused`: an RPC with an `xml`, `text`, `sql_variant`
+//! or table-valued parameter, a batch of RPCs, a BULK_LOAD message) has left nothing on the
+//! socket (`tests/unsupported_input.rs`, `refused_rpc_over_several_packets_is_read_to_its_end`). It is answered by error 50000 (severity 16, state 1) naming what
+//! was refused and a DONE carrying `DoneStatus::ERROR` ([`report_refused`]), and the
+//! connection serves the next request. A stream the codec cannot read (`TdsError::Malformed`)
+//! still closes the connection, as do the packet types of `ClientMessage::Unsupported`.
+//!
 //! No client error reaches `serve`: a `TdsError` is logged at `warn` and closes its own
 //! connection only. The password of a LOGIN7 is never logged: only named fields of the
 //! login appear in the journal, never the whole message.
@@ -594,6 +604,10 @@ async fn run_connection(
                     RequestOutcome::Close => return Ok(()),
                 }
             }
+            ClientMessage::Refused {
+                packet_type,
+                reason,
+            } => report_refused(&mut writer, packet_type, reason).await?,
             other @ (ClientMessage::Login7(_) | ClientMessage::Unsupported(_)) => {
                 warn!(
                     message = message_kind(&other),
@@ -947,6 +961,45 @@ async fn report_unencodable(writer: &mut TdsWriter, err: &TdsError) -> Result<()
     writer.flush().await
 }
 
+/// The error that answers a refused message: number 50000, severity 16, state 1, naming
+/// the message and what in it is not handled (unit test `refused_message_error`).
+fn refused_error(packet_type: u8, reason: &str) -> SqlError {
+    let message = match packet_type {
+        0x03 => "RPC request",
+        0x07 => "BULK_LOAD message",
+        _ => "client message",
+    };
+    SqlError::from(InternalError::Bug(format!(
+        "{message}: {reason} is not implemented yet"
+    )))
+}
+
+/// Answers a message the codec read whole but does not handle (`ClientMessage::Refused`):
+/// an ERROR then a DONE carrying `ERROR`, and the `flush` that ends the response. Nothing
+/// runs, so the open transaction and its uncommitted rows are as the previous request left
+/// them (`tests/unsupported_input.rs`, `refused_rpc_leaves_the_open_transaction_as_it_was`).
+async fn report_refused(
+    writer: &mut TdsWriter,
+    packet_type: u8,
+    reason: &'static str,
+) -> Result<(), TdsError> {
+    warn!(
+        packet_type = %format!("0x{packet_type:02X}"),
+        reason, "client message not handled by this version, answering an error"
+    );
+    writer
+        .write_tokens(&[
+            Token::Error(refused_error(packet_type, reason)),
+            Token::Done {
+                status: DoneStatus::ERROR,
+                cur_cmd: 0,
+                row_count: None,
+            },
+        ])
+        .await?;
+    writer.flush().await
+}
+
 /// Drops every token the cancelled request still had to send, until it lets go of the
 /// channel.
 async fn drain(rx: &mut mpsc::Receiver<Token>) {
@@ -1283,6 +1336,7 @@ fn message_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::Attention => "Attention",
         ClientMessage::TransactionManager(_) => "Transaction Manager Request",
         ClientMessage::Unsupported(_) => "unsupported",
+        ClientMessage::Refused { .. } => "refused",
     }
 }
 
@@ -1682,6 +1736,27 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// The error of a refused message names the message and the refused part, under the
+    /// number, severity and state of the other internal failures.
+    #[test]
+    fn refused_message_error() {
+        let rpc = refused_error(0x03, "XMLTYPE (xml)");
+        assert_eq!((rpc.number, rpc.severity, rpc.state), (50000, 16, 1));
+        assert!(
+            rpc.message
+                .ends_with("RPC request: XMLTYPE (xml) is not implemented yet"),
+            "{}",
+            rpc.message
+        );
+        let bulk = refused_error(0x07, "bulk copy of rows");
+        assert!(
+            bulk.message
+                .ends_with("BULK_LOAD message: bulk copy of rows is not implemented yet"),
+            "{}",
+            bulk.message
+        );
     }
 
     /// The message the client gets for a refused token: number 50000, severity 16, state 1,

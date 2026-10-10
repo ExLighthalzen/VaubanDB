@@ -151,6 +151,21 @@ fn decode_rpc_batch_unsupported() {
     ));
 }
 
+/// A parameter named `@` followed by 127 characters: its B_VARCHAR length byte is `0x80`,
+/// the `BatchFlag` of the versions before TDS 7.2, and must be read as a length.
+#[test]
+fn decode_param_name_of_128_characters() {
+    let name = format!("@{}", "p".repeat(127));
+    let mut body = sp_executesql_select_1();
+    body.push(0x80);
+    body.extend_from_slice(&utf16le(&name));
+    body.extend_from_slice(&hex("00 26 04 04 09 00 00 00"));
+    let rpc = decode(&message(&body)).unwrap();
+    assert_eq!(rpc.params.len(), 2);
+    assert_eq!(rpc.params[1].name, name);
+    assert_eq!(rpc.params[1].value, Value::I32(9));
+}
+
 #[test]
 fn decode_truncated_is_malformed() {
     // Length of the message once `OptionFlags` is read: a prefix that stops exactly
