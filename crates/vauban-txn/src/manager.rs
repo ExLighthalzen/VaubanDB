@@ -16,25 +16,39 @@
 //!
 //! The [`Mutex`] below guards the list of open transactions; the [`LockManager`] guards the
 //! lock table and is the one a thread parks on; the options map of `snapshot_modes.rs`
-//! guards the two database options. They are taken in that order, state first: `finish`
-//! calls [`LockManager::release_all`], which parks on nothing, while it holds the state
+//! guards the two database options. They are taken in that order, state first: `commit`
+//! and `rollback` call [`LockManager::release_all`], which parks on nothing, while it holds the state
 //! lock, and `lock_row`, which may park for as long as its [`LockTimeout`], takes the state
 //! lock neither before nor while it parks. `statement_snapshot` and `check_write_conflict`
 //! read the options while they hold the state lock; `set_versioning_options` holds the
 //! options lock alone.
 //!
-//! # One lock, one order
+//! # Ending a transaction outside the state lock
 //!
 //! [`State`] holds the counter and the list of open transactions — each with its action log —
-//! behind a single [`Mutex`]. `commit` and `rollback` hold that lock across the deferred
-//! actions and the call to [`Storage::commit`] / [`Storage::rollback`], and they call
-//! `storage` **before** taking the transaction out of the list of open ones. Since
-//! [`TransactionManager::statement_snapshot`] takes the same
-//! lock, a [`Snapshot`] built by another thread reads a state where the two steps have both
-//! happened or neither has. The test that tells the two orders apart is
-//! `a_refused_storage_commit_keeps_the_transaction_open` (`tests/txn_basic.rs`): swapping the
-//! two statements of `finish` makes it fail, on one thread, on a `storage` that refuses the
-//! commit.
+//! behind a single [`Mutex`]. `commit` does not hold that lock across the deferred drops and
+//! the call to [`Storage::commit`], which is where the journal is synced on disk. It runs in
+//! three steps:
+//!
+//! 1. under the lock, the transaction is marked as ending and its action log is taken out;
+//! 2. without the lock, the deferred drops run and `storage` commits the transaction, so that
+//!    a `begin`, a `statement_snapshot` or the commit of another transaction goes on meanwhile
+//!    (unit test `begin_and_snapshot_do_not_wait_for_a_commit_in_storage`), and the
+//!    transactions that end at the same time share one sync of the journal;
+//! 3. under the lock again, the transaction leaves the list of open ones once `storage` has
+//!    accepted the outcome, or, when it refused it, is marked as open again with its log put
+//!    back (`tests/txn_basic.rs`, `a_refused_storage_commit_keeps_the_transaction_open`).
+//!
+//! A transaction that is ending stays in the list of open ones until step 3, so the
+//! snapshots built during step 2 list it in `active` and do not see its writes: it becomes
+//! visible to the snapshots built after its commit has returned, which is after its commit
+//! record is durable (unit test `begin_and_snapshot_do_not_wait_for_a_commit_in_storage`).
+//! A second `commit` or `rollback` of the same handle during step 2, and the other methods
+//! that change its action log, answer the error of a transaction that is not open.
+//!
+//! `rollback` keeps the state lock across its compensations and [`Storage::rollback`], and
+//! calls `storage` before taking the transaction out of the list, so a [`Snapshot`] built by
+//! another thread reads a state where both steps have happened or neither has.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -103,6 +117,9 @@ struct Open {
     /// under the two other modes, what [`TransactionManager::check_write_conflict`]
     /// compares a row against.
     last: Option<Snapshot>,
+    /// Whether a `commit` or a `rollback` is ending the transaction in `storage` at the
+    /// moment (module documentation, "Ending a transaction outside the state lock").
+    ending: bool,
 }
 
 /// What the manager knows about the transactions it started, behind one lock.
@@ -123,9 +140,15 @@ impl State {
         self.open.iter().position(|txn| txn.handle.id == id)
     }
 
-    /// The action log of `id`, or `None` when the transaction is closed.
+    /// Position of `id` in [`State::open`], or `None` when the transaction is closed or
+    /// being ended by a `commit` or a `rollback`.
+    fn live_position(&self, id: TxnId) -> Option<usize> {
+        self.position(id).filter(|&pos| !self.open[pos].ending)
+    }
+
+    /// The action log of `id`, or `None` when the transaction is closed or being ended.
     fn log_mut(&mut self, id: TxnId) -> Option<&mut ActionLog> {
-        let pos = self.position(id)?;
+        let pos = self.live_position(id)?;
         Some(&mut self.open[pos].log)
     }
 
@@ -270,6 +293,7 @@ impl TransactionManager {
             db,
             pinned: None,
             last: None,
+            ending: false,
         });
         handle
     }
@@ -290,8 +314,8 @@ impl TransactionManager {
     /// unrun (`tests/txn_actions.rs`, `a_committed_compensation_leaves_the_table`).
     ///
     /// [`Storage::commit`] is called next and the transaction leaves
-    /// [`TransactionManager::active_sessions`] afterwards, under the same lock (module
-    /// documentation above). A transaction that wrote nothing commits fine: `storage` accepts
+    /// [`TransactionManager::active_sessions`] afterwards; neither step holds the state lock
+    /// (module documentation above). A transaction that wrote nothing commits fine: `storage` accepts
     /// it (unit test `horizon_and_xmin_fall_back_on_the_next_id`). A snapshot another
     /// transaction took while `txn` was open keeps hiding the writes of `txn` after the
     /// commit; the snapshot it takes next shows them (`tests/txn_basic.rs`,
@@ -307,7 +331,7 @@ impl TransactionManager {
     /// (`tests/txn_basic.rs`, `a_refused_storage_commit_keeps_the_transaction_open`), and the
     /// deferred drops already run are not undone.
     pub fn commit(&self, txn: TxnHandle) -> SqlResult<()> {
-        self.finish("commit", &txn, true)
+        self.finish_commit(&txn)
     }
 
     /// Rolls `txn` back: compensates the objects it created, undoes its writes in `storage`,
@@ -317,8 +341,9 @@ impl TransactionManager {
     /// [`TransactionManager::register_on_rollback`] run first, in **reverse** registration
     /// order (`tests/txn_actions.rs`, `create_compensated_on_rollback`,
     /// `rollback_actions_run_in_reverse_order`), and the [`CommitAction`]s are dropped unrun
-    /// (`tests/txn_actions.rs`, `a_rolled_back_deferred_drop_keeps_the_table`). Then the same
-    /// order and the same lock as [`TransactionManager::commit`]: after the call, a row `txn`
+    /// (`tests/txn_actions.rs`, `a_rolled_back_deferred_drop_keeps_the_table`). Then
+    /// [`Storage::rollback`], and the transaction leaves the list of open ones, both under the
+    /// state lock (module documentation above): after the call, a row `txn`
     /// inserted is hidden from a later snapshot and a row it deleted is back
     /// (`tests/txn_basic.rs`, `rollback_hides_the_row`).
     ///
@@ -338,24 +363,46 @@ impl TransactionManager {
     /// commit). Resuming the run where it stopped would need the log to keep what it has
     /// run, which it does not do.
     pub fn rollback(&self, txn: TxnHandle) -> SqlResult<()> {
-        self.finish("rollback", &txn, false)
+        let mut state = self.lock();
+        let Some(pos) = state.live_position(txn.id) else {
+            return Err(not_open("rollback", txn.id));
+        };
+        state.open[pos].log.run_on_rollback(self.storage.as_ref())?;
+        self.storage.rollback(txn.id)?;
+        // After `storage`, as in `commit`; an error above keeps the transaction open with
+        // its locks.
+        self.locks.release_all(txn.id);
+        state.open.remove(pos);
+        Ok(())
     }
 
-    /// Runs the deferred actions of `txn` and closes it through `storage`, committing it when
-    /// `commit` is true.
+    /// Runs the deferred drops of `txn` and commits it through `storage`.
     ///
-    /// The lock is held across the `storage` call on purpose, see the module documentation.
-    fn finish(&self, method: &str, txn: &TxnHandle, commit: bool) -> SqlResult<()> {
-        let mut state = self.lock();
-        let Some(pos) = state.position(txn.id) else {
-            return Err(not_open(method, txn.id));
+    /// The state lock is dropped across the `storage` call, in the three steps of the module
+    /// documentation.
+    fn finish_commit(&self, txn: &TxnHandle) -> SqlResult<()> {
+        let log = {
+            let mut state = self.lock();
+            let Some(pos) = state.live_position(txn.id) else {
+                return Err(not_open("commit", txn.id));
+            };
+            state.open[pos].ending = true;
+            std::mem::take(&mut state.open[pos].log)
         };
-        if commit {
-            state.open[pos].log.run_on_commit(self.storage.as_ref())?;
-            self.storage.commit(txn.id)?;
-        } else {
-            state.open[pos].log.run_on_rollback(self.storage.as_ref())?;
-            self.storage.rollback(txn.id)?;
+        let outcome = log
+            .run_on_commit(self.storage.as_ref())
+            .and_then(|()| self.storage.commit(txn.id));
+        let mut state = self.lock();
+        // The entry is still there: the flag set above turns away the calls that could
+        // remove it.
+        let Some(pos) = state.position(txn.id) else {
+            return Err(not_open("commit", txn.id));
+        };
+        if let Err(err) = outcome {
+            let open = &mut state.open[pos];
+            open.ending = false;
+            open.log = log;
+            return Err(err);
         }
         // After `storage`: a waiter woken here finds a transaction whose outcome `storage`
         // has already taken. An error above returns before this line,
@@ -381,7 +428,7 @@ impl TransactionManager {
     /// otherwise, in which case no mark is kept.
     pub fn savepoint(&self, txn: &TxnHandle) -> SqlResult<SavepointId> {
         let mut state = self.lock();
-        if state.position(txn.id).is_none() {
+        if state.live_position(txn.id).is_none() {
             return Err(not_open("savepoint", txn.id));
         }
         let sp = self.storage.savepoint(txn.id)?;
@@ -421,7 +468,7 @@ impl TransactionManager {
     /// consequences described on [`TransactionManager::rollback`].
     pub fn rollback_to(&self, txn: &TxnHandle, sp: SavepointId) -> SqlResult<()> {
         let mut state = self.lock();
-        let Some(pos) = state.position(txn.id) else {
+        let Some(pos) = state.live_position(txn.id) else {
             return Err(not_open("rollback_to", txn.id));
         };
         let Some(at) = state.open[pos].log.position_of(sp) else {

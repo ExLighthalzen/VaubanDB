@@ -15,10 +15,30 @@
 //!
 //! The register of the transactions is per instance: [`DiskStorage::begin_txn`] appends the
 //! `Begin` of the first write of a transaction, whichever table it lands in, and
-//! [`DiskStorage::end_txn`] appends its `Commit` **or** its `Abort` once
+//! [`DiskStorage::end_txn_grouped`] appends its `Commit` **or** its `Abort` once
 //! (`super::tests::one_begin_one_end_per_txn_over_two_tables`). [`Storage::commit`] and
 //! [`Storage::rollback`] then walk the tables the transaction wrote in and let each of them
 //! drop its undo log or replay it backwards.
+//!
+//! # Ending a transaction without holding the register across the sync
+//!
+//! The end record is appended under the lock of the register. The lock is then dropped, and
+//! the call waits for the record to be durable through the group commit of the journal
+//! ([`super::wal::WalHandle::wait_durable`]): the transactions that end at the same time
+//! append their records while one sync runs, and share the next one
+//! (`tests::sixteen_concurrent_commits_share_two_syncs`). [`Storage::commit`] returns once
+//! the record is durable, and not before
+//! (`tests::no_commit_returns_before_its_record_is_synced`). The tables are walked after that
+//! wait, so the pages the transaction wrote keep their `in_progress` flag until its end is on
+//! disk. The register says `Committed` or `Aborted` once the wait has returned `Ok`; when the
+//! sync fails, the transaction stays `InProgress` with its pages and its undo log, so a
+//! `rollback` of it goes through, and the `Abort` record it appends after the `Commit` one
+//! decides the replay of the journal
+//! (`tests::a_failed_commit_rolls_back_and_stays_rolled_back_after_a_reopen`).
+//!
+//! What hides a transaction from the readers while its record waits for the sync is the
+//! snapshot they read through: the `txn` module keeps it in the `active` list of the
+//! snapshots it builds until this call has returned.
 //!
 //! # Locks
 //!
@@ -592,7 +612,7 @@ impl DiskStorage {
             super::WalRecordKind::Abort => TxnStatus::Aborted,
             _ => TxnStatus::Committed,
         };
-        let lsn = self.end_txn(txn, kind)?;
+        let lsn = self.end_txn_grouped(txn, kind, status)?;
         for table in self.txn_tables(txn) {
             let mut catalogue = self.lock_catalogue()?;
             // A table the transaction wrote in and that was dropped since is left alone:
@@ -615,6 +635,53 @@ impl DiskStorage {
             self.store_catalogue(lsn)?;
         }
         Ok(())
+    }
+}
+
+impl DiskStorage {
+    /// Ends `txn` with `kind` as [`DiskStorage::end_txn`] does, but waits for the record to be
+    /// durable after the lock of the register is dropped, through the group commit of the
+    /// journal (module documentation).
+    ///
+    /// A transaction that wrote nothing appends no record and waits for nothing; its status is
+    /// registered too, so that a second end is reported.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Bug`] for a transaction that already committed or rolled back; the
+    /// errors of [`super::wal::WalHandle::append`] and of
+    /// [`super::wal::WalHandle::wait_durable`] otherwise, in which case the register keeps
+    /// the transaction `InProgress`.
+    ///
+    /// The status changes after the wait, so two ends of one transaction issued at the same
+    /// time may both append their record: a caller bug the `txn` module turns away, since it
+    /// refuses a second end of a transaction it is ending.
+    fn end_txn_grouped(
+        &self,
+        txn: TxnId,
+        kind: super::WalRecordKind,
+        status: TxnStatus,
+    ) -> Result<Option<super::Lsn>, InternalError> {
+        let lsn = {
+            let mut register = super::write_lock(&self.txns);
+            let record = register.txns.entry(txn).or_default();
+            if record.status != TxnStatus::InProgress {
+                return Err(InternalError::Bug(format!(
+                    "transaction {txn} is already {:?}",
+                    record.status
+                )));
+            }
+            if !record.began {
+                record.status = status;
+                return Ok(None);
+            }
+            self.wal.append(kind, txn, &[])?
+        };
+        self.wal.wait_durable(lsn)?;
+        if let Some(record) = super::write_lock(&self.txns).txns.get_mut(&txn) {
+            record.status = status;
+        }
+        Ok(Some(lsn))
     }
 }
 
@@ -846,3 +913,6 @@ impl Storage for DiskStorage {
         DiskStorage::next_txn_id(self).saturating_sub(1)
     }
 }
+
+#[cfg(test)]
+mod tests;

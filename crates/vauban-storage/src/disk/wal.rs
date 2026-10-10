@@ -119,11 +119,27 @@
 //! [`Wal`] appends through `&mut self`; [`WalHandle`] is the same journal behind a mutex,
 //! which is what [`super::DiskStorage`] holds so that the tables writing their records and the
 //! buffer pool reading [`Wal::durable_lsn`] share one journal.
+//!
+//! # Group commit
+//!
+//! [`WalHandle::wait_durable`] is how the end of a transaction becomes durable without holding
+//! the journal lock across `sync_all`. A caller appends its record, then waits until
+//! [`Wal::durable_lsn`] reaches it. The first waiter that finds no sync running becomes the
+//! leader: it reads the number of the last record appended so far, drops the journal lock,
+//! syncs the file through a second handle on it, then moves the durable LSN to that number.
+//! The callers that appended while it was syncing wait for it, and one of them leads the next
+//! sync, which covers the records of all of them. A sync that fails fails each caller whose
+//! record it was to cover, and none of them tries again
+//! (`storage_impl::tests::a_failed_group_sync_fails_each_commit_it_was_to_cover`). Sixteen threads that end a transaction
+//! while one sync is held back share at most two syncs
+//! (`storage_impl::tests::sixteen_concurrent_commits_share_two_syncs`), and a commit whose
+//! record is not covered yet has not returned
+//! (`storage_impl::tests::no_commit_returns_before_its_record_is_synced`).
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use vauban_errors::InternalError;
 
@@ -545,6 +561,9 @@ pub(crate) struct Wal {
     durable_lsn: Lsn,
     /// How many records the file holds.
     records: u64,
+    /// How many `sync_all` calls made records durable since the journal was opened.
+    #[cfg(test)]
+    syncs: u64,
 }
 
 impl Wal {
@@ -587,6 +606,8 @@ impl Wal {
             last_lsn: tail.last_lsn,
             durable_lsn: tail.last_lsn,
             records: tail.records,
+            #[cfg(test)]
+            syncs: 0,
         })
     }
 
@@ -807,8 +828,29 @@ impl Wal {
     /// loses with `sync_data` alone is not asserted anywhere in this crate.
     pub(crate) fn flush(&mut self) -> Result<(), InternalError> {
         self.file.sync_all()?;
-        self.durable_lsn = self.last_lsn;
+        self.note_sync(self.last_lsn);
         Ok(())
+    }
+
+    /// Records that a `sync_all` covered the records up to `covered`.
+    ///
+    /// The durable LSN does not go backwards: a group sync that read its target before a
+    /// [`Wal::flush`] moved the LSN further leaves it where the flush put it.
+    fn note_sync(&mut self, covered: Lsn) {
+        if covered > self.durable_lsn {
+            self.durable_lsn = covered;
+        }
+        #[cfg(test)]
+        {
+            self.syncs += 1;
+        }
+    }
+
+    /// How many `sync_all` calls made records durable since the journal was opened, the one
+    /// of [`Wal::open`] left out.
+    #[cfg(test)]
+    pub(crate) fn syncs(&self) -> u64 {
+        self.syncs
     }
 
     /// Reads the records of the journal in the order they were appended, which is the order
@@ -842,10 +884,101 @@ impl Wal {
 /// under the lock of the pool. Each method below takes the journal lock, does its file work
 /// and drops it, and the bodies of this file issue no call to the pool, so the pair is taken
 /// in that order here.
+///
+/// [`WalHandle::wait_durable`] takes the lock of the group, then the journal lock under it;
+/// [`WalHandle::sync_appended`] takes the journal lock and drops it before it takes the lock
+/// of the group. These two methods are where this file takes the lock of the group, and
+/// neither of them calls the pool.
 #[derive(Debug, Clone)]
 pub(crate) struct WalHandle {
     /// The journal itself, behind the lock that serialises the appends.
     wal: Arc<Mutex<Wal>>,
+    /// What the callers of [`WalHandle::wait_durable`] share to elect the leader of a sync.
+    group: Arc<Group>,
+}
+
+/// The group commit of one journal (module documentation, "Group commit").
+#[derive(Debug)]
+struct Group {
+    /// A second handle on the journal file, which the leader syncs without the journal lock.
+    file: File,
+    /// Whether a leader is syncing at the moment, and the records whose sync failed.
+    state: Mutex<GroupState>,
+    /// Where the callers wait for the leader to finish.
+    done: Condvar,
+    /// A gate the leader passes before it syncs, set by the tests that hold a sync back.
+    #[cfg(test)]
+    gate: Mutex<Option<Arc<SyncGate>>>,
+}
+
+/// What the callers of [`WalHandle::wait_durable`] share, behind the lock of the group.
+#[derive(Debug, Default)]
+struct GroupState {
+    /// Whether a leader is syncing at the moment.
+    syncing: bool,
+    /// The records a failed group sync was to cover: from the record after the durable LSN
+    /// read before that sync to its target, both ends included.
+    failed: Vec<(Lsn, Lsn)>,
+}
+
+impl GroupState {
+    /// Whether a failed group sync was to cover `lsn`.
+    fn failed_on(&self, lsn: Lsn) -> bool {
+        self.failed
+            .iter()
+            .any(|&(first, last)| first <= lsn && lsn <= last)
+    }
+}
+
+/// A gate that holds the leader of a group sync back until a test opens it.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct SyncGate {
+    /// Whether the gate is open, and how many leaders reached it.
+    state: Mutex<(bool, u64)>,
+    /// Where a leader waits for the gate to open.
+    opened: Condvar,
+    /// How many of the next leaders that pass the gate fail their sync instead of making it.
+    fail: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl SyncGate {
+    /// Counts the caller, then waits until the gate is open.
+    fn pass(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.1 += 1;
+        while !state.0 {
+            state = self.opened.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Opens the gate and lets the leaders waiting at it go on.
+    pub(crate) fn open(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).0 = true;
+        self.opened.notify_all();
+    }
+
+    /// Makes the next `count` leaders that pass the gate fail their sync.
+    pub(crate) fn fail_next(&self, count: u64) {
+        self.fail.store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the leader passing the gate fails its sync, counting it down.
+    fn fails(&self) -> bool {
+        self.fail
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            )
+            .is_ok()
+    }
+
+    /// How many leaders reached the gate.
+    pub(crate) fn reached(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
 }
 
 impl WalHandle {
@@ -855,8 +988,17 @@ impl WalHandle {
     ///
     /// Those of [`Wal::open`].
     pub(crate) fn open(path: &Path) -> Result<Self, InternalError> {
+        let wal = Wal::open(path)?;
+        let file = wal.file.try_clone()?;
         Ok(Self {
-            wal: Arc::new(Mutex::new(Wal::open(path)?)),
+            wal: Arc::new(Mutex::new(wal)),
+            group: Arc::new(Group {
+                file,
+                state: Mutex::new(GroupState::default()),
+                done: Condvar::new(),
+                #[cfg(test)]
+                gate: Mutex::new(None),
+            }),
         })
     }
 
@@ -940,6 +1082,115 @@ impl WalHandle {
         self.lock()?.flush()
     }
 
+    /// Waits until the record `lsn` is durable, syncing the journal as the leader of a group
+    /// when no other caller is (module documentation, "Group commit").
+    ///
+    /// `lsn` is a record the caller has appended. At an `Ok` return,
+    /// [`WalHandle::durable_lsn`] names `lsn` or a later record. The journal lock is not held
+    /// during the sync, so the other callers append their records meanwhile, and the next
+    /// sync covers them.
+    ///
+    /// # Errors
+    ///
+    /// When the group sync that was to cover `lsn` fails, [`InternalError::Io`] for each
+    /// caller whose record lies between the durable LSN read before that sync and its target,
+    /// the leader included; the waiters among them do not lead a second sync for their
+    /// record, since a sync that succeeds after a failed one does not say the pages of the
+    /// first are on disk. The durable LSN stays where it was
+    /// (`storage_impl::tests::a_failed_group_sync_fails_each_commit_it_was_to_cover`).
+    /// [`InternalError::Corruption`] for a poisoned lock.
+    pub(crate) fn wait_durable(&self, lsn: Lsn) -> Result<(), InternalError> {
+        let mut group = self.group_lock()?;
+        loop {
+            if group.failed_on(lsn) {
+                return Err(failed_sync(lsn));
+            }
+            if self.lock()?.durable_lsn() >= lsn {
+                return Ok(());
+            }
+            if !group.syncing {
+                break;
+            }
+            group = self
+                .group
+                .done
+                .wait(group)
+                .map_err(|_| poisoned("group commit"))?;
+        }
+        group.syncing = true;
+        drop(group);
+        let outcome = self.sync_appended();
+        let mut group = self.group_lock()?;
+        group.syncing = false;
+        if let Err((first, last)) = outcome {
+            group.failed.push((first, last));
+        }
+        drop(group);
+        self.group.done.notify_all();
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(_) => Err(failed_sync(lsn)),
+        }
+    }
+
+    /// Syncs the records appended so far, without holding the journal lock during the sync,
+    /// and moves the durable LSN to the last of them.
+    ///
+    /// A failure answers the records the sync was to cover, from the one after the durable
+    /// LSN read before the sync to the target; the durable LSN is left alone.
+    fn sync_appended(&self) -> Result<(), (Lsn, Lsn)> {
+        #[cfg(test)]
+        let gate = self
+            .group
+            .gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        #[cfg(test)]
+        if let Some(gate) = &gate {
+            gate.pass();
+        }
+        let (durable, target) = match self.lock() {
+            Ok(wal) => (wal.durable_lsn(), wal.last_lsn()),
+            Err(_) => return Err((Lsn(1), Lsn(u64::MAX))),
+        };
+        let first = Lsn(durable.0.saturating_add(1));
+        #[cfg(test)]
+        if gate.as_ref().is_some_and(|gate| gate.fails()) {
+            return Err((first, target));
+        }
+        if self.group.file.sync_all().is_err() {
+            return Err((first, target));
+        }
+        match self.lock() {
+            Ok(mut wal) => {
+                wal.note_sync(target);
+                Ok(())
+            }
+            Err(_) => Err((first, target)),
+        }
+    }
+
+    /// The state of the group, a poison reported as corruption.
+    fn group_lock(&self) -> Result<MutexGuard<'_, GroupState>, InternalError> {
+        self.group
+            .state
+            .lock()
+            .map_err(|_| poisoned("group commit"))
+    }
+
+    /// Puts `gate` in front of the next group syncs of this journal.
+    #[cfg(test)]
+    pub(crate) fn set_sync_gate(&self, gate: Option<Arc<SyncGate>>) {
+        *self.group.gate.lock().unwrap_or_else(|e| e.into_inner()) = gate;
+    }
+
+    /// How many `sync_all` calls made records durable since the journal was opened.
+    #[cfg(test)]
+    pub(crate) fn syncs(&self) -> u64 {
+        self.lock().map_or(0, |wal| wal.syncs())
+    }
+
     /// The records of the journal, read from its first byte.
     ///
     /// # Errors
@@ -957,10 +1208,20 @@ impl WalHandle {
     /// The lock around the journal, a poison reported as corruption, as the buffer pool
     /// reports its own.
     fn lock(&self) -> Result<MutexGuard<'_, Wal>, InternalError> {
-        self.wal
-            .lock()
-            .map_err(|_| InternalError::Corruption("journal lock poisoned".to_string()))
+        self.wal.lock().map_err(|_| poisoned("journal"))
     }
+}
+
+/// The error of a record whose group sync failed.
+fn failed_sync(lsn: Lsn) -> InternalError {
+    InternalError::Io(std::io::Error::other(format!(
+        "the sync of the journal that was to make record {lsn} durable failed"
+    )))
+}
+
+/// The error of a lock a panicking thread left poisoned.
+fn poisoned(what: &str) -> InternalError {
+    InternalError::Corruption(format!("{what} lock poisoned"))
 }
 
 impl DurableLsn for WalHandle {
