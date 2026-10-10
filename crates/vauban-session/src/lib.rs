@@ -12,7 +12,8 @@
 //! | `login.rs` | LOGIN7 handling and the login response |
 //! | `state.rs`, `set_options.rs` | per-session state and `SET` options |
 //! | `sink.rs` | `ResultSink` and its TDS implementation |
-//! | `batch.rs`, `fake_engine.rs` | batch and RPC dispatch, the `WAITFOR DELAY` fallback |
+//! | `batch.rs`, `fake_engine.rs` | the program of a batch or of a called level, the `WAITFOR DELAY` fallback |
+//! | `procedures.rs` | calls: system procedures, `EXEC('…')` and `sp_executesql`, each in a level of its own |
 //! | `statements.rs` | span, fragment and line of one statement inside the text it sits in |
 //! | `cancel.rs` | ATTENTION handling |
 //! | `disconnect.rs` | connection teardown and ATTENTION cleanup |
@@ -27,7 +28,6 @@ mod disconnect;
 mod eval_context;
 mod fake_engine;
 mod login;
-mod nested;
 mod prepared;
 mod procedures;
 mod registry;
@@ -54,8 +54,7 @@ pub use cancel::*;
 pub use fake_engine::*;
 #[allow(unused_imports)]
 pub use login::*;
-#[allow(unused_imports)]
-pub use nested::*;
+pub use procedures::{NestedOutcome, NestedParam};
 #[allow(unused_imports)]
 pub use rpc::*;
 #[allow(unused_imports)]

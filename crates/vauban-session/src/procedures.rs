@@ -1,16 +1,239 @@
-//! Execute a resolved system-procedure [`ProcAction`] through the session.
+//! Calls: a system procedure resolved to a [`ProcAction`], a dynamic text (`EXEC('…')`)
+//! and the text of `sp_executesql`, each run in a level of its own.
+//!
+//! # A called level
+//!
+//! A call that runs T-SQL opens a level ([`run_level`]): its text is parsed, prepared,
+//! compiled and run by the program of `batch.rs`, as a batch is, each of its statements
+//! closed by a DONEINPROC. The level starts with the `SET` options, the current database
+//! and the transaction of its caller, with no variable but the parameters of
+//! `sp_executesql`, which are its first variables (`tests/nested.rs`,
+//! `caller_variables_are_out_of_scope`, `parameter_is_visible_in_the_text`). When it
+//! returns, however it ended, the caller gets its own state back: its variables, the `SET`
+//! options the callee changed and its current database
+//! (`tests/nested.rs`, `the_options_and_the_database_of_a_callee_end_with_it`, on
+//! `QUOTED_IDENTIFIER`, `NOCOUNT` and `USE`).
+//!
+//! A call written in a program runs inside the level the interpreter of the executor
+//! opened for it (`interp/frame.rs`), one level deeper than the statement that made it; a
+//! call an RPC makes opens its level here. The depth therefore grows with each text that
+//! calls another (`tests/nested.rs`, `a_dynamic_text_runs_its_own_dynamic_texts_three_deep`),
+//! and `ExecSession::max_nest_level` refuses a call that would go past it
+//! (`procedures::tests::a_call_past_the_nesting_limit_is_refused`).
+//!
+//! How the level ended is the interpreter's answer to the program that made the call
+//! (`vauban_executor::ProgramEnd`): an error that stops its level alone lets the caller go
+//! on (`tests/nested.rs`, `a_208_in_an_exec_lets_the_caller_continue`), an error that stops
+//! the batch, or an error under `SET XACT_ABORT ON`, stops it too (`tests/nested.rs`,
+//! `an_error_of_the_batch_two_levels_down_ends_the_response_with_one_done`,
+//! `xact_abort_set_by_a_callee_ends_the_batch_on_its_error`).
+
+use std::sync::Arc;
 
 use crate::rpc::{DescribeKind, ProcAction, ProcArg, ProcParam, StaticResultColumn};
-use vauban_errors::{ErrorScope, SqlError, SqlResult, error_behavior};
-use vauban_executor::EvaluatedExecArg;
+use vauban_errors::{BatchErrorScope, SqlError, SqlResult};
+use vauban_executor::{EvaluatedExecArg, ExecSession, ProgramEnd};
 use vauban_tds::{ColumnFlags, ColumnMeta, RpcParam};
 use vauban_txn::IsolationLevel;
 use vauban_types::{Len, SqlType, TypeInfo, Value};
 
-use crate::batch::{Flow, Session};
+use crate::batch::{Level, Session, cancelled};
 use crate::eval_context::apply_exec_session;
-use crate::nested::{NestedOutcome, NestedParam, nested_done_proc_rowcount};
 use crate::sink::ResultSink;
+use crate::statements::Flow;
+use crate::txn_session;
+
+/// One parameter of a called level, declared before its text is bound.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NestedParam {
+    /// Variable name, `@` included.
+    pub name: String,
+    /// Declared type sent in metadata and used for binding.
+    pub ty: TypeInfo,
+    /// Initial value before the text runs.
+    pub value: Value,
+    /// When `true`, the final value is returned in [`NestedOutcome::outputs`].
+    pub output: bool,
+}
+
+/// What a called level leaves behind once its tokens are sent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NestedOutcome {
+    /// Final values of the `output` parameters, in declaration order.
+    pub outputs: Vec<(String, Value)>,
+    /// `RETURN` status: the value of an explicit `RETURN`, `0` on a text that ran to its end
+    /// without one, and the number of the error that stopped the text otherwise, whether
+    /// that error kept the text from compiling at all or stopped it partway through
+    /// (`tests/nested.rs`, `return_status_is_the_error_number_after_a_runtime_error` and
+    /// `return_status_is_the_error_number_after_a_compile_error`).
+    pub return_status: i32,
+    /// `@@ROWCOUNT` once the text is done: what its last executed statement left, unchanged
+    /// from the value the caller held when a compile-time error kept every statement of the
+    /// text from running, `0` when a statement started running and then raised an error
+    /// (`tests/nested.rs`, `rowcount_reflects_the_last_row_count_of_the_nested_text` and
+    /// `rowcount_is_zero_after_a_runtime_error_and_unchanged_after_a_compile_error`).
+    pub rowcount: i64,
+    /// `true` when an error of the text, or of a text it called, reached the client.
+    pub failed: bool,
+    /// `true` when the nested text emitted at least one result set.
+    pub had_result_set: bool,
+}
+
+/// Row count for the closing DONEPROC of a nested batch or RPC when it is known.
+pub(crate) fn nested_done_proc_rowcount(
+    failed: bool,
+    had_result_set: bool,
+    rowcount: i64,
+) -> Option<u64> {
+    if failed || had_result_set {
+        return None;
+    }
+    u64::try_from(rowcount).ok().filter(|count| *count > 0)
+}
+
+impl Session {
+    /// Runs `text` like the body of `sp_executesql` an RPC calls: a level of its own whose
+    /// variables are `params` (module documentation, "A called level"), then RETURNSTATUS
+    /// when no error reached the client, and the DONEPROC that closes the call.
+    ///
+    /// # Errors
+    ///
+    /// An internal error that ends the request: a sink that cannot take what it is
+    /// handed, a cancelled request.
+    pub fn run_nested(
+        &mut self,
+        text: &str,
+        params: &[NestedParam],
+        sink: &mut dyn ResultSink,
+    ) -> SqlResult<NestedOutcome> {
+        let (outcome, _) = run_level(self, text, params, None, false, sink)?;
+        if !outcome.failed {
+            sink.return_status(outcome.return_status)?;
+        }
+        sink.done_proc(nested_done_proc_rowcount(
+            outcome.failed,
+            outcome.had_result_set,
+            outcome.rowcount,
+        ))?;
+        Ok(outcome)
+    }
+}
+
+/// Runs `text` in a level of its own (module documentation, "A called level"), on
+/// `database` when the call named one and on the caller's otherwise, its statements closed
+/// in `sink`; the end of the level is the caller's to send. `in_program` tells that the
+/// interpreter already opened the level, its variables set aside and its depth counted.
+///
+/// A `database` named by the call is the current database of the text while it runs,
+/// without the 5701 a `USE` sends (`compat/tests/catalog_procs.rs`,
+/// `a_qualified_call_leaves_the_caller_database_and_sends_no_context_change`).
+///
+/// A transaction count the text left different from the one it found is 266, sent after
+/// the text when no other error was, and the transaction is rolled back.
+///
+/// # Errors
+///
+/// An internal error that ends the request: a sink that cannot take what it is handed, a
+/// cancelled request.
+fn run_level(
+    session: &mut Session,
+    text: &str,
+    params: &[NestedParam],
+    database: Option<&str>,
+    in_program: bool,
+    sink: &mut dyn ResultSink,
+) -> SqlResult<(NestedOutcome, ProgramEnd)> {
+    let trancount_before = session.state().trancount;
+    let mut level_state = session.state().clone();
+    if let Some(database) = database {
+        database.clone_into(&mut level_state.database);
+    }
+    let caller_state = std::mem::replace(session.state_mut(), level_state);
+    let exec = session.exec_mut();
+    let variables = std::mem::take(&mut exec.variables);
+    let variable_types = std::mem::take(&mut exec.variable_types);
+    if !in_program {
+        exec.nest_level += 1;
+    }
+    for param in params {
+        exec.variables
+            .insert(param.name.clone(), param.value.clone());
+        exec.variable_types
+            .insert(param.name.clone(), param.ty.clone());
+    }
+
+    let ran = session.run_body(text, Level::Called, params, sink);
+
+    let outputs = collect_outputs(params, session.exec());
+    let exec = session.exec_mut();
+    exec.variables = variables;
+    exec.variable_types = variable_types;
+    if !in_program {
+        exec.nest_level = exec.nest_level.saturating_sub(1);
+    }
+    let mut level_state = std::mem::replace(session.state_mut(), caller_state);
+    let (end, track) = ran?;
+    if end == ProgramEnd::Cancelled {
+        return Err(cancelled());
+    }
+    let mut outcome = NestedOutcome {
+        outputs,
+        return_status: track.status,
+        rowcount: level_state.rowcount,
+        failed: track.failed,
+        had_result_set: track.had_result_set,
+    };
+    if let ProgramEnd::Returned(code) = end {
+        outcome.return_status = code;
+    }
+    if level_state.trancount != trancount_before {
+        let err = SqlError::transaction_count_after_execute(
+            i64::from(trancount_before),
+            i64::from(level_state.trancount),
+        );
+        if !outcome.failed {
+            sink.error(&err)?;
+            outcome.failed = true;
+        }
+        txn_session::rollback_all(&mut level_state, &Arc::clone(session.engine()))?;
+    }
+    Ok((outcome, end))
+}
+
+/// The final values of the `output` parameters among `params`, read from the level that
+/// ran them.
+fn collect_outputs(params: &[NestedParam], exec: &ExecSession) -> Vec<(String, Value)> {
+    params
+        .iter()
+        .filter(|param| param.output)
+        .filter_map(|param| {
+            exec.variables
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&param.name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+        })
+        .collect()
+}
+
+/// Closes a level a call written in a program opened: with a DONE that ends the `EXECUTE`
+/// in the batch, with a DONEINPROC in a called level, where a further DONE follows. A level
+/// that an error of the whole batch ended is not closed in a called level: that error ends
+/// each level up to the batch, which sends the last DONE (`tests/nested.rs`,
+/// `an_error_of_the_batch_two_levels_down_ends_the_response_with_one_done`).
+fn close_level(
+    sink: &mut dyn ResultSink,
+    in_proc: bool,
+    outcome: &NestedOutcome,
+    end: &ProgramEnd,
+) -> SqlResult<()> {
+    let rowcount =
+        nested_done_proc_rowcount(outcome.failed, outcome.had_result_set, outcome.rowcount);
+    match (in_proc, end) {
+        (true, ProgramEnd::Aborted(_)) => Ok(()),
+        (true, _) => sink.done_in_proc(rowcount, true),
+        (false, _) => sink.done(rowcount, true),
+    }
+}
 
 /// How a procedure call closes on the wire.
 pub(crate) enum ProcFinish<'a> {
@@ -19,11 +242,32 @@ pub(crate) enum ProcFinish<'a> {
         /// Original RPC parameters, in wire order.
         rpc_params: &'a [RpcParam],
     },
-    /// `EXEC` inside a SQL batch: inner DONEINPROC tokens, then one batch DONE.
+    /// `EXEC` written in a program: the statements of the callee end with DONEINPROC, and
+    /// the call ends with a DONE in the batch, with a DONEINPROC in a called level.
     Batch {
-        /// Whether another batch statement follows.
-        more: bool,
+        /// The `EXEC` is written in a called level rather than in the batch.
+        in_proc: bool,
     },
+}
+
+/// How a call ended, for the program that made it: how the callee ended, or the error of
+/// the `EXECUTE` itself, already in the sink (`vauban_executor::Host::call`).
+pub(crate) type CallEnd = Result<ProgramEnd, SqlError>;
+
+/// An `EXEC` of a procedure written in a program, its arguments evaluated.
+pub(crate) struct BatchCall<'c> {
+    /// The procedure name, as the `EXEC` names it.
+    pub(crate) name: &'c str,
+    /// The database part written left of the name.
+    pub(crate) qualifier: Option<&'c str>,
+    /// The arguments, in written order.
+    pub(crate) args: &'c [EvaluatedExecArg],
+    /// The `@rc =` variable that receives the status.
+    pub(crate) return_into: Option<&'c str>,
+    /// The line of the `EXEC`.
+    pub(crate) line: u32,
+    /// The `EXEC` is written in a called level rather than in the batch.
+    pub(crate) in_proc: bool,
 }
 
 /// The database a call qualified by a name runs its body on, `None` when the call qualified
@@ -80,8 +324,8 @@ pub(crate) struct BatchProcOutcome {
     pub failed: bool,
     /// Client error number, `0` on success.
     pub error_number: u32,
-    /// Whether the batch may continue after this statement.
-    pub continues: bool,
+    /// `true` when the call sent at least one result set.
+    pub had_result_set: bool,
 }
 
 /// Runs `action` for an RPC or a batch `EXEC`.
@@ -95,6 +339,17 @@ pub(crate) fn execute_proc_action(
     finish: ProcFinish<'_>,
     sink: &mut dyn ResultSink,
 ) -> SqlResult<BatchProcOutcome> {
+    run_action(session, action, database, finish, sink).map(|(_, outcome)| outcome)
+}
+
+/// [`execute_proc_action`], with how the call ended for a program that made it.
+fn run_action(
+    session: &mut Session,
+    action: ProcAction,
+    database: Option<&str>,
+    finish: ProcFinish<'_>,
+    sink: &mut dyn ResultSink,
+) -> SqlResult<(CallEnd, BatchProcOutcome)> {
     match action {
         ProcAction::ExecuteSql { statement, params } => {
             execute_nested_sql(session, &statement, &params, database, finish, sink)
@@ -102,7 +357,9 @@ pub(crate) fn execute_proc_action(
         ProcAction::Template { sql, params } => {
             execute_nested_sql(session, &sql, &params, database, finish, sink)
         }
-        ProcAction::Static { columns, rows } => execute_static(&columns, &rows, finish, sink),
+        ProcAction::Static { columns, rows } => {
+            execute_static(session, &columns, &rows, finish, sink)
+        }
         ProcAction::Describe {
             statement,
             kind,
@@ -130,29 +387,24 @@ pub(crate) fn execute_proc_action(
     }
 }
 
-/// Resolves and runs a batch `EXEC` of a stored procedure.
+/// Resolves and runs an `EXEC` of a stored procedure written in a program.
 ///
-/// `database` is the qualifier the call wrote, resolved before the procedure name is: a call
-/// qualified by a database the catalogue does not hold fails whether or not the procedure
-/// exists (`compat/tests/catalog_procs.rs`,
+/// The database the call names is resolved before the procedure name is: a call qualified
+/// by a database the catalogue does not hold fails whether or not the procedure exists
+/// (`compat/tests/catalog_procs.rs`,
 /// `a_call_qualified_by_a_missing_database_fails_before_the_body_runs`).
-// The name parts, the database and the sinks travel together on the one call site.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_batch_procedure(
     session: &mut Session,
-    name: &str,
-    qualifier: Option<&str>,
-    exec_args: &[EvaluatedExecArg],
-    return_into: Option<&str>,
-    line: u32,
-    more: bool,
+    call: &BatchCall<'_>,
     sink: &mut dyn ResultSink,
-) -> SqlResult<(Flow, BatchProcOutcome)> {
-    let database = match resolve_call_database(session, qualifier) {
+) -> SqlResult<(CallEnd, BatchProcOutcome)> {
+    let database = match resolve_call_database(session, call.qualifier) {
         Ok(database) => database,
-        Err(err) => return finish_batch_exec_error(session, at_line(err, line), more, sink),
+        Err(err) => {
+            return refuse_call(session, at_line(err, call.line), call.in_proc, sink);
+        }
     };
-    let stored = exec_args_to_proc_args(name, exec_args);
+    let stored = exec_args_to_proc_args(call.name, call.args);
     let proc_args: Vec<ProcArg<'_>> = stored
         .iter()
         .map(|arg| ProcArg {
@@ -164,63 +416,55 @@ pub(crate) fn run_batch_procedure(
         })
         .collect();
     let Some(resolver) = super::rpc::system_procedure_resolver(session) else {
-        let err = SqlError::procedure_not_found(name).with_line(line);
-        return finish_batch_exec_error(session, err, more, sink);
+        let err = SqlError::procedure_not_found(call.name).with_line(call.line);
+        return refuse_call(session, err, call.in_proc, sink);
     };
-    match resolver(name, &proc_args) {
+    match resolver(call.name, &proc_args) {
         None => {
-            let err = SqlError::procedure_not_found(name).with_line(line);
-            finish_batch_exec_error(session, err, more, sink)
+            let err = SqlError::procedure_not_found(call.name).with_line(call.line);
+            refuse_call(session, err, call.in_proc, sink)
         }
-        Some(Err(err)) => finish_batch_exec_error(session, at_call_line(err), more, sink),
+        Some(Err(err)) => refuse_call(session, at_call_line(err), call.in_proc, sink),
         Some(Ok(action)) => {
-            let outcome = execute_proc_action(
-                session,
-                action,
-                database.as_deref(),
-                ProcFinish::Batch { more },
-                sink,
-            )?;
-            apply_batch_outputs(session, exec_args, return_into, &outcome);
-            Ok((flow_from_outcome(&outcome), outcome))
+            let finish = ProcFinish::Batch {
+                in_proc: call.in_proc,
+            };
+            let (end, outcome) = run_action(session, action, database.as_deref(), finish, sink)?;
+            apply_batch_outputs(session, call.args, call.return_into, &outcome);
+            Ok((end, outcome))
         }
     }
 }
 
-/// Runs `EXEC('…')` dynamic SQL inside a batch.
+/// Runs `EXEC('…')` written in a program: the text in a level of its own, closed as the
+/// `EXEC` is ([`close_level`]).
 pub(crate) fn run_batch_dynamic(
     session: &mut Session,
     text: &str,
-    line: u32,
-    more: bool,
+    in_proc: bool,
     sink: &mut dyn ResultSink,
-) -> SqlResult<(Flow, BatchProcOutcome)> {
-    let _ = line;
-    let mut wrapper = BatchExecSink::new(sink, more, session.state().options.xact_abort);
-    let nested = session.run_nested(text, &[], &mut wrapper)?;
+) -> SqlResult<(CallEnd, BatchProcOutcome)> {
+    let mut tracked = TrackedSink::new(sink);
+    let (nested, end) = run_level(session, text, &[], None, true, &mut tracked)?;
+    let error_number = tracked.last_error;
+    close_level(sink, in_proc, &nested, &end)?;
     let outcome = BatchProcOutcome {
-        outputs: nested.outputs.clone(),
+        outputs: nested.outputs,
         rowcount: nested.rowcount,
         return_status: nested.return_status,
         failed: nested.failed,
-        error_number: wrapper.last_error(),
-        continues: continues_after_nested(
-            more,
-            session.state().options.xact_abort,
-            wrapper.last_error(),
-        ),
+        error_number,
+        had_result_set: nested.had_result_set,
     };
-    if outcome.failed {
-        session.state_mut().last_error = outcome.error_number;
-    } else {
-        session.state_mut().last_error = 0;
-    }
+    session.state_mut().last_error = if outcome.failed { error_number } else { 0 };
     session.state_mut().rowcount = outcome.rowcount;
     let exec = session.exec().clone();
     apply_exec_session(session.state_mut(), &exec, true, !outcome.failed);
-    Ok((flow_from_outcome(&outcome), outcome))
+    Ok((Ok(end), outcome))
 }
 
+/// Runs the text of `sp_executesql`, or of a procedure written in T-SQL, in a level of its
+/// own whose variables are `params`, and closes the call as `finish` says.
 fn execute_nested_sql(
     session: &mut Session,
     statement: &str,
@@ -228,49 +472,45 @@ fn execute_nested_sql(
     database: Option<&str>,
     finish: ProcFinish<'_>,
     sink: &mut dyn ResultSink,
-) -> SqlResult<BatchProcOutcome> {
+) -> SqlResult<(CallEnd, BatchProcOutcome)> {
     let nested_params = proc_params_to_nested(params);
-    let mut body_sink = match finish {
-        ProcFinish::Rpc { .. } => BodySink::Rpc(RpcBodySink::new(sink)),
-        ProcFinish::Batch { more } => BodySink::Batch(BatchExecSink::new(
-            sink,
-            more,
-            session.state().options.xact_abort,
-        )),
-    };
-    let nested =
-        session.run_nested_in_database(statement, &nested_params, database, &mut body_sink)?;
-    let last_error = body_sink.last_error();
-    if let ProcFinish::Rpc { rpc_params } = finish {
-        if !nested.failed {
-            emit_rpc_return_values(sink, rpc_params, &nested)?;
-            sink.return_status(nested.return_status)?;
+    let in_program = matches!(finish, ProcFinish::Batch { .. });
+    let mut tracked = TrackedSink::new(sink);
+    let (nested, end) = run_level(
+        session,
+        statement,
+        &nested_params,
+        database,
+        in_program,
+        &mut tracked,
+    )?;
+    let last_error = tracked.last_error;
+    match finish {
+        ProcFinish::Rpc { rpc_params } => {
+            if !nested.failed {
+                emit_rpc_return_values(sink, rpc_params, &nested)?;
+                sink.return_status(nested.return_status)?;
+            }
+            sink.done_proc(nested_done_proc_rowcount(
+                nested.failed,
+                nested.had_result_set,
+                nested.rowcount,
+            ))?;
         }
-        sink.done_proc(nested_done_proc_rowcount(
-            nested.failed,
-            nested.had_result_set,
-            nested.rowcount,
-        ))?;
+        ProcFinish::Batch { in_proc } => close_level(sink, in_proc, &nested, &end)?,
     }
-    let continues = match finish {
-        ProcFinish::Batch { more } => {
-            continues_after_nested(more, session.state().options.xact_abort, last_error)
-        }
-        ProcFinish::Rpc { .. } => false,
-    };
-    if nested.failed {
-        session.state_mut().last_error = last_error;
-    } else {
-        session.state_mut().last_error = 0;
-    }
-    Ok(BatchProcOutcome {
-        outputs: nested.outputs.clone(),
-        rowcount: nested.rowcount,
-        return_status: nested.return_status,
-        failed: nested.failed,
-        error_number: last_error,
-        continues,
-    })
+    session.state_mut().last_error = if nested.failed { last_error } else { 0 };
+    Ok((
+        Ok(end),
+        BatchProcOutcome {
+            outputs: nested.outputs,
+            rowcount: nested.rowcount,
+            return_status: nested.return_status,
+            failed: nested.failed,
+            error_number: last_error,
+            had_result_set: nested.had_result_set,
+        },
+    ))
 }
 
 /// Describes a batch without running it, and answers one row per described item.
@@ -284,19 +524,22 @@ fn execute_describe(
     columns: &[StaticResultColumn],
     finish: ProcFinish<'_>,
     sink: &mut dyn ResultSink,
-) -> SqlResult<BatchProcOutcome> {
+) -> SqlResult<(CallEnd, BatchProcOutcome)> {
     match crate::prepared::describe_batch(session, statement, kind) {
-        Ok(rows) => execute_static(columns, &rows, finish, sink),
+        Ok(rows) => execute_static(session, columns, &rows, finish, sink),
         Err(err) => fail_proc(session, err, finish, sink),
     }
 }
 
+/// Sends a result set the procedure answers without running T-SQL. Its DONEINPROC in a
+/// called level follows `SET NOCOUNT`.
 fn execute_static(
+    session: &Session,
     columns: &[StaticResultColumn],
     rows: &[Vec<Value>],
     finish: ProcFinish<'_>,
     sink: &mut dyn ResultSink,
-) -> SqlResult<BatchProcOutcome> {
+) -> SqlResult<(CallEnd, BatchProcOutcome)> {
     let meta: Vec<ColumnMeta> = columns
         .iter()
         .map(|column| ColumnMeta {
@@ -318,107 +561,83 @@ fn execute_static(
             sink.return_status(0)?;
             sink.done_proc(Some(rowcount))?;
         }
-        ProcFinish::Batch { more } => {
-            sink.done(Some(rowcount), more)?;
+        ProcFinish::Batch { in_proc: false } => sink.done(Some(rowcount), true)?,
+        ProcFinish::Batch { in_proc: true } => {
+            let reported = (!session.state().options.nocount).then_some(rowcount);
+            sink.done_in_proc(reported, true)?;
         }
     }
-    Ok(BatchProcOutcome {
-        outputs: Vec::new(),
-        rowcount: rowcount as i64,
-        return_status: 0,
-        failed: false,
-        error_number: 0,
-        continues: true,
-    })
+    Ok((
+        Ok(ProgramEnd::Completed),
+        BatchProcOutcome {
+            outputs: Vec::new(),
+            rowcount: i64::try_from(rowcount).unwrap_or(i64::MAX),
+            return_status: 0,
+            failed: false,
+            error_number: 0,
+            had_result_set: true,
+        },
+    ))
 }
 
+/// Refuses a resolved call with `err`: the error goes to the client, and closes the call.
 fn fail_proc(
     session: &mut Session,
     err: SqlError,
     finish: ProcFinish<'_>,
     sink: &mut dyn ResultSink,
-) -> SqlResult<BatchProcOutcome> {
-    session.state_mut().last_error = err.number;
-    sink.error(&err)?;
-    let continues = match finish {
-        ProcFinish::Batch { more } => batch_continues(session, more, true, err.number),
-        ProcFinish::Rpc { .. } => false,
-    };
+) -> SqlResult<(CallEnd, BatchProcOutcome)> {
     match finish {
-        ProcFinish::Rpc { .. } => sink.done_proc(None)?,
-        ProcFinish::Batch { more: _ } => sink.done(None, continues)?,
+        ProcFinish::Rpc { .. } => {
+            session.state_mut().last_error = err.number;
+            sink.error(&err)?;
+            sink.done_proc(None)?;
+            Ok((Err(err.clone()), refused_outcome(&err)))
+        }
+        ProcFinish::Batch { in_proc } => refuse_call(session, err, in_proc, sink),
     }
-    Ok(BatchProcOutcome {
-        outputs: Vec::new(),
-        rowcount: 0,
-        return_status: 0,
-        failed: true,
-        error_number: err.number,
-        continues,
-    })
 }
 
-fn finish_batch_exec_error(
+/// The `EXECUTE` written in a program failed with `err` before a callee ran: the error
+/// goes to the client as the error of that statement, which ends with a DONE in the batch,
+/// and with a DONEINPROC in a called level when the level goes on after it.
+fn refuse_call(
     session: &mut Session,
     err: SqlError,
-    more: bool,
+    in_proc: bool,
     sink: &mut dyn ResultSink,
-) -> SqlResult<(Flow, BatchProcOutcome)> {
+) -> SqlResult<(CallEnd, BatchProcOutcome)> {
     session.state_mut().last_error = err.number;
     sink.error(&err)?;
-    let continues = batch_continues(session, more, true, err.number);
-    sink.done(None, continues)?;
-    let outcome = BatchProcOutcome {
+    match (in_proc, after_refusal(session, &err)) {
+        (false, _) => sink.done(None, true)?,
+        (true, Flow::Continue) => sink.done_in_proc(None, true)?,
+        (true, Flow::Stop) => {}
+    }
+    let outcome = refused_outcome(&err);
+    Ok((Err(err), outcome))
+}
+
+/// What a call refused with `err` leaves to its caller.
+fn refused_outcome(err: &SqlError) -> BatchProcOutcome {
+    BatchProcOutcome {
         outputs: Vec::new(),
         rowcount: 0,
         return_status: 0,
         failed: true,
         error_number: err.number,
-        continues,
-    };
-    Ok((flow_from_outcome(&outcome), outcome))
-}
-
-fn flow_from_outcome(outcome: &BatchProcOutcome) -> Flow {
-    if outcome.continues {
-        Flow::Continue
-    } else {
-        Flow::Stop
+        had_result_set: false,
     }
 }
 
-fn batch_continues(session: &Session, more: bool, failed: bool, error_number: u32) -> bool {
-    if !failed {
-        return more;
-    }
-    more && !session.state().options.xact_abort
-        && error_number != 0
-        && error_behavior(error_number).scope == ErrorScope::Statement
-}
-
-/// Whether the batch that issued `EXEC('…')` or `sp_executesql` runs its next statement once
-/// the nested text this call ran is done.
-///
-/// `XACT_ABORT ON` on the caller stops it after a failure. Otherwise the catalogued scope of
-/// the last error of the text decides ([`vauban_errors::error_behavior`]): an error that
-/// stops its statement or its level ([`ErrorScope::Statement`], [`ErrorScope::Level`]) lets
-/// the caller go on, a wider one stops it ([`ErrorScope::stops_the_caller`]). A text that
-/// fails to compile raises an error of its level: 208
-/// (`a_208_in_an_exec_lets_the_caller_continue` and its siblings for 206, 207 and 2812), 156
-/// (`a_156_syntax_error_in_a_nested_text_lets_the_caller_continue`) and 178
-/// (`a_178_return_with_a_value_in_a_nested_text_lets_the_caller_continue`). Errors raised
-/// while a statement of the text runs are covered by
-/// `nested_batch_scope_family_decides_caller_continuation`,
-/// `a_515_in_an_exec_lets_the_caller_continue` and its siblings for 547, 2627 and 3701
-/// (`tests/nested.rs`).
-pub(crate) fn continues_after_nested(more: bool, xact_abort: bool, error_number: u32) -> bool {
-    if error_number == 0 {
-        return more;
-    }
-    if xact_abort {
-        return false;
-    }
-    more && !error_behavior(error_number).scope.stops_the_caller()
+/// What the program that made a call does after `err`, the error of the `EXECUTE` itself,
+/// as the interpreter decides it: it goes on when the scope of the error is the statement
+/// and `SET XACT_ABORT ON` does not hold, and stops otherwise.
+fn after_refusal(session: &Session, err: &SqlError) -> Flow {
+    let goes_on = !session.state().options.xact_abort
+        && err.number != 0
+        && err.batch_scope() == BatchErrorScope::Statement;
+    if goes_on { Flow::Continue } else { Flow::Stop }
 }
 
 fn apply_batch_outputs(
@@ -596,92 +815,6 @@ fn at_call_line(err: SqlError) -> SqlError {
     err
 }
 
-enum BodySink<'a> {
-    Rpc(RpcBodySink<'a>),
-    Batch(BatchExecSink<'a>),
-}
-
-impl BodySink<'_> {
-    fn last_error(&self) -> u32 {
-        match self {
-            Self::Rpc(inner) => inner.last_error(),
-            Self::Batch(inner) => inner.last_error(),
-        }
-    }
-}
-
-impl ResultSink for BodySink<'_> {
-    fn columns(&mut self, cols: &[ColumnMeta]) -> SqlResult<()> {
-        match self {
-            Self::Rpc(inner) => inner.columns(cols),
-            Self::Batch(inner) => inner.columns(cols),
-        }
-    }
-
-    fn row(&mut self, row: &[Value]) -> SqlResult<()> {
-        match self {
-            Self::Rpc(inner) => inner.row(row),
-            Self::Batch(inner) => inner.row(row),
-        }
-    }
-
-    fn done(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
-        match self {
-            Self::Rpc(inner) => inner.done(rowcount, more),
-            Self::Batch(inner) => inner.done(rowcount, more),
-        }
-    }
-
-    fn done_in_proc(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
-        match self {
-            Self::Rpc(inner) => inner.done_in_proc(rowcount, more),
-            Self::Batch(inner) => inner.done_in_proc(rowcount, more),
-        }
-    }
-
-    fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
-        match self {
-            Self::Rpc(inner) => inner.done_proc(rowcount),
-            Self::Batch(inner) => inner.done_proc(rowcount),
-        }
-    }
-
-    fn info(&mut self, msg: &vauban_errors::InfoMessage) -> SqlResult<()> {
-        match self {
-            Self::Rpc(inner) => inner.info(msg),
-            Self::Batch(inner) => inner.info(msg),
-        }
-    }
-
-    fn error(&mut self, err: &SqlError) -> SqlResult<()> {
-        match self {
-            Self::Rpc(inner) => inner.error(err),
-            Self::Batch(inner) => inner.error(err),
-        }
-    }
-
-    fn env_change(&mut self, change: &vauban_tds::EnvChange) -> SqlResult<()> {
-        match self {
-            Self::Rpc(inner) => inner.env_change(change),
-            Self::Batch(inner) => inner.env_change(change),
-        }
-    }
-
-    fn return_value(&mut self, name: &str, ty: &TypeInfo, value: &Value) -> SqlResult<()> {
-        match self {
-            Self::Rpc(inner) => inner.return_value(name, ty, value),
-            Self::Batch(inner) => inner.return_value(name, ty, value),
-        }
-    }
-
-    fn return_status(&mut self, status: i32) -> SqlResult<()> {
-        match self {
-            Self::Rpc(inner) => inner.return_status(status),
-            Self::Batch(inner) => inner.return_status(status),
-        }
-    }
-}
-
 /// Forwards nested tokens and records the error number of the nested statement most
 /// recently closed, `0` once one finishes without one: the same rule `@@ERROR` follows
 /// between two statements of a batch (`eval_context.rs`, `apply_exec_session`), carried
@@ -762,129 +895,5 @@ impl ResultSink for TrackedSink<'_> {
     }
 }
 
-/// Swallows the nested procedure trailer for an RPC.
-struct RpcBodySink<'a> {
-    tracked: TrackedSink<'a>,
-}
-
-impl<'a> RpcBodySink<'a> {
-    fn new(inner: &'a mut dyn ResultSink) -> Self {
-        Self {
-            tracked: TrackedSink::new(inner),
-        }
-    }
-}
-
-impl ResultSink for RpcBodySink<'_> {
-    fn columns(&mut self, cols: &[ColumnMeta]) -> SqlResult<()> {
-        self.tracked.columns(cols)
-    }
-
-    fn row(&mut self, row: &[Value]) -> SqlResult<()> {
-        self.tracked.row(row)
-    }
-
-    fn done(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
-        self.tracked.done(rowcount, more)
-    }
-
-    fn done_in_proc(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
-        self.tracked.done_in_proc(rowcount, more)
-    }
-
-    fn done_proc(&mut self, _rowcount: Option<u64>) -> SqlResult<()> {
-        Ok(())
-    }
-
-    fn info(&mut self, msg: &vauban_errors::InfoMessage) -> SqlResult<()> {
-        self.tracked.info(msg)
-    }
-
-    fn error(&mut self, err: &SqlError) -> SqlResult<()> {
-        self.tracked.error(err)
-    }
-
-    fn env_change(&mut self, change: &vauban_tds::EnvChange) -> SqlResult<()> {
-        self.tracked.env_change(change)
-    }
-
-    fn return_value(&mut self, name: &str, ty: &TypeInfo, value: &Value) -> SqlResult<()> {
-        self.tracked.return_value(name, ty, value)
-    }
-
-    fn return_status(&mut self, _status: i32) -> SqlResult<()> {
-        Ok(())
-    }
-}
-
-impl RpcBodySink<'_> {
-    fn last_error(&self) -> u32 {
-        self.tracked.last_error
-    }
-}
-
-/// Swallows the nested procedure trailer and emits one batch DONE instead.
-struct BatchExecSink<'a> {
-    tracked: TrackedSink<'a>,
-    more: bool,
-    xact_abort: bool,
-}
-
-impl<'a> BatchExecSink<'a> {
-    fn new(inner: &'a mut dyn ResultSink, more: bool, xact_abort: bool) -> Self {
-        Self {
-            tracked: TrackedSink::new(inner),
-            more,
-            xact_abort,
-        }
-    }
-}
-
-impl ResultSink for BatchExecSink<'_> {
-    fn columns(&mut self, cols: &[ColumnMeta]) -> SqlResult<()> {
-        self.tracked.columns(cols)
-    }
-
-    fn row(&mut self, row: &[Value]) -> SqlResult<()> {
-        self.tracked.row(row)
-    }
-
-    fn done(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
-        self.tracked.done(rowcount, more)
-    }
-
-    fn done_in_proc(&mut self, rowcount: Option<u64>, more: bool) -> SqlResult<()> {
-        self.tracked.done_in_proc(rowcount, more)
-    }
-
-    fn done_proc(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
-        let more = continues_after_nested(self.more, self.xact_abort, self.tracked.last_error);
-        self.tracked.done(rowcount, more)
-    }
-
-    fn info(&mut self, msg: &vauban_errors::InfoMessage) -> SqlResult<()> {
-        self.tracked.info(msg)
-    }
-
-    fn error(&mut self, err: &SqlError) -> SqlResult<()> {
-        self.tracked.error(err)
-    }
-
-    fn env_change(&mut self, change: &vauban_tds::EnvChange) -> SqlResult<()> {
-        self.tracked.env_change(change)
-    }
-
-    fn return_value(&mut self, name: &str, ty: &TypeInfo, value: &Value) -> SqlResult<()> {
-        self.tracked.return_value(name, ty, value)
-    }
-
-    fn return_status(&mut self, _status: i32) -> SqlResult<()> {
-        Ok(())
-    }
-}
-
-impl BatchExecSink<'_> {
-    fn last_error(&self) -> u32 {
-        self.tracked.last_error
-    }
-}
+#[cfg(test)]
+mod tests;

@@ -1300,8 +1300,10 @@ fn the_tokens_that_close_a_three_level_call_carry_more() {
     assert!(has_int_row(&events.0, 13), "{:?}", events.0);
 }
 
-/// A two level call whose deepest text raises 8134: the token that closes the failed call
-/// carries `more` too, and the batch plays the statement that follows the outer call.
+/// A two level call whose deepest text raises 8134: the failed statement ends with its
+/// DONEINPROC, since an error of its statement lets its level go on, and the token that
+/// closes the failed call carries `more` too; the batch plays the statement that follows
+/// the outer call.
 #[test]
 fn the_token_that_closes_a_failed_two_level_call_carries_more() {
     let events = run_batch(
@@ -1309,6 +1311,212 @@ fn the_token_that_closes_a_failed_two_level_call_carries_more() {
         "EXEC sp_executesql N'EXEC sp_executesql N''SELECT 1/0 AS n''';\nSELECT 13 AS alive;",
     );
     assert_eq!(error_numbers(&events.0), vec![8134], "{:?}", events.0);
-    assert_eq!(done_in_proc_more(&events.0), vec![true], "{:?}", events.0);
+    assert_eq!(
+        done_in_proc_more(&events.0),
+        vec![true, true],
+        "{:?}",
+        events.0
+    );
     assert!(has_int_row(&events.0, 13), "{:?}", events.0);
+}
+
+/// The ints of the first column of each row of the events, in order.
+fn int_rows(events: &[Event]) -> Vec<i32> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Row(row) => match row.first() {
+                Some(Value::I32(n)) => Some(*n),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// A dynamic text that runs a dynamic text that runs a third one: each level runs its own
+/// statements around the call it makes, in the order they are written, and the batch goes
+/// on after the outermost call.
+#[test]
+fn a_dynamic_text_runs_its_own_dynamic_texts_three_deep() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('SELECT 1; EXEC(''SELECT 2; EXEC(''''SELECT 3'''') ; SELECT 4''); SELECT 5'); \
+         SELECT 6;",
+    );
+    assert_eq!(
+        error_numbers(&events.0),
+        Vec::<u32>::new(),
+        "{:?}",
+        events.0
+    );
+    assert_eq!(int_rows(&events.0), [1, 2, 3, 4, 5, 6], "{:?}", events.0);
+}
+
+/// An `EXEC` in the body of a `WHILE` of a dynamic text runs once per turn, and the loop
+/// reads its counter after each call: three result sets of one row, then the counter.
+#[test]
+fn an_exec_in_a_loop_of_a_dynamic_text_runs_on_each_turn() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('DECLARE @i int = 0; WHILE @i < 3 BEGIN EXEC(''SELECT 7''); SET @i += 1 END; \
+         SELECT @i'); SELECT 9;",
+    );
+    assert_eq!(
+        error_numbers(&events.0),
+        Vec::<u32>::new(),
+        "{:?}",
+        events.0
+    );
+    assert_eq!(int_rows(&events.0), [7, 7, 7, 3, 9], "{:?}", events.0);
+}
+
+/// The same loop through `sp_executesql`, its bound taken from a parameter, and a procedure
+/// call of the loop body answering 2812 on each turn without ending the loop.
+#[test]
+fn a_loop_of_sp_executesql_calls_on_each_turn_and_reads_its_parameter() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC sp_executesql N'DECLARE @i int = 0; WHILE @i < @n BEGIN \
+         EXEC(''SELECT @@ROWCOUNT''); EXEC nested_no_such_procedure; SET @i += 1 END; \
+         SELECT @i', N'@n int', 2;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2812, 2812], "{:?}", events.0);
+    assert_eq!(int_rows(&events.0).last(), Some(&2), "{:?}", events.0);
+}
+
+/// A parameter of `sp_executesql` is a variable of the level the call opens: the text it
+/// calls does not see it (137), and the text itself reads it again once the call returned.
+#[test]
+fn a_parameter_is_a_variable_of_its_own_level_alone() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC sp_executesql N'EXEC(''SELECT @a''); SELECT @a', N'@a int', 5;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![137], "{:?}", events.0);
+    assert_eq!(int_rows(&events.0), [5], "{:?}", events.0);
+}
+
+/// The `SET` options and the `USE` of a callee end with it: the caller's next batch is
+/// parsed, bound and run with its own `QUOTED_IDENTIFIER`, `NOCOUNT` and database.
+#[test]
+fn the_options_and_the_database_of_a_callee_end_with_it() {
+    let mut session = session();
+    let changed = run_batch(
+        &mut session,
+        "EXEC('SET QUOTED_IDENTIFIER OFF; SET NOCOUNT ON; USE tempdb; SELECT DB_NAME()');",
+    );
+    assert_eq!(
+        error_numbers(&changed.0),
+        Vec::<u32>::new(),
+        "{:?}",
+        changed.0
+    );
+    assert!(
+        changed.0.iter().any(
+            |event| matches!(event, Event::Row(row) if row.first().is_some_and(
+                |value| matches!(value, Value::String(text) if text.text == "tempdb")
+            ))
+        ),
+        "{:?}",
+        changed.0
+    );
+
+    let after = run_batch(&mut session, "SELECT DB_NAME();");
+    assert_eq!(error_numbers(&after.0), Vec::<u32>::new(), "{:?}", after.0);
+    assert!(
+        after.0.iter().any(
+            |event| matches!(event, Event::Row(row) if row.first().is_some_and(
+                |value| matches!(value, Value::String(text) if text.text == "master")
+            ))
+        ),
+        "{:?}",
+        after.0
+    );
+    // NOCOUNT is off again: the DONE of the SELECT carries its count.
+    assert!(
+        after.0.contains(&Event::Done(Some(1), false)),
+        "{:?}",
+        after.0
+    );
+
+    // QUOTED_IDENTIFIER is on again: a double-quoted name is a column, which does not exist.
+    let quoted = run_batch(&mut session, "SELECT \"a\";");
+    assert_eq!(error_numbers(&quoted.0), vec![207], "{:?}", quoted.0);
+}
+
+/// An error of the whole batch raised two levels down ends every level up to the batch:
+/// neither the statement after the inner call nor the one after the outer call runs, and
+/// the inner level sends no DONEINPROC of its own.
+#[test]
+fn an_error_of_the_batch_two_levels_down_ends_the_response_with_one_done() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('EXEC(''SELECT CAST(''''a'''' AS int)''); SELECT 3'); SELECT 2;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![245], "{:?}", events.0);
+    assert_eq!(int_rows(&events.0), Vec::<i32>::new(), "{:?}", events.0);
+    assert_eq!(
+        done_in_proc_more(&events.0),
+        Vec::<bool>::new(),
+        "{:?}",
+        events.0
+    );
+}
+
+/// `SET XACT_ABORT ON` written in a callee holds for the errors of that callee: a 2812
+/// there ends the batch, where without it the caller would go on.
+#[test]
+fn xact_abort_set_by_a_callee_ends_the_batch_on_its_error() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('SET XACT_ABORT ON; EXEC nested_no_such_procedure; SELECT 3'); SELECT 2;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2812], "{:?}", events.0);
+    assert_eq!(int_rows(&events.0), Vec::<i32>::new(), "{:?}", events.0);
+
+    let events = run_batch(
+        &mut session(),
+        "EXEC('EXEC nested_no_such_procedure; SELECT 3'); SELECT 2;",
+    );
+    assert_eq!(error_numbers(&events.0), vec![2812], "{:?}", events.0);
+    assert_eq!(int_rows(&events.0), [3, 2], "{:?}", events.0);
+}
+
+/// An error of a statement a block of a dynamic text holds answers the line of that
+/// statement in the text, not the line of the `IF` that holds the block.
+#[test]
+fn an_error_held_by_a_block_of_a_dynamic_text_keeps_the_line_of_its_statement() {
+    let events = run_batch(
+        &mut session(),
+        "EXEC('IF 1 = 1\nBEGIN\n  SELECT 1\n  SELECT 1/0\nEND');",
+    );
+    let err = only_error(&events.0);
+    assert_eq!((err.number, err.line), (8134, 4), "{:?}", events.0);
+}
+
+/// The body of `EXEC sp_executesql N'SELECT 1; CREATE TABLE t …; ALTER TABLE t ADD c int;'`
+/// is bound one statement at a time, since it holds an `ALTER TABLE`: the table is created
+/// and the column added.
+#[test]
+fn nested_select_create_alter_runs_all_statements() {
+    let mut session = session();
+    let (outcome, events) = run_nested(
+        &mut session,
+        "SELECT 1; CREATE TABLE dbo.nested_alter (id int); ALTER TABLE dbo.nested_alter ADD c int; \
+         SELECT c FROM dbo.nested_alter;",
+        &[],
+    );
+    assert!(!outcome.failed, "{:?}", events.0);
+    assert_eq!(int_rows(&events.0), [1], "{:?}", events.0);
+    assert_eq!(
+        events
+            .0
+            .iter()
+            .filter(|event| matches!(event, Event::Columns(_)))
+            .count(),
+        2,
+        "{:?}",
+        events.0
+    );
 }

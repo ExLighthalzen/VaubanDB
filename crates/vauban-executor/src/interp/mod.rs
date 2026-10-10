@@ -31,8 +31,13 @@
 //! before anything else runs. Then the scope of the error decides: an error whose scope is
 //! the statement ([`vauban_errors::BatchErrorScope::Statement`]) lets the program go on
 //! with the next instruction, and any other error, or any error under `SET XACT_ABORT ON`,
-//! ends the program with [`ProgramEnd::Aborted`]
-//! (`interp::tests::a_duplicate_key_in_a_loop_of_three_turns_answers_three_errors`). An
+//! ends the program (`interp::tests::a_duplicate_key_in_a_loop_of_three_turns_answers_three_errors`).
+//! How far that end reaches is read from the scope too ([`ProgramEnd::ended_by`]): an error
+//! that stops its level ([`vauban_errors::ErrorScope::Level`], 208 for instance) ends this
+//! program with [`ProgramEnd::LevelAborted`], and the caller of a procedure or of a dynamic
+//! text goes on; an error that stops the batch, or any error under `SET XACT_ABORT ON`, ends
+//! it with [`ProgramEnd::Aborted`], and each caller stops too
+//! (`interp::tests::a_callee_ended_by_an_error_of_its_level_lets_the_caller_go_on`). An
 //! error raised while a condition is evaluated counts as a condition that is not true: an
 //! `IF` takes its `ELSE`, a `WHILE` ends.
 //!
@@ -45,7 +50,8 @@
 //! An `EXECUTE` is evaluated where it is written, then handed to the [`CallHandler`] the
 //! caller supplied, which runs the procedure or the dynamic text in place and answers how
 //! it ended. The program goes on with the next instruction, so a call in the body of a
-//! loop runs once per turn (`interp::tests::a_loop_that_calls_three_times_runs_three_turns`).
+//! loop runs once per turn (`interp::tests::a_loop_that_calls_three_times_runs_three_turns`),
+//! unless the callee ended by [`ProgramEnd::Aborted`] or [`ProgramEnd::Cancelled`].
 //!
 //! The callee runs in a level of its own: the program sets its own variables and options
 //! aside in a frame before the handler runs, and takes them back after (`frame.rs`).
@@ -81,7 +87,7 @@ pub(crate) use single::run_alone;
 use std::collections::HashMap;
 
 use vauban_binder::BoundExpr;
-use vauban_errors::{SqlError, SqlResult};
+use vauban_errors::{SqlError, SqlResult, error_behavior};
 use vauban_planner::PhysicalStatement;
 
 use crate::context::ExecContext;
@@ -169,6 +175,7 @@ fn program_end(end: End) -> ProgramEnd {
         End::Returned(code) => ProgramEnd::Returned(code),
         End::Cancelled => ProgramEnd::Cancelled,
         End::Aborted(err) => ProgramEnd::Aborted(err),
+        End::LevelAborted(err) => ProgramEnd::LevelAborted(err),
         // A closed program resolves each of its jumps: what is left is a jump a statement
         // bound at run time named.
         End::Escaped(outcome) => ProgramEnd::Aborted(run::escape_error(&outcome)),
@@ -184,8 +191,28 @@ pub enum ProgramEnd {
     Returned(i32),
     /// The caller raised the cancellation token.
     Cancelled,
-    /// An error ended the program; it was already handed to the sink.
+    /// An error ended the program and the batch that holds it; it was already handed to
+    /// the sink. The caller of a procedure or of a dynamic text that ended so stops too.
     Aborted(SqlError),
+    /// An error ended the level of the program and that level alone; it was already handed
+    /// to the sink. The caller of a procedure or of a dynamic text that ended so goes on
+    /// with its next statement.
+    LevelAborted(SqlError),
+}
+
+impl ProgramEnd {
+    /// How a program that `err` ended ends, `xact_abort` telling whether `SET XACT_ABORT ON`
+    /// held in it: [`ProgramEnd::LevelAborted`] when the scope of the error does not stop a
+    /// caller ([`vauban_errors::ErrorScope::stops_the_caller`]) and `XACT_ABORT` is off,
+    /// [`ProgramEnd::Aborted`] otherwise.
+    #[must_use]
+    pub fn ended_by(err: SqlError, xact_abort: bool) -> Self {
+        if xact_abort || error_behavior(err.number).scope.stops_the_caller() {
+            Self::Aborted(err)
+        } else {
+            Self::LevelAborted(err)
+        }
+    }
 }
 
 /// A call an `EXECUTE` of the program asks for, its arguments evaluated.
@@ -246,9 +273,10 @@ pub trait CallHandler {
     /// returns, so a value meant for the caller is not written here.
     ///
     /// The handler hands the results of the callee to `sink` itself. A callee that ended by
-    /// an error it already handed to the sink answers [`ProgramEnd::Aborted`], and the
-    /// calling program ends there too; a callee cancelled answers
-    /// [`ProgramEnd::Cancelled`].
+    /// an error it already handed to the sink answers [`ProgramEnd::ended_by`] that error:
+    /// [`ProgramEnd::LevelAborted`] lets the calling program go on with its next
+    /// instruction, [`ProgramEnd::Aborted`] ends it too; a callee cancelled answers
+    /// [`ProgramEnd::Cancelled`], which ends it as well.
     ///
     /// # Errors
     ///
@@ -345,12 +373,15 @@ pub trait Host {
     fn report(&mut self, err: &SqlError, site: Site) -> SqlResult<()>;
 
     /// Runs `call`, made at `site`, in the level the interpreter opened for it, as
-    /// [`CallHandler::call`] does.
+    /// [`CallHandler::call`] does: `Ok` with how the callee ended, or `Err` with the error
+    /// of the `EXECUTE` statement itself (a procedure that does not exist, for instance),
+    /// which the host already reported and whose scope decides whether the program goes
+    /// on.
     ///
     /// # Errors
     ///
-    /// The error of the `EXECUTE` statement itself; the interpreter reports it.
-    fn call(&mut self, call: Call, site: Site) -> SqlResult<ProgramEnd>;
+    /// An error that ends the run at once.
+    fn call(&mut self, call: Call, site: Site) -> SqlResult<Result<ProgramEnd, SqlError>>;
 
     /// The level of the call is closed and the caller's state is back: makes `database`
     /// the current database again and writes what the callee hands back to its caller.

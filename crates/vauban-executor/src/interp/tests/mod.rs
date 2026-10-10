@@ -334,6 +334,70 @@ fn a_call_that_fails_with_an_error_of_batch_scope_ends_the_program() {
     assert!(sink.rows.is_empty(), "{sink:?}");
 }
 
+/// Answers each call with the end it holds, after the error of that end in the sink.
+struct Ending(ProgramEnd);
+
+impl CallHandler for Ending {
+    fn call(
+        &mut self,
+        _call: Call,
+        _ctx: &mut ExecContext<'_>,
+        sink: &mut dyn StatementSink,
+    ) -> SqlResult<ProgramEnd> {
+        if let ProgramEnd::Aborted(err) | ProgramEnd::LevelAborted(err) = &self.0 {
+            sink.error(err)?;
+        }
+        Ok(self.0.clone())
+    }
+
+    fn restore_database(&mut self, _database: &str, _ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+        Ok(())
+    }
+}
+
+/// A callee an error of its level ended (208 on a table its text names) lets its caller go
+/// on with the statement after the `EXECUTE`; a callee an error of its batch ended (245)
+/// ends its caller too.
+#[test]
+fn a_callee_ended_by_an_error_of_its_level_lets_the_caller_go_on() {
+    let level = SqlError::new(208, 16, 1, "the callee names a missing table");
+    let mut session = ExecSession::default();
+    let mut calls = Ending(ProgramEnd::ended_by(level, false));
+    assert!(
+        matches!(&calls.0, ProgramEnd::LevelAborted(_)),
+        "{:?}",
+        calls.0
+    );
+    let (end, sink) = run_scalar("EXEC('x'); SELECT 1;", &mut session, &mut calls);
+    assert_eq!(end, ProgramEnd::Completed);
+    assert_eq!(sink.rows, vec![vec![Value::I32(1)]]);
+
+    let batch = SqlError::new(245, 16, 1, "the callee failed a conversion");
+    let mut session = ExecSession::default();
+    let mut calls = Ending(ProgramEnd::ended_by(batch, false));
+    let (end, sink) = run_scalar("EXEC('x'); SELECT 1;", &mut session, &mut calls);
+    assert!(
+        matches!(&end, ProgramEnd::Aborted(error) if error.number == 245),
+        "{end:?}"
+    );
+    assert!(sink.rows.is_empty(), "{sink:?}");
+}
+
+/// Under `SET XACT_ABORT ON`, an error that stops its level alone ends the batch: the end
+/// of the program reaches its callers.
+#[test]
+fn under_xact_abort_an_error_of_a_level_ends_the_batch() {
+    let level = SqlError::new(208, 16, 1, "the callee names a missing table");
+    assert!(matches!(
+        ProgramEnd::ended_by(level.clone(), true),
+        ProgramEnd::Aborted(_)
+    ));
+    assert!(matches!(
+        ProgramEnd::ended_by(level, false),
+        ProgramEnd::LevelAborted(_)
+    ));
+}
+
 /// A `GOTO` written in an `IF` lands on a label of the `BEGIN … END` that holds that `IF`:
 /// the label is the place of the statement after it, inside the block.
 #[test]

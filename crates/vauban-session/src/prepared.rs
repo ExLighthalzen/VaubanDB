@@ -14,7 +14,7 @@ use vauban_types::{Collation, Len, SqlString, SqlType, TypeInfo, Value};
 
 use crate::batch::Session;
 use crate::eval_context::SessionEvalContext;
-use crate::nested::NestedParam;
+use crate::procedures::NestedParam;
 use crate::procedures::{BatchProcOutcome, ProcFinish};
 use crate::rpc::{DescribeKind, ProcAction, ProcParam};
 use crate::sink::ResultSink;
@@ -168,7 +168,7 @@ fn execute_prepare(
             return_status: nested.return_status,
             failed: false,
             error_number: 0,
-            continues: false,
+            had_result_set: nested.had_result_set,
         });
     }
 
@@ -183,7 +183,7 @@ fn execute_prepare(
         return_status: 0,
         failed: false,
         error_number: 0,
-        continues: false,
+        had_result_set: false,
     })
 }
 
@@ -219,7 +219,7 @@ fn execute_handle(
         return_status: nested.return_status,
         failed: false,
         error_number: 0,
-        continues: false,
+        had_result_set: nested.had_result_set,
     })
 }
 
@@ -244,7 +244,7 @@ fn execute_unprepare(
         return_status: 0,
         failed: false,
         error_number: 0,
-        continues: false,
+        had_result_set: false,
     })
 }
 
@@ -255,7 +255,7 @@ fn failed_outcome(error_number: u32) -> BatchProcOutcome {
         return_status: 0,
         failed: true,
         error_number,
-        continues: false,
+        had_result_set: false,
     }
 }
 
@@ -930,7 +930,7 @@ fn run_nested_tracked(
     text: &str,
     params: &[NestedParam],
     sink: &mut dyn ResultSink,
-) -> SqlResult<(crate::nested::NestedOutcome, u32)> {
+) -> SqlResult<(crate::procedures::NestedOutcome, u32)> {
     let mut body_sink = PrepareExecSink::new(sink);
     let nested = session.run_nested(text, params, &mut body_sink)?;
     Ok((nested, body_sink.last_error()))

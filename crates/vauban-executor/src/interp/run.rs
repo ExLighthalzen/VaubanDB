@@ -27,8 +27,10 @@ pub(crate) enum End {
     Returned(i32),
     /// The token was raised.
     Cancelled,
-    /// An error ended the program; it is in the sink already.
+    /// An error ended the program and its batch; it is in the sink already.
     Aborted(SqlError),
+    /// An error ended the level of the program alone; it is in the sink already.
+    LevelAborted(SqlError),
     /// A jump left a program compiled with [`Labels::Open`]: the enclosing program
     /// resolves it.
     Escaped(ExecOutcome),
@@ -141,7 +143,7 @@ fn run_statement(
     Ok(match host.statement(stmt, site)? {
         Ran::Outcome(outcome) => Reached::Outcome(outcome),
         Ran::Failed(err) => Reached::Failed(err),
-        Ran::Stopped(err) => Reached::Ended(End::Aborted(err)),
+        Ran::Stopped(err) => Reached::Ended(ended_by(err, host)),
         Ran::Holds(statement) => run_held(&statement, site, host)?,
     })
 }
@@ -260,15 +262,27 @@ fn run_call(call: Call, pc: usize, site: Site, host: &mut dyn Host) -> SqlResult
     };
     let ended = host.call(call, site);
     let left = leave(frame, site, host);
-    Ok(match (ended, left) {
-        (Ok(ProgramEnd::Completed | ProgramEnd::Returned(_)), Ok(())) => Step::Go(pc + 1),
-        (Ok(ProgramEnd::Completed | ProgramEnd::Returned(_)), Err(err)) => {
-            fail(err, pc + 1, site, host)?
-        }
-        (Err(err), left) => {
-            let step = fail(err, pc + 1, site, host)?;
+    let ended = match ended {
+        Ok(ended) => ended,
+        Err(err) => {
             report_left(left, site, host)?;
-            step
+            return Err(err);
+        }
+    };
+    Ok(match (ended, left) {
+        (
+            Ok(ProgramEnd::Completed | ProgramEnd::Returned(_) | ProgramEnd::LevelAborted(_)),
+            Ok(()),
+        ) => Step::Go(pc + 1),
+        (
+            Ok(ProgramEnd::Completed | ProgramEnd::Returned(_) | ProgramEnd::LevelAborted(_)),
+            Err(err),
+        ) => fail(err, pc + 1, site, host)?,
+        // The `EXECUTE` itself failed: the host reported it, and its scope decides, as for
+        // any statement.
+        (Err(err), left) => {
+            report_left(left, site, host)?;
+            decide(err, pc + 1, host)
         }
         (Ok(ProgramEnd::Cancelled), left) => {
             report_left(left, site, host)?;
@@ -339,14 +353,27 @@ fn fail(err: SqlError, next: usize, site: Site, host: &mut dyn Host) -> SqlResul
 }
 
 /// Whether an error the sink holds lets the program go on at `next`: its scope is the
-/// statement and `SET XACT_ABORT ON` does not hold.
+/// statement and `SET XACT_ABORT ON` does not hold. When it does not, how far the end
+/// reaches is [`ended_by`]'s decision.
 fn decide(err: SqlError, next: usize, host: &dyn Host) -> Step {
     let goes_on =
         !host.xact_abort() && err.number != 0 && err.batch_scope() == BatchErrorScope::Statement;
     if goes_on {
         Step::Go(next)
     } else {
-        Step::Stop(End::Aborted(err))
+        Step::Stop(ended_by(err, host))
+    }
+}
+
+/// How a program that `err` ended ends ([`ProgramEnd::ended_by`]): its level alone, or its
+/// batch with it.
+fn ended_by(err: SqlError, host: &dyn Host) -> End {
+    match ProgramEnd::ended_by(err, host.xact_abort()) {
+        ProgramEnd::LevelAborted(err) => End::LevelAborted(err),
+        ProgramEnd::Aborted(err) => End::Aborted(err),
+        other => End::Aborted(bug(&format!(
+            "interp: an error ended a program as {other:?}"
+        ))),
     }
 }
 

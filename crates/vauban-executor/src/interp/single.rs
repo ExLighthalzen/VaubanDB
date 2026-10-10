@@ -94,8 +94,16 @@ impl Host for SingleContext<'_, '_> {
         report(err, self.ctx, &mut *self.sink)
     }
 
-    fn call(&mut self, call: Call, _site: Site) -> SqlResult<ProgramEnd> {
-        self.calls.call(call, self.ctx, &mut *self.sink)
+    // The error of the `EXECUTE` itself goes to the sink here, with the end of its
+    // statement, as the error of any statement does.
+    fn call(&mut self, call: Call, _site: Site) -> SqlResult<Result<ProgramEnd, SqlError>> {
+        match self.calls.call(call, self.ctx, &mut *self.sink) {
+            Ok(end) => Ok(Ok(end)),
+            Err(err) => {
+                report(&err, self.ctx, &mut *self.sink)?;
+                Ok(Err(err))
+            }
+        }
     }
 
     fn leave_call(&mut self, database: &str) -> SqlResult<()> {
@@ -175,7 +183,7 @@ pub(crate) fn run_alone(
             held.flush()?;
             Ok(ExecOutcome::Cancelled)
         }
-        End::Aborted(err) => {
+        End::Aborted(err) | End::LevelAborted(err) => {
             held.withdraw(&err)?;
             Err(err)
         }
@@ -197,8 +205,8 @@ impl CallHandler for NoCalls {
         _sink: &mut dyn StatementSink,
     ) -> SqlResult<ProgramEnd> {
         Err(bug(
-            "an EXECUTE held by an IF, a WHILE or a BEGIN ... END of a nested text is not \
-             implemented yet",
+            "an EXECUTE held by an IF, a WHILE or a BEGIN ... END run alone is not \
+             implemented",
         ))
     }
 
