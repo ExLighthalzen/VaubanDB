@@ -272,3 +272,42 @@ fn the_tail_follows_the_join_order() {
     };
     assert_eq!(aggregate.row_id_count(), 0);
 }
+
+/// `UPDATE y SET x = 1 FROM t JOIN t AS y ON t.pk = y.pk`, bound with the row-identifier
+/// binding on the scan of `y`, the source the target names: the planner keeps that mark
+/// and adds none to the other read of `t`, so the rows of the input name one row of `t`.
+/// Without the mark, both reads would carry one.
+#[test]
+fn a_self_join_marks_the_source_the_target_names() {
+    let self_join = |marked: bool| {
+        let mut right = scan(TABLE_T, "y");
+        if marked && let LogicalPlan::Scan { columns, .. } = &mut right {
+            columns.push(row_id_binding(TABLE_T).expect("the identifier fits"));
+        }
+        LogicalPlan::Join {
+            left: Box::new(scan(TABLE_T, "t")),
+            right: Box::new(right),
+            kind: JoinKind::Inner,
+            on: Some(equals(column_ref("pk", 0), column_ref("pk", 2))),
+            schema: schema_of(&["pk", "x", "pk", "x"]),
+        }
+    };
+    let planned = |marked: bool| {
+        let stmt = BoundStatement::Update(UpdatePlan {
+            table: TABLE_T,
+            input: Box::new(self_join(marked)),
+            assignments: vec![(binding("x", 1), literal(1))],
+        });
+        let PhysicalStatement::Update(update) = plan_with(stmt, &FakeCatalog::new()) else {
+            panic!("an UPDATE plans to an Update");
+        };
+        let mut reads = Vec::new();
+        marked_reads(&update.input, &mut reads);
+        reads
+    };
+    assert_eq!(planned(true), vec![("y".to_owned(), TABLE_T)]);
+    assert_eq!(
+        planned(false),
+        vec![("t".to_owned(), TABLE_T), ("y".to_owned(), TABLE_T)]
+    );
+}

@@ -15,7 +15,7 @@
 //! | `sort.rs` | `Sort`, `TopN`, `Distinct` |
 //! | `subquery.rs` | `SubqueryEval` |
 //! | `setop.rs` | `Union`, `Except`, `Intersect` |
-//! | `spool.rs` | none: put over the source of a write statement by its `spool` flag |
+//! | `spool.rs` | none: put over the input of an `UPDATE` or a `DELETE` by its `spool` flag |
 //!
 //! The `build` function of a file whose operator is not written yet answers the internal
 //! error 50000 ([`not_implemented`]).

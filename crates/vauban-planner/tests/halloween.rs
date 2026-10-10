@@ -313,6 +313,25 @@ fn a_set_value_reading_another_table_requires_no_spool() {
     assert!(!update_set_from(OTHER).spool);
 }
 
+/// The subquery of a value of the `SET` list is planned under a `SubqueryEval` at the root of
+/// the input, over the read of the target, which keeps its row identifier.
+#[test]
+fn the_subqueries_of_a_set_are_planned_over_the_input() {
+    let update = update_set_from(OTHER);
+    let PhysicalPlan::SubqueryEval {
+        input, subplans, ..
+    } = &update.input
+    else {
+        panic!("a SubqueryEval at the root: {:?}", update.input);
+    };
+    assert_eq!(subplans.len(), 1);
+    assert!(
+        matches!(input.as_ref(), PhysicalPlan::TableScan { table, .. } if *table == TARGET),
+        "{input:?}"
+    );
+    assert_eq!(update.input.row_id_tables(), vec![TARGET]);
+}
+
 /// `DELETE target WHERE EXISTS (SELECT 1 FROM <read> AS s WHERE s.k = target.k)`.
 fn delete_where_exists(read: TableId) -> PhysicalDelete {
     plan_delete(filter(scan(TARGET), exists(correlated_on_k(read), false)))

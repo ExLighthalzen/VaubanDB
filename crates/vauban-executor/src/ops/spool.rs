@@ -1,10 +1,15 @@
 //! `Spool`: reads the whole input when it opens, then hands the rows out one at a time.
 //!
-//! A write statement whose source reads its own target table puts its source under a
-//! spool when the planner sets the `spool` flag of the statement: every row of the source
-//! is then read before the first write, so a write cannot change what the source reads
-//! (the Halloween problem). The input is closed as soon as it is drained, before the first
-//! row is handed out (`tests/spool.rs`, `the_input_is_drained_and_closed_when_the_spool_opens`).
+//! An `UPDATE` or a `DELETE` whose input reads its own target table puts that input under a
+//! spool when the planner sets the `spool` flag of the statement (`dml/update_delete.rs`):
+//! every row of the input is then read before the first write, so a write cannot change
+//! what the input reads (the Halloween problem; `tests/dml_input.rs`,
+//! `an_in_over_the_target_writes_each_row_once`). An `INSERT` with the flag reads its source
+//! to the end itself, before its first write (`dml/insert.rs`). The input is closed as soon
+//! as it is drained, before the first row is handed out (`tests/spool.rs`,
+//! `the_input_is_drained_and_closed_when_the_spool_opens`), and each row is handed out
+//! whole, the row identifiers of its tail included (`tests/dml_input.rs`,
+//! `the_row_identifier_crosses_the_spool`).
 
 use std::collections::VecDeque;
 
@@ -17,8 +22,7 @@ use crate::row::Row;
 
 /// Materialises `input` when it opens.
 ///
-/// Public so that a write statement, and a test, can put it over an operator of their own
-/// (`tests/spool.rs`).
+/// Public so that a test can put it over an operator of its own (`tests/spool.rs`).
 pub struct Spool<'a> {
     input: Box<dyn Operator<'a> + 'a>,
     /// The rows read when the operator opened, not handed out yet.
@@ -35,8 +39,8 @@ impl<'a> Spool<'a> {
         }
     }
 
-    /// `input` under a spool when `spool` is true, `input` itself otherwise: the shape a
-    /// write statement takes from its `spool` flag (`tests/spool.rs`,
+    /// `input` under a spool when `spool` is true, `input` itself otherwise: the shape the
+    /// input of an `UPDATE` or a `DELETE` takes from its `spool` flag (`tests/spool.rs`,
     /// `without_the_flag_the_input_is_handed_back_as_it_is`).
     #[must_use]
     pub fn wrap_if(spool: bool, input: Box<dyn Operator<'a> + 'a>) -> Box<dyn Operator<'a> + 'a> {
@@ -52,8 +56,10 @@ impl<'a> Operator<'a> for Spool<'a> {
     /// Opens the input, reads it to the end and closes it.
     ///
     /// The cancellation token is read every [`CANCEL_CHECK_ROWS`] rows: once it is up, the
-    /// rows read so far are dropped and `next` answers `None`, which the statement reports
-    /// as cancelled (`tests/spool.rs`, `a_cancelled_spool_hands_out_nothing`).
+    /// rows read so far are dropped and `next` answers `None` (`tests/spool.rs`,
+    /// `a_cancelled_spool_hands_out_nothing`). The statement reads the token once the spool
+    /// is open and reports itself cancelled, not as a write of zero rows
+    /// (`dml/update_delete/tests/mod.rs`, `a_cancelled_spool_cancels_the_statement`).
     fn open(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<()> {
         self.rows.clear();
         self.input.open(ctx)?;

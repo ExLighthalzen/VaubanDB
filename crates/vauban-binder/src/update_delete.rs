@@ -60,10 +60,9 @@
 //!   refused after the checks of step 5 on the columns before it, so that
 //!   `SET id = DEFAULT` over an `IDENTITY` answers 8102 (`identity_set_to_default_is_8102`).
 //!
-//! A hint list on the target (`UPDATE dbo.t WITH (UPDLOCK) SET …`) is accepted and its
-//! words are dropped, as `names.rs` drops them on a `FROM`: the `Scan` carries
-//! [`LockHints::default`](crate::bound::LockHints::default) until the words are read
-//! (`a_hint_list_on_the_target_is_accepted`).
+//! A hint list on the target (`UPDATE dbo.t WITH (UPDLOCK) SET …`) is read as `names.rs`
+//! reads one on a source of a `FROM`, and travels on the `Scan` of the target
+//! (`a_hint_list_on_the_target_is_accepted`), whose reads take the locks it asks for.
 
 use vauban_catalog::{ColumnId, ObjectId, TableId};
 use vauban_errors::{SqlError, SqlResult};
@@ -132,7 +131,7 @@ fn update(stmt: &UpdateStatement, ctx: &BindContext<'_>, line: u32) -> SqlResult
     if !stmt.from.is_empty() {
         return update_from(stmt, ctx, line);
     }
-    let target = bind_target(&stmt.target, &[], line, ctx)?;
+    let target = bind_target(&stmt.target, line, ctx)?;
     let input = filtered(target.scan, stmt.where_.as_ref(), &target.scope, ctx)?;
     let assignments = bind_assignments(
         &stmt.assignments,
@@ -160,7 +159,7 @@ fn delete(stmt: &DeleteStatement, ctx: &BindContext<'_>, line: u32) -> SqlResult
     if !stmt.from.is_empty() {
         return delete_from(stmt, ctx, line);
     }
-    let target = bind_target(&stmt.target, &[], line, ctx)?;
+    let target = bind_target(&stmt.target, line, ctx)?;
     let input = filtered(target.scan, stmt.where_.as_ref(), &target.scope, ctx)?;
     Ok(BoundStatement::Delete(DeletePlan {
         table: target.table,
@@ -180,13 +179,9 @@ struct Target {
     scope: Scope,
 }
 
-/// Resolves the target written on the statement and builds its `Scan`.
-///
-/// `from` is the list of sources a `FROM` clause put in scope, empty for the forms bound
-/// here: a one-part target is first matched against their exposed names
-/// ([`target_source`]), and a target that names one of them is not resolved by the
-/// catalogue. That match is what the joined form will read the target through; `update`
-/// and `delete` hand an empty slice.
+/// Resolves the target written on a statement without a `FROM` and builds its `Scan`. A
+/// statement with a `FROM` matches its target against the sources of that clause instead
+/// ([`joined_target`]).
 ///
 /// The parser reads the target as a [`TableRef::Table`] (a hint list allowed, no alias) or
 /// a [`TableRef::Variable`]; the other variants cannot come out of it for these two
@@ -196,14 +191,8 @@ struct Target {
 ///
 /// - 208 on `line` when the name resolves to nothing, four-part names included;
 /// - the refusal of `names::from_needs_the_catalogue` when the context has no catalogue;
-/// - the internal error 50000 for a view, a table variable, or a target that names a
-///   source of the `FROM`.
-fn bind_target(
-    reference: &TableRef,
-    from: &[Source],
-    line: u32,
-    ctx: &BindContext<'_>,
-) -> SqlResult<Target> {
+/// - the internal error 50000 for a view or a table variable.
+fn bind_target(reference: &TableRef, line: u32, ctx: &BindContext<'_>) -> SqlResult<Target> {
     let name = match reference {
         TableRef::Table { name, .. } | TableRef::Function { name, .. } => name,
         TableRef::Variable { .. } => {
@@ -223,11 +212,6 @@ fn bind_target(
             ));
         }
     };
-    if target_source(name, from).is_some() {
-        return Err(not_implemented(
-            "a target named by the alias of a source of the FROM clause",
-        ));
-    }
     let catalog = ctx.catalog.ok_or_else(from_needs_the_catalogue)?;
     let resolved = if name.server.is_some() {
         None
@@ -267,20 +251,6 @@ fn bind_target(
         scan,
         scope,
     })
-}
-
-/// The source of `from` a **one-part** target names by its exposed name, compared ASCII
-/// case-insensitively; `None` for a qualified target, and for a name no source answers to.
-///
-/// A statement without a `FROM` hands an empty slice, and the target is then the table
-/// the catalogue resolves (`bind_target`). The unit test
-/// `a_one_part_target_matches_the_exposed_name_of_a_source` builds a scope by hand.
-fn target_source<'a>(name: &ObjectName, from: &'a [Source]) -> Option<&'a Source> {
-    if name.server.is_some() || name.database.is_some() || name.schema.is_some() {
-        return None;
-    }
-    from.iter()
-        .find(|source| source.exposed_name().eq_ignore_ascii_case(&name.name.value))
 }
 
 /// The `Scan` of the target under the `Filter` of the `WHERE`, or the `Scan` alone.
@@ -600,13 +570,24 @@ fn dotted_column(column: &ColumnRef) -> String {
 // the errors of the `ON`, of the `WHERE` and of a right side keep the lines `expr.rs` gives
 // them (`the_errors_of_the_joined_form_carry_their_line`).
 //
-// # What the plan does not carry
+// # Which rows of the plan are written
 //
-// `UpdatePlan` and `DeletePlan` name the target by its `TableId` alone. When the same table
-// is read twice by the `FROM`, that identifier does not say which of the two sources the
-// rows are written through, and the columns of `assignments` index the row of the target and
-// not the row of the `Join`. A field naming the source is what a planner would need, and
-// adding one is not this file's to do.
+// `UpdatePlan` and `DeletePlan` name the target by its `TableId` alone, which does not say
+// which source of a `FROM` that reads the table twice is the one written through. The
+// `Scan` of the source the target names therefore carries one more binding after its
+// columns: the row-identifier binding `vauban_planner::row_id_binding` builds for its table
+// (`target_row_id`), which makes that scan, and no other, hand the identifier of each row
+// it reads to the rows of the plan. The other reads of the table carry none
+// (`tests/bind_update_from.rs`, `the_source_the_target_names_carries_the_row_identifier`).
+// The binding is not a column: the `schema` of the scan and the scope the statement is
+// bound in do not hold it, so the positions every expression reads are unchanged.
+//
+// A target that no source of the `FROM` names joins the `FROM` as one more source, after
+// the others and without an `ON`: `UPDATE dbo.b SET v = 7 FROM dbo.s WHERE s.id = 2` writes
+// the three rows of a `b` of three rows when `s` holds a row of `id` 2, and zero when it does
+// not (`vauban-executor/tests/dml_input.rs`, `a_target_outside_the_from_is_joined_to_it`).
+// Its columns are in scope for the `WHERE` and the right side of a `SET`, under the name the
+// target was written with (`update_target_outside_the_from_joins_the_from`).
 
 /// The body of the joined `UPDATE`, in the order of the section above.
 ///
@@ -619,11 +600,8 @@ fn update_from(
     ctx: &BindContext<'_>,
     line: u32,
 ) -> SqlResult<BoundStatement> {
-    let (sources, scope) = crate::join::bind_from(&stmt.from, line, ctx)?;
-    let target_name = target_name(&stmt.target)?;
-    check_update_target_exposed_names(target_name, &stmt.from, line, ctx)?;
-    let target = joined_target(&stmt.target, &stmt.from, line, ctx)?;
-    let input = filtered(sources, stmt.where_.as_ref(), &scope, ctx)?;
+    let (input, scope, target) =
+        joined_input(&stmt.target, &stmt.from, stmt.where_.as_ref(), line, ctx)?;
     let assignments = bind_assignments(
         &stmt.assignments,
         &target.scope,
@@ -649,15 +627,97 @@ fn delete_from(
     ctx: &BindContext<'_>,
     line: u32,
 ) -> SqlResult<BoundStatement> {
-    let (sources, scope) = crate::join::bind_from(&stmt.from, line, ctx)?;
-    let target_name = target_name(&stmt.target)?;
-    check_update_target_exposed_names(target_name, &stmt.from, line, ctx)?;
-    let target = joined_target(&stmt.target, &stmt.from, line, ctx)?;
-    let input = filtered(sources, stmt.where_.as_ref(), &scope, ctx)?;
+    let (input, _, target) =
+        joined_input(&stmt.target, &stmt.from, stmt.where_.as_ref(), line, ctx)?;
     Ok(BoundStatement::Delete(DeletePlan {
         table: target.table,
         input: Box::new(input),
     }))
+}
+
+/// The rows a joined statement writes through, the scope its `WHERE` and the right side of
+/// its `SET` are bound in, and its target, in the order of the checks above.
+///
+/// The `FROM` is bound first, then the target is matched against its sources. A target no
+/// source names is appended to the `FROM` and the clause bound again with it. The `Scan` of
+/// the source the target names then carries the row-identifier binding of its table
+/// ([`mark_target`]), and the `WHERE` is bound over the scope of the clause.
+///
+/// # Errors
+///
+/// The errors of the section above, in its order.
+fn joined_input(
+    reference: &TableRef,
+    from: &[TableRef],
+    condition: Option<&Expr>,
+    line: u32,
+    ctx: &BindContext<'_>,
+) -> SqlResult<(LogicalPlan, Scope, JoinedTarget)> {
+    let (sources, scope) = crate::join::bind_from(from, line, ctx)?;
+    let name = target_name(reference)?;
+    check_update_target_exposed_names(name, from, line, ctx)?;
+    let target = joined_target(reference, from, line, ctx)?;
+    let (mut sources, scope, exposed) = match &target.exposed {
+        Some(exposed) => (sources, scope, exposed.clone()),
+        None => {
+            let mut widened = from.to_vec();
+            widened.push(reference.clone());
+            let (sources, scope) = crate::join::bind_from(&widened, line, ctx)?;
+            (sources, scope, alias_of(name, None))
+        }
+    };
+    mark_target(&mut sources, target.table, &exposed)?;
+    let input = filtered(sources, condition, &scope, ctx)?;
+    Ok((input, scope, target))
+}
+
+/// Appends the row-identifier binding of `table` ([`target_row_id`]) to the columns of the
+/// `Scan` of `table` exposed as `exposed` in the tree of joins `plan` holds, and answers
+/// whether one was found. The exposed names of a `FROM` are distinct, which the binding of
+/// the clause has checked (1011 to 1013), so one scan at most answers both.
+///
+/// # Errors
+///
+/// The internal error 50000 for a table whose identifier does not fit in a column
+/// identifier.
+fn mark_target(plan: &mut LogicalPlan, table: TableId, exposed: &str) -> SqlResult<bool> {
+    match plan {
+        LogicalPlan::Join { left, right, .. } => {
+            Ok(mark_target(left, table, exposed)? || mark_target(right, table, exposed)?)
+        }
+        LogicalPlan::Scan {
+            table: read,
+            columns,
+            alias,
+            ..
+        } if *read == table && alias.eq_ignore_ascii_case(exposed) => {
+            let binding = target_row_id(table).ok_or_else(|| {
+                bug("mark_target: the table identifier does not fit in a column identifier")
+            })?;
+            columns.push(binding);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// The binding `vauban_planner::row_id_binding` builds for `table`, which asks the scan that
+/// carries it for the identifier of each row it reads: the table negated and moved one
+/// down in `column`, `index` 0, the name `%rowid`, a `bigint`. The binder does not depend on
+/// the planner, so the value is built here. That the planner reads it as the mark of the
+/// target is what a self-join written through the chain needs
+/// (`vauban-executor/tests/dml_input.rs`, `a_self_join_writes_the_source_the_target_names`).
+///
+/// `None` for a table whose identifier does not fit in a column identifier.
+fn target_row_id(table: TableId) -> Option<ColumnBinding> {
+    let id = i32::try_from(table.0).ok()?;
+    Some(ColumnBinding {
+        column: ColumnId(-id - 1),
+        index: 0,
+        name: "%rowid".to_owned(),
+        ty: TypeInfo::new(SqlType::BigInt, false),
+        depth: 0,
+    })
 }
 
 /// The target of a joined statement: the table written into, and the scope the left side of
@@ -670,6 +730,9 @@ struct JoinedTarget {
     /// The target alone, exposed under the name the statement refers to it by: the columns
     /// index the row of the **target**, not the row of the `Join`.
     scope: Scope,
+    /// The exposed name of the source of the `FROM` the target names; `None` for a target
+    /// the catalogue resolved, which no source names.
+    exposed: Option<String>,
 }
 
 /// A source of the `FROM` as it was written, which the target is matched against.
@@ -692,7 +755,7 @@ struct Leaf<'a> {
 ///   them carries no alias (`update_self_join_requires_the_alias`);
 /// - 208 on `line` when no source names the target and the catalogue holds no such table;
 /// - the refusal of `names::from_needs_the_catalogue` without a catalogue;
-/// - the internal error 50000 for a table variable or a view as the target.
+/// - the internal error 50000 for a table variable, a view or a derived table as the target.
 fn joined_target(
     reference: &TableRef,
     from: &[TableRef],
@@ -700,6 +763,16 @@ fn joined_target(
     ctx: &BindContext<'_>,
 ) -> SqlResult<JoinedTarget> {
     let target = target_name(reference)?;
+    let one_part = target.server.is_none() && target.database.is_none() && target.schema.is_none();
+    if one_part
+        && derived_aliases(from)
+            .iter()
+            .any(|alias| alias.value.eq_ignore_ascii_case(&target.name.value))
+    {
+        return Err(not_implemented(
+            "a derived table as the target of an UPDATE or a DELETE",
+        ));
+    }
     let mut leaves = Vec::new();
     collect_leaves(from, &mut leaves)?;
     match pick_target_leaf(&leaves, target, line, ctx)? {
@@ -860,6 +933,7 @@ fn joined_target_from_leaf(leaf: &Leaf<'_>, ctx: &BindContext<'_>) -> SqlResult<
     Ok(JoinedTarget {
         table,
         object: resolved.object,
+        exposed: Some(alias_of(leaf.name, leaf.alias)),
         scope: Scope::over(Source::new(
             &alias_of(leaf.name, leaf.alias),
             written,
@@ -897,6 +971,7 @@ fn resolve_target_from_catalog(
     Ok(JoinedTarget {
         table,
         object: resolved.object,
+        exposed: None,
         scope: Scope::over(Source::new(
             &alias_of(target, None),
             Some(target),
@@ -931,12 +1006,14 @@ fn target_name(reference: &TableRef) -> SqlResult<&ObjectName> {
     }
 }
 
-/// Collects the sources of a `FROM` in written order, walking each `JOIN` left side first.
+/// Collects the tables of a `FROM` in written order, walking each `JOIN` left side first. A
+/// derived table and a `VALUES` list are not tables, and are not collected: the target is
+/// not matched against them ([`derived_aliases`]).
 ///
 /// # Errors
 ///
-/// The internal error 50000 for a source that is neither a table nor a `name(…)`:
-/// `join::bind_from` refuses those before this point.
+/// The internal error 50000 for a source that is neither a table, a `name(…)`, a derived
+/// table nor a `VALUES` list: `join::bind_from` refuses those before this point.
 fn collect_leaves<'a>(from: &'a [TableRef], leaves: &mut Vec<Leaf<'a>>) -> SqlResult<()> {
     for reference in from {
         match reference {
@@ -950,6 +1027,7 @@ fn collect_leaves<'a>(from: &'a [TableRef], leaves: &mut Vec<Leaf<'a>>) -> SqlRe
                     alias: alias.as_ref(),
                 });
             }
+            TableRef::Derived { .. } | TableRef::Values { .. } => {}
             _ => {
                 return Err(bug(
                     "collect_leaves: a source the FROM binder does not read as a table",
@@ -958,6 +1036,28 @@ fn collect_leaves<'a>(from: &'a [TableRef], leaves: &mut Vec<Leaf<'a>>) -> SqlRe
         }
     }
     Ok(())
+}
+
+/// The aliases of the derived tables and `VALUES` lists of a `FROM`, at any depth of its
+/// joins.
+fn derived_aliases(from: &[TableRef]) -> Vec<&Ident> {
+    let mut aliases = Vec::new();
+    for reference in from {
+        match reference {
+            TableRef::Join { left, right, .. } => {
+                aliases.extend(derived_aliases(std::slice::from_ref(left.as_ref())));
+                aliases.extend(derived_aliases(std::slice::from_ref(right.as_ref())));
+            }
+            TableRef::Derived {
+                alias: Some(alias), ..
+            }
+            | TableRef::Values {
+                alias: Some(alias), ..
+            } => aliases.push(alias),
+            _ => {}
+        }
+    }
+    aliases
 }
 
 /// Whether two written names reach one table, the parts neither carries completed from the

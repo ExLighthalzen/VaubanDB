@@ -388,7 +388,7 @@ fn a_hint_list_on_the_target_is_accepted() {
     let LogicalPlan::Scan { hints, .. } = scan else {
         unreachable!()
     };
-    assert!(matches!(hints, LockHints { .. }));
+    assert!(hints.updlock, "{hints:?}");
     let plan = delete_of("DELETE FROM dbo.t WITH (ROWLOCK);");
     assert!(matches!(*plan.input, LogicalPlan::Scan { .. }));
 }

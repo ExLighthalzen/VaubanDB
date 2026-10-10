@@ -3,9 +3,13 @@
 //! the seek that reaches the target rows, and the `spool` flag that protects against the
 //! Halloween problem.
 
-use vauban_binder::{BoundExpr, ColumnBinding, DeletePlan, InsertPlan, SelectIntoPlan, UpdatePlan};
+use vauban_binder::{
+    BoundExpr, ColumnBinding, DeletePlan, InsertPlan, OutputColumn, OutputSchema, SelectIntoPlan,
+    UpdatePlan,
+};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::TableId;
+use vauban_types::{SqlType, TypeInfo};
 
 use crate::context::PlanContext;
 use crate::physical::{
@@ -49,7 +53,10 @@ pub(crate) fn plan_update(
     ctx: &PlanContext<'_>,
 ) -> SqlResult<PhysicalStatement> {
     let mut input = plan_node(&stmt.input, ctx)?;
-    request_row_ids(&mut input, stmt.table, ctx)?;
+    if !input.row_id_tables().contains(&stmt.table) {
+        request_row_ids(&mut input, stmt.table, ctx)?;
+    }
+    let input = with_assignment_subqueries(input, &stmt.assignments, ctx)?;
     let spool = spool_for_update(&input, &stmt.assignments, stmt.table, ctx);
     Ok(PhysicalStatement::Update(PhysicalUpdate {
         table: stmt.table,
@@ -65,13 +72,57 @@ pub(crate) fn plan_delete(
     ctx: &PlanContext<'_>,
 ) -> SqlResult<PhysicalStatement> {
     let mut input = plan_node(&stmt.input, ctx)?;
-    request_row_ids(&mut input, stmt.table, ctx)?;
+    if !input.row_id_tables().contains(&stmt.table) {
+        request_row_ids(&mut input, stmt.table, ctx)?;
+    }
     let spool = count_table_references(&input, stmt.table, ctx) > 1;
     Ok(PhysicalStatement::Delete(PhysicalDelete {
         table: stmt.table,
         input,
         spool,
     }))
+}
+
+/// `input` under a [`SubqueryEval`](PhysicalPlan::SubqueryEval) that holds the plans of the
+/// subqueries the assigned values of an `UPDATE` hold, in the order of the assignments;
+/// `input` unchanged when none holds one (`tests/halloween.rs`,
+/// `the_subqueries_of_a_set_are_planned_over_the_input`).
+///
+/// The node is the root of the input of the statement, where a `WHERE` that holds a subquery
+/// is planned as a `Filter` or a join above its own `SubqueryEval`. The executor evaluates each assigned value over a row of `input` with these plans installed,
+/// a correlated subquery reading that row as the row of the query that encloses it.
+///
+/// # Errors
+///
+/// What planning a subquery raises.
+fn with_assignment_subqueries(
+    input: PhysicalPlan,
+    assignments: &[(ColumnBinding, BoundExpr)],
+    ctx: &PlanContext<'_>,
+) -> SqlResult<PhysicalPlan> {
+    let mut subplans = Vec::new();
+    for (_, value) in assignments {
+        subplans.extend(plan_statement_subplans(value, ctx)?);
+    }
+    if subplans.is_empty() {
+        return Ok(input);
+    }
+    let mut columns = input.schema().columns.clone();
+    for subplan in &subplans {
+        let ty = subplan.plan.schema().columns.first().map_or_else(
+            || TypeInfo::new(SqlType::Bit, false),
+            |column| column.ty.clone(),
+        );
+        columns.push(OutputColumn {
+            name: String::new(),
+            ty,
+        });
+    }
+    Ok(PhysicalPlan::SubqueryEval {
+        input: Box::new(input),
+        subplans,
+        schema: OutputSchema { columns },
+    })
 }
 
 /// Asks each scan and each seek of `table` in `plan` for the row identifier of the rows it
@@ -83,6 +134,11 @@ pub(crate) fn plan_delete(
 /// ([`PhysicalPlan::row_id_tables`]) and stops at the others, and at the inner side of a
 /// semi-join or an anti-semi-join, whose rows are not handed over. A node that already
 /// carries the binding is left as it is.
+///
+/// Not called when the bound input already carries the binding for `table`: the binder puts
+/// it on the source the target of a joined statement names, and the other reads of the
+/// table, a self-join among them, stay unmarked (`tests/row_id.rs`,
+/// `a_self_join_marks_the_source_the_target_names`).
 ///
 /// # Errors
 ///

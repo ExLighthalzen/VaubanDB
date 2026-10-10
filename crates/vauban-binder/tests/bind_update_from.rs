@@ -1015,3 +1015,119 @@ fn a_joined_statement_needs_the_catalogue() {
     let error = bind(&batch.statements[0], &ctx).expect_err("no catalogue, no source");
     assert_eq!(error.number, 50000, "{}", error.message);
 }
+
+/// The scans of the tree of joins under `input`, in written order: the alias of each, and
+/// whether its columns end with a row-identifier binding (a negative column identifier,
+/// which no column of a table carries).
+fn marked_scans(input: &LogicalPlan) -> Vec<(String, bool)> {
+    fn walk(plan: &LogicalPlan, out: &mut Vec<(String, bool)>) {
+        match plan {
+            LogicalPlan::Filter { input, .. } => walk(input, out),
+            LogicalPlan::Join { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            LogicalPlan::Scan {
+                columns,
+                alias,
+                schema,
+                ..
+            } => {
+                let marked = columns.last().is_some_and(|last| last.column.0 < 0);
+                let width = columns.len() - usize::from(marked);
+                assert_eq!(
+                    width,
+                    schema.columns.len(),
+                    "{alias}: the schema is unchanged"
+                );
+                out.push((alias.clone(), marked));
+            }
+            other => panic!("not a tree of joins: {other:?}"),
+        }
+    }
+    let mut out = Vec::new();
+    walk(input, &mut out);
+    out
+}
+
+/// Of two reads of the target's table, the source the target names alone carries the
+/// row-identifier binding, after its columns: the unaliased source for `UPDATE dbo.t`, the
+/// source `y` for `UPDATE y`. A source of another table carries none.
+#[test]
+fn the_source_the_target_names_carries_the_row_identifier() {
+    let cases = [
+        (
+            "UPDATE dbo.t SET a = 1 FROM dbo.t JOIN dbo.t AS y ON y.k = t.k;",
+            vec![("t", true), ("y", false)],
+        ),
+        (
+            "UPDATE y SET a = 1 FROM dbo.t JOIN dbo.t AS y ON y.k = t.k;",
+            vec![("t", false), ("y", true)],
+        ),
+        (
+            "UPDATE x SET a = y.b FROM dbo.u AS y JOIN dbo.t AS x ON x.k = y.k;",
+            vec![("y", false), ("x", true)],
+        ),
+    ];
+    for (text, expected) in cases {
+        let plan = update_of(text);
+        let expected: Vec<(String, bool)> = expected
+            .into_iter()
+            .map(|(alias, marked)| (alias.to_owned(), marked))
+            .collect();
+        assert_eq!(marked_scans(&plan.input), expected, "{text}");
+    }
+    let plan = delete_of("DELETE y FROM dbo.t JOIN dbo.t AS y ON y.k = t.k + 1;");
+    assert_eq!(
+        marked_scans(&plan.input),
+        vec![("t".to_owned(), false), ("y".to_owned(), true)]
+    );
+}
+
+/// A target no source names joins the `FROM` after its sources, without an `ON`, and its
+/// columns are in scope for the `WHERE` and the values: `u.k` in the `WHERE` reads the
+/// column after the two of `t`.
+#[test]
+fn update_target_outside_the_from_joins_the_from() {
+    let plan = update_of("UPDATE dbo.u SET b = t.a FROM dbo.t WHERE t.k = u.k;");
+    assert_eq!(plan.table, TableId(2));
+    let LogicalPlan::Filter { input, predicate } = plan.input.as_ref() else {
+        panic!("a Filter over the join: {:?}", plan.input);
+    };
+    assert!(
+        matches!(
+            input.as_ref(),
+            LogicalPlan::Join {
+                kind: JoinKind::Cross,
+                on: None,
+                ..
+            }
+        ),
+        "{input:?}"
+    );
+    assert_eq!(
+        marked_scans(input),
+        vec![("t".to_owned(), false), ("u".to_owned(), true)]
+    );
+    let BoundExprKind::Compare { right, .. } = &predicate.kind else {
+        panic!("a comparison: {predicate:?}");
+    };
+    let BoundExprKind::ColumnRef(column) = &right.kind else {
+        panic!("a column: {right:?}");
+    };
+    assert_eq!(column.index, 2);
+    let (_, value) = &plan.assignments[0];
+    let mut value = value;
+    while let BoundExprKind::Convert { expr, .. } = &value.kind {
+        value = expr;
+    }
+    let BoundExprKind::ColumnRef(column) = &value.kind else {
+        panic!("a column: {value:?}");
+    };
+    assert_eq!((column.name.as_str(), column.index), ("a", 1));
+    let plan = delete_of("DELETE dbo.u FROM dbo.t WHERE t.k = 1;");
+    assert_eq!(
+        marked_scans(&plan.input),
+        vec![("t".to_owned(), false), ("u".to_owned(), true)]
+    );
+}

@@ -190,6 +190,17 @@ impl Fixture {
     /// `UPDATE t SET b = <value> WHERE a = <key>`, run in `handle`; the whole table when
     /// `key` is `None`.
     fn update(&self, handle: &TxnHandle, key: Option<i32>, value: i32) -> SqlResult<()> {
+        self.update_with(handle, key, value, LockHints::default())
+    }
+
+    /// `UPDATE t WITH (<hints>) SET b = <value> WHERE a = <key>`, run in `handle`.
+    fn update_with(
+        &self,
+        handle: &TxnHandle,
+        key: Option<i32>,
+        value: i32,
+        hints: LockHints,
+    ) -> SqlResult<()> {
         let eval = StaticContext::default();
         let snap = self.txn.statement_snapshot(handle);
         let mut ctx = ExecContext::scalar(&eval, SessionOptions::default())
@@ -201,7 +212,7 @@ impl Fixture {
             columns: vec![binding(0, "a"), binding(1, "b")],
             alias: "t".to_owned(),
             schema: schema(),
-            hints: LockHints::default(),
+            hints,
         };
         let input = match key {
             None => scan,
@@ -571,11 +582,16 @@ fn write_takes_an_exclusive_lock() {
     await_waiter(fixture.txn.locks(), second.id);
     still_waiting(&write, "the second writer");
 
-    // The counter-proof: the other row is not held, and an update of it goes through while
-    // the first transaction is still open.
+    // The counter-proof: the other row is not held. The update of it scans the table, and
+    // its scan would wait on the held row as the second writer does; stepping over that row
+    // with `READPAST`, it goes through while the first transaction is still open.
     let other = fixture.txn.begin(IsolationLevel::ReadCommitted);
     let (shared, handle) = (fixture.share(), other.clone());
-    let free = in_background(move || shared.update(&handle, Some(2), 400));
+    let readpast = LockHints {
+        readpast: true,
+        ..LockHints::default()
+    };
+    let free = in_background(move || shared.update_with(&handle, Some(2), 400, readpast));
     free.recv_timeout(SOON)
         .expect("the update of a free row does not wait")
         .expect("the update succeeds");
