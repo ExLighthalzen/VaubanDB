@@ -1,20 +1,17 @@
-//! Variables and the control of flow: `DECLARE`, `SET @x = e`, `SELECT @x = e`, `IF`,
-//! `WHILE`, `BEGIN ... END`, `BREAK`, `CONTINUE`, `RETURN`, `PRINT`.
+//! Variables and the control of flow: `DECLARE`, `SET @x = e`, `SELECT @x = e`, `PRINT`
+//! run here; `IF`, `WHILE`, `BEGIN ... END`, `BREAK`, `CONTINUE`, `GOTO`, labels and
+//! `RETURN` are compiled into a program and run by the interpreter (`interp/`).
 //!
 //! # What one statement answers
 //!
-//! `DECLARE`, `SET`, `WHILE` and `PRINT` answer [`ExecOutcome::NoRows`]; `IF` and `Block`
-//! answer what the statement they ran answered, and so pass a `RETURN` or a `BREAK` up the
-//! tree. `BREAK` and `CONTINUE` answer themselves, and their enclosing `WHILE` reads them.
-//!
-//! # A jump out of the tree
-//!
-//! A label runs nothing and answers `NoRows`; a `GOTO` answers
-//! [`ExecOutcome::Goto`] with the name it wrote. Where that name sits is a position in a
-//! list of statements this crate does not hold, so the outcome climbs instead of being
-//! acted upon: the `WHILE` that reads a `BREAK` passes a `Goto` up as it passes a
-//! `RETURN` up, and so does a `BEGIN … END` (`tests/control.rs`,
-//! `a_goto_in_a_block_stops_the_block`, `a_goto_in_a_while_body_leaves_the_loop`).
+//! `DECLARE`, `SET` and `PRINT` answer [`ExecOutcome::NoRows`]. A statement that holds
+//! others runs through [`crate::interp`] in the mode of the statement tree: a `WHILE` and a
+//! `BEGIN … END` answer `NoRows`, an `IF` answers what the statement of the branch it took
+//! answered when that statement holds no other, and a `RETURN`, a call, a `GOTO` to a label
+//! the statement does not hold, a `BREAK` or a `CONTINUE` outside any loop it holds leave
+//! it as the outcome that names them (`tests/control.rs`,
+//! `a_goto_in_a_block_stops_the_block`, `a_goto_in_a_while_body_leaves_the_loop`). An
+//! error a held statement raises ends the statement that holds it, as the `Err` it is.
 //!
 //! A `WHILE` reads the cancellation token once per iteration, so an infinite loop ends by
 //! [`ExecOutcome::Cancelled`] and not by waiting.
@@ -24,9 +21,10 @@
 //! [`PhysicalStatement::Deferred`] is a statement of a branch or of a loop body that the
 //! binder left as it was parsed because the catalogue answered about the name it wrote:
 //! a table it did not hold, or a name it already held (`binder/control.rs`).
-//! [`run_deferred`] binds it, plans it and checks it here, against the catalogue as it
-//! stands when the control of flow reaches it, then runs it like the statement it turned
-//! out to be. Four consequences, each with its test in `tests/control.rs`:
+//! [`bind_and_plan`] binds it and plans it, and the interpreter checks it against the
+//! catalogue as it stands when the control of flow reaches it, then runs it like the
+//! statement it turned out to be. Four consequences, each with its test in
+//! `tests/control.rs`:
 //!
 //! * a branch that is not taken runs nothing, so what it holds stays unbound
 //!   (`a_branch_that_is_not_taken_never_binds_its_statement`);
@@ -78,9 +76,8 @@ use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
 use vauban_planner::{
     NoIndexes, PhysicalPlan, PhysicalStatement, PlanCatalog, PlanContext, StorageIndexes, SubPlan,
 };
-use vauban_types::{SqlType, TypeInfo, Value, convert, default_display};
+use vauban_types::{TypeInfo, Value, convert, default_display};
 
-use crate::compile::compile;
 use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
 use crate::errors::at;
 use crate::expr::eval_expr;
@@ -136,76 +133,6 @@ pub(crate) fn execute<'a>(
         PhysicalStatement::SelectAssign { input, assignments } => {
             select_assign(input, assignments, ctx, sink)
         }
-        // An unknown condition takes the `ELSE` branch, as it does on SQL Server: a true
-        // predicate runs the `THEN`, an unknown one does not.
-        PhysicalStatement::If {
-            condition,
-            then_,
-            else_,
-        } => {
-            let value = eval_expr(condition, None, ctx).map_err(condition_error)?;
-            if matches!(value, Value::Bit(true)) {
-                run_nested(then_, ctx, sink)
-            } else if let Some(else_) = else_ {
-                run_nested(else_, ctx, sink)
-            } else {
-                Ok(ExecOutcome::NoRows)
-            }
-        }
-        PhysicalStatement::While { condition, body } => {
-            loop {
-                if ctx.cancelled() {
-                    return Ok(ExecOutcome::Cancelled);
-                }
-                let value = eval_expr(condition, None, ctx).map_err(condition_error)?;
-                if !matches!(value, Value::Bit(true)) {
-                    break;
-                }
-                match run_nested(body, ctx, sink)? {
-                    ExecOutcome::Break => break,
-                    ExecOutcome::Return(code) => return Ok(ExecOutcome::Return(code)),
-                    flow @ (ExecOutcome::CallProcedure { .. }
-                    | ExecOutcome::RunDynamic { .. }
-                    | ExecOutcome::Goto(_)) => {
-                        return Ok(flow);
-                    }
-                    ExecOutcome::Cancelled => return Ok(ExecOutcome::Cancelled),
-                    ExecOutcome::BatchAbort(err) => return Ok(ExecOutcome::BatchAbort(err)),
-                    ExecOutcome::NoRows | ExecOutcome::Rows(_) | ExecOutcome::Continue => {}
-                }
-            }
-            Ok(ExecOutcome::NoRows)
-        }
-        PhysicalStatement::Block(statements) => {
-            for statement in statements {
-                match run_nested(statement, ctx, sink)? {
-                    ExecOutcome::NoRows | ExecOutcome::Rows(_) => {}
-                    flow @ (ExecOutcome::Continue
-                    | ExecOutcome::Break
-                    | ExecOutcome::Return(_)
-                    | ExecOutcome::Goto(_)
-                    | ExecOutcome::CallProcedure { .. }
-                    | ExecOutcome::RunDynamic { .. }
-                    | ExecOutcome::Cancelled
-                    | ExecOutcome::BatchAbort(_)) => return Ok(flow),
-                }
-            }
-            Ok(ExecOutcome::NoRows)
-        }
-        PhysicalStatement::Break => Ok(ExecOutcome::Break),
-        PhysicalStatement::Continue => Ok(ExecOutcome::Continue),
-        PhysicalStatement::Goto { label } => Ok(ExecOutcome::Goto(label.clone())),
-        PhysicalStatement::Label { .. } => Ok(ExecOutcome::NoRows),
-        PhysicalStatement::Return(expr) => {
-            let code = match expr {
-                None => 0,
-                Some(expr) => {
-                    let value = eval_expr(expr, None, ctx)?;
-                    return_code(&value, &expr.ty, expr.line)?
-                }
-            };
-            Ok(ExecOutcome::Return(code))
-        }
         PhysicalStatement::Print(expr) => {
             let value = eval_expr(expr, None, ctx)?;
             let message = match value {
@@ -221,25 +148,17 @@ pub(crate) fn execute<'a>(
             })?;
             Ok(ExecOutcome::NoRows)
         }
-        PhysicalStatement::Deferred(deferred) => run_deferred(deferred, ctx, sink),
+        PhysicalStatement::If { .. }
+        | PhysicalStatement::While { .. }
+        | PhysicalStatement::Block(_)
+        | PhysicalStatement::Break
+        | PhysicalStatement::Continue
+        | PhysicalStatement::Goto { .. }
+        | PhysicalStatement::Label { .. }
+        | PhysicalStatement::Return(_)
+        | PhysicalStatement::Deferred(_) => crate::interp::run_tree(stmt, ctx, sink),
         _ => Err(bug("control::execute: not a control-of-flow statement")),
     }
-}
-
-/// Binds, plans, checks and runs a statement the binder left unbound (module header).
-///
-/// The catalogue is the one `ctx` carries, so a `CREATE TABLE` that ran earlier in the
-/// same block is seen. The compile-time checks run here rather than in [`run_nested`],
-/// which sends a control-of-flow statement straight to [`execute`] without them
-/// (`tests/control.rs`, `a_deferred_statement_gets_the_compile_time_checks`).
-fn run_deferred<'a>(
-    deferred: &DeferredStatement,
-    ctx: &mut ExecContext<'a>,
-    sink: &mut dyn StatementSink,
-) -> SqlResult<ExecOutcome> {
-    let statement = bind_and_plan(deferred, ctx)?;
-    compile(&statement, ctx)?;
-    run_nested(&statement, ctx, sink)
 }
 
 /// Binds `deferred` against the catalogue `ctx` carries and plans what comes out.
@@ -249,7 +168,7 @@ fn run_deferred<'a>(
 /// `a_deferred_statement_reads_a_variable_declared_before_it`). The database, the default
 /// schema and the text the spans index into travel on the statement: they are what the
 /// first binding attempt used.
-fn bind_and_plan(
+pub(crate) fn bind_and_plan(
     deferred: &DeferredStatement,
     ctx: &mut ExecContext<'_>,
 ) -> SqlResult<PhysicalStatement> {
@@ -292,35 +211,6 @@ impl VariableScope for DeclaredTypes {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, ty)| ty.clone())
-    }
-}
-
-/// Runs one statement nested in an `IF`, a `WHILE` or a `BLOCK`.
-///
-/// A control-of-flow statement is run here without another frame, so the statement
-/// savepoint of `txn_exec` stays the one of the outermost statement; anything else — a
-/// query, a DML or DDL statement written in a branch — is a statement of its own and goes
-/// through [`crate::execute`].
-fn run_nested<'a>(
-    stmt: &PhysicalStatement,
-    ctx: &mut ExecContext<'a>,
-    sink: &mut dyn StatementSink,
-) -> SqlResult<ExecOutcome> {
-    match stmt {
-        PhysicalStatement::Declare(_)
-        | PhysicalStatement::SetVariable { .. }
-        | PhysicalStatement::SelectAssign { .. }
-        | PhysicalStatement::If { .. }
-        | PhysicalStatement::While { .. }
-        | PhysicalStatement::Block(_)
-        | PhysicalStatement::Break
-        | PhysicalStatement::Continue
-        | PhysicalStatement::Goto { .. }
-        | PhysicalStatement::Label { .. }
-        | PhysicalStatement::Return(_)
-        | PhysicalStatement::Print(_)
-        | PhysicalStatement::Deferred(_) => execute(stmt, ctx, sink),
-        _ => crate::execute(stmt, ctx, sink),
     }
 }
 
@@ -446,26 +336,6 @@ fn eval_statement_expr(
     let value = eval_expr(expr, None, ctx);
     ctx.unwind_to(mark);
     value
-}
-
-/// The integer a `RETURN e` returns: `e` converted to `int`, `NULL` counting as 0.
-fn return_code(value: &Value, ty: &TypeInfo, line: u32) -> SqlResult<i32> {
-    let int = TypeInfo::new(SqlType::Int, false);
-    let converted = convert(value, ty, &int, None).map_err(|err| at(err, line))?;
-    Ok(match converted {
-        Value::I32(n) => n,
-        _ => 0,
-    })
-}
-
-/// An error raised while the condition of an `IF` or a `WHILE` is evaluated belongs to
-/// that statement, not to the sub-expression that failed: its line is cleared here, and the
-/// layer that runs the batch puts the statement's own line on it, whether the condition sits
-/// on its own line or is folded onto the line of the first statement held
-/// (`crates/vauban-session/tests/run_batch_pipeline.rs`,
-/// `an_error_of_a_condition_carries_the_line_of_the_statement_that_holds_it`).
-fn condition_error(err: SqlError) -> SqlError {
-    err.with_line(0)
 }
 
 /// The internal error 50000 for a broken precondition.

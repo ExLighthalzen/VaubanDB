@@ -69,7 +69,8 @@
 //! | `ddl_index.rs` | `CREATE INDEX` and `DROP INDEX` |
 //! | `ddl_options.rs`, `ddl_alter.rs` | `ALTER DATABASE ... SET`, `ALTER TABLE` |
 //! | `dml/` | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE TABLE` (`dml/mod.rs`) |
-//! | `control.rs` | variables and the control of flow |
+//! | `control.rs` | variables, and the control of flow of a statement run on its own |
+//! | `interp/` | a body compiled into a linear program and run with a program counter |
 //! | `execute.rs` | `EXECUTE`: arguments evaluated, hand-off to the session |
 //! | `txn_exec.rs` | the transaction statements and the frame around each statement |
 //! | `locking.rs` | reading and writing under locks |
@@ -87,6 +88,7 @@ mod dml;
 mod errors;
 mod execute;
 mod expr;
+mod interp;
 mod locking;
 mod operator;
 pub mod ops;
@@ -100,6 +102,7 @@ pub mod txn_exec;
 pub use compile::compile;
 pub use context::{CancelToken, ExecContext, ExecSession};
 pub use expr::eval_expr;
+pub use interp::{Call, CallHandler, Program, ProgramEnd};
 pub use operator::{Operator, bucket_hash, build_operator, keys_equal};
 pub use row::{EvaluatedExecArg, ExecOutcome, Row, RowSet};
 pub use sink::{CollectSink, EnvironmentChange, ResultColumn, SinkEvent, StatementSink};
