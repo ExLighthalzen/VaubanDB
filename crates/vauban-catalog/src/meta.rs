@@ -331,6 +331,36 @@ pub enum ConstraintMeta {
     },
 }
 
+impl ColumnMeta {
+    /// The stored text of the expression of a computed column, `None` for a stored column:
+    /// the text `sys.computed_columns.definition` publishes, which the binder parses and
+    /// binds (unit test `the_expression_texts_are_the_published_texts`).
+    pub fn computed_text(&self) -> Option<String> {
+        self.computed.as_ref().map(definition_text)
+    }
+
+    /// The stored text of the `DEFAULT` of the column, `None` for a column without one: the text
+    /// `sys.default_constraints.definition` publishes, `((0))` for `DEFAULT 0`.
+    pub fn default_text(&self) -> Option<String> {
+        self.default.as_ref().map(definition_text)
+    }
+}
+
+impl ConstraintMeta {
+    /// The stored text of the expression of a `CHECK` or of a `DEFAULT`, `None` for the
+    /// other kinds: `([a]>=(0))` for `CHECK (a >= 0)`, `((0))` for `DEFAULT 0` (unit test
+    /// `the_expression_texts_are_the_published_texts`).
+    pub fn expression_text(&self) -> Option<String> {
+        match self {
+            ConstraintMeta::Check { definition, .. } => Some(definition.clone()),
+            ConstraintMeta::Default { expr, .. } => Some(definition_text(expr)),
+            ConstraintMeta::PrimaryKey(_)
+            | ConstraintMeta::Unique(_)
+            | ConstraintMeta::ForeignKey { .. } => None,
+        }
+    }
+}
+
 pub use crate::def::AlterTable;
 
 /// How the text of an object expression is read back: a `CHECK` is a predicate, a `DEFAULT`
@@ -1757,6 +1787,41 @@ mod tests {
         };
         assert_eq!(ty.name, "varchar");
         assert_eq!(ty.args, vec![TypeArg::Number(10)]);
+    }
+
+    #[test]
+    fn the_expression_texts_are_the_published_texts() {
+        let (_, zero) = stored_expression(&written(V, "0"), V).expect("0");
+        let (definition, check) = stored_expression(&written(P, "a >= 0"), P).expect("a >= 0");
+        let column = ColumnMeta {
+            id: ColumnId(1),
+            name: "a".to_owned(),
+            ty: vauban_types::TypeInfo::new(vauban_types::SqlType::Int, true),
+            ordinal: 0,
+            default: Some(zero.clone()),
+            identity: None,
+            computed: Some(written(V, "a + 1")),
+        };
+        assert_eq!(column.default_text().as_deref(), Some("((0))"));
+        assert_eq!(column.computed_text().as_deref(), Some("([a]+(1))"));
+        let default = ConstraintMeta::Default {
+            constraint: ObjectId(7),
+            system_named: true,
+            column: ColumnId(1),
+            expr: zero,
+        };
+        assert_eq!(default.expression_text().as_deref(), Some("((0))"));
+        let check = ConstraintMeta::Check {
+            constraint: ObjectId(8),
+            system_named: false,
+            expr: check,
+            definition,
+        };
+        assert_eq!(check.expression_text().as_deref(), Some("([a]>=(0))"));
+        assert_eq!(
+            ConstraintMeta::PrimaryKey(IndexId(1)).expression_text(),
+            None
+        );
     }
 
     #[test]

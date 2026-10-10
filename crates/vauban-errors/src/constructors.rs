@@ -2829,6 +2829,31 @@ impl SqlError {
         from_catalog(512, 1, &[])
     }
 
+    /// Error 128, severity 15, state 1 (`CREATE TABLE dbo.t (a int, b int DEFAULT a);`): a
+    /// name read as a column where column names are not allowed, the `DEFAULT` of a column.
+    ///
+    /// `name` is the name as written, delimiters removed.
+    ///
+    /// ```text
+    /// The name "a" is a column, and a column cannot be named here: this place takes constants, constant expressions and, where the context allows, variables.
+    /// ```
+    pub fn column_name_not_permitted(name: &str) -> Self {
+        from_catalog(128, 1, &[Arg::Str(name)])
+    }
+
+    /// Error 1046, severity 15, state 1
+    /// (`CREATE TABLE dbo.t (a int, b int DEFAULT (SELECT 1));`): a subquery where a scalar
+    /// expression is expected, the `DEFAULT` or the `CHECK` of a table.
+    ///
+    /// No argument.
+    ///
+    /// ```text
+    /// A subquery cannot be written here: this place takes a scalar expression.
+    /// ```
+    pub fn subquery_not_allowed_here() -> Self {
+        from_catalog(1046, 1, &[])
+    }
+
     /// Error 1047, severity 15, state 1
     /// (`SELECT * FROM dbo.lone WITH (NOLOCK, TABLOCKX);`): a table hint list holds two
     /// hints that contradict each other.

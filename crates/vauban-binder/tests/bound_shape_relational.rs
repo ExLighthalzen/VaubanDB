@@ -245,11 +245,13 @@ fn a_subquery_predicate_is_a_predicate_and_a_scalar_one_is_not() {
 fn every_statement_variant_exists() {
     let values = vec![
         BoundStatement::Insert(InsertPlan {
+            target: Default::default(),
             table: TableId(1),
             columns: vec![binding("c", 0)],
             source: Box::new(source("c")),
         }),
         BoundStatement::Update(UpdatePlan {
+            target: Default::default(),
             table: TableId(1),
             input: Box::new(source("c")),
             assignments: vec![(binding("c", 0), literal())],

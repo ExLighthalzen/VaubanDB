@@ -15,11 +15,15 @@
 
 use vauban_catalog::{
     CatalogSnapshot, ColumnId, ColumnMeta, ConstraintMeta, IndexMeta, ObjectId, ObjectKind,
+    QualifiedName,
 };
 use vauban_parser::ObjectName;
 
 use crate::bound::ColumnBinding;
-use crate::context::{CatalogView, ResolvedTable, ResolvedTableKind, TableReferenceKind};
+use crate::context::{
+    CatalogView, ExpressionText, ObjectExpressionTexts, ResolvedTable, ResolvedTableKind,
+    TableReferenceKind,
+};
 
 impl CatalogView for CatalogSnapshot {
     /// Resolves the written name against this snapshot.
@@ -90,6 +94,67 @@ impl CatalogView for CatalogSnapshot {
                 .map(|column| column.id)
                 .collect()
         })
+    }
+
+    /// The stored texts of the object expressions of `object`, read from
+    /// [`CatalogSnapshot::table`]: the `DEFAULT` of a column from its
+    /// [`ConstraintMeta::Default`] (or from [`ColumnMeta::default`] when the table holds no
+    /// such constraint for it), the computed columns from [`ColumnMeta::computed`], the
+    /// `CHECK` constraints from [`ConstraintMeta::Check`], each named through
+    /// [`CatalogSnapshot::constraint_name`] (`tests/catalog_view.rs`,
+    /// `object_expressions_reads_the_texts_and_the_names`).
+    fn object_expressions(&self, object: ObjectId) -> ObjectExpressionTexts {
+        let Some(meta) = self.table(object) else {
+            return ObjectExpressionTexts::default();
+        };
+        let name_of = |id: ObjectId| self.constraint_name(id).map(|name| name.name);
+        let mut texts = ObjectExpressionTexts {
+            name: self.database_by_id(meta.database).map(|db| QualifiedName {
+                database: db.name.clone(),
+                schema: meta.schema.clone(),
+                name: meta.name.clone(),
+            }),
+            columns: columns_of(&meta.columns),
+            ..ObjectExpressionTexts::default()
+        };
+        for column in &meta.columns {
+            let constraint = meta.constraints.iter().find(|constraint| {
+                matches!(constraint, ConstraintMeta::Default { column: id, .. } if *id == column.id)
+            });
+            let text = match constraint {
+                Some(constraint) => constraint.expression_text(),
+                None => column.default_text(),
+            };
+            if let Some(text) = text {
+                texts.defaults.push(ExpressionText {
+                    column: Some(column.id),
+                    constraint: constraint.and_then(|constraint| match constraint {
+                        ConstraintMeta::Default { constraint, .. } => name_of(*constraint),
+                        _ => None,
+                    }),
+                    text,
+                });
+            }
+            if let Some(text) = column.computed_text() {
+                texts.computed.push(ExpressionText {
+                    column: Some(column.id),
+                    constraint: None,
+                    text,
+                });
+            }
+        }
+        for constraint in &meta.constraints {
+            if let ConstraintMeta::Check { constraint: id, .. } = constraint
+                && let Some(text) = constraint.expression_text()
+            {
+                texts.checks.push(ExpressionText {
+                    column: None,
+                    constraint: name_of(*id),
+                    text,
+                });
+            }
+        }
+        texts
     }
 
     /// Names of the constraints on `table`: index-backed `PRIMARY KEY` and `UNIQUE`, then

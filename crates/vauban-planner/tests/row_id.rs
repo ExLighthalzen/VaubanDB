@@ -150,6 +150,7 @@ fn the_binding_names_its_table() {
 #[test]
 fn an_update_over_a_join_asks_the_target_side_alone() {
     let stmt = BoundStatement::Update(UpdatePlan {
+        target: Default::default(),
         table: TABLE_T,
         input: Box::new(t_join_u()),
         assignments: vec![(binding("x", 1), literal(1))],
@@ -294,6 +295,7 @@ fn a_self_join_marks_the_source_the_target_names() {
     };
     let planned = |marked: bool| {
         let stmt = BoundStatement::Update(UpdatePlan {
+            target: Default::default(),
             table: TABLE_T,
             input: Box::new(self_join(marked)),
             assignments: vec![(binding("x", 1), literal(1))],

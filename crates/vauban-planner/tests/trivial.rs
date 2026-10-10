@@ -419,6 +419,7 @@ fn an_expression_without_a_subquery_goes_through() {
 #[test]
 fn dml_plans_to_physical_insert() {
     let insert = InsertPlan {
+        target: Default::default(),
         table: TableId(7),
         columns: vec![id_binding()],
         source: Box::new(LogicalPlan::Values {
@@ -437,6 +438,7 @@ fn dml_plans_to_physical_insert() {
 #[test]
 fn dml_plans_to_physical_update() {
     let update = UpdatePlan {
+        target: Default::default(),
         table: TableId(7),
         input: Box::new(scan()),
         assignments: vec![(id_binding(), literal(2))],

@@ -22,6 +22,13 @@
 //! | `SELECT 1; DROP DATABASE nosuchdatabase;` | 3701 | **1** | at execution |
 //! | `SELECT 1; USE nosuchdatabase;` | 911 | 0 | at compilation |
 //! | `SELECT 1; ALTER DATABASE nosuchdatabase SET READ_COMMITTED_SNAPSHOT ON;` | 5011 | **1** | at execution |
+//! | `SELECT 1; CREATE TABLE dbo.d1 (a int, b int DEFAULT a);` | 128 | 0 | at compilation |
+//! | `SELECT 1; CREATE TABLE dbo.d2 (a int, b int DEFAULT (SELECT 1));` | 1046 | 0 | at compilation |
+//! | `SELECT 1; CREATE TABLE dbo.d3 (a int, CHECK (z > 0));` | 207 | 0 | at compilation |
+//! | `SELECT 1; CREATE TABLE dbo.d9 (a date DEFAULT 1); SELECT 2;` | 206 | 0 | at compilation, the batch stops |
+//!
+//! The `DEFAULT` and `CHECK` expressions are bound here ([`check_default_expression`],
+//! [`check_check_expression`]); the refusals they lead to are listed there.
 //!
 //! So the type of a column is resolved here (2715), and the existence of a table or of a
 //! database is **not** looked at for a `DROP` or an `ALTER DATABASE`: the executor and the
@@ -84,20 +91,25 @@ use vauban_catalog::{
 };
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{
-    AlterDatabaseStatement, Clustering, ColumnConstraintKind, ColumnDef as AstColumnDef,
-    CreateDatabaseStatement, CreateTableStatement, DatabaseOption, ForeignKeyRef, Ident,
-    IndexColumn, ObjectName, RefAction, SortDirection, Span, TableConstraint, TableConstraintKind,
+    AlterDatabaseStatement, Clustering, ColumnConstraintKind, ColumnDef as AstColumnDef, ColumnRef,
+    CreateDatabaseStatement, CreateTableStatement, DatabaseOption, Expr, ForeignKeyRef, Ident,
+    InList, IndexColumn, ObjectName, RefAction, SortDirection, Span, TableConstraint,
+    TableConstraintKind,
 };
-use vauban_types::{Collation, TypeInfo};
+use vauban_types::{Collation, SqlType, TypeInfo};
 
-use crate::bound::{BoundStatement, DdlStatement};
-use crate::context::{BindContext, ResolvedTableKind};
+use crate::bound::{BoundStatement, ColumnBinding, DdlStatement};
+use crate::call::{bind_niladic, is_untyped_null};
+use crate::context::{BindContext, NoVariables, ResolvedTableKind};
 use crate::datatype::resolve_data_type;
 use crate::ddl_index::{
     primary_key_clustered_by_default, refuse_duplicate_key_column, refuse_two_keys,
 };
+use crate::expr::{Scope, bind_condition, bind_expr};
+use crate::insert::unbracket_type_names;
 use crate::names::from_needs_the_catalogue;
 use crate::query::not_yet;
+use crate::star::Source;
 
 /// Binds `CREATE DATABASE d [options]`.
 ///
@@ -509,6 +521,7 @@ pub(crate) fn bind_create_table(
         &written_null,
         &stmt.name.name.value,
     )?;
+    check_table_expressions(stmt, &columns, ctx)?;
 
     if let Some(catalog) = ctx.catalog
         && catalog
@@ -527,6 +540,53 @@ pub(crate) fn bind_create_table(
             constraints,
         },
     }))
+}
+
+/// Checks each `DEFAULT` and `CHECK` of a `CREATE TABLE` by binding it, in written order:
+/// [`check_default_expression`] against the type of its column, [`check_check_expression`]
+/// against the columns of the statement, exposed under the name of the table.
+fn check_table_expressions(
+    stmt: &CreateTableStatement,
+    columns: &[ColumnDef],
+    ctx: &BindContext<'_>,
+) -> SqlResult<()> {
+    let bindings: Vec<ColumnBinding> = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| ColumnBinding {
+            column: vauban_catalog::ColumnId(i32::try_from(index + 1).unwrap_or(i32::MAX)),
+            index,
+            name: column.name.clone(),
+            ty: column.ty.clone(),
+            depth: 0,
+        })
+        .collect();
+    let scope = Scope::over(Source::new(
+        &stmt.name.name.value,
+        Some(&stmt.name),
+        &bindings,
+        ctx.default_schema,
+        ctx.database,
+    ));
+    for (column, def) in stmt.definition.columns.iter().zip(columns) {
+        for constraint in &column.constraints {
+            match &constraint.kind {
+                ColumnConstraintKind::Default(expr) => {
+                    check_default_expression(expr, &def.ty, stmt.span.line, ctx)?;
+                }
+                ColumnConstraintKind::Check { expr, .. } => {
+                    check_check_expression(expr, &scope, ctx)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    for constraint in &stmt.definition.constraints {
+        if let TableConstraintKind::Check { expr, .. } = &constraint.kind {
+            check_check_expression(expr, &scope, ctx)?;
+        }
+    }
+    Ok(())
 }
 
 /// Binds `DROP TABLE [IF EXISTS] t1, t2`.
@@ -692,8 +752,9 @@ pub(crate) fn written(name: &ObjectName) -> String {
 /// [`ConstraintDef::Default`] without a name so the catalogue can refuse the pair
 /// (`tests/bind_ddl.rs`). A `CONSTRAINT df DEFAULT 0` becomes a
 /// [`ConstraintDef::Default`] so that the name the client chose survives to
-/// `sys.default_constraints`. Neither is evaluated here: the catalogue holds the
-/// `parser::Expr`.
+/// `sys.default_constraints`. Neither is evaluated here: [`bind_create_table`] binds each
+/// expression and refuses the shapes [`check_default_expression`] lists, and the catalogue
+/// holds the `parser::Expr`.
 ///
 /// # Errors
 ///
@@ -981,6 +1042,312 @@ fn apply_primary_key_not_null(
 /// `ddl::tests::unknown_type_2715_numbers_the_column_and_names_the_statement`.
 fn on_statement(err: SqlError, statement: &Span) -> SqlError {
     err.with_line(statement.line)
+}
+
+// -------------------------------------------------------------------------------------------
+// The object expressions of a table definition
+// -------------------------------------------------------------------------------------------
+
+/// The errors of a binding that a `DEFAULT` or a `CHECK` is refused for: an unknown column or
+/// qualifier, an undeclared `@variable`, a value where a condition is expected, two operands
+/// that do not compare (`ddl::tests`, `a_check_that_does_not_bind_is_refused`). Any other
+/// error of the binding leaves the statement to bind: a function the binder does not know
+/// (`NEWSEQUENTIALID()`, `FORMAT`, `CHECKSUM`) would otherwise refuse a table SQL Server
+/// creates (`ddl::tests`, `a_function_the_binder_does_not_know_is_not_refused`). Two
+/// exceptions, [`is_refused`], leave the statement to bind as well.
+const REFUSED_BINDING_ERRORS: [u32; 5] = [137, 206, 207, 4104, 4145];
+
+/// Whether `err`, raised by binding `expr`, refuses the `DEFAULT` or `CHECK`: a number of
+/// [`REFUSED_BINDING_ERRORS`], except a 137 of an expression that reads a `@@` global the
+/// binder does not know, and a 206 between `uniqueidentifier` and a binary type, which
+/// SQL Server converts (`ddl::tests`, `a_global_or_a_guid_to_binary_comparison_is_not_refused`).
+fn is_refused(err: &SqlError, expr: &Expr) -> bool {
+    if !REFUSED_BINDING_ERRORS.contains(&err.number) {
+        return false;
+    }
+    match err.number {
+        137 => !reads_a_global(expr),
+        206 => {
+            let message = err.message.to_ascii_lowercase();
+            !(message.contains("uniqueidentifier") && message.contains("binary"))
+        }
+        _ => true,
+    }
+}
+
+/// Whether `expr` reads a `@@` global.
+fn reads_a_global(expr: &Expr) -> bool {
+    first_in(expr, &mut |node| match node {
+        Expr::Variable { name, .. } if name.starts_with("@@") => Some(()),
+        _ => None,
+    })
+    .is_some()
+}
+
+/// The date-part functions, whose first argument is a date part (`day`, `yy`) and not a
+/// column.
+const DATE_PART_FUNCTIONS: [&str; 7] = [
+    "DATEADD",
+    "DATEDIFF",
+    "DATEDIFF_BIG",
+    "DATENAME",
+    "DATEPART",
+    "DATETRUNC",
+    "DATE_BUCKET",
+];
+
+/// Checks the expression of a `DEFAULT` written for a column of type `column` by binding it.
+///
+/// Errors, in this order, on the line of the node unless said otherwise (with the expression
+/// on line 5 of a batch whose statement starts on line 2, the first two answer 5):
+///
+/// | written | refusal |
+/// |---|---|
+/// | `b int DEFAULT (SELECT 1)` | 1046, severity 15, state 1 |
+/// | `b int DEFAULT a`, a column of the table or an unknown name | 128, severity 15, state 1 |
+/// | `a int DEFAULT @x` | 137, as `bind_expr` raises it |
+/// | `a date DEFAULT 1`, `a int DEFAULT NEWID()` | 206 state 2, the value's type named first, on the line of the statement |
+///
+/// The first argument of a date-part function (`DATEADD(day, 1, GETDATE())`) is a date part,
+/// not a name. A type written between brackets (`CONVERT([bit],(0))`) is read without them.
+///
+/// The 206 is raised for the pairs of [`refuses_default_conversion`] alone, and, as SQL
+/// Server raises it, at compilation: no result set of the batch is sent and the batch stops
+/// (`ddl::tests`, `a_default_of_a_type_that_does_not_convert_is_206`). The untyped `NULL` is
+/// exempt.
+///
+/// # Errors
+///
+/// The refusals of the table above.
+pub(crate) fn check_default_expression(
+    expr: &Expr,
+    column: &TypeInfo,
+    statement_line: u32,
+    ctx: &BindContext<'_>,
+) -> SqlResult<()> {
+    let mut expr = expr.clone();
+    unbracket_type_names(&mut expr);
+    refuse_subquery(&expr)?;
+    if let Some(column) = first_column_reference(&expr)? {
+        return Err(column_not_permitted(&column.name.value).with_line(column.span.line));
+    }
+    let local = BindContext {
+        text: ctx.text,
+        catalog: ctx.catalog,
+        database: ctx.database,
+        default_schema: ctx.default_schema,
+        variables: &NoVariables,
+        options: ctx.options,
+    };
+    let bound = match bind_expr(&expr, &local, &Scope::empty()) {
+        Ok(bound) => bound,
+        Err(err) if is_refused(&err, &expr) => return Err(err),
+        Err(_) => return Ok(()),
+    };
+    if !is_untyped_null(&expr) && refuses_default_conversion(&bound.ty.ty, &column.ty) {
+        return Err(
+            SqlError::operand_type_clash(bound.ty.ty.name(), column.ty.name())
+                .with_line(statement_line),
+        );
+    }
+    Ok(())
+}
+
+/// Whether a `DEFAULT` of type `value` on a column of type `column` is refused with 206.
+///
+/// The pairs below are the ones SQL Server refuses with 206 on
+/// `CREATE TABLE t (c <column> DEFAULT <value>)`; a pair outside them is not refused here,
+/// `datetime` towards `int` included, which SQL Server refuses with 257 (`ddl::tests`,
+/// `a_default_of_a_type_that_does_not_convert_is_206` and
+/// `a_default_of_an_untested_pair_is_not_refused`):
+///
+/// - `bit`, `tinyint`, `smallint`, `int`, `bigint`, `decimal`, `numeric` towards `date`,
+///   `time`, `datetime2`, `datetimeoffset`, `uniqueidentifier`;
+/// - `uniqueidentifier` towards `date`, `time`, `datetime2`, `datetimeoffset`, `bit`,
+///   `tinyint`, `smallint`, `int`, `bigint`, `decimal`, `numeric`, `float`, `money`;
+/// - `datetime` towards `uniqueidentifier`.
+fn refuses_default_conversion(value: &SqlType, column: &SqlType) -> bool {
+    let exact = |ty: &SqlType| {
+        matches!(
+            ty,
+            SqlType::Bit
+                | SqlType::TinyInt
+                | SqlType::SmallInt
+                | SqlType::Int
+                | SqlType::BigInt
+                | SqlType::Decimal { .. }
+                | SqlType::Numeric { .. }
+        )
+    };
+    let dated = |ty: &SqlType| {
+        matches!(
+            ty,
+            SqlType::Date | SqlType::Time(_) | SqlType::DateTime2(_) | SqlType::DateTimeOffset(_)
+        )
+    };
+    match value {
+        ty if exact(ty) => dated(column) || matches!(column, SqlType::UniqueIdentifier),
+        SqlType::UniqueIdentifier => {
+            dated(column) || exact(column) || matches!(column, SqlType::Float | SqlType::Money)
+        }
+        SqlType::DateTime => matches!(column, SqlType::UniqueIdentifier),
+        _ => false,
+    }
+}
+
+/// Checks the predicate of a `CHECK` by binding it against `scope`, the columns of its
+/// table: 1046 for a subquery, then the errors of
+/// [`bind_condition`] that [`REFUSED_BINDING_ERRORS`] lists (207 for an unknown column, 4104
+/// for an unknown qualifier, 4145 for a value that is not a condition, 206 for operands that
+/// do not compare), each on the line of its node (`ddl::tests`,
+/// `a_check_that_does_not_bind_is_refused`). A type written between brackets is read
+/// without them, as for [`check_default_expression`].
+///
+/// # Errors
+///
+/// The numbers above.
+pub(crate) fn check_check_expression(
+    expr: &Expr,
+    scope: &Scope,
+    ctx: &BindContext<'_>,
+) -> SqlResult<()> {
+    let mut expr = expr.clone();
+    unbracket_type_names(&mut expr);
+    refuse_subquery(&expr)?;
+    match bind_condition(&expr, ctx, scope) {
+        Err(err) if is_refused(&err, &expr) => Err(err),
+        _ => Ok(()),
+    }
+}
+
+/// 1046 on the line of the first subquery of `expr`, `Ok` otherwise.
+fn refuse_subquery(expr: &Expr) -> SqlResult<()> {
+    let found = first_in(expr, &mut |node| match node {
+        Expr::Exists(query, _) | Expr::Subquery(query, _) => Some(query.span.line),
+        Expr::Quantified { subquery, .. } => Some(subquery.span.line),
+        Expr::In {
+            list: InList::Subquery(query),
+            ..
+        } => Some(query.span.line),
+        _ => None,
+    });
+    match found {
+        Some(line) => Err(subquery_not_allowed().with_line(line)),
+        None => Ok(()),
+    }
+}
+
+/// The first name of `expr` that is a column: neither a niladic function
+/// (`CURRENT_TIMESTAMP`, `USER`) nor the date part of a date-part function.
+fn first_column_reference(expr: &Expr) -> SqlResult<Option<&ColumnRef>> {
+    let mut date_parts: Vec<&ColumnRef> = Vec::new();
+    let mut columns = Vec::new();
+    first_in(expr, &mut |node| {
+        match node {
+            Expr::Function { name, args, .. }
+                if name.schema.is_none()
+                    && DATE_PART_FUNCTIONS
+                        .iter()
+                        .any(|function| function.eq_ignore_ascii_case(&name.name.value)) =>
+            {
+                if let Some(Expr::Column(part)) = args.first() {
+                    date_parts.push(part);
+                }
+            }
+            Expr::Column(column) => columns.push(column),
+            _ => {}
+        }
+        None::<()>
+    });
+    for column in columns {
+        if date_parts.iter().any(|part| std::ptr::eq(*part, column)) {
+            continue;
+        }
+        if column.qualifier.is_none() && bind_niladic(&column.name, &column.span)?.is_some() {
+            continue;
+        }
+        return Ok(Some(column));
+    }
+    Ok(None)
+}
+
+/// The first answer of `visit` over the nodes of `expr`, read in written order; the
+/// subqueries are visited and not entered.
+fn first_in<'e, T>(expr: &'e Expr, visit: &mut impl FnMut(&'e Expr) -> Option<T>) -> Option<T> {
+    let mut pending = vec![expr];
+    while let Some(node) = pending.pop() {
+        if let Some(found) = visit(node) {
+            return Some(found);
+        }
+        let mut children: Vec<&Expr> = Vec::new();
+        match node {
+            Expr::Nested(inner, _)
+            | Expr::Unary { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::IsNull { expr: inner, .. }
+            | Expr::Collate { expr: inner, .. }
+            | Expr::Quantified { expr: inner, .. }
+            | Expr::Assign { value: inner, .. } => children.push(inner),
+            Expr::Binary { left, right, .. } => children.extend([left.as_ref(), right.as_ref()]),
+            Expr::Function { args, .. } => children.extend(args.iter()),
+            Expr::Convert { expr, style, .. } => {
+                children.push(expr);
+                children.extend(style.as_deref());
+            }
+            Expr::Case {
+                operand,
+                arms,
+                else_,
+                ..
+            } => {
+                children.extend(operand.as_deref());
+                for arm in arms {
+                    children.extend([&arm.when, &arm.then]);
+                }
+                children.extend(else_.as_deref());
+            }
+            Expr::In { expr, list, .. } => {
+                children.push(expr);
+                if let InList::Exprs(items) = list {
+                    children.extend(items.iter());
+                }
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                children.extend([expr.as_ref(), pattern.as_ref()]);
+                children.extend(escape.as_deref());
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                children.extend([expr.as_ref(), low.as_ref(), high.as_ref()]);
+            }
+            Expr::Literal(..)
+            | Expr::Column(_)
+            | Expr::Variable { .. }
+            | Expr::Exists(..)
+            | Expr::Subquery(..)
+            | Expr::NextValueFor { .. }
+            | Expr::InvalidNiladic { .. }
+            | Expr::Placeholder(_) => {}
+        }
+        pending.extend(children.into_iter().rev());
+    }
+    None
+}
+
+/// Error 128 for `name`, a column named in a `DEFAULT`.
+fn column_not_permitted(name: &str) -> SqlError {
+    SqlError::column_name_not_permitted(name)
+}
+
+/// Error 1046, a subquery in a `DEFAULT` or a `CHECK`.
+fn subquery_not_allowed() -> SqlError {
+    SqlError::subquery_not_allowed_here()
 }
 
 #[cfg(test)]

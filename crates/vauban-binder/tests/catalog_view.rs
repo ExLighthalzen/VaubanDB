@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use vauban_binder::{
-    BindContext, BoundStatement, CatalogView, DdlStatement, NoVariables, ResolvedTableKind,
-    SessionOptions, TableReferenceKind, bind,
+    BindContext, BoundExpr, BoundExprKind, BoundStatement, CatalogView, DdlStatement, NoVariables,
+    ResolvedTableKind, SessionOptions, TableReferenceKind, bind,
 };
 use vauban_catalog::{
     AlterTable, Catalog, CatalogSnapshot, ColumnDef, ObjectId, QualifiedName, TableDef,
@@ -20,7 +20,7 @@ use vauban_parser::{Expr, Ident, Literal, ObjectName, ParseOptions, Span, parse_
 use vauban_storage::{MemoryStorage, Storage};
 use vauban_sysfn::register_builtins;
 use vauban_txn::{IsolationLevel, TransactionManager};
-use vauban_types::{SqlType, TypeInfo};
+use vauban_types::{SqlType, TypeInfo, Value};
 
 /// A bootstrapped catalogue over memory storage and the transaction manager it runs under.
 struct Fixture {
@@ -438,4 +438,231 @@ fn a_taken_constraint_name_binds_and_leaves_2714_to_the_catalogue() {
         let error = fixture.run(text).expect_err("the catalogue refuses");
         assert_eq!(number_state(&error), (2714, 16, 5), "{text}");
     }
+}
+
+#[test]
+fn object_expressions_reads_the_texts_and_the_names() {
+    let fixture = Fixture::with(
+        "CREATE TABLE x (a int CONSTRAINT df_a DEFAULT 5, b int CONSTRAINT ck_b CHECK (b >= 0), \
+         c int DEFAULT 1, d int);",
+    );
+    let snapshot = fixture.snapshot();
+    let texts = snapshot.object_expressions(id_of(&snapshot, "x"));
+    let defaults: Vec<_> = texts
+        .defaults
+        .iter()
+        .map(|text| (text.text.as_str(), text.constraint.as_deref()))
+        .collect();
+    assert_eq!(defaults[0], ("((5))", Some("df_a")));
+    assert_eq!(defaults[1].0, "((1))");
+    assert!(
+        defaults[1]
+            .1
+            .is_some_and(|name| name.starts_with("DF__x__c__")),
+        "{defaults:?}"
+    );
+    assert_eq!(defaults.len(), 2);
+    let checks: Vec<_> = texts
+        .checks
+        .iter()
+        .map(|text| (text.text.as_str(), text.constraint.as_deref()))
+        .collect();
+    assert_eq!(checks, [("([b]>=(0))", Some("ck_b"))]);
+    assert!(texts.computed.is_empty());
+    assert_eq!(texts.columns.len(), 4);
+    assert_eq!(
+        texts.name.as_ref().map(|name| name.name.as_str()),
+        Some("x")
+    );
+    assert!(
+        snapshot
+            .object_expressions(ObjectId(i32::MAX))
+            .columns
+            .is_empty()
+    );
+}
+
+/// The tree of the value `text` as a statement writes it.
+fn value(text: &str) -> Expr {
+    let sql = format!("SELECT {text}");
+    let batch = parse_batch(&sql, &ParseOptions::default()).expect("parse");
+    let vauban_parser::Statement::Select(select) = &batch.statements[0] else {
+        panic!("{sql} is a SELECT");
+    };
+    let vauban_parser::QueryBody::Select(spec) = &select.body else {
+        panic!("{sql} is a query specification");
+    };
+    let vauban_parser::SelectItem::Expr { expr, .. } = &spec.items[0] else {
+        panic!("{sql} selects one expression");
+    };
+    expr.clone()
+}
+
+/// `c (a int, b AS a * 2, d int DEFAULT 7, CONSTRAINT ck_c CHECK (c.a >= 0 AND d < 100))`,
+/// created through [`Catalog::create_table`]: the binder does not bind a computed column
+/// yet.
+fn table_with_object_expressions() -> Fixture {
+    let fixture = Fixture::new();
+    let column = |name: &str, default: Option<Expr>, computed: Option<Expr>| ColumnDef {
+        name: name.to_owned(),
+        ty: TypeInfo::new(SqlType::Int, true),
+        default,
+        identity: None,
+        computed,
+    };
+    let check = parse_batch(
+        "SELECT 1 WHERE c.a >= 0 AND d < 100",
+        &ParseOptions::default(),
+    )
+    .expect("parse");
+    let vauban_parser::Statement::Select(select) = &check.statements[0] else {
+        panic!("a SELECT");
+    };
+    let vauban_parser::QueryBody::Select(spec) = &select.body else {
+        panic!("a query specification");
+    };
+    let def = TableDef {
+        name: QualifiedName {
+            database: "master".to_owned(),
+            schema: "dbo".to_owned(),
+            name: "c".to_owned(),
+        },
+        columns: vec![
+            column("a", None, None),
+            column("b", None, Some(value("a * 2"))),
+            column("d", Some(value("7")), None),
+        ],
+        constraints: vec![vauban_catalog::ConstraintDef::Check {
+            name: Some("ck_c".to_owned()),
+            expr: spec.where_.clone().expect("a WHERE"),
+        }],
+    };
+    let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);
+    fixture.catalog.create_table(&handle, &def).expect("create");
+    fixture.txn.commit(handle).expect("commit");
+    fixture
+}
+
+/// The ordinal a bound column reference reads, `None` for another node.
+fn column_index(expr: &BoundExpr) -> Option<usize> {
+    match &expr.kind {
+        BoundExprKind::ColumnRef(column) => Some(column.index),
+        BoundExprKind::Convert { expr, .. } => column_index(expr),
+        _ => None,
+    }
+}
+
+#[test]
+fn an_insert_carries_the_bound_object_expressions_of_its_table() {
+    let fixture = table_with_object_expressions();
+    let BoundStatement::Insert(plan) = fixture.bound("INSERT INTO c (a) VALUES (1);") else {
+        panic!("an INSERT");
+    };
+    let target = &plan.target;
+    // The `DEFAULT` of `d`, which the statement leaves out, with the name of its constraint.
+    let [default] = target.defaults.as_slice() else {
+        panic!("{:?}", target.defaults);
+    };
+    assert_eq!(
+        default.column.as_ref().map(|column| column.name.as_str()),
+        Some("d")
+    );
+    assert!(
+        default
+            .constraint
+            .as_deref()
+            .is_some_and(|name| name.starts_with("DF__c__d__"))
+    );
+    assert!(
+        matches!(&default.expr.kind, BoundExprKind::Literal(Value::I32(7))),
+        "{:?}",
+        default.expr
+    );
+    // The computed column `b`, `a * 2` over the row of the table.
+    let [computed] = target.computed.as_slice() else {
+        panic!("{:?}", target.computed);
+    };
+    assert_eq!(computed.column.as_ref().map(|column| column.index), Some(1));
+    assert!(computed.constraint.is_none());
+    let BoundExprKind::Arith { left, .. } = &computed.expr.kind else {
+        panic!("{:?}", computed.expr);
+    };
+    assert_eq!(column_index(left), Some(0));
+    // The `CHECK`, named, a predicate over `a` (qualified by the table in its text) and `d`.
+    let [check] = target.checks.as_slice() else {
+        panic!("{:?}", target.checks);
+    };
+    assert_eq!(check.constraint.as_deref(), Some("ck_c"));
+    assert!(check.column.is_none());
+    assert!(check.expr.is_predicate());
+    let BoundExprKind::Logical { left, right, .. } = &check.expr.kind else {
+        panic!("{:?}", check.expr);
+    };
+    let operand = |side: &BoundExpr| match &side.kind {
+        BoundExprKind::Compare { left, .. } => column_index(left),
+        _ => None,
+    };
+    assert_eq!((operand(left), operand(right)), (Some(0), Some(2)));
+}
+
+#[test]
+fn an_insert_that_writes_the_column_binds_no_default_for_it() {
+    let fixture = table_with_object_expressions();
+    let BoundStatement::Insert(plan) = fixture.bound("INSERT INTO c (a, d) VALUES (1, 2);") else {
+        panic!("an INSERT");
+    };
+    assert!(plan.target.defaults.is_empty());
+    assert_eq!(plan.target.checks.len(), 1);
+}
+
+#[test]
+fn an_update_carries_the_checks_and_the_computed_columns() {
+    let fixture = table_with_object_expressions();
+    let BoundStatement::Update(plan) = fixture.bound("UPDATE c SET a = 2 WHERE d = 7;") else {
+        panic!("an UPDATE");
+    };
+    assert!(plan.target.defaults.is_empty());
+    assert_eq!(plan.target.computed.len(), 1);
+    let [check] = plan.target.checks.as_slice() else {
+        panic!("{:?}", plan.target.checks);
+    };
+    assert_eq!(check.constraint.as_deref(), Some("ck_c"));
+    assert!(check.expr.is_predicate());
+}
+
+#[test]
+fn a_bracketed_type_name_of_a_stored_text_binds() {
+    let fixture = Fixture::with(
+        "CREATE TABLE v (a varchar(10) CONSTRAINT ck_v CHECK (CONVERT(varchar(10), a) <> ''), \
+         b int DEFAULT CAST(1 AS int));",
+    );
+    let BoundStatement::Insert(plan) = fixture.bound("INSERT INTO v (a) VALUES ('x');") else {
+        panic!("an INSERT");
+    };
+    assert_eq!(plan.target.checks.len(), 1);
+    assert_eq!(plan.target.defaults.len(), 1);
+}
+
+#[test]
+fn an_insert_over_a_default_the_binder_does_not_bind_still_binds() {
+    let fixture = Fixture::with(
+        "CREATE TABLE n (a int, g uniqueidentifier DEFAULT NEWSEQUENTIALID(), \
+         d int DEFAULT 3, c varchar(10) CONSTRAINT ck_n CHECK (FORMAT(1, 'N') <> c));",
+    );
+    let BoundStatement::Insert(plan) = fixture.bound("INSERT INTO n (a) VALUES (1);") else {
+        panic!("an INSERT");
+    };
+    // `NEWSEQUENTIALID()` and `FORMAT` are left out of the plan; the `DEFAULT` of `d` is in.
+    let defaults: Vec<_> = plan
+        .target
+        .defaults
+        .iter()
+        .filter_map(|default| default.column.as_ref().map(|column| column.name.as_str()))
+        .collect();
+    assert_eq!(defaults, ["d"]);
+    assert!(plan.target.checks.is_empty());
+    let BoundStatement::Update(update) = fixture.bound("UPDATE n SET a = 2;") else {
+        panic!("an UPDATE");
+    };
+    assert!(update.target.checks.is_empty());
 }

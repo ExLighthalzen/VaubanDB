@@ -79,6 +79,7 @@ use crate::context::{BindContext, CatalogView, ResolvedTableKind};
 use crate::depth::at_statement;
 use crate::errors::{line_of, on_the_statement};
 use crate::expr::{Scope, bind_condition, bind_expr};
+use crate::insert::bind_target_expressions;
 use crate::names::{alias_of, bind_from, from_needs_the_catalogue, resolve_table};
 use crate::query::{bug, dotted, not_implemented};
 use crate::star::{self, Lookup, Source};
@@ -141,10 +142,12 @@ fn update(stmt: &UpdateStatement, ctx: &BindContext<'_>, line: u32) -> SqlResult
         line,
         ctx,
     )?;
+    let expressions = bind_target_expressions(target.object, None, ctx);
     Ok(BoundStatement::Update(UpdatePlan {
         table: target.table,
         input: Box::new(input),
         assignments,
+        target: expressions,
     }))
 }
 
@@ -610,10 +613,12 @@ fn update_from(
         line,
         ctx,
     )?;
+    let expressions = bind_target_expressions(target.object, None, ctx);
     Ok(BoundStatement::Update(UpdatePlan {
         table: target.table,
         input: Box::new(input),
         assignments,
+        target: expressions,
     }))
 }
 

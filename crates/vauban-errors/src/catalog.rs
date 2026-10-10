@@ -326,6 +326,12 @@ const CATALOG: &[ErrorDef] = &[
         }),
     },
     ErrorDef {
+        number: 128,
+        severity: 15,
+        template: "The name \"%.*ls\" is a column, and a column cannot be named here: this place takes constants, constant expressions and, where the context allows, variables.",
+        exception: None,
+    },
+    ErrorDef {
         number: 130,
         severity: 15,
         template: "An aggregate function cannot be applied to an expression that holds an aggregate or a subquery.",
@@ -822,6 +828,12 @@ const CATALOG: &[ErrorDef] = &[
         number: 1038,
         severity: 15,
         template: "An object or column name is empty: each SELECT INTO column needs a name, and an alias written \"\" or [] is not allowed.",
+        exception: None,
+    },
+    ErrorDef {
+        number: 1046,
+        severity: 15,
+        template: "A subquery cannot be written here: this place takes a scalar expression.",
         exception: None,
     },
     ErrorDef {

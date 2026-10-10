@@ -167,6 +167,7 @@ fn context(catalog: &FakeCatalog) -> PlanContext<'_> {
 fn plan_insert(source: LogicalPlan) -> PhysicalInsert {
     let catalog = FakeCatalog::new();
     let stmt = BoundStatement::Insert(InsertPlan {
+        target: Default::default(),
         table: TARGET,
         columns: vec![k(0)],
         source: Box::new(source),
@@ -181,6 +182,7 @@ fn plan_insert(source: LogicalPlan) -> PhysicalInsert {
 fn plan_update(input: LogicalPlan, value: BoundExpr) -> PhysicalUpdate {
     let catalog = FakeCatalog::new();
     let stmt = BoundStatement::Update(UpdatePlan {
+        target: Default::default(),
         table: TARGET,
         input: Box::new(input),
         assignments: vec![(v(), value)],

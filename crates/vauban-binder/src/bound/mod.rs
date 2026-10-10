@@ -205,6 +205,10 @@ pub struct InsertPlan {
     pub columns: Vec<ColumnBinding>,
     /// The rows to insert, one column of the schema per entry of `columns`.
     pub source: Box<LogicalPlan>,
+    /// The `DEFAULT` of each column of the table that `columns` leaves out, the computed
+    /// columns and the `CHECK` constraints of the table, bound against its row
+    /// (`insert.rs`, `bind_target_expressions`).
+    pub target: TargetExpressions,
 }
 
 /// A `SELECT … INTO`, bound.
@@ -227,6 +231,40 @@ pub struct UpdatePlan {
     /// One `SET c = e` per entry, in the order they were written: the column assigned and
     /// the value, already converted to the type of that column.
     pub assignments: Vec<(ColumnBinding, BoundExpr)>,
+    /// The computed columns and the `CHECK` constraints of the table, bound against its
+    /// row; [`TargetExpressions::defaults`] is empty for an `UPDATE`.
+    pub target: TargetExpressions,
+}
+
+/// The object expressions of the table a DML statement writes, each parsed from the text
+/// the catalogue stores and bound once for the statement.
+///
+/// Each expression reads the row of the **table**: a [`BoundExprKind::ColumnRef`] in it
+/// carries the `ordinal` of the column in the row `storage` hands out, as the columns of a
+/// `Scan` of the table do (`tests/catalog_view.rs`,
+/// `an_insert_carries_the_bound_object_expressions_of_its_table`). A `DEFAULT` and a computed column keep the type they are written with; the conversion
+/// towards the column is the one an explicit value goes through.
+#[derive(Debug, Clone, Default)]
+pub struct TargetExpressions {
+    /// One entry per column that takes its `DEFAULT`, in the order of the columns.
+    pub defaults: Vec<BoundObjectExpression>,
+    /// One entry per computed column, in the order of the columns.
+    pub computed: Vec<BoundObjectExpression>,
+    /// One entry per `CHECK` constraint, each a predicate, in the order the table declares
+    /// them.
+    pub checks: Vec<BoundObjectExpression>,
+}
+
+/// One object expression of [`TargetExpressions`], bound.
+#[derive(Debug, Clone)]
+pub struct BoundObjectExpression {
+    /// The column a `DEFAULT` or a computed column fills; `None` for a `CHECK`.
+    pub column: Option<ColumnBinding>,
+    /// The name of the constraint, which message 547 prints for a `CHECK`; `None` for a
+    /// computed column.
+    pub constraint: Option<String>,
+    /// The expression, a predicate for a `CHECK`.
+    pub expr: BoundExpr,
 }
 
 /// A `DELETE`, bound.

@@ -680,3 +680,221 @@ fn the_six_statements_of_this_file_bind() {
     }
     assert!(matches!(bound("SELECT 1;"), Ok(BoundStatement::Query(_))));
 }
+
+/// Number, severity, state and line of `err`.
+fn shape(err: &SqlError) -> (u32, u8, u8, u32) {
+    (err.number, err.severity, err.state, err.line)
+}
+
+#[test]
+fn a_default_that_names_a_column_is_128() {
+    vauban_sysfn::register_builtins();
+    for (text, name) in [
+        ("CREATE TABLE dbo.d1 (a int, b int DEFAULT a);", "a"),
+        ("CREATE TABLE dbo.e3 (a int DEFAULT zz);", "zz"),
+        ("CREATE TABLE dbo.e4 (a int DEFAULT ABS(zz));", "zz"),
+    ] {
+        let error = err(text);
+        assert_eq!(
+            error,
+            SqlError::column_name_not_permitted(name).with_line(1),
+            "{text}"
+        );
+        assert_eq!(shape(&error), (128, 15, 1, 1), "{text}");
+    }
+}
+
+#[test]
+fn a_subquery_in_a_default_or_a_check_is_1046() {
+    vauban_sysfn::register_builtins();
+    for text in [
+        "CREATE TABLE dbo.d2 (a int, b int DEFAULT (SELECT 1));",
+        "CREATE TABLE dbo.d5 (a int CHECK (a > (SELECT 1)));",
+        "CREATE TABLE dbo.d6 (a int, CHECK (EXISTS (SELECT 1)));",
+        "CREATE TABLE dbo.d8 (a int, CHECK (a IN (SELECT 1)));",
+    ] {
+        let error = err(text);
+        assert_eq!(
+            error,
+            SqlError::subquery_not_allowed_here().with_line(1),
+            "{text}"
+        );
+        assert_eq!(shape(&error), (1046, 15, 1, 1), "{text}");
+    }
+}
+
+#[test]
+fn a_check_that_does_not_bind_is_refused() {
+    vauban_sysfn::register_builtins();
+    for (text, number, severity) in [
+        ("CREATE TABLE dbo.d3 (a int, CHECK (z > 0));", 207, 16),
+        ("CREATE TABLE dbo.d4 (a int CHECK (z > 0));", 207, 16),
+        ("CREATE TABLE dbo.e12 (a int CHECK (b.a > 1));", 4104, 16),
+        ("CREATE TABLE dbo.e10 (a int CHECK (a));", 4145, 15),
+        ("CREATE TABLE dbo.d7 (a date CHECK (a > 1));", 206, 16),
+    ] {
+        let error = err(text);
+        assert_eq!(
+            (error.number, error.severity, error.line),
+            (number, severity, 1),
+            "{text}: {}",
+            error.message
+        );
+    }
+}
+
+#[test]
+fn a_global_or_a_guid_to_binary_comparison_is_not_refused() {
+    vauban_sysfn::register_builtins();
+    for text in [
+        "CREATE TABLE dbo.g1 (a smallint DEFAULT @@LANGID);",
+        "CREATE TABLE dbo.g2 (a int DEFAULT @@NESTLEVEL);",
+        "CREATE TABLE dbo.g3 (c uniqueidentifier CHECK (c <> 0x00));",
+        "CREATE TABLE dbo.g4 (c binary(16) CHECK (c <> NEWID()));",
+        "CREATE TABLE dbo.g5 (c varbinary(16) CHECK (c <> NEWID()));",
+    ] {
+        table_def(text);
+    }
+}
+
+#[test]
+fn a_default_that_reads_an_undeclared_variable_is_137() {
+    vauban_sysfn::register_builtins();
+    let variable = err("CREATE TABLE dbo.d11 (a int DEFAULT @x);");
+    assert_eq!(shape(&variable), (137, 15, 2, 1), "{}", variable.message);
+}
+
+#[test]
+fn a_default_of_a_type_that_does_not_convert_is_206() {
+    vauban_sysfn::register_builtins();
+    for (text, value, column) in [
+        ("CREATE TABLE dbo.d9 (a date DEFAULT 1);", "int", "date"),
+        (
+            "CREATE TABLE dbo.p044 (x int, c int DEFAULT NEWID());",
+            "uniqueidentifier",
+            "int",
+        ),
+        (
+            "CREATE TABLE dbo.y13 (c uniqueidentifier DEFAULT 1);",
+            "int",
+            "uniqueidentifier",
+        ),
+        (
+            "CREATE TABLE dbo.y93 (c datetime2 DEFAULT 1.5);",
+            "numeric",
+            "datetime2",
+        ),
+    ] {
+        let error = err(text);
+        assert_eq!(
+            error,
+            SqlError::operand_type_clash(value, column).with_line(1),
+            "{text}: the type of the value is named first"
+        );
+    }
+}
+
+#[test]
+fn a_default_of_an_untested_pair_is_not_refused() {
+    vauban_sysfn::register_builtins();
+    for text in [
+        // Accepted by SQL Server.
+        "CREATE TABLE dbo.p043 (x int, c binary(16) DEFAULT NEWID());",
+        "CREATE TABLE dbo.y14 (c varchar(10) DEFAULT 1);",
+        "CREATE TABLE dbo.y30 (c binary(16) DEFAULT NEWID());",
+        // SQL Server answers 257 for this pair, which is not refused here.
+        "CREATE TABLE dbo.p035 (x int, c int DEFAULT GETDATE());",
+    ] {
+        table_def(text);
+    }
+}
+
+#[test]
+fn the_date_part_of_a_date_part_function_is_not_a_column() {
+    vauban_sysfn::register_builtins();
+    for text in [
+        "CREATE TABLE dbo.p060 (x int, c int DEFAULT DATEPART(year, GETDATE()));",
+        "CREATE TABLE dbo.p061 (x int, c int DEFAULT DATEDIFF(day, '20200101', GETDATE()));",
+        "CREATE TABLE dbo.p062 (x int, c varchar(20) DEFAULT DATENAME(month, GETDATE()));",
+        "CREATE TABLE dbo.p063 (x int, c datetime DEFAULT DATEADD(dd, 1, GETDATE()));",
+        "CREATE TABLE dbo.c1 (a datetime CHECK (a < DATEADD(day, 1, GETDATE())));",
+    ] {
+        table_def(text);
+    }
+    let altered = bind_with(
+        "ALTER TABLE ex ADD c datetime DEFAULT DATEADD(day, 1, GETDATE());",
+        Some(&OneTable),
+    );
+    assert!(altered.is_ok(), "{altered:?}");
+    let column = bind_with(
+        "ALTER TABLE ex ADD c datetime DEFAULT DATEADD(day, 1, a);",
+        Some(&OneTable),
+    )
+    .expect_err("a is a column");
+    assert_eq!(shape(&column), (128, 15, 1, 1), "{column:?}");
+}
+
+#[test]
+fn a_type_written_between_brackets_is_read_without_them() {
+    vauban_sysfn::register_builtins();
+    for text in [
+        "CREATE TABLE dbo.b1 (a bit DEFAULT (CONVERT([bit],(0))));",
+        "CREATE TABLE dbo.b2 (a int, b int CHECK (CAST(b AS [varchar](10)) <> 'x'));",
+    ] {
+        table_def(text);
+    }
+}
+
+#[test]
+fn a_function_the_binder_does_not_know_is_not_refused() {
+    vauban_sysfn::register_builtins();
+    for text in [
+        "CREATE TABLE dbo.u1 (a uniqueidentifier DEFAULT NEWSEQUENTIALID());",
+        "CREATE TABLE dbo.u2 (a datetimeoffset DEFAULT SYSDATETIMEOFFSET());",
+        "CREATE TABLE dbo.u3 (a varchar(10) DEFAULT FORMAT(GETDATE(), 'yyyy'));",
+        "CREATE TABLE dbo.u4 (a varchar(10) CHECK (FORMAT(1, 'N') <> ''));",
+        "CREATE TABLE dbo.u5 (a int DEFAULT ABS(CHECKSUM(NEWID())));",
+        "CREATE TABLE dbo.u6 (a int DEFAULT USER_ID());",
+        "CREATE TABLE dbo.u7 (a varbinary(85) DEFAULT SUSER_SID());",
+        "CREATE TABLE dbo.u8 (a nvarchar(128) DEFAULT SUSER_NAME());",
+        "CREATE TABLE dbo.u9 (a nvarchar(128) DEFAULT CONVERT(nvarchar(128), CONTEXT_INFO()));",
+        "CREATE TABLE dbo.d10 (a int DEFAULT nosuchfn());",
+    ] {
+        table_def(text);
+    }
+}
+
+#[test]
+fn the_errors_of_an_expression_carry_the_line_of_its_node() {
+    vauban_sysfn::register_builtins();
+    // The statement starts on line 2 and the expression sits on line 5; the 206 of a
+    // `DEFAULT` names the statement.
+    for (body, number, line) in [
+        ("b int DEFAULT\n a);", 128, 5),
+        ("b int CHECK (\n z > 0));", 207, 5),
+        ("b int DEFAULT (\n SELECT 1));", 1046, 5),
+        ("b date DEFAULT\n 1);", 206, 2),
+    ] {
+        let text = format!("\nCREATE TABLE dbo.f1 (\n a int,\n {body}");
+        let error = err(&text);
+        assert_eq!((error.number, error.line), (number, line), "{text}");
+    }
+}
+
+#[test]
+fn expressions_that_bind_create_the_table() {
+    vauban_sysfn::register_builtins();
+    for text in [
+        "CREATE TABLE dbo.ok1 (a datetime DEFAULT GETDATE());",
+        "CREATE TABLE dbo.ok2 (a datetime DEFAULT CURRENT_TIMESTAMP);",
+        "CREATE TABLE dbo.ok3 (a date DEFAULT NULL);",
+        "CREATE TABLE dbo.ok4 (a int DEFAULT 'abc');",
+        "CREATE TABLE dbo.ok5 (a int DEFAULT (1 + 'x'));",
+        "CREATE TABLE dbo.ok6 (a int CHECK (a + 'x' > 0));",
+        "CREATE TABLE dbo.ok7 (a int CHECK (ok7.a > 1));",
+        "CREATE TABLE dbo.ok8 (a int, b int, CHECK (a < b));",
+        "CREATE TABLE dbo.ok9 (a int CONSTRAINT df DEFAULT -1 CHECK (a BETWEEN -1 AND 5));",
+    ] {
+        table_def(text);
+    }
+}

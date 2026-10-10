@@ -25,6 +25,15 @@
 //! place in that shape: the form is refused by an internal error naming it
 //! (`default_in_some_rows_only_is_not_bound`).
 //!
+//! # The object expressions of the table
+//!
+//! [`InsertPlan::target`] carries the `DEFAULT` of each column the statement leaves out, the
+//! computed columns and the `CHECK` constraints of the table, each read from the text the
+//! catalogue stores and bound once for the statement against the row of the table
+//! ([`bind_target_expressions`]; `tests/catalog_view.rs`,
+//! `an_insert_carries_the_bound_object_expressions_of_its_table`). An `UPDATE` carries the
+//! computed columns and the `CHECK` constraints the same way (`update_delete.rs`).
+//!
 //! # The conversion towards the column
 //!
 //! Each expression of a `VALUES` row is wrapped in a [`BoundExprKind::Convert`] towards
@@ -110,24 +119,29 @@
 //! (`'ti'`); the spelling of the catalogue, which SQL Server prints there, is not available
 //! to the binder.
 
-use vauban_catalog::{ColumnDef, ColumnId, TableDef, TableId};
+use vauban_catalog::{ColumnDef, ColumnId, ObjectId, TableDef, TableId};
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{
-    Expr, Ident, InsertSource, InsertStatement, Literal, ObjectName, QueryBody, SelectStatement,
-    TableRef,
+    DataType, Expr, Ident, InList, InsertSource, InsertStatement, Literal, ObjectName,
+    ParseOptions, QueryBody, SelectItem, SelectStatement, Statement, TableRef, parse_batch,
 };
 use vauban_types::{Len, SqlType, TypeInfo, Value, implicit_result_type};
 
+use crate::alter::object_name_from_qualified;
 use crate::bound::{
-    BoundExpr, BoundExprKind, BoundStatement, ColumnBinding, InsertPlan, LogicalPlan, OutputColumn,
-    OutputSchema, SelectIntoPlan,
+    BoundExpr, BoundExprKind, BoundObjectExpression, BoundStatement, ColumnBinding, InsertPlan,
+    LogicalPlan, OutputColumn, OutputSchema, SelectIntoPlan, TargetExpressions,
 };
-use crate::context::{BindContext, CatalogView, ResolvedTable, ResolvedTableKind};
+use crate::context::{
+    BindContext, CatalogView, ExpressionText, NoVariables, ObjectExpressionTexts, ResolvedTable,
+    ResolvedTableKind,
+};
 use crate::ddl::table_name;
 use crate::errors::{line_of, on_the_statement};
-use crate::expr::{Scope, bind_expr};
+use crate::expr::{Scope, bind_condition, bind_expr};
 use crate::names::{check_object_exists, from_needs_the_catalogue};
 use crate::query::{bind_select, bug, dotted, not_implemented, not_yet, reread_table_arguments};
+use crate::star::Source as RowSource;
 
 /// Binds an `INSERT` into [`BoundStatement::Insert`].
 ///
@@ -163,11 +177,266 @@ pub(crate) fn bind_insert(
     };
     check_repeated(&columns, line)?;
     target.check_identity_written(&source.columns, line, ctx)?;
+    let expressions = bind_target_expressions(target.object, Some(&source.columns), ctx);
     Ok(BoundStatement::Insert(InsertPlan {
         table: target.table,
         columns: source.columns,
         source: Box::new(source.plan),
+        target: expressions,
     }))
+}
+
+// -------------------------------------------------------------------------------------------
+// The object expressions of the target
+// -------------------------------------------------------------------------------------------
+
+/// Where the text of an object expression is read: a `CHECK` is a predicate, a `DEFAULT` and
+/// a computed column are values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// The value of a `DEFAULT` or of a computed column.
+    Value,
+    /// The predicate of a `CHECK`.
+    Predicate,
+}
+
+/// Binds the object expressions of the table `object` from the texts the catalogue stores
+/// ([`CatalogView::object_expressions`]), once for the statement.
+///
+/// `written` is the list of the columns the statement fills itself: the `DEFAULT` of each
+/// other column is bound. `None`, for an `UPDATE`, binds no `DEFAULT`. The computed columns
+/// and the `CHECK` constraints are bound in both cases (`tests/catalog_view.rs`,
+/// `an_insert_carries_the_bound_object_expressions_of_its_table` and
+/// `an_update_carries_the_checks_and_the_computed_columns`).
+///
+/// Each text is read as `SELECT <text>` or `SELECT 1 WHERE <text>` and bound against the row
+/// of the table, under its three-part name, so that a column the text qualifies by the name
+/// of the table (`([t].[a]>(0))`) resolves.
+///
+/// A text that does not parse or bind is left out of the plan, which then holds no entry for
+/// it; the executor reads the catalogue for what the plan does not carry.
+///
+pub(crate) fn bind_target_expressions(
+    object: ObjectId,
+    written: Option<&[ColumnBinding]>,
+    ctx: &BindContext<'_>,
+) -> TargetExpressions {
+    let Some(catalog) = ctx.catalog else {
+        return TargetExpressions::default();
+    };
+    let texts = catalog.object_expressions(object);
+    let scope = row_scope(&texts, ctx);
+    // A text the binder does not bind (a function it does not know, `NEWSEQUENTIALID()`) is
+    // left out of the plan: the statement binds as it did before the plan carried these
+    // expressions (`tests/catalog_view.rs`,
+    // `an_insert_over_a_default_the_binder_does_not_bind_still_binds`).
+    let bind_one = |text: &ExpressionText, place: Place| -> Option<BoundObjectExpression> {
+        let expr = bind_stored_text(&text.text, place, &scope, ctx).ok()?;
+        Some(BoundObjectExpression {
+            column: text.column.and_then(|id| {
+                texts
+                    .columns
+                    .iter()
+                    .find(|column| column.column == id)
+                    .cloned()
+            }),
+            constraint: text.constraint.clone(),
+            expr,
+        })
+    };
+    let mut bound = TargetExpressions::default();
+    if let Some(written) = written {
+        bound.defaults = texts
+            .defaults
+            .iter()
+            .filter(|text| {
+                !written
+                    .iter()
+                    .any(|column| Some(column.column) == text.column)
+            })
+            .filter_map(|text| bind_one(text, Place::Value))
+            .collect();
+    }
+    bound.computed = texts
+        .computed
+        .iter()
+        .filter_map(|text| bind_one(text, Place::Value))
+        .collect();
+    bound.checks = texts
+        .checks
+        .iter()
+        .filter_map(|text| bind_one(text, Place::Predicate))
+        .collect();
+    bound
+}
+
+/// The scope an object expression is bound in: the row of its table, exposed under the
+/// object part of its name and under its three-part name.
+fn row_scope(texts: &ObjectExpressionTexts, ctx: &BindContext<'_>) -> Scope {
+    let written = texts.name.as_ref().map(object_name_from_qualified);
+    let alias = texts.name.as_ref().map_or("", |name| name.name.as_str());
+    Scope::over(RowSource::new(
+        alias,
+        written.as_ref(),
+        &texts.columns,
+        ctx.default_schema,
+        ctx.database,
+    ))
+}
+
+/// Parses the stored `text` as an expression of `place` and binds it in `scope`.
+///
+/// A type name the stored text writes between brackets, `CONVERT([int],(1))`, is taken out
+/// of its brackets before the binding, which resolves `int` and not `[int]`.
+///
+/// # Errors
+///
+/// The syntax error of the text, the internal error of a text that is not one expression,
+/// and what binding it raises.
+fn bind_stored_text(
+    text: &str,
+    place: Place,
+    scope: &Scope,
+    ctx: &BindContext<'_>,
+) -> SqlResult<BoundExpr> {
+    let batch = match place {
+        Place::Value => format!("SELECT {text}"),
+        Place::Predicate => format!("SELECT 1 WHERE {text}"),
+    };
+    let parsed = parse_batch(&batch, &ParseOptions::default())?;
+    let found = match parsed.statements.as_slice() {
+        [Statement::Select(select)] => match &select.body {
+            QueryBody::Select(spec) if spec.from.is_empty() => match place {
+                Place::Predicate => spec.where_.clone(),
+                Place::Value => match spec.items.as_slice() {
+                    [
+                        SelectItem::Expr {
+                            expr, alias: None, ..
+                        },
+                    ] if spec.where_.is_none() => Some(expr.clone()),
+                    _ => None,
+                },
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut expr = found.ok_or_else(|| {
+        bug(format!(
+            "bind: the stored expression {text} does not read back as one expression"
+        ))
+    })?;
+    unbracket_type_names(&mut expr);
+    let local = BindContext {
+        text: &batch,
+        catalog: ctx.catalog,
+        database: ctx.database,
+        default_schema: ctx.default_schema,
+        variables: &NoVariables,
+        options: ctx.options,
+    };
+    match place {
+        Place::Value => bind_expr(&expr, &local, scope),
+        Place::Predicate => bind_condition(&expr, &local, scope),
+    }
+}
+
+/// Takes the brackets off the type names of the `CAST` and `CONVERT` calls of `expr`:
+/// `[varchar]` becomes `varchar`, `]]` inside the brackets becomes `]`. `pub(crate)` for
+/// `ddl.rs`, which reads a type a `DEFAULT` or a `CHECK` writes between brackets the same
+/// way.
+pub(crate) fn unbracket_type_names(expr: &mut Expr) {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::Cast {
+                expr: inner, ty, ..
+            } => {
+                unbracket_type_name(ty);
+                pending.push(inner);
+            }
+            Expr::Convert {
+                ty,
+                expr: inner,
+                style,
+                ..
+            } => {
+                unbracket_type_name(ty);
+                pending.push(inner);
+                if let Some(style) = style {
+                    pending.push(style);
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                pending.push(left);
+                pending.push(right);
+            }
+            Expr::Unary { expr: inner, .. }
+            | Expr::Nested(inner, _)
+            | Expr::IsNull { expr: inner, .. }
+            | Expr::Collate { expr: inner, .. } => pending.push(inner),
+            Expr::Function { args, .. } => pending.extend(args.iter_mut()),
+            Expr::Case {
+                operand,
+                arms,
+                else_,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    pending.push(operand);
+                }
+                for arm in arms {
+                    pending.push(&mut arm.when);
+                    pending.push(&mut arm.then);
+                }
+                if let Some(otherwise) = else_ {
+                    pending.push(otherwise);
+                }
+            }
+            Expr::In {
+                expr: inner, list, ..
+            } => {
+                pending.push(inner);
+                if let InList::Exprs(items) = list {
+                    pending.extend(items.iter_mut());
+                }
+            }
+            Expr::Like {
+                expr: inner,
+                pattern,
+                escape,
+                ..
+            } => {
+                pending.push(inner);
+                pending.push(pattern);
+                if let Some(escape) = escape {
+                    pending.push(escape);
+                }
+            }
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                ..
+            } => {
+                pending.push(inner);
+                pending.push(low);
+                pending.push(high);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `[varchar]` to `varchar`, `]]` inside the brackets to `]`.
+fn unbracket_type_name(ty: &mut DataType) {
+    if let Some(inner) = ty
+        .name
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        ty.name = inner.replace("]]", "]");
+    }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -275,6 +544,8 @@ fn check_output_columns(schema: &OutputSchema, table: &str, line: u32) -> SqlRes
 struct Target {
     /// The rows in `storage`.
     table: TableId,
+    /// The object in the catalogue, whose object expressions the plan carries.
+    object: ObjectId,
     /// The name as written, for the messages of 544 and 8101.
     name: ObjectName,
     /// The columns of the table, in the order of the catalogue.
@@ -347,6 +618,7 @@ impl Target {
         };
         Ok(Self {
             table,
+            object: resolved.object,
             name: name.clone(),
             all: resolved.columns,
             identity: catalog.identity_column(resolved.object),

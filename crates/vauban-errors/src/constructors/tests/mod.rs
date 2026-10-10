@@ -142,6 +142,8 @@ fn all_constructors() -> Vec<SqlError> {
         SqlError::transaction_count_after_execute(0, 1),
         SqlError::subquery_returned_more_than_one_value(),
         SqlError::conflicting_locking_hints(),
+        SqlError::column_name_not_permitted("a"),
+        SqlError::subquery_not_allowed_here(),
         SqlError::nolock_not_allowed_on_target(),
         SqlError::foreign_key_references_invalid_column("fk_bad", "nosuch", "lone"),
         SqlError::no_matching_key_in_referenced_table("dbo.nopk", "fk_nopk"),
@@ -2643,11 +2645,11 @@ fn computed_column_271_is_rendered() {
     assert_eq!(identity.message, "Identity column 'id' cannot be updated.");
 }
 
-/// The DML, flow control, transaction and concurrency constructors, on four fields:
-/// number, severity on the wire, state, and the substituted message compared as a
-/// whole string. Each row is built with the arguments of the query quoted next to it,
-/// so the comparison leaves no specifier behind. Thirty rows for twenty-nine
-/// numbers: 1222 has one constructor per lock granularity.
+/// The DML, flow control, transaction, concurrency and object-expression constructors, on
+/// four fields: number, severity on the wire, state, and the substituted message compared as
+/// a whole string. Each row is built with the arguments of the query quoted next to it, so
+/// the comparison leaves no specifier behind. Thirty-four rows for thirty-three numbers:
+/// 1222 has one constructor per lock granularity.
 #[test]
 fn dml_and_transaction_messages_are_rendered() {
     let expected: &[(SqlError, u32, u8, u8, &str)] = &[
@@ -2698,6 +2700,22 @@ fn dml_and_transaction_messages_are_rendered() {
             16,
             1,
             "The subquery returned several values, which is not allowed after a comparison operator or as an expression.",
+        ),
+        (
+            // CREATE TABLE dbo.t (a int, b int DEFAULT a);
+            SqlError::column_name_not_permitted("a"),
+            128,
+            15,
+            1,
+            "The name \"a\" is a column, and a column cannot be named here: this place takes constants, constant expressions and, where the context allows, variables.",
+        ),
+        (
+            // CREATE TABLE dbo.t (a int, b int DEFAULT (SELECT 1));
+            SqlError::subquery_not_allowed_here(),
+            1046,
+            15,
+            1,
+            "A subquery cannot be written here: this place takes a scalar expression.",
         ),
         (
             // SELECT * FROM dbo.lone WITH (NOLOCK, TABLOCKX);
@@ -2919,11 +2937,11 @@ fn dml_and_transaction_messages_are_rendered() {
         );
         assert_eq!(err.line, 0, "line of error {number}");
     }
-    assert_eq!(expected.len(), 32);
+    assert_eq!(expected.len(), 34);
     let mut numbers: Vec<u32> = expected.iter().map(|row| row.1).collect();
     numbers.sort_unstable();
     numbers.dedup();
-    assert_eq!(numbers.len(), 31);
+    assert_eq!(numbers.len(), 33);
 }
 
 /// Fifteen DML numbers and their sixteen constructors, 1222 counting twice, each

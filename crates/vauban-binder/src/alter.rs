@@ -44,8 +44,8 @@ use vauban_types::{Collation, TypeInfo};
 use crate::bound::{BoundStatement, DdlStatement};
 use crate::context::{BindContext, CatalogView, ResolvedTable, ResolvedTableKind};
 use crate::datatype::resolve_data_type;
-use crate::ddl::table_name;
-use crate::expr::{Scope, bind_condition};
+use crate::ddl::{check_check_expression, check_default_expression, table_name};
+use crate::expr::Scope;
 use crate::names::from_needs_the_catalogue;
 use crate::query::{not_implemented, not_yet};
 use crate::star::Source;
@@ -82,7 +82,7 @@ pub(crate) fn bind_alter_table(
             with_check,
         } => {
             refuse_with_check(with_check)?;
-            bind_add_columns(columns, &table, &resolved, &stmt.span)?
+            bind_add_columns(columns, &table, &resolved, &stmt.span, ctx)?
         }
         AlterTableAction::DropColumns {
             names,
@@ -144,6 +144,7 @@ fn bind_add_columns(
     table: &QualifiedName,
     resolved: &ResolvedTable,
     span: &Span,
+    ctx: &BindContext<'_>,
 ) -> SqlResult<AlterTable> {
     if columns.is_empty() {
         return Err(SqlError::from(InternalError::Bug(
@@ -178,6 +179,9 @@ fn bind_add_columns(
     for (offset, column) in columns.iter().enumerate() {
         let position = base.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
         let (def, default_name) = column_def(column, position, span)?;
+        if let Some(expr) = &def.default {
+            check_default_expression(expr, &def.ty, span.line, ctx)?;
+        }
         added.push((Box::new(def), default_name));
     }
     if added.len() == 1 {
@@ -381,7 +385,7 @@ fn table_constraint_def(
             span,
         ),
         TableConstraintKind::Check { expr, .. } => {
-            bind_condition(expr, ctx, scope).map_err(|err| on_statement(err, span))?;
+            check_check_expression(expr, scope, ctx).map_err(|err| on_statement(err, span))?;
             Ok(ConstraintDef::Check {
                 name,
                 expr: expr.clone(),
@@ -561,7 +565,9 @@ fn qualified(name: &QualifiedName) -> String {
     format!("{}.{}", name.schema, name.name)
 }
 
-fn object_name_from_qualified(name: &QualifiedName) -> ObjectName {
+/// The [`ObjectName`] a three-part name is written as, without delimiters; an empty part is
+/// left out. `pub(crate)` for `insert.rs`, which exposes the row of a table under it.
+pub(crate) fn object_name_from_qualified(name: &QualifiedName) -> ObjectName {
     ObjectName {
         server: None,
         database: if name.database.is_empty() {

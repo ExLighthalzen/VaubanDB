@@ -51,9 +51,10 @@ impl<'a> BindContext<'a> {
 
 /// The view of the catalogue the binder needs.
 ///
-/// No method has a default body: an implementation answers each question itself, so a
-/// question the production implementation leaves out does not compile instead of
-/// answering as an empty catalogue would. `catalog_view.rs` implements the trait for a
+/// One method has a default body, [`CatalogView::object_expressions`], which answers as a
+/// table without object expressions; each other method is answered by the implementation
+/// itself, so a question the production implementation leaves out does not compile instead
+/// of answering as an empty catalogue would. `catalog_view.rs` implements the trait for a
 /// [`CatalogSnapshot`](vauban_catalog::CatalogSnapshot), which is what `session` hands over
 /// in production, and `tests/catalog_view.rs` asks each method of it over a catalogue built
 /// by [`Catalog::bootstrap`](vauban_catalog::Catalog::bootstrap).
@@ -106,6 +107,18 @@ pub trait CatalogView {
     /// the key a `FOREIGN KEY` points at when the `PRIMARY KEY` is not it).
     fn unique_key_on(&self, table: ObjectId, columns: &[String]) -> bool;
 
+    /// The stored texts of the `DEFAULT`, computed column and `CHECK` expressions of the
+    /// table of identifier `object`, empty when it declares none or when `object` is not a
+    /// table. An `INSERT` and an `UPDATE` parse and bind them against the row of the table
+    /// (`insert.rs`, [`TargetExpressions`](crate::bound::TargetExpressions)).
+    ///
+    /// The default answers empty texts, for a view of the catalogue that holds no table
+    /// expression.
+    fn object_expressions(&self, object: ObjectId) -> ObjectExpressionTexts {
+        let _ = object;
+        ObjectExpressionTexts::default()
+    }
+
     /// Classifies the written name in the current database and default schema.
     /// `Unknown` means no classification is available, not that the object is absent.
     ///
@@ -118,6 +131,37 @@ pub trait CatalogView {
         database: &str,
         default_schema: &str,
     ) -> TableReferenceKind;
+}
+
+/// The stored texts of the object expressions of one table, as
+/// [`CatalogView::object_expressions`] hands them out.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectExpressionTexts {
+    /// The three-part name of the table, which a column qualified by it in a text resolves
+    /// against (`([t].[a]>(0))`).
+    pub name: Option<vauban_catalog::QualifiedName>,
+    /// The columns of the table, in the order of the row `storage` hands out, as
+    /// [`ResolvedTable::columns`] carries them: the row the expressions read.
+    pub columns: Vec<ColumnBinding>,
+    /// One entry per column that has a `DEFAULT`, in the order of the columns.
+    pub defaults: Vec<ExpressionText>,
+    /// One entry per computed column, in the order of the columns.
+    pub computed: Vec<ExpressionText>,
+    /// One entry per `CHECK` constraint, in the order the table declares them.
+    pub checks: Vec<ExpressionText>,
+}
+
+/// The text of one object expression and what it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpressionText {
+    /// The column a `DEFAULT` or a computed column belongs to; `None` for a `CHECK`.
+    pub column: Option<ColumnId>,
+    /// The name of the constraint, for a `DEFAULT` and a `CHECK` that have one; `None` for a
+    /// computed column.
+    pub constraint: Option<String>,
+    /// The text the catalogue stores: `((0))` for `DEFAULT 0`, `([a]>=(0))` for
+    /// `CHECK (a >= 0)`.
+    pub text: String,
 }
 
 /// What [`CatalogView::resolve_table`] found behind a written name.

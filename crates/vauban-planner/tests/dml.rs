@@ -167,6 +167,7 @@ fn insert_values_keeps_its_rows() {
     let catalog = FakeCatalog::new();
     let insert = plan_insert(
         InsertPlan {
+            target: Default::default(),
             table: TABLE_T,
             columns: vec![binding("pk", 0, 1)],
             source: Box::new(LogicalPlan::Values {
@@ -195,6 +196,7 @@ fn insert_select_gets_the_planner_rules() {
     );
     let insert = plan_insert(
         InsertPlan {
+            target: Default::default(),
             table: TABLE_T,
             columns: vec![binding("pk", 0, 1)],
             source: Box::new(LogicalPlan::Filter {
@@ -222,6 +224,7 @@ fn the_target_column_list_is_kept_in_order() {
     let columns = vec![binding("b", 1, 2), binding("a", 0, 1)];
     let insert = plan_insert(
         InsertPlan {
+            target: Default::default(),
             table: TABLE_T,
             columns: columns.clone(),
             source: Box::new(LogicalPlan::Values {
@@ -242,6 +245,7 @@ fn insert_reading_its_own_target_requires_a_spool() {
     let catalog = FakeCatalog::new();
     let insert = plan_insert(
         InsertPlan {
+            target: Default::default(),
             table: TABLE_T,
             columns: vec![binding("pk", 0, 1)],
             source: Box::new(LogicalPlan::Filter {
@@ -260,6 +264,7 @@ fn insert_from_another_table_requires_no_spool() {
     let catalog = FakeCatalog::new();
     let insert = plan_insert(
         InsertPlan {
+            target: Default::default(),
             table: TABLE_T,
             columns: vec![binding("pk", 0, 1)],
             source: Box::new(LogicalPlan::Filter {
@@ -290,6 +295,7 @@ fn update_locates_rows_by_seek() {
     );
     let upd = plan_update(
         UpdatePlan {
+            target: Default::default(),
             table: TABLE_T,
             input: Box::new(LogicalPlan::Filter {
                 input: Box::new(scan_t()),
@@ -322,6 +328,7 @@ fn updating_a_seek_key_column_requires_a_spool() {
     );
     let upd = plan_update(
         UpdatePlan {
+            target: Default::default(),
             table: TABLE_T,
             input: Box::new(LogicalPlan::Filter {
                 input: Box::new(scan_t()),
@@ -350,6 +357,7 @@ fn updating_a_non_key_column_requires_no_spool() {
     );
     let upd = plan_update(
         UpdatePlan {
+            target: Default::default(),
             table: TABLE_T,
             input: Box::new(LogicalPlan::Filter {
                 input: Box::new(scan_t()),
