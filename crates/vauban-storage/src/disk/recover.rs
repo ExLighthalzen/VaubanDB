@@ -167,6 +167,11 @@ pub(crate) struct Recovery {
     /// The transactions the journal holds an [`WalRecordKind::Abort`] for, and the ones whose
     /// `Begin` is followed by neither end, sorted.
     pub(crate) losers: Vec<TxnId>,
+    /// The largest transaction identifier a record of the journal carries, winner, loser or
+    /// neither (a record of the instance carries 0). [`super::DiskStorage::next_txn_id`]
+    /// hands out identifiers past it, so a later `Commit` cannot turn a loser into a winner
+    /// (`tests::the_identifier_of_a_loser_is_not_handed_out_again`).
+    pub(crate) max_txn: u64,
     /// The identifier the next insert takes: one past the largest the journal names, and at
     /// least the counter of `vauban.ctl`.
     pub(crate) next_row_id: u64,
@@ -196,6 +201,7 @@ impl Default for Recovery {
         Self {
             winners: Vec::new(),
             losers: Vec::new(),
+            max_txn: 0,
             next_row_id: 1,
             next_seq: 1,
             tables: BTreeMap::new(),
@@ -390,6 +396,8 @@ struct Scan {
     aborted: BTreeSet<TxnId>,
     /// Transactions the journal names in a `Begin` or a row record.
     seen: BTreeSet<TxnId>,
+    /// Largest transaction identifier a record carries, row, end or instance record.
+    max_txn: u64,
     /// Largest [`RowId`] a row record names, winners and losers together.
     max_row_id: u64,
     /// Largest version serial a row record names.
@@ -413,6 +421,7 @@ impl Scan {
         // The LSN of the last record seen, so the range of records a rollback takes back can
         // be looked up in the journal without a second pass.
         for record in records {
+            scan.max_txn = scan.max_txn.max(record.txn.0);
             match record.kind {
                 WalRecordKind::Commit => {
                     scan.seen.insert(record.txn);
@@ -482,6 +491,7 @@ impl Scan {
         Ok(Recovery {
             winners: self.winners.into_iter().collect(),
             losers,
+            max_txn: self.max_txn,
             next_row_id,
             next_seq: self.max_seq.saturating_add(1),
             tables,

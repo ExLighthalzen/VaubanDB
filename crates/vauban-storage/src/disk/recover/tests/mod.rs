@@ -375,6 +375,55 @@ fn a_winner_is_registered_committed_and_may_not_write_again() {
     );
 }
 
+/// A loser at the largest identifier of the journal, a reopen, a new transaction that takes
+/// the identifier the reopened instance hands out and commits on a second table, a second
+/// reopen: the write of the loser stays out.
+#[test]
+fn the_identifier_of_a_loser_is_not_handed_out_again() {
+    const OTHER: TableId = TableId(8);
+    let dir = TempDir::created("recover-loser-txn-id");
+    {
+        let storage = open(&dir);
+        let head = install(&storage);
+        let mut table = HeapTable::open(&storage, TABLE, head, int_shape());
+        table.insert(TxnId(4), &row(11)).expect("insert");
+        table.commit(TxnId(4)).expect("commit");
+        // The crash comes before the end of transaction 5.
+        table.insert(TxnId(5), &row(12)).expect("insert");
+    }
+
+    let next = {
+        let storage = open(&dir);
+        let recovery = storage.recovery().clone();
+        assert_eq!(recovery.winners, vec![TxnId(4)]);
+        assert_eq!(recovery.losers, vec![TxnId(5)]);
+        let next = storage.next_txn_id();
+        assert_eq!(next, 6, "one past the loser, not one past the winner");
+        assert_eq!(crate::Storage::committed_txn_high_water(&storage), 5);
+        // The new transaction writes on a table of its own, so that no resume of `TABLE`
+        // registers transaction 5 before it.
+        let head = alloc::allocate(&storage).expect("allocate the head page");
+        let mut other = HeapTable::create(&storage, OTHER, head, int_shape()).expect("create");
+        install_single_heap(&storage, OTHER, head, int_shape()).expect("install the heap");
+        other.insert(TxnId(next), &row(21)).expect("insert");
+        other.commit(TxnId(next)).expect("commit");
+        next
+    };
+
+    let storage = open(&dir);
+    let recovery = storage.recovery().clone();
+    assert_eq!(recovery.winners, vec![TxnId(4), TxnId(next)]);
+    assert_eq!(recovery.losers, vec![TxnId(5)]);
+    assert_eq!(storage.next_txn_id(), next + 1);
+    let table = resumed(&storage);
+    assert_eq!(table.status(TxnId(5)), TxnStatus::Aborted);
+    assert_eq!(
+        table.scan(&snap(99, 100)).expect("scan"),
+        vec![(RowId(1), row(11))],
+        "the insert of the loser is not replayed"
+    );
+}
+
 #[test]
 fn a_loser_whose_page_reached_data_is_invisible() {
     let dir = TempDir::created("recover-shared-page");

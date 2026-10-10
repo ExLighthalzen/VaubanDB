@@ -731,14 +731,20 @@ impl DiskStorage {
             .unwrap_or_default()
     }
 
-    /// One past the highest transaction identifier the journal already ended.
+    /// One past the highest transaction identifier the register or the journal names.
+    ///
+    /// The journal counts winners and losers alike ([`Recovery::max_txn`]): a loser the
+    /// register does not hold yet, because no table it wrote in has been resumed, still has
+    /// its identifier kept out
+    /// (`recover::tests::the_identifier_of_a_loser_is_not_handed_out_again`).
     pub(crate) fn next_txn_id(&self) -> u64 {
-        let from_register = read_lock(&self.txns).txns.keys().map(|id| id.0).max();
-        let from_recovery = self.recovery.winners.iter().map(|id| id.0).max();
-        from_register
-            .max(from_recovery)
-            .unwrap_or(0)
-            .saturating_add(1)
+        let from_register = read_lock(&self.txns)
+            .txns
+            .keys()
+            .map(|id| id.0)
+            .max()
+            .unwrap_or(0);
+        from_register.max(self.recovery.max_txn).saturating_add(1)
     }
 
     /// Registers the outcome the recovery of the `open` read in the journal: `winners`
