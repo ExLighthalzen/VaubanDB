@@ -748,6 +748,26 @@ impl DiskStorage {
             .unwrap_or_default()
     }
 
+    /// The tables `txn` wrote in that the catalogue still holds, by increasing identifier.
+    ///
+    /// A table the transaction wrote in and that was dropped since is left out: the copy an
+    /// `ALTER TABLE` fills and that the return to a savepoint drops before the writes are
+    /// undone, whose rows went with its pages (`vauban-session`, `tests/savepoint_alter_on_disk.rs`). Its writes have
+    /// nothing left to undo in, as at the end of the transaction
+    /// ([`DiskStorage::end_transaction`]).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`DiskStorage::lock_catalogue`].
+    pub(crate) fn live_txn_tables(&self, txn: TxnId) -> SqlResult<Vec<TableId>> {
+        let tables = self.txn_tables(txn);
+        let catalogue = self.lock_catalogue()?;
+        Ok(tables
+            .into_iter()
+            .filter(|&table| catalogue.table(table).is_some())
+            .collect())
+    }
+
     /// One past the highest transaction identifier the register or the journal names.
     ///
     /// The journal counts winners and losers alike ([`Recovery::max_txn`]): a loser the
@@ -819,7 +839,6 @@ impl DiskStorage {
         register.next_savepoint_id = next;
         let record = register.txns.entry(txn).or_default();
         record.began = true;
-        let tables: Vec<TableId> = record.tables.iter().copied().collect();
         self.wal
             .append(WalRecordKind::Savepoint, txn, &id.0.to_le_bytes())?;
         // Record the current writes length per table. Tables are locked one by one, so this
@@ -827,7 +846,7 @@ impl DiskStorage {
         // savepoint + writes + rollback_to sequence.
         drop(register);
         let mut marks = HashMap::new();
-        for table in tables {
+        for table in self.live_txn_tables(txn)? {
             let mark = self.with_rows(table, |store| Ok(store.writes_len(txn)))?;
             marks.insert(table, mark);
         }
@@ -890,7 +909,7 @@ impl DiskStorage {
         // (`savepoint_invalidated_after_rollback_to`). The undo of a write pushes an [`IndexChange::Removed`] into the store's
         // maintenance log; that log is drained here and applied to the trees, as `commit`
         // and `rollback` do at the end of a transaction.
-        for table in self.txn_tables(txn) {
+        for table in self.live_txn_tables(txn)? {
             let mark = marks.get(&table).copied().unwrap_or(0);
             let changes = self.with_rows(table, |store| {
                 store.rollback_to_savepoint(txn, mark)?;
