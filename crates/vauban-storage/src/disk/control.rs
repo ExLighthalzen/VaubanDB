@@ -6,9 +6,10 @@
 //! [`super::DiskStorage::open`] writes it when it creates an instance and reads it when it
 //! reopens one; the layout of the directory around it is documented there.
 
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
-use std::path::Path;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
 
 use vauban_errors::InternalError;
 
@@ -260,34 +261,57 @@ impl Control {
         self.durable_lsn = lsn;
     }
 
-    /// Writes the whole file at `path`, creating or truncating it, and `sync_all`s it.
+    /// Writes the whole file at `path` and `sync_all`s it, so that a stopped process does not
+    /// leave a file cut short.
     ///
-    /// The file is 128 bytes and is rewritten in full rather than patched field by field. The
-    /// call truncates before it writes, so a write that stops in the middle leaves a file
-    /// shorter than 128 bytes, which [`Control::read`] reports by its size and not by a
-    /// checksum (test `control_rejects_a_file_of_another_size`). The checksum answers the
-    /// other case: a file of 128 bytes whose bytes no longer hash to the value they carry
-    /// (test `control_rejects_a_checksum_that_disagrees`, checked on the bytes through
-    /// [`Control::from_bytes`]).
+    /// A file already at `path` is overwritten in place, its 128 bytes written from offset 0
+    /// without truncating it first: the file keeps its size through the call, and the checksum
+    /// answers for bytes that the write would leave half old and half new. A truncation
+    /// followed by a write would leave an empty file to a process stopped between the two.
+    ///
+    /// A file that is not there yet is created in one step: the 128 bytes go to a staging file
+    /// beside `path` ([`staging_path`]), which is `sync_all`ed and then renamed to `path`; on
+    /// Unix the directory is `sync_all`ed after the rename. A process stopped during the
+    /// creation leaves no file at `path`, or the whole one (test
+    /// `a_creation_stopped_before_its_rename_leaves_no_ctl`); a staging file left behind by
+    /// such a stop is truncated and written again by the next creation.
     pub(crate) fn write(&self, path: &Path) -> Result<(), InternalError> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        file.write_all(&self.to_bytes())?;
-        file.sync_all()?;
-        Ok(())
+        let bytes = self.to_bytes();
+        match OpenOptions::new().write(true).open(path) {
+            Ok(mut file) => {
+                file.write_all(&bytes)?;
+                if file.metadata()?.len() != CONTROL_SIZE as u64 {
+                    file.set_len(CONTROL_SIZE as u64)?;
+                }
+                file.sync_all()?;
+                Ok(())
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => create(path, &bytes),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Reads the file at `path`, checking its size, its magic, its version and its checksum.
     ///
     /// A file whose size is not [`CONTROL_SIZE`] is [`InternalError::Corruption`] naming the
     /// size that was read, not a bare end-of-file.
+    ///
+    /// An empty file is what a build that truncated the file in place before writing it
+    /// leaves when it stops between the two. When the `data` and `wal` files beside it are
+    /// both there and both empty, the instance had not written anything yet: the file is
+    /// written again with the block of a fresh instance, [`Control::default`], and that
+    /// block is returned (test `an_empty_ctl_beside_an_empty_instance_is_written_again`).
+    /// Otherwise the error says that the file is empty and that a directory whose creation
+    /// was interrupted can be removed and created again (test
+    /// `an_empty_ctl_beside_a_used_instance_is_refused_with_a_way_out`).
     pub(crate) fn read(path: &Path) -> Result<Self, InternalError> {
         let mut file = OpenOptions::new().read(true).open(path)?;
         let mut bytes = Vec::with_capacity(CONTROL_SIZE);
         file.read_to_end(&mut bytes)?;
+        drop(file);
+        if bytes.is_empty() {
+            return Self::read_empty(path);
+        }
         let bytes: [u8; CONTROL_SIZE] = bytes.as_slice().try_into().map_err(|_| {
             InternalError::Corruption(format!(
                 "control file {} is {} bytes, expected {CONTROL_SIZE}",
@@ -297,6 +321,70 @@ impl Control {
         })?;
         Self::from_bytes(&bytes)
     }
+
+    /// The answer of [`Control::read`] for an empty file at `path`.
+    fn read_empty(path: &Path) -> Result<Self, InternalError> {
+        let empty_sibling = |name: &str| {
+            path.parent()
+                .map(|dir| dir.join(name))
+                .and_then(|sibling| fs::metadata(sibling).ok())
+                .is_some_and(|meta| meta.is_file() && meta.len() == 0)
+        };
+        if empty_sibling(super::DATA_FILE_NAME) && empty_sibling(super::WAL_FILE_NAME) {
+            let fresh = Self::default();
+            fresh.write(path)?;
+            return Ok(fresh);
+        }
+        Err(InternalError::Corruption(format!(
+            "control file {} is 0 bytes, expected {CONTROL_SIZE}: a write of it was \
+             interrupted and the instance beside it holds pages or journal records it no \
+             longer describes; if this directory was being created, remove it and start again",
+            path.display()
+        )))
+    }
+}
+
+/// Creates the file at `path` holding `bytes`, through a staging file renamed to `path`
+/// ([`Control::write`]).
+fn create(path: &Path, bytes: &[u8; CONTROL_SIZE]) -> Result<(), InternalError> {
+    let staging = staging_path(path);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&staging)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&staging, path)?;
+    sync_directory_of(path)?;
+    Ok(())
+}
+
+/// The staging file [`Control::write`] writes before renaming it to `path`: the same name
+/// with `.tmp` appended, in the same directory, so that the rename stays within one file
+/// system.
+fn staging_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(OsString::from).unwrap_or_default();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// `sync_all`s the directory that holds `path`, which makes a rename in it durable.
+#[cfg(unix)]
+fn sync_directory_of(path: &Path) -> Result<(), InternalError> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Elsewhere a directory is not opened as a file; the rename is left to the file system.
+#[cfg(not(unix))]
+fn sync_directory_of(_path: &Path) -> Result<(), InternalError> {
+    Ok(())
 }
 
 /// Writes the checksum of `bytes` into its checksum field.

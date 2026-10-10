@@ -221,11 +221,54 @@ fn open_rejects_data_without_a_control_file() {
     let dir = TempDir::created("no-ctl");
     DiskStorage::open(dir.path(), DiskOptions::default()).expect("create an instance");
     fs::remove_file(dir.child(CONTROL_FILE_NAME)).expect("remove the ctl");
+    fs::write(dir.child(DATA_FILE_NAME), vec![0u8; super::page::PAGE_SIZE])
+        .expect("a page in data");
 
     let err = DiskStorage::open(dir.path(), DiskOptions::default())
-        .expect_err("data and wal without a ctl is not an empty directory");
+        .expect_err("a data that holds a page without a ctl is not an empty directory");
     assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
     assert!(err.to_string().contains(CONTROL_FILE_NAME), "{err}");
+    assert_eq!(
+        fs::metadata(dir.child(DATA_FILE_NAME)).expect("data").len(),
+        super::page::PAGE_SIZE as u64,
+        "the refused data is left as it was"
+    );
+}
+
+#[test]
+fn open_rejects_a_journal_without_a_control_file() {
+    let dir = TempDir::created("no-ctl-wal");
+    fs::write(dir.child(DATA_FILE_NAME), []).expect("an empty data");
+    fs::write(dir.child(WAL_FILE_NAME), [1u8; 40]).expect("a journal with bytes");
+    let err = DiskStorage::open(dir.path(), DiskOptions::default())
+        .expect_err("a journal with bytes without a ctl is not an empty directory");
+    assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
+}
+
+#[test]
+fn open_completes_a_creation_stopped_before_its_control_file() {
+    // `data` and `wal` both empty, or one of them not created yet.
+    for files in [
+        &[DATA_FILE_NAME, WAL_FILE_NAME][..],
+        &[DATA_FILE_NAME][..],
+        &[WAL_FILE_NAME][..],
+    ] {
+        let dir = TempDir::created("stopped-creation");
+        for name in files {
+            fs::write(dir.child(name), []).expect("an empty file");
+        }
+        let storage = DiskStorage::open(dir.path(), DiskOptions::default())
+            .unwrap_or_else(|err| panic!("{files:?}: {err}"));
+        assert_eq!(storage.control().expect("control"), Control::default());
+        drop(storage);
+        assert_eq!(
+            fs::metadata(dir.child(CONTROL_FILE_NAME))
+                .expect("the ctl")
+                .len(),
+            128
+        );
+        DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+    }
 }
 
 #[test]
@@ -2279,4 +2322,37 @@ fn a_clustered_root_moved_by_a_split_survives_a_checkpointed_reopen() {
 #[test]
 fn a_clustered_root_moved_by_the_redo_survives_the_next_reopen() {
     clustered_split_then_reopen("cl-split-redo", false);
+}
+
+#[test]
+fn a_directory_locked_by_another_handle_is_refused() {
+    // The open instance holds the lock: another holder is refused.
+    let (dir, storage) = empty_instance("locked-by-instance");
+    let err = lock_directory(dir.path()).expect_err("the instance holds the lock");
+    assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("in use by another process"),
+        "{err}"
+    );
+    drop(storage);
+    drop(lock_directory(dir.path()).expect("free once the instance is dropped"));
+
+    // Another holder has the lock: the open is refused before a file of the instance exists.
+    let dir = TempDir::created("locked-by-other");
+    let held = lock_directory(dir.path()).expect("take the lock");
+    let err = DiskStorage::open(dir.path(), DiskOptions::default())
+        .expect_err("a directory another holder locks");
+    assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("in use by another process"),
+        "{err}"
+    );
+    for name in [CONTROL_FILE_NAME, DATA_FILE_NAME, WAL_FILE_NAME] {
+        assert!(
+            !dir.child(name).exists(),
+            "{name} written by a refused open"
+        );
+    }
+    drop(held);
+    DiskStorage::open(dir.path(), DiskOptions::default()).expect("free once released");
 }

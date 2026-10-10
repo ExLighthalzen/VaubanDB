@@ -9,6 +9,11 @@
 //! `a_directory_of_another_catalogue_shape_is_refused_before_listening` of `vauban-cli`).
 //! The catalogue does not migrate: such a directory is opened by the binary that wrote it.
 //!
+//! The number is read from the committed rows of a registry that holds some. A registry with
+//! no committed row carries no number either; `bootstrap.rs` checks whether the rest of the
+//! storage is what a stopped first start leaves, bootstraps it again when it is and refuses it
+//! otherwise (section "A first start that stopped").
+//!
 //! The entry is a row of the registry whose `table_id` column carries the number rather than
 //! a [`TableId`](vauban_storage::TableId); the readers of the registry skip it by its name.
 
@@ -35,7 +40,8 @@ pub(crate) const SHAPE_VERSION_ENTRY: &str = "vauban_catalog_shape_version";
 
 /// Compares the shape version a data directory carries with [`CATALOG_SHAPE_VERSION`].
 ///
-/// `found` is `None` for a directory written before the number existed.
+/// `found` is `None` for a directory whose registry holds committed rows and not this one,
+/// which is a directory written before the number existed.
 ///
 /// # Errors
 ///

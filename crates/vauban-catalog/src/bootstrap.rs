@@ -66,6 +66,25 @@
 //! [`InternalError::Bug`]: the bootstrap cannot tell which of those tables is which (unit test
 //! `a_master_without_registry_is_refused`).
 //!
+//! # A first start that stopped
+//!
+//! A first start creates the databases and the tables of `master` outside any transaction,
+//! and writes the rows, those of the registry included, in one transaction it commits last.
+//! A process stopped before that commit leaves a `master` whose first table is the registry
+//! with no committed row, possibly followed by internal tables that hold no committed row
+//! either. The next start checks that the storage holds nothing else: the system databases
+//! alone, no table outside `master`, and behind the registry at most the tables a first start
+//! creates, each with the shape of its rank. It then drops the tables behind the registry and
+//! runs the first start again, reusing the databases and the registry already there. Anything
+//! else, a user database or a table a first start does not create, is refused before a write
+//! (unit tests `a_first_start_stopped_on_disk_completes_on_the_next` and
+//! `a_registry_without_rows_beside_a_user_database_is_refused`). A registry that holds a
+//! committed row is opened as a bootstrapped catalogue.
+//!
+//! What the check does not tell apart: a bootstrapped directory still without a user database
+//! or table, whose journal has lost the commit of its first start, is bootstrapped again; the
+//! rows a client wrote in the tables of [`MASTER_DBO_SHIPPED_TABLES`] go with it.
+//!
 //! # Transactions
 //!
 //! The rows are written inside a transaction the catalogue opens itself,
@@ -74,8 +93,9 @@
 //! immediate in `storage` and takes no `TxnId` (`Storage` documentation: DDL is not
 //! transactional at the storage level). Compensation actions are not registered for them: a
 //! bootstrap that fails is fatal to the instance, and the server turns it into a panic at
-//! start-up. On the error path the transaction is rolled back rather than left open, so its
-//! rows stay invisible to a later reader.
+//! start-up; a first start that stopped is taken up by the next one (section above). On the
+//! error path the transaction is rolled back rather than left open, so its rows stay
+//! invisible to a later reader.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -318,9 +338,12 @@ pub(crate) fn bootstrap(
 ///
 /// A storage without `master`, or whose `master` holds no table, is a first start: the
 /// registry is created, then the internal tables, then the tables of
-/// [`MASTER_DBO_SHIPPED_TABLES`]. Otherwise the registry must be the first table of `master`,
-/// and the call creates what the descriptions name and the registry does not
-/// ([`install_missing`]).
+/// [`MASTER_DBO_SHIPPED_TABLES`]. A registry without a committed row is a first start that
+/// stopped before its transaction committed (module documentation, section "A first start
+/// that stopped"): the tables created after the registry are dropped and the first start
+/// runs again over the registry already there. Otherwise the registry must be the first
+/// table of `master`, and the call creates what the descriptions name and the registry does
+/// not ([`install_missing`]).
 fn open(
     storage: Arc<dyn Storage>,
     txn: Arc<TransactionManager>,
@@ -331,14 +354,20 @@ fn open(
         txn,
         tables: Default::default(),
     };
-    let fresh = match find_database(&catalog, SYSTEM_DATABASES[0])? {
-        None => true,
+    let (fresh, registry) = match find_database(&catalog, SYSTEM_DATABASES[0])? {
+        None => (true, None),
         Some(master) => {
             let tables = catalog.storage.tables(master).map_err(internal)?;
             if tables.is_empty() {
-                true
-            } else if registry_table_of(&tables).is_some() {
-                false
+                (true, None)
+            } else if let Some(registry) = registry_table_of(&tables) {
+                if holds_committed_rows(&catalog, registry)? {
+                    (false, Some(registry))
+                } else {
+                    check_leftovers_of_a_first_start(&catalog, master, &tables[1..], declared)?;
+                    drop_leftovers_of_a_first_start(&catalog, &tables[1..])?;
+                    (true, Some(registry))
+                }
             } else {
                 return Err(InternalError::Bug(format!(
                     "bootstrap: master holds {} tables and no registry of internal tables",
@@ -351,11 +380,12 @@ fn open(
         shape::check(stored_shape_version(&catalog)?)?;
     }
     let databases = system_databases(&catalog)?;
-    if fresh {
+    if registry.is_none() {
         catalog
             .storage
             .create_table(databases[0].0, &registry_shape())
             .map_err(internal)?;
+        interruption_point();
     }
     install_missing(&catalog, &databases, declared, fresh)?;
     if !fresh {
@@ -381,7 +411,11 @@ fn system_databases(catalog: &Catalog) -> Result<Vec<(DbId, &'static str)>, Inte
     for name in SYSTEM_DATABASES {
         let id = match find_database(catalog, name)? {
             Some(id) => id,
-            None => catalog.storage.create_database(name).map_err(internal)?,
+            None => {
+                let id = catalog.storage.create_database(name).map_err(internal)?;
+                interruption_point();
+                id
+            }
         };
         databases.push((id, name));
     }
@@ -446,7 +480,9 @@ fn install_missing(
                 .storage
                 .insert(txn.id, registry, &registry_row(&def.name, table))
                 .map_err(internal)?;
+            interruption_point();
             insert_rows(catalog, txn, table, def)?;
+            interruption_point();
         }
         if fresh {
             views::sys_tables::write_internal_object_rows(catalog, txn, master, instant.clone())
@@ -454,15 +490,147 @@ fn install_missing(
         } else {
             insert_internal_object_rows(catalog, txn, master, &filled, &instant)?;
         }
+        interruption_point();
         stamp_internal_object_rows(catalog, txn, master)?;
+        interruption_point();
         if fresh {
             for def in master_dbo_shipped_tables() {
                 catalog.create_table(txn, &def).map_err(internal)?;
+                interruption_point();
             }
         }
         Ok(())
     })
 }
+
+/// Whether `registry` holds a row a committed transaction wrote.
+///
+/// A first start writes the rows of the registry, its shape version among them, in the
+/// transaction that writes the rest of the internal rows. A registry with a committed row is
+/// opened as a bootstrapped catalogue. A registry without one is what a first start stopped
+/// before that commit leaves, and also what a bootstrapped directory whose journal lost the
+/// commit may show: [`check_leftovers_of_a_first_start`] tells the two apart before anything
+/// is dropped.
+fn holds_committed_rows(catalog: &Catalog, registry: TableId) -> Result<bool, InternalError> {
+    let snapshot = registry_snapshot(catalog, TxnId(0));
+    let mut rows = catalog
+        .storage
+        .scan(&snapshot, registry)
+        .map_err(internal)?;
+    match rows.next() {
+        Some(row) => row.map(|_| true).map_err(internal),
+        None => Ok(false),
+    }
+}
+
+/// The shapes of the tables a first start creates in `master` behind the registry, in
+/// creation order: the internal tables `declared` describes, then the tables of
+/// [`MASTER_DBO_SHIPPED_TABLES`] (unit test
+/// `the_shapes_a_first_start_creates_are_the_ones_expected_behind_the_registry`).
+fn first_start_shapes(declared: Declared<'_>) -> Result<Vec<TableShape>, InternalError> {
+    let mut shapes: Vec<TableShape> = declared(&[], &placeholder_instant())?
+        .iter()
+        .map(shape_of)
+        .collect();
+    shapes.extend(master_dbo_shipped_tables().iter().map(|def| TableShape {
+        columns: def.columns.iter().map(|column| column.ty.clone()).collect(),
+        clustered_key: None,
+    }));
+    Ok(shapes)
+}
+
+/// Checks that a storage whose registry holds no committed row holds nothing a first start
+/// does not create: the system databases alone, no table outside `master`, and behind the
+/// registry at most the tables of [`first_start_shapes`], each of the shape of its rank.
+///
+/// # Errors
+///
+/// [`InternalError::Corruption`] naming what does not fit, before anything is written or
+/// dropped (unit tests `a_registry_without_rows_beside_a_user_database_is_refused` and
+/// its neighbours).
+fn check_leftovers_of_a_first_start(
+    catalog: &Catalog,
+    master: DbId,
+    leftovers: &[(TableId, TableShape)],
+    declared: Declared<'_>,
+) -> Result<(), InternalError> {
+    let refuse = |what: String| {
+        InternalError::Corruption(format!(
+            "the registry of internal tables holds no committed row, yet {what}: this is not \
+             what a first start that stopped leaves, and the data directory is left as it is; \
+             restore it from a copy or start on a new data directory"
+        ))
+    };
+    for (db, name) in catalog.storage.databases().map_err(internal)? {
+        if !SYSTEM_DATABASES
+            .iter()
+            .any(|system| system.eq_ignore_ascii_case(&name))
+        {
+            return Err(refuse(format!("the storage holds database {name}")));
+        }
+        let tables = catalog.storage.tables(db).map_err(internal)?;
+        if db != master && !tables.is_empty() {
+            return Err(refuse(format!(
+                "database {name} holds {} tables",
+                tables.len()
+            )));
+        }
+    }
+    let expected = first_start_shapes(declared)?;
+    if leftovers.len() > expected.len() {
+        return Err(refuse(format!(
+            "master holds {} tables behind the registry, where a first start creates {}",
+            leftovers.len(),
+            expected.len()
+        )));
+    }
+    for (rank, ((table, shape), wanted)) in leftovers.iter().zip(&expected).enumerate() {
+        if shape != wanted {
+            return Err(refuse(format!(
+                "table {} of master, number {} behind the registry, has a shape a first start \
+                 does not give it",
+                table.0,
+                rank + 1
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Drops `tables`, the tables of `master` behind the registry that a first start created
+/// before it stopped.
+///
+/// [`check_leftovers_of_a_first_start`] has found them to be tables a first start creates;
+/// their rows were written by the transaction that did not commit, so a reader sees no row of
+/// theirs, and the registry does not name them.
+/// Dropping them before the first start runs again keeps a second copy of each internal table
+/// out of `master` (unit test `a_first_start_stopped_on_disk_completes_on_the_next`).
+/// A stop during this loop leaves fewer of them, the first ones, which the next start drops
+/// in turn.
+fn drop_leftovers_of_a_first_start(
+    catalog: &Catalog,
+    tables: &[(TableId, TableShape)],
+) -> Result<(), InternalError> {
+    // Last created first, so that a stop in this loop leaves the first tables of the list,
+    // which the check of the next start still recognises.
+    for &(table, _) in tables.iter().rev() {
+        catalog.storage.drop_table(table).map_err(internal)?;
+        interruption_point();
+    }
+    Ok(())
+}
+
+/// A point of the first start where a test stops the process abruptly
+/// ([`tests::interruption_point`]); nothing outside the tests.
+#[cfg(test)]
+fn interruption_point() {
+    tests::interruption_point();
+}
+
+/// A point of the first start where a test stops the process abruptly; nothing here.
+#[cfg(not(test))]
+#[inline(always)]
+fn interruption_point() {}
 
 /// Runs `body` in a transaction, committed when `body` succeeds and rolled back when it
 /// fails.
@@ -473,6 +641,7 @@ fn in_transaction<T>(
     let handle = catalog.txn.begin(IsolationLevel::ReadCommitted);
     match body(&handle) {
         Ok(value) => {
+            interruption_point();
             catalog.txn.commit(handle).map_err(internal)?;
             Ok(value)
         }
@@ -1663,11 +1832,14 @@ mod tests {
 
     impl TempDir {
         fn new(label: &str) -> Self {
+            // The clock alone repeats between threads of this process; the counter does not.
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_nanos());
             let path = std::env::temp_dir().join(format!(
-                "vauban-catalog-{label}-{}-{nanos}",
+                "vauban-catalog-{label}-{}-{n}-{nanos}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&path).expect("create the directory of the instance");
@@ -1980,6 +2152,440 @@ mod tests {
                 .last()
                 .map(|row| row.0[objects_columns::OBJECT_ID].clone()),
             Some(Value::I32(-2_000))
+        );
+    }
+
+    // The point the first start of this thread stops at, counted from 1, `None` to run
+    // through; and the number of points it has passed.
+    std::thread_local! {
+        static STOP_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+        static PASSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The payload of the panic that stops a first start, told apart from a real failure.
+    struct Stopped;
+
+    /// Counts the point and stops the first start, by a panic that unwinds through it without
+    /// a commit or a rollback, when it is the one [`STOP_AT`] names.
+    pub(super) fn interruption_point() {
+        let Some(stop) = STOP_AT.get() else {
+            return;
+        };
+        let passed = PASSED.get() + 1;
+        PASSED.set(passed);
+        if passed == stop {
+            std::panic::panic_any(Stopped);
+        }
+    }
+
+    /// What a bootstrapped catalogue holds, the instants of its rows and the `TableId`s aside.
+    #[derive(Debug, PartialEq)]
+    struct Holdings {
+        databases: Vec<String>,
+        tables_of_master: usize,
+        rows_per_internal_table: Vec<(String, usize)>,
+        objects: Vec<String>,
+    }
+
+    fn holdings(catalog: &Catalog) -> Holdings {
+        use views::sys_tables::objects_columns;
+
+        let mut databases: Vec<String> = catalog
+            .storage
+            .databases()
+            .unwrap()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        databases.sort();
+        let master = find_database(catalog, SYSTEM_DATABASES[0])
+            .unwrap()
+            .unwrap();
+        let mut registered: Vec<String> = registered_internal_tables(catalog)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        registered.sort();
+        let rows_per_internal_table = registered
+            .iter()
+            .map(|name| (name.clone(), rows_of(catalog, name).len()))
+            .collect();
+        let objects = rows_of(catalog, views::sys_tables::OBJECTS_TABLE)
+            .into_iter()
+            .map(|row| {
+                // The `object_id` of an internal table is a constant; the one of a table of
+                // `master.dbo` sits above the largest `TableId`, which the tables a stopped
+                // first start created and the next one dropped have moved up.
+                let object_id = if row[objects_columns::TYPE] == text(SYSTEM_TABLE_TYPE) {
+                    format!("{:?}", row[objects_columns::OBJECT_ID])
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{:?} {:?} {:?} {:?} {object_id}",
+                    row[objects_columns::DATABASE_ID],
+                    row[objects_columns::SCHEMA_ID],
+                    row[objects_columns::NAME],
+                    row[objects_columns::TYPE],
+                )
+            })
+            .collect::<Vec<String>>();
+        let mut objects = objects;
+        objects.sort();
+        Holdings {
+            databases,
+            tables_of_master: catalog.storage.tables(master).unwrap().len(),
+            rows_per_internal_table,
+            objects,
+        }
+    }
+
+    /// Compares two [`Holdings`] field by field, so that a failure names the field.
+    fn assert_same_holdings(found: &Holdings, expected: &Holdings, context: &str) {
+        assert_eq!(found.databases, expected.databases, "{context}");
+        assert_eq!(
+            found.tables_of_master, expected.tables_of_master,
+            "{context}"
+        );
+        assert_eq!(
+            found.rows_per_internal_table, expected.rows_per_internal_table,
+            "{context}"
+        );
+        assert_eq!(found.objects, expected.objects, "{context}");
+    }
+
+    /// Opens the catalogue of `dir` as a restart does.
+    fn restarted(dir: &TempDir) -> Result<Catalog, InternalError> {
+        let (storage, txn) = on_disk(dir);
+        txn.bump_next_id_above_storage();
+        bootstrap(storage, txn)
+    }
+
+    /// Runs a first start on `dir` stopped at its `stop`-th point; `false` when it ran through
+    /// without reaching that point.
+    fn stopped_start(dir: &TempDir, stop: usize) -> bool {
+        let (storage, txn) = on_disk(dir);
+        txn.bump_next_id_above_storage();
+        STOP_AT.set(Some(stop));
+        PASSED.set(0);
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bootstrap(storage, txn)));
+        STOP_AT.set(None);
+        match outcome {
+            Ok(catalog) => {
+                catalog.expect("a start that ran through");
+                false
+            }
+            Err(payload) => {
+                assert!(payload.is::<Stopped>(), "stop {stop}: a panic of its own");
+                true
+            }
+        }
+    }
+
+    /// Stops the first start of a new directory at its `stop`-th point, then at each point of
+    /// `then` in turn on the starts that follow, and checks that the next start completes it
+    /// into `reference`; with `again`, that the start after that opens it unchanged.
+    fn stop_then_complete(stop: usize, then: &[usize], again: bool, reference: &Holdings) {
+        let dir = TempDir::new("first-start-stopped");
+        assert!(
+            stopped_start(&dir, stop),
+            "stop {stop} is past the last point"
+        );
+        for &next in then {
+            assert!(stopped_start(&dir, next), "stop {stop} then {next}");
+        }
+        let context = format!("stop {stop} then {then:?}");
+        let catalog =
+            restarted(&dir).unwrap_or_else(|err| panic!("{context}: the next start fails: {err}"));
+        assert_same_holdings(&holdings(&catalog), reference, &context);
+        if again {
+            drop(catalog);
+            let catalog = restarted(&dir)
+                .unwrap_or_else(|err| panic!("{context}: the start after it fails: {err}"));
+            assert_same_holdings(&holdings(&catalog), reference, &format!("{context}, again"));
+        }
+    }
+
+    /// The points of a first start, by their number: the first one of each step.
+    struct Points {
+        /// How many points a whole first start passes.
+        total: usize,
+        /// The first internal table, created and registered.
+        first_table: usize,
+        /// The internal table in the middle of the list, created and registered.
+        middle_table: usize,
+        /// The last internal table, created and registered.
+        last_table: usize,
+        /// The rows of `sys.objects` written.
+        objects: usize,
+        /// The first shipped table of `master.dbo` created.
+        first_shipped: usize,
+    }
+
+    /// What a whole first start builds, and where its points fall.
+    ///
+    /// Built on a `MemoryStorage`: the counted run and the holdings it leaves are those of an
+    /// on-disk start, the constants of the internal tables not depending on the storage.
+    fn whole_first_start() -> (Holdings, Points) {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let txn = Arc::new(TransactionManager::new(Arc::clone(&storage)));
+        STOP_AT.set(Some(usize::MAX));
+        PASSED.set(0);
+        let catalog = bootstrap(storage, txn);
+        STOP_AT.set(None);
+        let reference = holdings(&catalog.expect("a whole first start"));
+        let total = PASSED.get();
+        let tables = internal_table_defs().unwrap().len();
+        let shipped = MASTER_DBO_SHIPPED_TABLES.len();
+        assert_eq!(
+            reference.tables_of_master,
+            1 + tables + shipped,
+            "the registry, the internal tables, the shipped tables"
+        );
+        let mut seen = BTreeSet::new();
+        for object in &reference.objects {
+            assert!(seen.insert(object), "{object} twice in a whole first start");
+        }
+        // Four databases, the registry, two points per internal table (created and
+        // registered, then filled), the rows of `sys.objects` and their stamping, the five
+        // shipped tables, the commit.
+        assert_eq!(
+            total,
+            SYSTEM_DATABASES.len() + 1 + 2 * tables + 2 + shipped + 1
+        );
+        let first_table = SYSTEM_DATABASES.len() + 2;
+        let last_table = first_table + 2 * (tables - 1);
+        let objects = last_table + 2;
+        let points = Points {
+            total,
+            first_table,
+            middle_table: first_table + 2 * (tables / 2),
+            last_table,
+            objects,
+            first_shipped: objects + 2,
+        };
+        assert_eq!(points.first_shipped + shipped, total);
+        (reference, points)
+    }
+
+    /// Runs each `(stop, then, again)` of `runs` through [`stop_then_complete`], on four
+    /// workers: each stopped first start on disk is seconds of work.
+    fn stop_then_complete_all(runs: &[(usize, Vec<usize>, bool)], reference: &Holdings) {
+        std::thread::scope(|scope| {
+            for chunk in runs.chunks(runs.len().div_ceil(4)) {
+                scope.spawn(move || {
+                    for (stop, then, again) in chunk {
+                        stop_then_complete(*stop, then, *again, reference);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn a_first_start_stopped_on_disk_completes_on_the_next() {
+        // Three steps: the registry alone, half the internal tables, everything but the
+        // commit; and a start that stops in turn while it drops what the first one left.
+        let (reference, points) = whole_first_start();
+        stop_then_complete_all(
+            &[
+                (SYSTEM_DATABASES.len() + 1, Vec::new(), false),
+                (points.middle_table + 1, Vec::new(), false),
+                (points.total, vec![2], true),
+            ],
+            &reference,
+        );
+    }
+
+    /// Each step of the first start once, at its first and last occurrence when it repeats.
+    /// Around a hundred seconds of disk work on a loaded machine, hence ignored by default:
+    /// `cargo test -p vauban-catalog --lib -- --ignored a_first_start_stopped_at_each_step`.
+    #[test]
+    #[ignore = "minutes of disk work; the short form is a_first_start_stopped_on_disk_completes_on_the_next"]
+    fn a_first_start_stopped_at_each_step_completes_on_the_next() {
+        let (reference, points) = whole_first_start();
+        let databases = SYSTEM_DATABASES.len();
+        let shipped = MASTER_DBO_SHIPPED_TABLES.len();
+        let mut runs: Vec<(usize, Vec<usize>, bool)> = [
+            1,
+            databases,
+            databases + 1,
+            points.first_table,
+            points.first_table + 1,
+            points.middle_table,
+            points.middle_table + 1,
+            points.last_table,
+            points.last_table + 1,
+            points.objects,
+            points.objects + 1,
+            points.first_shipped,
+            points.first_shipped + shipped - 1,
+            points.total,
+        ]
+        .into_iter()
+        .map(|stop| (stop, Vec::new(), false))
+        .collect();
+        // A start that drops what the stopped one left behind can stop in turn: at its first
+        // drop and at a later one. The next start completes the directory still, and the one
+        // after it opens a bootstrapped directory rather than one to bootstrap.
+        runs.push((points.total, vec![1, 3], true));
+        runs.push((points.middle_table, vec![2], true));
+        stop_then_complete_all(&runs, &reference);
+    }
+
+    #[test]
+    fn a_registry_with_a_committed_row_is_not_bootstrapped_again() {
+        let dir = TempDir::new("registry-committed");
+        let reference = {
+            let (storage, txn) = on_disk(&dir);
+            holdings(&bootstrap(storage, txn).expect("first start"))
+        };
+        let catalog = restarted(&dir).expect("restart");
+        assert_eq!(holdings(&catalog), reference);
+        // A restart drops nothing and creates nothing in `master`.
+        let master = find_database(&catalog, SYSTEM_DATABASES[0])
+            .unwrap()
+            .unwrap();
+        let before: Vec<TableId> = catalog
+            .storage
+            .tables(master)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        drop(catalog);
+        let catalog = restarted(&dir).expect("second restart");
+        let after: Vec<TableId> = catalog
+            .storage
+            .tables(master)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(after, before);
+    }
+
+    /// A `MemoryStorage` holding `master` and the registry with no row, as a first start that
+    /// stopped right after creating the registry leaves it.
+    fn registry_without_rows() -> (Arc<dyn Storage>, DbId) {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let master = storage.create_database("master").unwrap();
+        storage.create_table(master, &registry_shape()).unwrap();
+        (storage, master)
+    }
+
+    /// The databases and the tables of each, by name and shape.
+    fn layout(storage: &Arc<dyn Storage>) -> Vec<(String, Vec<(TableId, TableShape)>)> {
+        storage
+            .databases()
+            .unwrap()
+            .into_iter()
+            .map(|(db, name)| (name, storage.tables(db).unwrap()))
+            .collect()
+    }
+
+    /// Opens the catalogue of `storage`, expects a refusal that names `what`, and checks that
+    /// the storage is left as it was.
+    fn refused_without_a_write(storage: &Arc<dyn Storage>, what: &str) {
+        let before = layout(storage);
+        let txn = Arc::new(TransactionManager::new(Arc::clone(storage)));
+        let Err(err) = bootstrap(Arc::clone(storage), txn) else {
+            panic!("a storage beside {what} is bootstrapped again");
+        };
+        assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains(what), "{message}");
+        assert!(message.contains("left as it is"), "{message}");
+        assert_eq!(
+            layout(storage),
+            before,
+            "a refused start changed the storage"
+        );
+    }
+
+    #[test]
+    fn the_shapes_a_first_start_creates_are_the_ones_expected_behind_the_registry() {
+        let catalog = bootstrapped();
+        let master = find_database(&catalog, SYSTEM_DATABASES[0])
+            .unwrap()
+            .unwrap();
+        let created: Vec<TableShape> = catalog
+            .storage
+            .tables(master)
+            .unwrap()
+            .into_iter()
+            .skip(1)
+            .map(|(_, shape)| shape)
+            .collect();
+        assert_eq!(created, first_start_shapes(&internal_tables).unwrap());
+    }
+
+    #[test]
+    fn a_registry_without_rows_beside_a_user_database_is_refused() {
+        let (storage, _) = registry_without_rows();
+        storage.create_database("userdb").unwrap();
+        refused_without_a_write(&storage, "database userdb");
+    }
+
+    #[test]
+    fn a_registry_without_rows_beside_a_table_of_another_system_database_is_refused() {
+        let (storage, _) = registry_without_rows();
+        let tempdb = storage.create_database("tempdb").unwrap();
+        storage.create_table(tempdb, &registry_shape()).unwrap();
+        refused_without_a_write(&storage, "database tempdb holds 1 tables");
+    }
+
+    #[test]
+    fn a_registry_without_rows_beside_a_table_of_another_shape_is_refused() {
+        let (storage, master) = registry_without_rows();
+        let shapes = first_start_shapes(&internal_tables).unwrap();
+        storage.create_table(master, &shapes[0]).unwrap();
+        // A user table of `master`: one `int`, a shape no internal table has first.
+        storage
+            .create_table(
+                master,
+                &TableShape {
+                    columns: vec![TypeInfo::new(SqlType::Int, true)],
+                    clustered_key: None,
+                },
+            )
+            .unwrap();
+        refused_without_a_write(&storage, "number 2 behind the registry");
+    }
+
+    #[test]
+    fn a_registry_without_rows_beside_more_tables_than_a_first_start_creates_is_refused() {
+        let (storage, master) = registry_without_rows();
+        let shapes = first_start_shapes(&internal_tables).unwrap();
+        for shape in &shapes {
+            storage.create_table(master, shape).unwrap();
+        }
+        storage
+            .create_table(master, shapes.last().unwrap())
+            .unwrap();
+        refused_without_a_write(
+            &storage,
+            &format!(
+                "master holds {} tables behind the registry",
+                shapes.len() + 1
+            ),
+        );
+    }
+
+    #[test]
+    fn a_registry_without_rows_beside_the_tables_of_a_first_start_is_bootstrapped_again() {
+        let (storage, master) = registry_without_rows();
+        let shapes = first_start_shapes(&internal_tables).unwrap();
+        for shape in &shapes {
+            storage.create_table(master, shape).unwrap();
+        }
+        let txn = Arc::new(TransactionManager::new(Arc::clone(&storage)));
+        let catalog = bootstrap(Arc::clone(&storage), txn).expect("a stopped first start");
+        assert_eq!(
+            catalog.storage.tables(master).unwrap().len(),
+            1 + shapes.len()
         );
     }
 }

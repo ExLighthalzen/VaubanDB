@@ -228,3 +228,116 @@ fn control_rejects_a_file_of_another_size() {
     assert!(err.to_string().contains("64 bytes"), "{err}");
     assert!(err.to_string().contains("128"), "{err}");
 }
+
+#[test]
+fn a_creation_stopped_before_its_rename_leaves_no_ctl() {
+    let dir = TempDir::created("ctl-staged");
+    let path = dir.child("vauban.ctl");
+    // A creation stopped after the staging file was truncated, or halfway through its bytes:
+    // there is no file at `path`.
+    for staged in [&[][..], &[0xAB; 64][..]] {
+        std::fs::write(staging_path(&path), staged).expect("leave a staging file");
+        assert!(!path.exists());
+        assert!(matches!(Control::read(&path), Err(InternalError::Io(_))));
+    }
+
+    // The next creation goes through the staging file left behind.
+    let created = Control {
+        next_page_id: PageId(4),
+        ..Control::default()
+    };
+    created.write(&path).expect("create the ctl");
+    assert_eq!(Control::read(&path).expect("the new ctl"), created);
+    assert!(
+        !staging_path(&path).exists(),
+        "the staging file is renamed away"
+    );
+}
+
+#[test]
+fn a_rewrite_overwrites_in_place_and_keeps_the_size() {
+    let dir = TempDir::created("ctl-in-place");
+    let path = dir.child("vauban.ctl");
+    Control::default().write(&path).expect("create the ctl");
+    let moved = Control {
+        next_page_id: PageId(9),
+        ..Control::default()
+    };
+    moved.write(&path).expect("rewrite the ctl");
+    assert!(!staging_path(&path).exists(), "a rewrite stages nothing");
+    assert_eq!(
+        std::fs::metadata(&path).expect("the ctl").len(),
+        CONTROL_SIZE as u64
+    );
+    assert_eq!(Control::read(&path).expect("read back"), moved);
+
+    // Bytes past the block, which this build does not write, are cut by the next rewrite.
+    let mut longer = moved.to_bytes().to_vec();
+    longer.extend_from_slice(&[0xCD; 72]);
+    std::fs::write(&path, &longer).expect("a longer ctl");
+    Control::default().write(&path).expect("rewrite the ctl");
+    assert_eq!(
+        std::fs::metadata(&path).expect("the ctl").len(),
+        CONTROL_SIZE as u64
+    );
+    assert_eq!(Control::read(&path).expect("read back"), Control::default());
+}
+
+#[test]
+fn the_staging_file_sits_beside_the_ctl() {
+    let dir = TempDir::created("ctl-staging-name");
+    let path = dir.child("vauban.ctl");
+    assert_eq!(staging_path(&path), dir.child("vauban.ctl.tmp"));
+}
+
+#[test]
+fn an_empty_ctl_beside_an_empty_instance_is_written_again() {
+    let dir = TempDir::created("ctl-empty-fresh");
+    let path = dir.child("vauban.ctl");
+    std::fs::write(&path, []).expect("an empty ctl");
+    std::fs::write(dir.child(super::super::DATA_FILE_NAME), []).expect("an empty data");
+    std::fs::write(dir.child(super::super::WAL_FILE_NAME), []).expect("an empty wal");
+
+    assert_eq!(
+        Control::read(&path).expect("an instance that wrote nothing yet"),
+        Control::default()
+    );
+    assert_eq!(
+        std::fs::metadata(&path).expect("the ctl").len(),
+        CONTROL_SIZE as u64,
+        "the ctl is written again"
+    );
+    assert_eq!(Control::read(&path).expect("read back"), Control::default());
+}
+
+#[test]
+fn an_empty_ctl_beside_a_used_instance_is_refused_with_a_way_out() {
+    // Each of `data` and `wal` holding bytes, or missing, keeps the empty ctl refused.
+    type Contents<'a> = Option<&'a [u8]>;
+    let cases: [(Contents, Contents); 3] = [
+        (Some(&[0u8; 8192]), Some(&[])),
+        (Some(&[]), Some(&[1u8; 40])),
+        (None, Some(&[])),
+    ];
+    for (data, wal) in cases {
+        let dir = TempDir::created("ctl-empty-used");
+        let path = dir.child("vauban.ctl");
+        std::fs::write(&path, []).expect("an empty ctl");
+        if let Some(bytes) = data {
+            std::fs::write(dir.child(super::super::DATA_FILE_NAME), bytes).expect("data");
+        }
+        if let Some(bytes) = wal {
+            std::fs::write(dir.child(super::super::WAL_FILE_NAME), bytes).expect("wal");
+        }
+        let err = Control::read(&path).expect_err("an empty ctl beside a used instance");
+        assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("0 bytes"), "{message}");
+        assert!(message.contains("remove it and start again"), "{message}");
+        assert_eq!(
+            std::fs::metadata(&path).expect("the ctl").len(),
+            0,
+            "the refused ctl is left as it was"
+        );
+    }
+}

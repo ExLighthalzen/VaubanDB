@@ -2,7 +2,9 @@
 //! its tables: their rows, their keys, their constraints, their defaults and their identity.
 //! Two ways of stopping are covered: the SIGINT shutdown, and a `SIGKILL`, which the process
 //! cannot catch. A directory whose catalogue carries another shape version is refused at
-//! start-up, before the port is bound.
+//! start-up, before the port is bound. A first start stopped before its commit is completed
+//! by the next start, and an empty control file is written again when the instance beside it
+//! is empty too, refused with a way out otherwise.
 //!
 //! Everything runs on `127.0.0.1` through a real TDS client (`tiberius`).
 //!
@@ -24,8 +26,8 @@ use tiberius::error::Error;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio::net::TcpStream as AsyncTcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
-use vauban_storage::{DiskOptions, DiskStorage, Row, Snapshot, Storage, TxnId};
-use vauban_types::{SqlString, Value};
+use vauban_storage::{DiskOptions, DiskStorage, Row, Snapshot, Storage, TableShape, TxnId};
+use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
 /// Cap, in seconds, on every wait for the server when `VAUBAN_TEST_TIMEOUT_SECS` is unset.
 /// Each wait ends on the event it observes, so a large cap costs nothing on an idle machine.
@@ -578,4 +580,248 @@ fn a_directory_of_another_catalogue_shape_is_refused_before_listening() {
         "{output}"
     );
     assert!(!output.contains("vauban listening"), "{output}");
+}
+
+/// Starts `serve --data <data>` on `port(offset)` and waits for the process to exit, which it
+/// does when it refuses the directory; gives back its output.
+fn refused_start(offset: u16, data: &Path, log: &Path) -> String {
+    let port = port(offset);
+    let out = fs::File::create(log).expect("log file");
+    let err = out.try_clone().expect("log file");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vauban"))
+        .env_remove("VAUBAN_SA_PASSWORD")
+        .env_remove("RUST_LOG")
+        .current_dir(env!("CARGO_TARGET_TMPDIR"))
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .args(["serve", "--data"])
+        .arg(data)
+        .args([
+            "--no-auth",
+            "--encrypt",
+            "off",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .spawn()
+        .expect("spawn the server");
+    let started = Instant::now();
+    let cap = wait_cap();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if started.elapsed() > cap {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the server did not exit within {cap:?}\n{}",
+                fs::read_to_string(log).unwrap_or_default()
+            );
+        }
+        sleep(Duration::from_millis(50));
+    };
+    let output = fs::read_to_string(log).unwrap_or_default();
+    assert!(
+        !status.success(),
+        "the server exited with {status}\n{output}"
+    );
+    assert!(!output.contains("vauban listening"), "{output}");
+    output
+}
+
+/// Three counts: the databases of `sys.databases`, the names of `sys.all_objects` that come
+/// back more than once in a schema, and the tables of `master.sys.tables`.
+async fn system_counts(client: &mut Session) -> Vec<Vec<i32>> {
+    ints(
+        client,
+        "SELECT (SELECT COUNT(*) FROM sys.databases), \
+         (SELECT COUNT(*) FROM (SELECT schema_id, name FROM sys.all_objects \
+          GROUP BY schema_id, name HAVING COUNT(*) > 1) AS twice), \
+         (SELECT COUNT(*) FROM master.sys.tables)",
+    )
+    .await
+}
+
+/// Leaves in `data` what a first start stopped before its commit leaves: `master` with the
+/// registry of the internal tables, and a row of it written by a transaction that did not
+/// commit.
+fn leave_a_stopped_first_start(data: &Path) {
+    let storage = DiskStorage::open(data, DiskOptions::default()).expect("a new directory");
+    let master = storage.create_database("master").expect("master");
+    let name = || TypeInfo::new(SqlType::NVarChar(Len::Fixed(128)), false);
+    let registry = storage
+        .create_table(
+            master,
+            &TableShape {
+                columns: vec![name(), TypeInfo::new(SqlType::BigInt, false)],
+                clustered_key: None,
+            },
+        )
+        .expect("the registry");
+    let txn = TxnId(storage.next_txn_id());
+    let text = |text: &str| {
+        Value::String(SqlString {
+            text: text.to_owned(),
+        })
+    };
+    storage
+        .insert(
+            txn,
+            registry,
+            &Row(vec![text("vauban_sys_databases"), Value::I64(2)]),
+        )
+        .expect("a registry row");
+    // Neither commit nor checkpoint: the process stops here.
+}
+
+#[test]
+fn a_first_start_stopped_before_its_commit_is_completed_by_the_next() {
+    let reference = TempDir::new("whole-first-start");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let server = Running::start(54, &reference.data(), &reference.log(1));
+    let expected = runtime.block_on(async {
+        let mut client = connect(server.port).await;
+        system_counts(&mut client).await
+    });
+    server.interrupt();
+    assert_eq!(expected[0][..2], [4, 0], "{expected:?}");
+
+    let dir = TempDir::new("stopped-first-start");
+    leave_a_stopped_first_start(&dir.data());
+    let server = Running::start(54, &dir.data(), &dir.log(1));
+    runtime.block_on(async {
+        let mut client = connect(server.port).await;
+        assert_eq!(system_counts(&mut client).await, expected);
+        ok(&mut client, "CREATE TABLE dbo.after_resume (a int)").await;
+    });
+    server.interrupt();
+
+    // The completed directory opens as a bootstrapped one.
+    let server = Running::start(54, &dir.data(), &dir.log(2));
+    runtime.block_on(async {
+        let mut client = connect(server.port).await;
+        assert_eq!(
+            ints(&mut client, "SELECT COUNT(*) FROM dbo.after_resume").await,
+            vec![vec![0]]
+        );
+        let mut counts = expected.clone();
+        counts[0][2] += 1;
+        assert_eq!(system_counts(&mut client).await, counts);
+    });
+    server.interrupt();
+}
+
+#[test]
+fn an_empty_control_file_of_an_unwritten_instance_is_written_again() {
+    let dir = TempDir::new("empty-ctl");
+    for name in ["vauban.ctl", "data", "wal"] {
+        fs::write(dir.data().join(name), []).expect("an empty file");
+    }
+    let server = Running::start(55, &dir.data(), &dir.log(1));
+    server.interrupt();
+    assert_eq!(
+        fs::metadata(dir.data().join("vauban.ctl"))
+            .expect("the control file")
+            .len(),
+        128
+    );
+    let server = Running::start(55, &dir.data(), &dir.log(2));
+    server.interrupt();
+}
+
+#[test]
+fn an_empty_control_file_beside_pages_is_refused_with_a_way_out() {
+    let dir = TempDir::new("empty-ctl-pages");
+    fs::write(dir.data().join("vauban.ctl"), []).expect("an empty control file");
+    fs::write(dir.data().join("data"), vec![0u8; 8192]).expect("a page");
+    fs::write(dir.data().join("wal"), []).expect("an empty journal");
+    let output = refused_start(56, &dir.data(), &dir.log(1));
+    assert!(
+        output.contains("0 bytes") && output.contains("remove it and start again"),
+        "{output}"
+    );
+}
+
+/// The databases of the instance in `data` and the shape of each of their tables, as
+/// `storage` lists them.
+fn layout(data: &Path) -> Vec<(String, Vec<String>)> {
+    let storage = DiskStorage::open(data, DiskOptions::default()).expect("open the directory");
+    storage
+        .databases()
+        .expect("databases")
+        .into_iter()
+        .map(|(db, name)| {
+            let tables = storage
+                .tables(db)
+                .expect("tables")
+                .into_iter()
+                .map(|(id, shape)| format!("{id:?} {shape:?}"))
+                .collect();
+            (name, tables)
+        })
+        .collect()
+}
+
+#[test]
+fn a_bootstrapped_directory_whose_journal_lost_its_commits_is_refused_untouched() {
+    let dir = TempDir::new("journal-cut");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let server = Running::start(57, &dir.data(), &dir.log(1));
+    runtime.block_on(async {
+        let mut client = connect(server.port).await;
+        ok(&mut client, "CREATE DATABASE userdb").await;
+        ok(
+            &mut client,
+            "CREATE TABLE dbo.precious (a int NOT NULL); \
+             INSERT dbo.precious (a) VALUES (1), (2), (3);",
+        )
+        .await;
+    });
+    server.interrupt();
+    let before = layout(&dir.data());
+    assert!(
+        before.iter().any(|(name, _)| name == "userdb"),
+        "{before:?}"
+    );
+
+    // The journal loses everything past its first thousand bytes, the commit of the first
+    // start among it; the pages of the checkpoint still hold the tables.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(dir.data().join("wal"))
+        .expect("open the journal")
+        .set_len(1000)
+        .expect("cut the journal");
+
+    let mut data_seen: Option<Vec<u8>> = None;
+    for start in 2..5 {
+        let output = refused_start(57, &dir.data(), &dir.log(start));
+        assert!(
+            output.contains("holds database userdb") && output.contains("left as it is"),
+            "{output}"
+        );
+        // The pages stay as they are from one refused start to the next; the journal is the
+        // recovery's to write.
+        let data = fs::read(dir.data().join("data")).expect("data");
+        if let Some(seen) = &data_seen {
+            assert!(&data == seen, "start {start} changed data");
+        }
+        data_seen = Some(data);
+        assert_eq!(layout(&dir.data()), before, "start {start}");
+    }
+}
+
+#[test]
+fn a_second_server_on_a_directory_in_use_is_refused() {
+    let dir = TempDir::new("two-servers");
+    let first = Running::start(58, &dir.data(), &dir.log(1));
+    let output = refused_start(59, &dir.data(), &dir.log(2));
+    assert!(output.contains("in use by another process"), "{output}");
+    first.interrupt();
+    let again = Running::start(58, &dir.data(), &dir.log(3));
+    again.interrupt();
 }

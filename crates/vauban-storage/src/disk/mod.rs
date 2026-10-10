@@ -113,6 +113,10 @@ pub(crate) const DATA_FILE_NAME: &str = "data";
 /// Name of the journal file inside the directory of an instance.
 pub(crate) const WAL_FILE_NAME: &str = "wal";
 
+/// Name of the file whose lock keeps the directory of an instance to one process
+/// ([`InstanceGuard`]). It holds no byte; the lock is what counts.
+pub(crate) const LOCK_FILE_NAME: &str = "vauban.lock";
+
 /// Options of an on-disk instance, passed to [`DiskStorage::open`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiskOptions {
@@ -214,10 +218,12 @@ impl DiskStorage {
     /// `tls/` directory the server writes does not make it look like an instance.
     ///
     /// `data` and `wal` are created first, then `vauban.ctl` is written and `sync_all`ed. A
-    /// crash between the two steps therefore leaves `data` or `wal` without a `vauban.ctl`,
-    /// which the next `open` reports as corruption rather than creating an instance over the
-    /// files already there; a crash before them leaves a directory this `open` treats as the
-    /// empty one it is.
+    /// crash between the two steps leaves `data` or `wal` without a `vauban.ctl`. When both
+    /// are empty or absent, the creation had written nothing yet: the next `open` removes
+    /// them and creates the instance again (test
+    /// `open_completes_a_creation_stopped_before_its_control_file`). When one of them holds
+    /// bytes, the next `open` reports corruption rather than creating an instance over them;
+    /// a crash before them leaves a directory this `open` treats as the empty one it is.
     ///
     /// # Reopening
     ///
@@ -227,8 +233,9 @@ impl DiskStorage {
     /// [`InternalError::Corruption`], and this build does not migrate it. `data` and `wal`
     /// are then opened as they stand; either of the two missing is
     /// [`InternalError::Corruption`] naming the file, and so is a `data` whose size is not a
-    /// whole number of pages. A directory that holds `data` or `wal` without a `vauban.ctl`
-    /// is corruption too: it holds part of an instance, and this build does not complete it.
+    /// whole number of pages. A directory that holds a non-empty `data` or `wal` without a
+    /// `vauban.ctl` is corruption too: it holds part of an instance, and this build does not
+    /// complete it.
     ///
     /// The journal is opened by [`wal::Wal::open`], which scans its records and truncates a
     /// tail an unfinished append left behind.
@@ -270,11 +277,20 @@ impl DiskStorage {
         let mut storage = if control_path.exists() {
             Self::reopen(dir, opts, instance, &control_path, &data_path, &wal_path)?
         } else if data_path.exists() || wal_path.exists() {
-            return Err(InternalError::Corruption(format!(
-                "directory {} holds {DATA_FILE_NAME} or {WAL_FILE_NAME} but no \
-                 {CONTROL_FILE_NAME}",
-                dir.display()
-            )));
+            if !(empty_or_absent(&data_path)? && empty_or_absent(&wal_path)?) {
+                return Err(InternalError::Corruption(format!(
+                    "directory {} holds {DATA_FILE_NAME} or {WAL_FILE_NAME} but no \
+                     {CONTROL_FILE_NAME}",
+                    dir.display()
+                )));
+            }
+            // A creation stopped before its control file: nothing was written yet.
+            for path in [&data_path, &wal_path] {
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+            }
+            Self::create(dir, opts, instance, &control_path, &data_path, &wal_path)?
         } else {
             Self::create(dir, opts, instance, &control_path, &data_path, &wal_path)?
         };
@@ -515,8 +531,9 @@ impl DiskStorage {
     /// each and overwrite what the other wrote: the second `checkpoint` of such a pair would
     /// leave a journal of one record and a `vauban.ctl` naming it. The register of directories
     /// of the process refuses the second [`DiskStorage::open`] of one directory
-    /// (`tests::a_second_open_of_the_same_directory_is_refused`). Two processes are not
-    /// covered by that register.
+    /// (`tests::a_second_open_of_the_same_directory_is_refused`), and the lock of
+    /// [`LOCK_FILE_NAME`] refuses it from another process
+    /// (`tests::a_directory_locked_by_another_handle_is_refused`).
     ///
     /// # Errors
     ///
@@ -1577,17 +1594,21 @@ fn same_key(
 ///
 /// # What this guard covers
 ///
-/// The set is a `static` of this process: what is refused is a second `open` **in the process
-/// that holds the first**, which is the shape a test can observe. Two processes are not
-/// caught — that would be a lock held by the operating system, and `flock` needs a dependency
-/// this workspace does not carry. A process that dies takes its entries with it, which a
-/// marker written in `vauban.ctl` or a lock file would not: after a `kill -9` the directory
-/// opens again.
+/// Two levels. A `static` set of this process refuses a second `open` **in the process that
+/// holds the first**, with [`InternalError::Bug`]. Across processes, the guard holds an
+/// exclusive lock of the operating system ([`fs::File::try_lock`], `flock` on Unix) on
+/// [`LOCK_FILE_NAME`] in the directory, for as long as it lives: a second process that opens
+/// the directory meanwhile is refused with [`InternalError::Corruption`] naming the directory,
+/// before it reads or writes a file of the instance
+/// (`a_directory_locked_by_another_handle_is_refused`). The operating system releases the lock
+/// of a process that dies, so after a `kill -9` the directory opens again.
 #[derive(Debug)]
 struct InstanceGuard {
     /// The directory, as [`fs::canonicalize`] answers it, so that two spellings of one
     /// directory are one entry.
     key: PathBuf,
+    /// [`LOCK_FILE_NAME`], opened and locked; closing it releases the lock.
+    _lock: fs::File,
 }
 
 /// The directories this process holds an instance on.
@@ -1608,14 +1629,50 @@ impl InstanceGuard {
         let mut open = OPEN_INSTANCES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !open.insert(key.clone()) {
+        if open.contains(&key) {
             return Err(InternalError::Bug(format!(
                 "directory {} is already open in this process; one instance holds it until it \
                  is dropped",
                 key.display()
             )));
         }
-        Ok(Self { key })
+        let lock = lock_directory(&key)?;
+        open.insert(key.clone());
+        Ok(Self { key, _lock: lock })
+    }
+}
+
+/// Opens [`LOCK_FILE_NAME`] in `dir`, creating it, and takes its exclusive lock without
+/// waiting.
+///
+/// # Errors
+///
+/// [`InternalError::Corruption`] naming the directory when another holder has the lock;
+/// [`InternalError::Io`] when the file cannot be opened or the lock cannot be asked for.
+fn lock_directory(dir: &Path) -> Result<fs::File, InternalError> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(LOCK_FILE_NAME))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(InternalError::Corruption(format!(
+            "directory {} is in use by another process (lock on {LOCK_FILE_NAME}); one \
+             server opens a data directory at a time",
+            dir.display()
+        ))),
+        Err(fs::TryLockError::Error(err)) => Err(err.into()),
+    }
+}
+
+/// Whether the file at `path` is absent or holds no byte.
+fn empty_or_absent(path: &Path) -> Result<bool, InternalError> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_file() && meta.len() == 0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err.into()),
     }
 }
 
