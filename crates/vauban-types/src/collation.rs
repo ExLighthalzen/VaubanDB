@@ -432,7 +432,7 @@ impl Collation {
     }
 
     /// The family of rules this collation compares with.
-    fn rules(&self) -> Rules {
+    pub(crate) fn rules(&self) -> Rules {
         if self.flags & FLAG_BINARY2 != 0 {
             Rules::Binary2
         } else if self.flags & FLAG_BINARY != 0 {
@@ -447,7 +447,7 @@ impl Collation {
     }
 
     /// The levels a table comparison goes through for this collation, in order.
-    fn levels(&self, table: &Table) -> ([Level; 5], usize) {
+    pub(crate) fn levels(&self, table: &Table) -> ([Level; 5], usize) {
         let mut levels = [Level::Primary; 5];
         let mut count = 1;
         let mut push = |level| {
@@ -559,24 +559,7 @@ impl Collation {
             let ordering = if level == Level::Last {
                 compare_sequences(ascii_last(rows, a), ascii_last(rows, b), None)
             } else {
-                let weight = move |r: AsciiRow| -> u64 {
-                    let w = &r.weights;
-                    match level {
-                        Level::Primary | Level::Own => u64::from(w.primary),
-                        Level::Accent => u64::from(w.accent),
-                        Level::Tertiary => {
-                            let case = if flags & FLAG_IGNORE_CASE != 0 {
-                                0
-                            } else if flags & FLAG_IGNORE_ACCENT != 0 {
-                                w.case_only
-                            } else {
-                                w.case_accent
-                            };
-                            u64::from(case) << 2
-                        }
-                        Level::Last => 0,
-                    }
-                };
+                let weight = move |r: AsciiRow| ascii_weight(r, level, flags);
                 let plain = |r: &AsciiRow| r.class == AsciiClass::Plain;
                 compare_sequences(
                     a.iter().map(row).filter(plain).map(weight),
@@ -592,7 +575,7 @@ impl Collation {
     }
 
     /// The weights of `s` at one level, in order.
-    fn level_weights<'a>(
+    pub(crate) fn level_weights<'a>(
         &self,
         table: &'a Table,
         s: &'a str,
@@ -631,7 +614,7 @@ impl Collation {
 
 /// The four families of comparison rules ([`Collation::compare`]).
 #[derive(Clone, Copy)]
-enum Rules {
+pub(crate) enum Rules {
     /// `_BIN`: first code unit, then little-endian bytes.
     Binary,
     /// `_BIN2`: UTF-16 code units.
@@ -642,7 +625,7 @@ enum Rules {
 
 /// One level of a table comparison ([`Collation::compare`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Level {
+pub(crate) enum Level {
     /// The letter.
     Primary,
     /// The accent, compared under `_AS`.
@@ -681,7 +664,7 @@ const fn w(primary: u16, accent: u16, case_accent: u16, case_only: u16) -> Weigh
 }
 
 /// A weight table and the rules that go with it.
-struct Table {
+pub(crate) struct Table {
     /// The weights, indexed by code page 1252 byte.
     weights: &'static [Weights; 256],
     /// The letters that expand to two, with their expansion.
@@ -697,14 +680,14 @@ struct Table {
     /// The table compares a `Last` level.
     has_last_level: bool,
     /// The 128 ASCII characters, read without lookup ([`ascii_rows`]).
-    ascii: [AsciiRow; 128],
+    pub(crate) ascii: [AsciiRow; 128],
     /// [`Table::unit`] of U+0000 to U+00FF, computed on first use.
     latin1: OnceLock<[Unit; 256]>,
 }
 
 /// How an ASCII character takes part in a table comparison.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AsciiClass {
+pub(crate) enum AsciiClass {
     /// Weighed at the levels before the last.
     Plain,
     /// Weighed at the last level.
@@ -715,16 +698,19 @@ enum AsciiClass {
 
 /// The weights and the class of one ASCII character under a table.
 #[derive(Clone, Copy)]
-struct AsciiRow {
+pub(crate) struct AsciiRow {
     /// The class.
-    class: AsciiClass,
+    pub(crate) class: AsciiClass,
     /// The weights, from the table row of the same byte.
     weights: Weights,
 }
 
 /// The last-level weights of an ASCII string: position among the characters that are not
 /// skipped, then weight, as [`Collation::level_weights`] computes them.
-fn ascii_last<'a>(rows: &'a [AsciiRow; 128], text: &'a [u8]) -> impl Iterator<Item = u64> + 'a {
+pub(crate) fn ascii_last<'a>(
+    rows: &'a [AsciiRow; 128],
+    text: &'a [u8],
+) -> impl Iterator<Item = u64> + 'a {
     text.iter()
         .map(move |byte| rows[usize::from(*byte & 0x7F)])
         .filter(|row| row.class != AsciiClass::Ignored)
@@ -733,6 +719,27 @@ fn ascii_last<'a>(rows: &'a [AsciiRow; 128], text: &'a [u8]) -> impl Iterator<It
         .map(|(position, row)| {
             ((position as u64) << 32) | (u64::from(row.weights.case_accent) << 1)
         })
+}
+
+/// The weight of a plain ASCII row at a level before the last, as [`Element::weight`]
+/// computes it for the same character under a collation with `flags`.
+pub(crate) fn ascii_weight(row: AsciiRow, level: Level, flags: u8) -> u64 {
+    let w = &row.weights;
+    match level {
+        Level::Primary | Level::Own => u64::from(w.primary),
+        Level::Accent => u64::from(w.accent),
+        Level::Tertiary => {
+            let case = if flags & FLAG_IGNORE_CASE != 0 {
+                0
+            } else if flags & FLAG_IGNORE_ACCENT != 0 {
+                w.case_only
+            } else {
+                w.case_accent
+            };
+            u64::from(case) << 2
+        }
+        Level::Last => 0,
+    }
 }
 
 /// The ASCII rows of a table, from its weights and its `last` and `ignored` lists.
@@ -955,7 +962,7 @@ fn compare_binary(a: &str, b: &str) -> Ordering {
 }
 
 /// The space as a UTF-16 code unit, the padding of `_BIN2`.
-const SPACE_UNIT: u16 = 0x20;
+pub(crate) const SPACE_UNIT: u16 = 0x20;
 /// Version byte of the `Latin1_General_100_*` collations.
 const WINDOWS_100_VERSION: u8 = 2;
 /// First full-width form of an ASCII character (`！`, U+FF01).
