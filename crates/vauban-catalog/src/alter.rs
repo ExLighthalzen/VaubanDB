@@ -77,6 +77,7 @@ pub(crate) fn alter_table(
     if uses_constraint_session(catalog, txn, table, change)? {
         return alter_table_constraint(catalog, txn, table, change);
     }
+    lock_current_storage(catalog, txn, table)?;
     let (old, plan, old_storage) = {
         let mut store = table::store(catalog);
         table::refresh(catalog, &mut store)?;
@@ -95,6 +96,8 @@ pub(crate) fn alter_table(
         (old, plan, old_storage)
     };
     let (meta, index_defs) = copy_table(catalog, txn, &old, &plan)?;
+    // Granted at once: no other transaction knows the new storage table yet.
+    catalog.txn.schema_modify_lock(txn, meta.storage_id)?;
     catalog
         .txn
         .register_on_commit(txn, CommitAction::DropTable(old_storage))?;
@@ -102,7 +105,7 @@ pub(crate) fn alter_table(
         let mut store = table::store(catalog);
         remove_storage_indexes(&mut store, old.id, old_storage);
         if let Some(entry) = store.entries.get_mut(&table) {
-            entry.previous_meta = Some(old.clone());
+            entry.previous_metas.push(old.clone());
             entry.meta = meta.clone();
             entry.dropped_by = None;
             entry.column_id_watermark = plan.column_id_watermark;
@@ -117,6 +120,35 @@ pub(crate) fn alter_table(
         .get(table)
         .cloned()
         .expect("alter_table stored the table"))
+}
+
+/// Takes the `Sch-M` of the storage table `table` stands on, the store let go during the
+/// wait, until the storage table read after the wait is one already locked: an `ALTER TABLE`
+/// of another transaction may have switched it meanwhile.
+///
+/// A transaction that reads the table, or that has altered or dropped it without committing,
+/// makes this call wait for its end (`table.rs`, module documentation). An identifier the
+/// store does not hold returns at once; the caller answers it.
+///
+/// # Errors
+///
+/// The error of the `storage` calls of the refresh, and the error of the lock manager.
+fn lock_current_storage(catalog: &Catalog, txn: &TxnHandle, table: ObjectId) -> SqlResult<()> {
+    let mut locked = BTreeSet::new();
+    loop {
+        let storage = {
+            let mut store = table::store(catalog);
+            table::refresh(catalog, &mut store)?;
+            match store.entries.get(&table) {
+                Some(entry) => entry.meta.storage_id,
+                None => return Ok(()),
+            }
+        };
+        if !locked.insert(storage) {
+            return Ok(());
+        }
+        catalog.txn.schema_modify_lock(txn, storage)?;
+    }
 }
 
 /// Whether `change` is handled without recopying the table.

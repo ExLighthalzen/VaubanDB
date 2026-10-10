@@ -200,7 +200,7 @@ use vauban_executor::{
 use vauban_parser::{SetOptionStatement, Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
-use vauban_txn::IsolationLevel;
+use vauban_txn::{IsolationLevel, TxnHandle};
 use vauban_types::{TypeInfo, Value};
 
 /// Default schema of a login, `dbo` until `catalog` knows better.
@@ -579,6 +579,15 @@ impl Session {
         Ok(end)
     }
 
+    /// The catalogue a batch is bound against: the one the open transaction of the session
+    /// sees when there is one, so that a table that transaction has created, altered or
+    /// dropped is bound as it left it (`tests/ddl_visibility.rs`,
+    /// `an_alter_in_an_open_transaction_is_bound_by_the_next_statements`); the one `binding`
+    /// sees otherwise.
+    fn binding_snapshot(&self, binding: &TxnHandle) -> CatalogSnapshot {
+        binding_snapshot(&self.engine, &self.state, binding)
+    }
+
     /// Parses, binds and compile-checks every statement without changing live session state.
     /// `params` are declared before the first statement is bound.
     fn prepare_batch(
@@ -590,7 +599,7 @@ impl Session {
         let mut state = self.state.clone();
         let mut batch_variables = declared_parameters(params)?;
         let binding = self.engine.txn.begin(IsolationLevel::ReadCommitted);
-        let snapshot = self.engine.catalog.snapshot(&binding);
+        let snapshot = self.binding_snapshot(&binding);
         let prepared = self.bind_batch(
             text,
             statements,
@@ -618,7 +627,7 @@ impl Session {
         batch_variables: &mut BatchVariables,
     ) -> SqlResult<Vec<PreparedStatement>> {
         let binding = self.engine.txn.begin(IsolationLevel::ReadCommitted);
-        let snapshot = self.engine.catalog.snapshot(&binding);
+        let snapshot = self.binding_snapshot(&binding);
         let prepared = self.bind_batch(
             text,
             statements,
@@ -1846,6 +1855,19 @@ pub(crate) fn batch_has_alter_table(statements: &[Statement]) -> bool {
 /// the tail is prepared one statement at a time when the batch holds an `ALTER TABLE`.
 pub(crate) fn bind_limit_for(statements: &[Statement]) -> Option<usize> {
     batch_has_alter_table(statements).then_some(1)
+}
+
+/// The catalogue a statement is bound against, for a session in `state`: what the open
+/// transaction of the session sees when there is one, what `binding` sees otherwise.
+pub(crate) fn binding_snapshot(
+    engine: &Engine,
+    state: &SessionState,
+    binding: &TxnHandle,
+) -> CatalogSnapshot {
+    match &state.txn {
+        Some(session_txn) => engine.catalog.snapshot(&session_txn.handle),
+        None => engine.catalog.snapshot(binding),
+    }
 }
 
 #[cfg(test)]

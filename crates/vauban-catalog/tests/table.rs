@@ -488,15 +488,11 @@ fn a_create_that_cannot_be_compensated_leaves_nothing() {
     assert_eq!(table_ids(&storage, db), before);
 }
 
-/// `SAVE TRANSACTION s; DROP TABLE t; ROLLBACK TRANSACTION s;` — the state this version
-/// leaves, frozen so that the change which lifts it sees this test change.
-///
-/// `rollback_to` forgets the deferred drop, so the table lives on in `storage` and survives
-/// the `COMMIT`; the catalogue keeps its mark, so it answers 3701 on a table that is still
-/// there. Lifting the mark asks `vauban_txn` for something its public API does not give:
-/// whether an action registered earlier is still in the log (rustdoc of `drop_table`).
+/// `SAVE TRANSACTION s; DROP TABLE t; ROLLBACK TRANSACTION s;`: the rows the `DROP` deleted
+/// come back with the savepoint, so the transaction sees the table again, can drop it again,
+/// and the `COMMIT` leaves it in place once that second `DROP` is undone as well.
 #[test]
-fn a_savepoint_rollback_leaves_the_drop_mark_in_place() {
+fn a_savepoint_rollback_brings_the_dropped_table_back() {
     let (catalog, storage, txn) = instance();
     let db = master(&storage);
     let handle = begin(&txn);
@@ -508,17 +504,103 @@ fn a_savepoint_rollback_leaves_the_drop_mark_in_place() {
     let dropper = begin(&txn);
     let mark = txn.savepoint(&dropper).expect("savepoint");
     catalog.drop_table(&dropper, meta.id).expect("drop_table");
+    assert!(
+        catalog.snapshot(&dropper).table(meta.id).is_none(),
+        "dropped in its own transaction"
+    );
     txn.rollback_to(&dropper, mark)
         .expect("rollback to the savepoint");
-    let err = catalog
+    assert_eq!(
+        catalog
+            .snapshot(&dropper)
+            .resolve_object("master", None, "t", "dbo")
+            .map(|object| object.id),
+        Some(meta.id),
+        "the savepoint brings the table back"
+    );
+    catalog
         .drop_table(&dropper, meta.id)
-        .expect_err("the mark is still there: current state, not the aim");
-    assert_eq!(err.number, 3701);
+        .expect("a second drop is accepted");
+    txn.rollback_to(&dropper, mark)
+        .expect("rollback to the savepoint again");
     txn.commit(dropper).expect("commit");
     assert!(
         table_ids(&storage, db).contains(&meta.storage_id),
-        "the deferred drop was forgotten by rollback_to: the table is still in storage"
+        "the deferred drops were forgotten by rollback_to: the table is still in storage"
     );
+    let reader = begin(&txn);
+    assert_eq!(
+        catalog
+            .snapshot(&reader)
+            .table(meta.id)
+            .map(|t| t.storage_id),
+        Some(meta.storage_id)
+    );
+}
+
+/// Runs `create_table` of `def` in `handle` on another thread, and says whether it is still
+/// waiting after a while.
+fn create_on_a_thread(
+    catalog: &Arc<Catalog>,
+    handle: &TxnHandle,
+    def: TableDef,
+) -> (
+    std::thread::JoinHandle<Result<vauban_catalog::TableMeta, SqlError>>,
+    bool,
+) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let catalog = Arc::clone(catalog);
+    let handle = handle.clone();
+    let thread = std::thread::spawn(move || {
+        let answer = catalog.create_table(&handle, &def);
+        let _ = sender.send(());
+        answer
+    });
+    let waiting = receiver
+        .recv_timeout(std::time::Duration::from_millis(300))
+        .is_err();
+    (thread, waiting)
+}
+
+/// A `CREATE TABLE` of a name another open transaction has created waits for that
+/// transaction, then decides: a new table once the other `CREATE` is rolled back, 2714 once it
+/// is committed.
+#[test]
+fn a_create_of_a_name_another_transaction_holds_waits_for_it() {
+    let (catalog, _storage, txn) = instance();
+    let catalog = Arc::new(catalog);
+
+    let first = begin(&txn);
+    catalog
+        .create_table(&first, &two_columns("t"))
+        .expect("create_table");
+    let second = begin(&txn);
+    let (thread, waiting) = create_on_a_thread(&catalog, &second, two_columns("t"));
+    assert!(waiting, "the second CREATE waits for the first transaction");
+    txn.rollback(first).expect("rollback of the first CREATE");
+    let created = thread
+        .join()
+        .expect("thread")
+        .expect("the name is free once the first CREATE is rolled back");
+    txn.commit(second).expect("commit of the second CREATE");
+
+    let third = begin(&txn);
+    catalog
+        .drop_table(&third, created.id)
+        .expect("drop of the second table");
+    let fourth = begin(&txn);
+    let (thread, waiting) = create_on_a_thread(&catalog, &fourth, two_columns("t"));
+    assert!(
+        waiting,
+        "a CREATE waits for an uncommitted DROP of the name"
+    );
+    txn.rollback(third).expect("rollback of the DROP");
+    let err = thread
+        .join()
+        .expect("thread")
+        .expect_err("the table is still there");
+    assert_eq!(err.number, 2714);
+    txn.rollback(fourth).expect("rollback");
 }
 
 /// The other half of the savepoint case: a `CREATE` undone by `rollback_to` is compensated by

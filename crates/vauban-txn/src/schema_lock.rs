@@ -76,13 +76,13 @@
 //!
 //! # What the schema lock does not settle
 //!
-//! A table created by a transaction that has not committed is visible to the snapshots of
-//! the other transactions (`crates/vauban-catalog/tests/snapshot.rs`,
-//! `the_table_half_does_not_follow_the_transaction_yet`). A `Sch-M` held by the creator does
-//! not answer that: it makes a reader that **asks** for a `Sch-S` on that table wait, and a
-//! reader that resolves a name in the catalogue asks for nothing. What the catalogue needs
-//! is the `created_by: TxnId` its own test names, in `crates/vauban-catalog/src/table.rs`;
-//! this file does not turn that around.
+//! Which tables a transaction sees is not decided here: the catalogue reads it from its
+//! versioned rows, so a table whose `CREATE` is not committed is out of the snapshots of the
+//! other transactions (`crates/vauban-catalog/tests/snapshot.rs`,
+//! `an_uncommitted_create_is_seen_by_its_transaction_alone`). The catalogue takes the `Sch-M`
+//! of the storage table a `CREATE`, `DROP` or `ALTER TABLE` works on; a reader that resolves a
+//! name in the catalogue asks for no `Sch-S`, so it meets that `Sch-M` only when it locks a
+//! row of the table.
 
 use vauban_errors::SqlResult;
 use vauban_storage::TableId;

@@ -349,7 +349,7 @@ fn validate_prepared_text(
         batch_variables.declare(&decl.name, ty.clone())?;
     }
     let binding = session.engine().txn.begin(IsolationLevel::ReadCommitted);
-    let snapshot = session.engine().catalog.snapshot(&binding);
+    let snapshot = crate::batch::binding_snapshot(session.engine(), state, &binding);
     let result = bind_prepared_statements(
         session,
         text,
@@ -459,7 +459,7 @@ pub(crate) fn describe_batch(
     }
     let mut batch_variables = BatchVariables::new();
     let binding = session.engine().txn.begin(IsolationLevel::ReadCommitted);
-    let snapshot = session.engine().catalog.snapshot(&binding);
+    let snapshot = crate::batch::binding_snapshot(session.engine(), &state, &binding);
     let described = bind_prepared_statements(
         session,
         text,

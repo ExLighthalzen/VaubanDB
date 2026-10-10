@@ -356,9 +356,7 @@ fn uncommitted_table_is_visible_in_own_snapshot() {
 }
 
 #[test]
-fn the_table_half_does_not_follow_the_transaction_yet() {
-    // The bound of `src/snapshot.rs`: the metadata of a table is a map in memory, so the
-    // two shapes below answer as this build does and not as SQL Server answers them.
+fn an_uncommitted_create_is_seen_by_its_transaction_alone() {
     let (catalog, manager) = instance();
     database(&catalog, &manager, "d");
 
@@ -367,29 +365,83 @@ fn the_table_half_does_not_follow_the_transaction_yet() {
         .create_table(&writer, &def("d", "dbo", "t"))
         .expect("create_table");
     let reader = begin(&manager);
+    assert!(
+        catalog
+            .snapshot(&reader)
+            .resolve_object("d", None, "t", "dbo")
+            .is_none(),
+        "another transaction does not resolve a table whose create is not committed"
+    );
+    assert!(catalog.snapshot(&reader).table(meta.id).is_none());
+    assert_eq!(
+        catalog
+            .snapshot(&writer)
+            .resolve_object("d", None, "t", "dbo")
+            .map(|object| object.id),
+        Some(meta.id),
+        "the creating transaction does"
+    );
+    manager.commit(writer).expect("commit of the create");
     assert_eq!(
         catalog
             .snapshot(&reader)
             .resolve_object("d", None, "t", "dbo")
             .map(|object| object.id),
         Some(meta.id),
-        "current state: another transaction resolves a table whose create is not committed"
+        "the next statement of the reader sees the committed table"
     );
-    manager.commit(writer).expect("commit of the create");
+    manager.commit(reader).expect("commit of the reader");
+}
+
+#[test]
+fn an_uncommitted_drop_hides_the_table_from_its_transaction_alone() {
+    let (catalog, manager, meta) = instance_with_d_dbo_t();
+
+    let dropper = begin(&manager);
+    catalog.drop_table(&dropper, meta.id).expect("drop_table");
+    assert!(
+        catalog
+            .snapshot(&dropper)
+            .resolve_object("d", None, "t", "dbo")
+            .is_none(),
+        "the dropping transaction no longer resolves the table"
+    );
+    let reader = begin(&manager);
+    assert_eq!(
+        catalog
+            .snapshot(&reader)
+            .resolve_object("d", None, "t", "dbo")
+            .map(|object| object.id),
+        Some(meta.id),
+        "another transaction resolves the table until the drop commits"
+    );
+    assert_eq!(
+        catalog
+            .snapshot(&reader)
+            .table(meta.id)
+            .map(|t| t.storage_id),
+        Some(meta.storage_id)
+    );
+    manager.rollback(dropper).expect("rollback of the drop");
+    assert!(
+        catalog
+            .snapshot(&reader)
+            .resolve_object("d", None, "t", "dbo")
+            .is_some()
+    );
     manager.commit(reader).expect("commit of the reader");
 
     let dropper = begin(&manager);
     catalog.drop_table(&dropper, meta.id).expect("drop_table");
+    manager.commit(dropper).expect("commit of the drop");
     let reader = begin(&manager);
     assert!(
         catalog
             .snapshot(&reader)
             .resolve_object("d", None, "t", "dbo")
             .is_none(),
-        "current state: another transaction misses a table whose drop is not committed"
+        "a committed drop is seen by the next statement"
     );
-    manager.commit(reader).expect("commit of the reader");
-    manager.rollback(dropper).expect("rollback of the drop");
 }
 
 #[test]

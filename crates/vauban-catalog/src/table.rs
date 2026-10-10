@@ -22,19 +22,45 @@
 //!
 //! # Where the metadata sits
 //!
-//! In [`TableStore`], behind the `tables` field of [`Catalog`]; the internal tables of
-//! `storage` that the `sys.objects` and `sys.columns` views read are written from it
-//! (`sys_rows.rs`), and a catalogue opened over a storage that already holds tables rebuilds
-//! the store from those rows ([`reload`], unit test
-//! `a_reopened_catalogue_holds_the_tables_it_wrote`). What follows from that: the map is in
-//! memory and is not versioned, so
-//! `storage` — which is versioned — stays the reference on the question "does this table
-//! still exist" ([`refresh`]). What that costs is written where it bites: a `DROP` undone by
-//! a `ROLLBACK TRANSACTION <savepoint>` keeps its mark ([`drop_table`]), and two names that
-//! differ outside ASCII are two tables ([`TableStore::live_named`]).
+//! In [`TableStore`], behind the `tables` field of [`Catalog`]: a cache of the [`TableMeta`]
+//! of each table, built by [`create_table`] and `alter.rs`, and by [`reload`] from the rows a
+//! previous catalogue wrote (unit test `a_reopened_catalogue_holds_the_tables_it_wrote`). The
+//! internal tables of `storage` that the `sys.objects` and `sys.columns` views read are
+//! written from it in the transaction of the statement (`sys_rows.rs`).
 //!
-//! The read side is [`store`] plus [`TableStore::get`] and [`TableStore::live`], which is
-//! what `snapshot.rs` and `identity.rs` use without reopening this file.
+//! Which tables a transaction sees is not read from the cache: it is read from the versioned
+//! rows of [`reload::STORAGE_TABLE`], under the snapshot of that transaction
+//! ([`reload::visible_tables`]). A row names the table and the storage table of the version
+//! the transaction sees, and [`TableStore::visible`] hands back the cached [`TableMeta`] of
+//! that version. So a `CREATE TABLE` is seen by its own transaction and by the others once
+//! committed, a `DROP TABLE` hides the table from its own transaction alone, and a
+//! `ROLLBACK TRANSACTION <savepoint>` brings a dropped table back to the snapshot and to a
+//! second `DROP TABLE`, the rows unwinding with it (`alter.rs` still refuses that table)
+//! (`tests/snapshot.rs`, `an_uncommitted_create_is_seen_by_its_transaction_alone`,
+//! `an_uncommitted_drop_hides_the_table_from_its_transaction_alone`; `tests/table.rs`,
+//! `a_savepoint_rollback_brings_the_dropped_table_back`).
+//!
+//! The cache keeps, for a table an `ALTER TABLE` has rebuilt and not yet committed, the
+//! versions before it ([`TableEntry::previous_metas`]), so that a transaction still reading
+//! the old storage table gets the old shape (`tests/alter.rs`,
+//! `another_transaction_reads_the_old_shape_until_the_commit`). `storage` stays the reference
+//! on the question "is this storage table still there" ([`refresh`]).
+//!
+//! # Schema locks
+//!
+//! A `CREATE TABLE` takes the `Sch-M` of the storage table it creates, a `DROP TABLE` the one
+//! of the storage table it drops, an `ALTER TABLE` the ones of the old and the new storage
+//! tables, each held to the end of the transaction. A `CREATE TABLE` that meets a name
+//! another open transaction has created or dropped waits for that lock before it decides
+//! between 2714 and a new table, and a `DROP TABLE` waits for the `Sch-M` of another
+//! transaction before it decides between 3701 and the drop (`tests/table.rs`,
+//! `a_create_of_a_name_another_transaction_holds_waits_for_it`). A lock is not waited for
+//! while the store is locked.
+//!
+//! The read side is [`store`] plus [`TableStore::get`], [`TableStore::live`] and
+//! [`TableStore::visible`], which is what `snapshot.rs` and `identity.rs` use without
+//! reopening this file. Two names that differ outside ASCII are two tables
+//! ([`TableStore::named`]).
 //!
 //! # Identifiers
 //!
@@ -135,8 +161,14 @@ impl TableStore {
         Ok(ObjectId(id))
     }
 
-    /// The entry of the table called `schema.name` in database `db` that no `DROP` has
-    /// claimed, or `None`.
+    /// What a `CREATE TABLE` of `schema.name` in database `db` meets, for transaction `me`.
+    ///
+    /// Each entry of that name is looked at: one that another open transaction of `open` has
+    /// created or dropped without committing answers [`Named::Pending`] while its storage
+    /// table is not in `waited`, and [`Named::Taken`] once it is; otherwise one `visible`
+    /// names answers [`Named::Taken`]; otherwise the name is [`Named::Free`]. A table `me` has dropped is
+    /// not in `visible`, so its name is free for `me` (`tests/table.rs`,
+    /// `a_name_freed_by_a_rollback_can_be_taken_again`).
     ///
     /// Compared with `eq_ignore_ascii_case`: two names that differ on a letter outside ASCII
     /// are two tables here, where SQL Server answers 2714 state 6 (`CREATE TABLE dbo.Été`
@@ -144,12 +176,44 @@ impl TableStore {
     /// for the collation of the database, which the resolution of `snapshot.rs` carries;
     /// the state this comparison gives is frozen by `tests/table.rs`,
     /// `two_names_that_differ_outside_ascii_are_two_tables_here`.
-    fn live_named(&self, db: DbId, schema: &str, name: &str) -> Option<&TableEntry> {
-        self.entries.values().find(|entry| {
-            entry.dropped_by.is_none()
-                && entry.meta.database == db
-                && entry.meta.schema.eq_ignore_ascii_case(schema)
-                && entry.meta.name.eq_ignore_ascii_case(name)
+    fn named(&self, db: DbId, schema: &str, name: &str, sight: &Sight<'_>) -> Named {
+        let mut taken = false;
+        for (id, entry) in &self.entries {
+            if entry.meta.database != db
+                || !entry.meta.schema.eq_ignore_ascii_case(schema)
+                || !entry.meta.name.eq_ignore_ascii_case(name)
+            {
+                continue;
+            }
+            if entry.pending_for(sight.me, sight.open) {
+                if !sight.waited.contains(&entry.meta.storage_id) {
+                    return Named::Pending(entry.meta.storage_id);
+                }
+                // The wait is over and the other transaction is still open: it was chosen
+                // as a deadlock victim and lost its locks without ending, so its table keeps
+                // the name (`tests/ddl_visibility.rs`,
+                // `a_crossed_create_deadlock_leaves_one_table_per_name`).
+                taken = true;
+            }
+            taken |= sight.visible.contains_key(id);
+        }
+        if taken { Named::Taken } else { Named::Free }
+    }
+
+    /// The tables `visible` names, each in the version whose storage table its row carries,
+    /// by increasing [`ObjectId`].
+    ///
+    /// `visible` is what [`reload::visible_tables`] read for one transaction. An entry it
+    /// does not name is left out, and so is one whose current and kept versions stand on
+    /// another storage table than the one its row names: the cache no longer holds that
+    /// version.
+    pub(crate) fn visible<'a>(
+        &'a self,
+        visible: &'a BTreeMap<ObjectId, TableId>,
+    ) -> impl Iterator<Item = &'a TableMeta> {
+        self.entries.iter().filter_map(move |(id, entry)| {
+            let storage = visible.get(id)?;
+            entry.version_on(*storage)
         })
     }
 
@@ -200,10 +264,15 @@ impl TableStore {
 pub(crate) struct TableEntry {
     /// What [`create_table`] gave back to its caller.
     pub(crate) meta: TableMeta,
-    /// The shape before the current `ALTER TABLE`, kept until the statement commits so a
-    /// `ROLLBACK` can put [`TableMeta::storage_id`] back (`tests/alter.rs`,
-    /// `alter_rollback_restores_the_old_shape`).
-    pub(crate) previous_meta: Option<TableMeta>,
+    /// The shapes before the `ALTER TABLE`s not committed yet, oldest first, each kept while
+    /// its storage table is in `storage`: a `ROLLBACK` puts [`TableMeta::storage_id`] back
+    /// to the last one still there (`tests/alter.rs`,
+    /// `alter_rollback_restores_the_old_shape`), and a transaction that reads the old storage
+    /// table reads its shape ([`TableStore::visible`]).
+    pub(crate) previous_metas: Vec<TableMeta>,
+    /// The transaction whose `CREATE TABLE` made the entry, `None` once that transaction has
+    /// closed ([`refresh`]) and for an entry [`reload`] rebuilt.
+    pub(crate) created_by: Option<TxnId>,
     /// The transaction that registered the deferred [`CommitAction::DropTable`], `None` when
     /// the table carries no pending `DROP`. Cleared by [`refresh`] when that transaction
     /// closed without the drop taking effect, which is what a rolled-back `DROP TABLE` looks
@@ -214,6 +283,53 @@ pub(crate) struct TableEntry {
     /// `tests/alter.rs`, `drop_last_column_then_add_uses_high_water`). `alter.rs` owns the
     /// accesses to it; it sits here so that it dies with the table it counts for.
     pub(crate) column_id_watermark: i32,
+}
+
+impl TableEntry {
+    /// The version of the table whose storage table is `storage`: the current one or one an
+    /// uncommitted `ALTER TABLE` keeps, `None` when the entry holds neither.
+    fn version_on(&self, storage: TableId) -> Option<&TableMeta> {
+        if self.meta.storage_id == storage {
+            return Some(&self.meta);
+        }
+        self.previous_metas
+            .iter()
+            .rev()
+            .find(|meta| meta.storage_id == storage)
+    }
+
+    /// Whether a transaction of `open` other than `me` has created or dropped the table and
+    /// not committed yet.
+    fn pending_for(&self, me: TxnId, open: &BTreeSet<TxnId>) -> bool {
+        [self.created_by, self.dropped_by]
+            .into_iter()
+            .flatten()
+            .any(|txn| txn != me && open.contains(&txn))
+    }
+}
+
+/// What a transaction sees of the store, for [`TableStore::named`].
+struct Sight<'a> {
+    /// The transaction.
+    me: TxnId,
+    /// The transactions open when the store was read.
+    open: &'a BTreeSet<TxnId>,
+    /// The tables `me` sees, read by [`reload::visible_tables`].
+    visible: &'a BTreeMap<ObjectId, TableId>,
+    /// The storage tables whose schema lock `me` has already waited for.
+    waited: &'a BTreeSet<TableId>,
+}
+
+/// What [`TableStore::named`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Named {
+    /// No table of that name for the transaction.
+    Free,
+    /// A table of that name the transaction sees: 2714.
+    Taken,
+    /// A table of that name another open transaction has created or dropped: wait for the
+    /// schema lock of its storage table, then look again.
+    Pending(TableId),
 }
 
 /// Creates a table. See [`Catalog::create_table`].
@@ -280,14 +396,30 @@ pub(crate) fn create_table(
     // `constraints.rs` stores: it reads the copy of `def` that carries the keys alone.
     let keys = crate::index::table_keys(&crate::constraints::keys_only(def), &columns)?;
     let db = database_of(catalog, &def.name.database)?;
-    let mut store = store(catalog);
-    refresh(catalog, &mut store)?;
-    if store
-        .live_named(db, &def.name.schema, &def.name.name)
-        .is_some()
-    {
-        return Err(SqlError::object_already_exists(&def.name.name));
-    }
+    let mut waited = BTreeSet::new();
+    let mut store = loop {
+        let visible = reload::visible_tables(catalog, txn)?;
+        let mut store = store(catalog);
+        refresh(catalog, &mut store)?;
+        let open = open_transactions(catalog);
+        let sight = Sight {
+            me: txn.id,
+            open: &open,
+            visible: &visible,
+            waited: &waited,
+        };
+        match store.named(db, &def.name.schema, &def.name.name, &sight) {
+            Named::Free => break store,
+            Named::Taken => return Err(SqlError::object_already_exists(&def.name.name)),
+            Named::Pending(storage) => {
+                // The other transaction holds the `Sch-M` of that storage table until it
+                // ends; the store is let go before the wait (module documentation).
+                drop(store);
+                catalog.txn.schema_stability_lock(txn, storage)?;
+                waited.insert(storage);
+            }
+        }
+    };
     let shape = TableShape {
         columns: columns
             .iter()
@@ -303,6 +435,9 @@ pub(crate) fn create_table(
         catalog.storage.drop_table(storage_id)?;
         return Err(err);
     }
+    // Granted at once: no other transaction knows the storage table yet. Held to the end of
+    // `txn`, it is what a `CREATE TABLE` of the same name in another transaction waits for.
+    catalog.txn.schema_modify_lock(txn, storage_id)?;
     let id = store.take_object_id()?;
     let mut meta = TableMeta {
         id,
@@ -347,7 +482,8 @@ pub(crate) fn create_table(
                 .max()
                 .unwrap_or(0),
             meta: meta.clone(),
-            previous_meta: None,
+            previous_metas: Vec::new(),
+            created_by: Some(txn.id),
             dropped_by: None,
         },
     );
@@ -414,38 +550,53 @@ fn table_name_for_8148(def: &TableDef) -> String {
 /// and a `ROLLBACK` leaves the table where it was (`tests/table.rs`, `drop_table_deferred`,
 /// `a_rolled_back_drop_leaves_the_table_droppable`).
 ///
-/// # Bound: a `DROP` undone by `ROLLBACK TRANSACTION <savepoint>`
+/// # Schema lock
+///
+/// The `Sch-M` of the storage table is taken first, with the store let go: a `DROP` of a
+/// table another open transaction has dropped, altered or is reading waits for that
+/// transaction to end, then decides on what it left (module documentation).
+///
+/// # A `DROP` undone by `ROLLBACK TRANSACTION <savepoint>`
 ///
 /// `TransactionManager::rollback_to` forgets the [`CommitAction`] registered after the
-/// savepoint, and the mark this function left on the entry stays: the catalogue goes on
-/// believing the table is dropped while `storage` keeps it, so a second `DROP TABLE` of that
-/// table answers 3701 and the `COMMIT` leaves the table in place. The state of that
-/// sequence — `savepoint`, `drop_table`, `rollback_to`, `drop_table` — is frozen by
-/// `tests/table.rs`, `a_savepoint_rollback_leaves_the_drop_mark_in_place`. Lifting the mark
-/// asks for something the public API of `vauban_txn` does not give: whether an action
-/// registered earlier is still in the log. `refresh` reads that indirectly for a whole
-/// `ROLLBACK` (the transaction is closed) and cannot for a partial one; the fix needs
-/// either a way to read or cancel a registered action, or versioned rows, which unwind with
-/// the transaction.
+/// savepoint and `storage` puts back the rows `sys_rows.rs` deleted, so the table is visible
+/// again to its transaction, a second `DROP TABLE` of it is accepted and the `COMMIT` leaves
+/// the table in place (`tests/table.rs`, `a_savepoint_rollback_brings_the_dropped_table_back`).
 ///
 /// # Errors
 ///
-/// - 3701 when `table` names no table of this catalogue, or one a `DROP` of the same
-///   transaction has already claimed (`tests/table.rs`, `dropping_an_unknown_table_is_3701`,
-///   `dropping_the_same_table_twice_is_3701`). The catalogue holds an [`ObjectId`] and the
-///   name that goes with it; when it holds neither, the identifier is printed in place of
-///   the name, the client-facing name having been resolved before the call;
+/// - 3701 when `table` names no table of this catalogue, or one the transaction does not see:
+///   a `DROP` of the same transaction has already claimed it (`tests/table.rs`,
+///   `dropping_an_unknown_table_is_3701`, `dropping_the_same_table_twice_is_3701`). The
+///   catalogue holds an [`ObjectId`] and the name that goes with it; when it holds neither,
+///   the identifier is printed in place of the name, the client-facing name having been
+///   resolved before the call;
 /// - 3726 when a `FOREIGN KEY` of another table points at `table`, the name printed with its
 ///   schema (`crate::constraints`; `tests/constraints.rs`, `drop_table_referenced_is_3726`);
-/// - the error of `storage` or of the transaction manager otherwise.
+/// - the error of `storage`, of the lock manager or of the transaction manager otherwise.
 pub(crate) fn drop_table(catalog: &Catalog, txn: &TxnHandle, table: ObjectId) -> SqlResult<()> {
-    let mut store = store(catalog);
-    refresh(catalog, &mut store)?;
-    crate::constraints::forget_dropped(&mut store);
+    let mut waited = BTreeSet::new();
+    let (mut store, visible) = loop {
+        let visible = reload::visible_tables(catalog, txn)?;
+        let mut store = store(catalog);
+        refresh(catalog, &mut store)?;
+        crate::constraints::forget_dropped(&mut store);
+        let Some(entry) = store.entries.get(&table) else {
+            return Err(SqlError::cannot_drop("drop", "table", &table.to_string()));
+        };
+        let storage = entry.meta.storage_id;
+        if waited.contains(&storage) {
+            break (store, visible);
+        }
+        drop(store);
+        catalog.txn.schema_modify_lock(txn, storage)?;
+        waited.insert(storage);
+    };
     let Some(entry) = store.entries.get(&table) else {
         return Err(SqlError::cannot_drop("drop", "table", &table.to_string()));
     };
-    if entry.dropped_by.is_some() {
+    let open = open_transactions(catalog);
+    if !visible.contains_key(&table) || entry.pending_for(txn.id, &open) {
         return Err(SqlError::cannot_drop("drop", "table", &entry.meta.name));
     }
     let dropped = entry.meta.clone();
@@ -519,8 +670,8 @@ fn column_metas(def: &TableDef) -> SqlResult<Vec<ColumnMeta>> {
 /// catalogue sits on the execution path of a query, where a panic is forbidden.
 ///
 /// A reader outside this file — `snapshot.rs`, `identity.rs` — takes the guard here, calls
-/// [`refresh`] and reads through [`TableStore::get`] or
-/// [`TableStore::live`].
+/// [`refresh`] and reads through [`TableStore::get`], [`TableStore::live`] or
+/// [`TableStore::visible`].
 pub(crate) fn store(catalog: &Catalog) -> MutexGuard<'_, TableStore> {
     catalog
         .tables
@@ -528,24 +679,29 @@ pub(crate) fn store(catalog: &Catalog) -> MutexGuard<'_, TableStore> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Brings the store back in line with `storage`, which is the reference on existence.
+/// Brings the store back in line with `storage`, which is the reference on existence, and
+/// with the transactions still open.
 ///
-/// The map is in memory and is not versioned (module documentation), so two things it cannot
-/// see by itself are read from `storage` and from the transaction manager:
+/// The cache cannot see by itself what a `COMMIT` or a `ROLLBACK` did, so that is read from
+/// `storage` and from the transaction manager:
 ///
-/// - an entry whose table is gone from `storage` is forgotten. That covers a `CREATE` undone
-///   by a `ROLLBACK` — the compensation dropped the table — and a `DROP` carried out by a
+/// - an entry whose current storage table is gone goes back to the last version of
+///   [`TableEntry::previous_metas`] still in `storage`: an `ALTER TABLE` was rolled back, the
+///   compensation dropped the new storage table (`tests/alter.rs`,
+///   `alter_rollback_restores_the_old_shape`). A version whose storage table is gone leaves
+///   the list: the `COMMIT` of the `ALTER TABLE` dropped it;
+/// - an entry left with no storage table is forgotten. That covers a `CREATE` undone by a
+///   `ROLLBACK` — the compensation dropped the table — and a `DROP` carried out by a
 ///   `COMMIT`. This is what frees the name for a later `CREATE TABLE` (`tests/table.rs`,
 ///   `a_name_freed_by_a_rollback_can_be_taken_again`);
-/// - an entry marked dropped by a transaction that is no longer open, whose table is still
-///   in `storage`, has its mark cleared: the deferred drop did not run, the `DROP` was
-///   rolled back (`tests/table.rs`, `a_rolled_back_drop_leaves_the_table_droppable`).
+/// - the creating and dropping transactions of an entry are cleared once closed: the
+///   `CREATE` is committed, the deferred drop did not run (`tests/table.rs`,
+///   `a_rolled_back_drop_leaves_the_table_droppable`).
 ///
 /// It also moves the counter of the store past the identifiers a previous catalogue on this
 /// storage handed out ([`TableStore::raise_counter_above`]).
 ///
-/// The cost is one `databases()` and one `tables()` per database, per `create_table` or
-/// `drop_table` call.
+/// The cost is one `databases()` and one `tables()` per database, per call.
 ///
 /// # Errors
 ///
@@ -553,37 +709,42 @@ pub(crate) fn store(catalog: &Catalog) -> MutexGuard<'_, TableStore> {
 pub(crate) fn refresh(catalog: &Catalog, store: &mut TableStore) -> SqlResult<()> {
     let live = live_tables(catalog)?;
     store.raise_counter_above(&live);
-    let open: BTreeSet<TxnId> = catalog
-        .txn
-        .active_sessions()
-        .into_iter()
-        .map(|info| info.id)
-        .collect();
+    let open = open_transactions(catalog);
     for entry in store.entries.values_mut() {
         if !live.contains(&entry.meta.storage_id)
-            && let Some(previous) = entry.previous_meta.take()
-            && live.contains(&previous.storage_id)
+            && let Some(at) = entry
+                .previous_metas
+                .iter()
+                .rposition(|previous| live.contains(&previous.storage_id))
         {
-            entry.meta = previous;
+            entry.meta = entry.previous_metas.remove(at);
+            entry.previous_metas.truncate(at);
         }
-        if let Some(previous) = &entry.previous_meta
-            && live.contains(&entry.meta.storage_id)
-            && !live.contains(&previous.storage_id)
-        {
-            entry.previous_meta = None;
-        }
+        entry
+            .previous_metas
+            .retain(|previous| live.contains(&previous.storage_id));
     }
     store
         .entries
         .retain(|_, entry| live.contains(&entry.meta.storage_id));
     for entry in store.entries.values_mut() {
-        if let Some(dropper) = entry.dropped_by
-            && !open.contains(&dropper)
-        {
-            entry.dropped_by = None;
+        for mark in [&mut entry.created_by, &mut entry.dropped_by] {
+            if mark.is_some_and(|txn| !open.contains(&txn)) {
+                mark.take();
+            }
         }
     }
     Ok(())
+}
+
+/// The transactions the manager holds open.
+fn open_transactions(catalog: &Catalog) -> BTreeSet<TxnId> {
+    catalog
+        .txn
+        .active_sessions()
+        .into_iter()
+        .map(|info| info.id)
+        .collect()
 }
 
 /// The tables `storage` holds, across the databases of the instance.

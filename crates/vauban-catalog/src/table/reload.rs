@@ -268,6 +268,40 @@ pub(crate) fn stored_watermark(
         .max())
 }
 
+/// The tables `txn` sees, each with the [`TableId`] of the version it sees: the rows of
+/// [`STORAGE_TABLE`] that describe a table, read under the snapshot of the statement.
+///
+/// The rows are versioned, so a table whose `CREATE` is not committed is in the answer of
+/// its own transaction alone, one whose `DROP` is not committed is missing from that answer
+/// alone, and an uncommitted `ALTER TABLE` gives its own transaction the new storage table
+/// and the others the old one (`table.rs`, module documentation).
+///
+/// # Errors
+///
+/// The error of the scan.
+pub(crate) fn visible_tables(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+) -> SqlResult<BTreeMap<ObjectId, TableId>> {
+    let snapshot = catalog.txn.statement_snapshot(txn);
+    let mut visible = BTreeMap::new();
+    for row in scan_named(catalog, &snapshot, STORAGE_TABLE)? {
+        if !matches!(row.get(storage_columns::INDEX_NAME), Some(Value::Null)) {
+            continue;
+        }
+        let (Some(object), Some(&Value::I64(storage))) = (
+            int(&row, storage_columns::OBJECT_ID),
+            row.get(storage_columns::STORAGE_ID),
+        ) else {
+            continue;
+        };
+        if let Ok(storage) = u32::try_from(storage) {
+            visible.insert(ObjectId(object), TableId(storage));
+        }
+    }
+    Ok(visible)
+}
+
 /// Writes in `txn` a row of [`HIGH_WATER_TABLE`] when an identifier `table` carries — its
 /// own, one of its constraints — is above the largest value `txn` reads there.
 ///
@@ -396,7 +430,8 @@ pub(crate) fn reload(catalog: &Catalog) -> Result<(), InternalError> {
             rebuilt.meta.id,
             TableEntry {
                 meta: rebuilt.meta,
-                previous_meta: None,
+                previous_metas: Vec::new(),
+                created_by: None,
                 dropped_by: None,
                 column_id_watermark: rebuilt.column_id_watermark.max(watermark.unwrap_or(0)),
             },

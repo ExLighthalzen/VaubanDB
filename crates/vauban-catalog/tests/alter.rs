@@ -268,6 +268,47 @@ fn alter_rollback_restores_the_old_shape() {
     );
 }
 
+/// An `ALTER TABLE` not committed yet gives its own transaction the new shape and the other
+/// transactions the old one, on the old storage table; two `ALTER TABLE` in one transaction
+/// keep the first shape for the others. The commit hands the last shape to everyone.
+#[test]
+fn another_transaction_reads_the_old_shape_until_the_commit() {
+    let (catalog, _storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &two_int_columns("t"))
+        .expect("create_table");
+    txn.commit(handle).expect("commit create");
+
+    let alterer = begin(&txn);
+    let add = |name: &str| AlterTable::AddColumn {
+        column: Box::new(column(name, SqlType::Int, true)),
+        default_name: None,
+    };
+    catalog
+        .alter_table(&alterer, meta.id, &add("c"))
+        .expect("first alter_table");
+    let altered = catalog
+        .alter_table(&alterer, meta.id, &add("d"))
+        .expect("second alter_table");
+    let shape = |handle: &TxnHandle| {
+        let snapshot = catalog.snapshot(handle);
+        snapshot
+            .table(meta.id)
+            .map(|table| (table.storage_id, table.columns.len()))
+    };
+    let reader = begin(&txn);
+    assert_eq!(shape(&reader), Some((meta.storage_id, 2)), "the old shape");
+    assert_eq!(
+        shape(&alterer),
+        Some((altered.storage_id, 4)),
+        "the new shape for the altering transaction"
+    );
+    txn.commit(alterer).expect("commit of the alter");
+    assert_eq!(shape(&reader), Some((altered.storage_id, 4)));
+    txn.commit(reader).expect("commit of the reader");
+}
+
 #[test]
 fn add_not_null_without_default_follows_the_measure() {
     let (catalog, storage, txn) = instance();
@@ -941,6 +982,9 @@ fn drop_constraint_removes_the_object() {
         .expect("drop constraint");
     assert_eq!(dropped.storage_id, storage_id);
     assert!(dropped.constraints.is_empty());
+    // Read by another transaction once the table it sees is committed: an uncommitted
+    // `CREATE TABLE` is in the snapshot of its own transaction alone.
+    txn.commit(handle).expect("commit");
     let reader = begin(&txn);
     let snapshot = catalog.snapshot(&reader);
     let after = snapshot.table(dropped.id).expect("table");
@@ -951,7 +995,6 @@ fn drop_constraint_removes_the_object() {
             .expect("constraints_of")
             .is_empty()
     );
-    txn.commit(handle).expect("commit");
 }
 
 #[test]

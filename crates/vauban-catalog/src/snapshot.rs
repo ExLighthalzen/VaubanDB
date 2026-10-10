@@ -12,12 +12,15 @@
 //!   `CREATE DATABASE` its transaction has not committed is in the snapshot of that
 //!   transaction and not in the snapshot of another one (`tests/snapshot.rs`,
 //!   `an_uncommitted_database_is_visible_in_its_own_snapshot_only`);
-//! - the **tables** are the [`TableMeta`] of the in-memory store of `table.rs`, read through
-//!   `table::store` and `TableStore::live`, refreshed against `storage` first
-//!   (`table::refresh`). Their **indexes** come from the same store, the `IndexStore` that
+//! - the **tables** are the ones the rows of `vauban_sys_object_storage` name under the
+//!   snapshot of the transaction (`table::reload::visible_tables`), each in the version
+//!   whose storage table its row carries, the [`TableMeta`] of that version being read from
+//!   the cache of `table.rs` (`TableStore::visible`, refreshed against `storage` first by
+//!   `table::refresh`). Their **indexes** come from the same cache, the `IndexStore` that
 //!   `table.rs` holds beside the tables: read through `IndexStore::of_table` once
 //!   `index::refresh` has brought it back in line with `storage`, which is the reference on
-//!   existence (`tests/snapshot.rs`, `indexes_of_a_table_with_a_primary_key_has_its_index`);
+//!   existence, and kept to those of the storage table of the version read
+//!   (`tests/snapshot.rs`, `indexes_of_a_table_with_a_primary_key_has_its_index`);
 //! - the **internal tables of `master`** are the `InternalTableDef` the bootstrap created a
 //!   table of `storage` for, read from code ([`internal_table_objects`]) and paired with the
 //!   `TableId` the registry of `bootstrap.rs` gives for their name. They are entries of `tables` as well as of
@@ -156,30 +159,27 @@
 //!   (`tests/snapshot.rs`,
 //!   `an_internal_table_cannot_be_dropped`).
 //!
-//! # Bound: what the table half of a snapshot does not follow
+//! # What the table half of a snapshot follows
 //!
-//! The store of `table.rs` is a map in memory, not a set of versioned rows. A snapshot shows
-//! the tables of the store as they stand when it is built, whichever transaction created or
-//! dropped them, so visibility splits in two:
+//! The rows of `vauban_sys_object_storage` are versioned, so the tables of a snapshot follow
+//! the transaction that reads:
 //!
-//! - a `create_table` its transaction has not committed **is** in the snapshot of that
-//!   transaction (`tests/snapshot.rs`, `uncommitted_table_is_visible_in_own_snapshot`);
-//! - it is in the snapshot of another transaction as well, and a `drop_table` not committed
-//!   yet is missing from the snapshot of another transaction. That state is frozen by
-//!   `tests/snapshot.rs`, `the_table_half_does_not_follow_the_transaction_yet`, so that the
-//!   change which makes a DDL follow its transaction sees the test turn red when it fixes
-//!   them. Nothing readable from this file tells the two apart today: an entry of the store
-//!   carries no creating transaction, and `vauban_txn` publishes no way to read a registered
-//!   action (`table.rs`, section "Bound").
+//! - a `create_table` its transaction has not committed is in the snapshot of that
+//!   transaction (`tests/snapshot.rs`, `uncommitted_table_is_visible_in_own_snapshot`) and
+//!   not in the snapshot of another one (`tests/snapshot.rs`,
+//!   `an_uncommitted_create_is_seen_by_its_transaction_alone`);
+//! - a `drop_table` not committed yet hides the table from its own transaction and from no
+//!   other (`tests/snapshot.rs`,
+//!   `an_uncommitted_drop_hides_the_table_from_its_transaction_alone`);
+//! - an `alter_table` not committed yet gives its own transaction the new shape and the
+//!   others the old one (`tests/alter.rs`,
+//!   `another_transaction_reads_the_old_shape_until_the_commit`).
 //!
-//! An index sits in the same store as its table, so it carries that bound too: a
-//! `create_index` its transaction has not committed is in the snapshot of another
-//! transaction (`tests/snapshot.rs`, `indexes_of_after_create_index_has_two`), and an index
-//! whose table carries a deferred `DROP TABLE` is out of the snapshot before the `COMMIT`,
-//! as its table is (`tests/snapshot.rs`, `the_indexes_of_a_dropped_table_leave_with_it`).
-//!
-//! What does follow the transaction, through the rows above: a table whose database is
-//! invisible to the snapshot is invisible too, its three-part name having no first part to
+//! What does not follow it yet: the indexes and the `FOREIGN KEY`, `CHECK` and `DEFAULT`
+//! constraints of a table are read from the cache as they stand, so a `create_index` its
+//! transaction has not committed is in the snapshot of another transaction
+//! (`tests/snapshot.rs`, `indexes_of_after_create_index_has_two`). A table whose database
+//! is invisible to the snapshot is invisible too, its three-part name having no first part to
 //! be written with.
 //!
 //! # Comparison of names
@@ -567,7 +567,7 @@ impl CatalogSnapshot {
     ///   `a_dropped_index_leaves_the_snapshot_after_commit`,
     ///   `a_rolled_back_drop_index_is_in_the_snapshot_again`);
     /// - an index follows its table: a table out of the snapshot answers here with an empty
-    ///   slice, the indexes being read under the tables `TableStore::live` gives
+    ///   slice, the indexes being read under the tables `TableStore::visible` gives
     ///   (`tests/snapshot.rs`, `the_indexes_of_a_dropped_table_leave_with_it`).
     pub fn indexes_of(&self, table: ObjectId) -> &[IndexMeta] {
         self.indexes.get(&table).map_or(&[], Vec::as_slice)
@@ -645,10 +645,11 @@ pub(crate) fn build(catalog: &Catalog, txn: &TxnHandle) -> CatalogSnapshot {
 ///
 /// # Errors
 ///
-/// The error of the `storage` calls, of the scan of `vauban_sys_databases` as of the refresh
-/// of the table store and of the index store.
+/// The error of the `storage` calls, of the scans of `vauban_sys_databases` and of
+/// `vauban_sys_object_storage` as of the refresh of the table store and of the index store.
 fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
     let databases = databases_of(catalog, txn)?;
+    let visible = table::reload::visible_tables(catalog, txn)?;
     let (live, mut indexes, constraint_names) = {
         let mut store = table::store(catalog);
         table::refresh(catalog, &mut store)?;
@@ -658,14 +659,24 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
         // `FOREIGN KEY` or a `CHECK` this snapshot names comes from one state of the store.
         constraints::refresh_sessions(catalog, &mut store)?;
         constraints::forget_dropped(&mut store);
-        let live: Vec<TableMeta> = store.live().cloned().collect();
+        let live: Vec<TableMeta> = store.visible(&visible).cloned().collect();
         let indexes: BTreeMap<ObjectId, Vec<IndexMeta>> = live
             .iter()
             .filter_map(|meta| {
+                // The indexes of the version this transaction sees: an uncommitted
+                // `ALTER TABLE` of another transaction has put those of its new storage
+                // table in the store, which this version does not carry.
                 let metas: Vec<IndexMeta> = store
                     .indexes
                     .of_table(meta.id)
                     .into_iter()
+                    .filter(|index| {
+                        store
+                            .indexes
+                            .entries
+                            .get(&index.id)
+                            .is_some_and(|entry| entry.storage_table == meta.storage_id)
+                    })
                     .cloned()
                     .collect();
                 (!metas.is_empty()).then_some((meta.id, metas))
