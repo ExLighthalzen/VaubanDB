@@ -21,7 +21,7 @@
 
 use vauban_binder::TxnStatement;
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSink};
+use vauban_executor::{ExecContext, ExecOutcome, ExecSession, StatementSink};
 use vauban_planner::PhysicalStatement;
 use vauban_tds::EnvChange;
 use vauban_txn::TxnHandle;
@@ -114,7 +114,7 @@ pub(crate) fn execute_in_a_transaction(
     exec: &mut ExecSession,
     cancel: &CancelHandle,
     bound: &PhysicalStatement,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> (SqlResult<ExecOutcome>, StatementTxn) {
     if let Err(err) = guard_snapshot_table_read(state, &engine.storage, &engine.txn, bound) {
         sync_exec_session(state, exec);

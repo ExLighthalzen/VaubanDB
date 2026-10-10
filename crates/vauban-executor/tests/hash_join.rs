@@ -11,7 +11,7 @@ use vauban_binder::{
 };
 use vauban_catalog::ColumnId;
 use vauban_executor::{
-    CancelToken, CollectSink, ExecContext, ExecOutcome, RowSink, build_operator, execute,
+    CancelToken, CollectSink, ExecContext, ExecOutcome, StatementSink, build_operator, execute,
 };
 use vauban_planner::{PhysicalJoinKind, PhysicalPlan, PhysicalStatement};
 use vauban_storage::{MemoryStorage, Snapshot, Storage, TableShape};
@@ -182,7 +182,7 @@ impl DualFixture {
         }
     }
 
-    fn run(&self, plan: &PhysicalPlan, sink: &mut dyn RowSink) -> ExecOutcome {
+    fn run(&self, plan: &PhysicalPlan, sink: &mut dyn StatementSink) -> ExecOutcome {
         let eval = StaticContext::default();
         let snap = self.snapshot();
         let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_engine(
@@ -197,7 +197,7 @@ impl DualFixture {
         &self,
         plan: &PhysicalPlan,
         token: &CancelToken,
-        sink: &mut dyn RowSink,
+        sink: &mut dyn StatementSink,
     ) -> ExecOutcome {
         let eval = StaticContext::default();
         let snap = self.snapshot();

@@ -9,7 +9,9 @@ use vauban_binder::{
     BoundExpr, BoundExprKind, ColumnBinding, LockHints, OutputColumn, OutputSchema, SessionOptions,
 };
 use vauban_catalog::ColumnId;
-use vauban_executor::{CancelToken, CollectSink, ExecContext, ExecOutcome, Row, RowSink, execute};
+use vauban_executor::{
+    CancelToken, CollectSink, ExecContext, ExecOutcome, Row, StatementSink, execute,
+};
 use vauban_planner::PhysicalPlan;
 use vauban_storage::{MemoryStorage, Row as StorageRow, Storage, TableId, TableShape};
 use vauban_sysfn::{lookup, register_builtins};
@@ -117,7 +119,7 @@ impl Fixture {
         self.txn.statement_snapshot(&handle)
     }
 
-    fn run(&self, plan: &PhysicalPlan, sink: &mut dyn RowSink) -> ExecOutcome {
+    fn run(&self, plan: &PhysicalPlan, sink: &mut dyn StatementSink) -> ExecOutcome {
         let eval = vauban_sysfn::StaticContext::default();
         let snap = self.snapshot();
         let token = CancelToken::never();

@@ -1,12 +1,12 @@
 //! The shape of the executor: the names `session` compiles against.
 //!
 //! The `use` below is the contract of the module — `execute`, `execute_collect`,
-//! `eval_expr`, `ExecContext`, `ExecOutcome`, `RowSink`, `CollectSink`, `CancelToken`,
+//! `eval_expr`, `ExecContext`, `ExecOutcome`, `StatementSink`, `CollectSink`, `CancelToken`,
 //! `ExecSession`, `RowSet` and `Row` — written in the order `rustfmt` imposes.
 
 use vauban_binder::{BoundExpr, BoundExprKind, OutputColumn, OutputSchema, SessionOptions};
 use vauban_executor::{
-    CancelToken, CollectSink, ExecContext, ExecOutcome, ExecSession, Row, RowSet, RowSink,
+    CancelToken, CollectSink, ExecContext, ExecOutcome, ExecSession, Row, RowSet, StatementSink,
     eval_expr, execute, execute_collect,
 };
 use vauban_planner::{PhysicalPlan, PhysicalStatement};
@@ -42,7 +42,7 @@ fn execute_runs_the_plan() {
     match outcome {
         ExecOutcome::Rows(count) => {
             assert_eq!(count, 1);
-            let schema = sink.schema.expect("the columns were announced");
+            let schema = sink.schema().expect("the columns were announced");
             assert!(schema.columns.is_empty());
             assert_eq!(sink.rows.len(), 1);
             assert!(sink.rows[0].is_empty());
@@ -119,12 +119,15 @@ fn rowset_carries_its_schema_and_its_rows() {
     assert!(matches!(ExecOutcome::Cancelled, ExecOutcome::Cancelled));
 }
 
-/// A sink of `session`'s shape: the three methods, each answering `Ok(())`.
+/// A sink of `session`'s shape: the six methods, each answering `Ok(())`.
 #[test]
-fn row_sink_is_implementable() {
+fn statement_sink_is_implementable() {
     struct Counting(usize);
-    impl RowSink for Counting {
-        fn columns(&mut self, _schema: &OutputSchema) -> vauban_errors::SqlResult<()> {
+    impl StatementSink for Counting {
+        fn columns(
+            &mut self,
+            _columns: &[vauban_executor::ResultColumn],
+        ) -> vauban_errors::SqlResult<()> {
             Ok(())
         }
         fn row(&mut self, _row: &[Value]) -> vauban_errors::SqlResult<()> {
@@ -132,6 +135,18 @@ fn row_sink_is_implementable() {
             Ok(())
         }
         fn info(&mut self, _message: &vauban_errors::InfoMessage) -> vauban_errors::SqlResult<()> {
+            Ok(())
+        }
+        fn done(&mut self, _rowcount: Option<u64>) -> vauban_errors::SqlResult<()> {
+            Ok(())
+        }
+        fn error(&mut self, _error: &vauban_errors::SqlError) -> vauban_errors::SqlResult<()> {
+            Ok(())
+        }
+        fn env_change(
+            &mut self,
+            _change: &vauban_executor::EnvironmentChange,
+        ) -> vauban_errors::SqlResult<()> {
             Ok(())
         }
     }

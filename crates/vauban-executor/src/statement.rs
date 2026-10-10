@@ -1,5 +1,5 @@
 //! The entry point of the executor: one physical statement in, one outcome out, the rows
-//! handed to a [`RowSink`] as they are produced.
+//! handed to a [`StatementSink`] as they are produced.
 //!
 //! One statement, not a batch. `SELECT 1; SELECT 2;` is **two** statements, so two calls of
 //! [`execute`], two result sets and two `DONE` tokens. The batch itself is `parser`'s —
@@ -29,10 +29,11 @@ use vauban_errors::SqlResult;
 use vauban_planner::{PhysicalPlan, PhysicalStatement};
 
 use crate::compile::compile;
-use crate::context::{CANCEL_CHECK_ROWS, CollectSink, ExecContext, RowSink};
+use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
 use crate::ddl::execute_ddl;
 use crate::operator::build_operator;
 use crate::row::{ExecOutcome, RowSet};
+use crate::sink::{CollectSink, ResultColumn, StatementSink};
 use crate::{control, dml, txn_exec};
 
 /// Runs one physical statement against `ctx`, handing its rows to `sink`, and returns
@@ -61,7 +62,7 @@ use crate::{control, dml, txn_exec};
 pub fn execute<'a>(
     stmt: &PhysicalStatement,
     ctx: &mut ExecContext<'a>,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> SqlResult<ExecOutcome> {
     // The checks SQL Server runs while it compiles the statement come first, and a caller
     // that only knows `execute` still gets them in that order. `session` calls
@@ -89,7 +90,7 @@ pub fn execute_collect(
 ) -> SqlResult<(ExecOutcome, RowSet)> {
     let mut sink = CollectSink::new();
     let outcome = execute(stmt, ctx, &mut sink)?;
-    let schema = sink.schema.unwrap_or(vauban_binder::OutputSchema {
+    let schema = sink.schema().unwrap_or(vauban_binder::OutputSchema {
         columns: Vec::new(),
     });
     Ok((
@@ -105,7 +106,7 @@ pub fn execute_collect(
 fn dispatch<'a>(
     stmt: &PhysicalStatement,
     ctx: &mut ExecContext<'a>,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> SqlResult<ExecOutcome> {
     // No `_ =>` arm: a variant added to `PhysicalStatement` must break this file rather
     // than be silently reported as something else, exactly as `planner::plan` does.
@@ -148,13 +149,13 @@ fn dispatch<'a>(
 fn run_query<'a>(
     plan: &PhysicalPlan,
     ctx: &mut ExecContext<'a>,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> SqlResult<ExecOutcome> {
     if ctx.cancelled() {
         return Ok(ExecOutcome::Cancelled);
     }
     let mut root = build_operator(plan)?;
-    sink.columns(root.schema())?;
+    sink.columns(&ResultColumn::of_schema(root.schema()))?;
     let driven = drive(root.as_mut(), ctx, sink);
     root.close();
     let count = driven?;
@@ -173,7 +174,7 @@ fn run_query<'a>(
 fn drive<'a>(
     root: &mut (dyn crate::Operator<'a> + 'a),
     ctx: &mut ExecContext<'a>,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> SqlResult<u64> {
     root.open(ctx)?;
     let mut count = 0u64;
@@ -225,7 +226,7 @@ mod tests {
         let mut sink = CollectSink::new();
         let outcome = execute(&physical, &mut ctx, &mut sink).expect("USE runs without an engine");
         assert!(matches!(outcome, ExecOutcome::NoRows));
-        assert!(sink.schema.is_none(), "USE published no schema");
+        assert!(sink.columns.is_none(), "USE published no schema");
         assert!(sink.rows.is_empty());
     }
 }

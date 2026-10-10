@@ -121,19 +121,3 @@ fn infos_are_queued_in_order() {
     assert_eq!(ctx.take_infos(), vec![first, second]);
     assert!(ctx.take_infos().is_empty());
 }
-
-/// `CollectSink` refuses a row that comes before the columns, and keeps the rest.
-#[test]
-fn a_row_before_the_columns_is_refused() {
-    let mut sink = CollectSink::new();
-    let refused = sink.row(&[Value::I32(1)]).unwrap_err();
-    assert_eq!(refused.number, 50000);
-    assert!(sink.rows.is_empty());
-    sink.columns(&OutputSchema {
-        columns: Vec::new(),
-    })
-    .expect("the columns are taken");
-    sink.row(&[Value::I32(1)]).expect("a row after the columns");
-    assert_eq!(sink.rows, vec![vec![Value::I32(1)]]);
-    assert!(sink.schema.is_some());
-}

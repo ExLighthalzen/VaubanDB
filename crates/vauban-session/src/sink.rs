@@ -8,17 +8,19 @@
 //! up and `blocking_send` blocks the pool thread, never the async loop: that is the
 //! intended back-pressure.
 //!
-//! # The adapter between [`executor::RowSink`] and [`ResultSink`]
+//! # The adapter between [`StatementSink`] and [`ResultSink`]
 //!
-//! [`RowSinkAdapter`] implements the executor's streaming sink and writes everything it
-//! receives onto a `&mut dyn ResultSink`. It is built per statement, wraps the
-//! caller's sink, and counts the rows so that [`batch.rs`](crate::batch) can read the
-//! count for the DONE token and for `@@ROWCOUNT`.
+//! The executor hands its results to a [`StatementSink`], a trait of `vauban-executor`
+//! that knows nothing of the wire. [`StatementSinkAdapter`] implements it on top of a
+//! `&mut dyn ResultSink` and turns each call into the matching token: the neutral columns
+//! into COLMETADATA, an [`EnvironmentChange`] into an ENVCHANGE, and the end of a
+//! statement into DONE, or DONEINPROC inside a nested batch. Whether that end carries
+//! `more` depends on where the statement sits in what the client sent: the adapter holds
+//! it ([`StatementSinkAdapter::set_more`]), set by the caller that knows it.
 
 use tokio::sync::mpsc;
-use vauban_binder::OutputSchema;
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
-use vauban_executor::RowSink;
+use vauban_executor::{EnvironmentChange, ResultColumn, StatementSink};
 use vauban_tds::{ColumnFlags, ColumnMeta, DoneStatus, EnvChange, Token};
 use vauban_types::{TypeInfo, Value};
 
@@ -69,47 +71,99 @@ pub trait ResultSink {
     }
 }
 
-/// Adapts [`executor::RowSink`] to a [`ResultSink`].
+/// Adapts the executor's [`StatementSink`] to a [`ResultSink`] (module documentation).
 ///
-/// Built per statement, wraps the caller's sink and counts the rows the adapter receives
-/// so that the statement's caller can read the count for the DONE token and for
-/// `@@ROWCOUNT`.
-pub(crate) struct RowSinkAdapter<'a> {
+/// Built per statement, wraps the caller's sink and counts the rows it receives.
+pub(crate) struct StatementSinkAdapter<'a> {
     sink: &'a mut dyn ResultSink,
     row_count: u64,
+    /// The end of the statement carries `more`: another result follows in the response.
+    more: bool,
+    /// The end of the statement is a DONEINPROC: the statement runs in a nested batch.
+    in_proc: bool,
 }
 
-impl<'a> RowSinkAdapter<'a> {
-    /// Wraps `sink` and starts counting from zero.
+impl<'a> StatementSinkAdapter<'a> {
+    /// Wraps `sink` for a statement of a top-level batch: the end of the statement is a
+    /// DONE, without `more` until [`StatementSinkAdapter::set_more`] says otherwise.
     pub(crate) fn new(sink: &'a mut dyn ResultSink) -> Self {
-        Self { sink, row_count: 0 }
+        Self {
+            sink,
+            row_count: 0,
+            more: false,
+            in_proc: false,
+        }
     }
 
-    /// How many rows the sink received since [`RowSinkAdapter::new`].
+    /// Wraps `sink` for a statement of a nested batch: the end of the statement is a
+    /// DONEINPROC, with `more`, since the DONEPROC that closes the nested batch follows it.
+    pub(crate) fn in_proc(sink: &'a mut dyn ResultSink) -> Self {
+        Self {
+            more: true,
+            in_proc: true,
+            ..Self::new(sink)
+        }
+    }
+
+    /// Whether the next end of statement carries `more`.
+    pub(crate) fn set_more(&mut self, more: bool) {
+        self.more = more;
+    }
+
+    /// The wrapped sink, for the tokens that are not results of the statement (the
+    /// procedure tokens, the end of a batch).
+    pub(crate) fn tds(&mut self) -> &mut dyn ResultSink {
+        &mut *self.sink
+    }
+
+    /// How many rows the sink received since the adapter was built.
     ///
     /// Kept for assertions in tests; the batch flow reads the count from
-    /// [`ExecOutcome::Rows`](vauban_executor::ExecOutcome::Rows). The `#[allow(dead_code)]`
-    /// is required because clippy does not see the test usage when compiling the library.
-    #[expect(dead_code)]
+    /// [`ExecOutcome::Rows`](vauban_executor::ExecOutcome::Rows).
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn row_count(&self) -> u64 {
         self.row_count
     }
 }
 
-impl RowSink for RowSinkAdapter<'_> {
-    fn columns(&mut self, schema: &OutputSchema) -> SqlResult<()> {
-        let cols: Vec<ColumnMeta> = schema
-            .columns
-            .iter()
-            .map(|col| ColumnMeta {
-                name: col.name.clone(),
-                ty: col.ty.clone(),
-                flags: ColumnFlags {
-                    nullable: col.ty.nullable,
-                    ..ColumnFlags::default()
-                },
-            })
-            .collect();
+/// The ENVCHANGE that announces `change` ([MS-TDS] 2.2.7 ENVCHANGE).
+pub(crate) fn env_change_token(change: &EnvironmentChange) -> EnvChange {
+    match change {
+        EnvironmentChange::Database { old, new } => EnvChange::Database {
+            old: old.clone(),
+            new: new.clone(),
+        },
+        EnvironmentChange::Language { old, new } => EnvChange::Language {
+            old: old.clone(),
+            new: new.clone(),
+        },
+        EnvironmentChange::TransactionBegun(descriptor) => EnvChange::BeginTransaction(*descriptor),
+        EnvironmentChange::TransactionCommitted(descriptor) => {
+            EnvChange::CommitTransaction(*descriptor)
+        }
+        EnvironmentChange::TransactionRolledBack(descriptor) => {
+            EnvChange::RollbackTransaction(*descriptor)
+        }
+    }
+}
+
+/// The COLMETADATA entry of `column` ([MS-TDS] 2.2.7 COLMETADATA): `fNullable` follows
+/// the nullability of the column, the other flags are clear
+/// (`tests::the_adapter_turns_a_statement_into_batch_tokens`).
+pub(crate) fn column_meta(column: &ResultColumn) -> ColumnMeta {
+    ColumnMeta {
+        name: column.name.clone(),
+        ty: column.ty.clone(),
+        flags: ColumnFlags {
+            nullable: column.nullable,
+            ..ColumnFlags::default()
+        },
+    }
+}
+
+impl StatementSink for StatementSinkAdapter<'_> {
+    fn columns(&mut self, columns: &[ResultColumn]) -> SqlResult<()> {
+        let cols: Vec<ColumnMeta> = columns.iter().map(column_meta).collect();
         self.sink.columns(&cols)
     }
 
@@ -118,8 +172,24 @@ impl RowSink for RowSinkAdapter<'_> {
         self.sink.row(row)
     }
 
+    fn done(&mut self, rowcount: Option<u64>) -> SqlResult<()> {
+        if self.in_proc {
+            self.sink.done_in_proc(rowcount, self.more)
+        } else {
+            self.sink.done(rowcount, self.more)
+        }
+    }
+
     fn info(&mut self, message: &InfoMessage) -> SqlResult<()> {
         self.sink.info(message)
+    }
+
+    fn error(&mut self, error: &SqlError) -> SqlResult<()> {
+        self.sink.error(error)
+    }
+
+    fn env_change(&mut self, change: &EnvironmentChange) -> SqlResult<()> {
+        self.sink.env_change(&env_change_token(change))
     }
 }
 
@@ -488,5 +558,114 @@ mod tests {
         let err = sink.done(None, false).unwrap_err();
         assert_eq!(err.number, 50000);
         assert!(err.message.starts_with("Internal error: "));
+    }
+
+    /// The adapter turns the neutral calls into the tokens of a statement of a batch: the
+    /// nullability of a column into `fNullable`, the end into DONE with the `more` it was
+    /// given, and counts the rows.
+    #[test]
+    fn the_adapter_turns_a_statement_into_batch_tokens() {
+        let (mut sink, mut rx) = sink();
+        let column = ResultColumn {
+            name: "a".into(),
+            ty: TypeInfo::new(SqlType::Int, false),
+            nullable: true,
+        };
+        let mut adapter = StatementSinkAdapter::new(&mut sink);
+        adapter.columns(std::slice::from_ref(&column)).unwrap();
+        adapter.row(&[Value::I32(1)]).unwrap();
+        adapter.set_more(true);
+        adapter.done(Some(1)).unwrap();
+        assert_eq!(adapter.row_count(), 1);
+        let tokens = drain(&mut rx);
+        assert_eq!(
+            tokens[0],
+            Token::ColMetaData(vec![ColumnMeta {
+                name: "a".into(),
+                ty: TypeInfo::new(SqlType::Int, false),
+                flags: ColumnFlags {
+                    nullable: true,
+                    ..ColumnFlags::default()
+                },
+            }])
+        );
+        assert_eq!(
+            tokens[2],
+            Token::Done {
+                status: DoneStatus::MORE | DoneStatus::COUNT,
+                cur_cmd: CUR_CMD_SELECT,
+                row_count: Some(1),
+            }
+        );
+    }
+
+    /// In a nested batch the end of a statement is a DONEINPROC with `more`.
+    #[test]
+    fn the_adapter_ends_a_nested_statement_with_doneinproc() {
+        let (mut sink, mut rx) = sink();
+        let mut adapter = StatementSinkAdapter::in_proc(&mut sink);
+        adapter.done(None).unwrap();
+        assert_eq!(
+            drain(&mut rx),
+            vec![Token::DoneInProc {
+                status: DoneStatus::MORE,
+                cur_cmd: 0,
+                row_count: None,
+            }]
+        );
+    }
+
+    /// An error and an environment change go out as ERROR and ENVCHANGE, and the error
+    /// flags the DONE that follows.
+    #[test]
+    fn the_adapter_sends_errors_and_environment_changes() {
+        let (mut sink, mut rx) = sink();
+        let err = SqlError::incorrect_syntax_near("x", 1);
+        let mut adapter = StatementSinkAdapter::new(&mut sink);
+        adapter
+            .env_change(&EnvironmentChange::Database {
+                old: "master".into(),
+                new: "tempdb".into(),
+            })
+            .unwrap();
+        adapter
+            .env_change(&EnvironmentChange::TransactionBegun(3))
+            .unwrap();
+        adapter
+            .env_change(&EnvironmentChange::TransactionCommitted(3))
+            .unwrap();
+        adapter
+            .env_change(&EnvironmentChange::TransactionRolledBack(4))
+            .unwrap();
+        adapter
+            .env_change(&EnvironmentChange::Language {
+                old: String::new(),
+                new: "us_english".into(),
+            })
+            .unwrap();
+        adapter.error(&err).unwrap();
+        adapter.done(None).unwrap();
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                Token::EnvChange(EnvChange::Database {
+                    old: "master".into(),
+                    new: "tempdb".into(),
+                }),
+                Token::EnvChange(EnvChange::BeginTransaction(3)),
+                Token::EnvChange(EnvChange::CommitTransaction(3)),
+                Token::EnvChange(EnvChange::RollbackTransaction(4)),
+                Token::EnvChange(EnvChange::Language {
+                    old: String::new(),
+                    new: "us_english".into(),
+                }),
+                Token::Error(err),
+                Token::Done {
+                    status: DoneStatus::FINAL | DoneStatus::ERROR,
+                    cur_cmd: 0,
+                    row_count: None,
+                },
+            ]
+        );
     }
 }

@@ -81,11 +81,12 @@ use vauban_planner::{
 use vauban_types::{SqlType, TypeInfo, Value, convert, default_display};
 
 use crate::compile::compile;
-use crate::context::{CANCEL_CHECK_ROWS, ExecContext, RowSink};
+use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
 use crate::errors::at;
 use crate::expr::eval_expr;
 use crate::operator::{Operator, build_operator};
 use crate::row::ExecOutcome;
+use crate::sink::StatementSink;
 
 /// Runs one statement of the control of flow, the nested statements included.
 ///
@@ -97,7 +98,7 @@ use crate::row::ExecOutcome;
 pub(crate) fn execute<'a>(
     stmt: &PhysicalStatement,
     ctx: &mut ExecContext<'a>,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> SqlResult<ExecOutcome> {
     match stmt {
         PhysicalStatement::Declare(declarations) => {
@@ -234,7 +235,7 @@ pub(crate) fn execute<'a>(
 fn run_deferred<'a>(
     deferred: &DeferredStatement,
     ctx: &mut ExecContext<'a>,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> SqlResult<ExecOutcome> {
     let statement = bind_and_plan(deferred, ctx)?;
     compile(&statement, ctx)?;
@@ -303,7 +304,7 @@ impl VariableScope for DeclaredTypes {
 fn run_nested<'a>(
     stmt: &PhysicalStatement,
     ctx: &mut ExecContext<'a>,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> SqlResult<ExecOutcome> {
     match stmt {
         PhysicalStatement::Declare(_)
@@ -378,7 +379,7 @@ fn select_assign<'a>(
     input: &PhysicalPlan,
     assignments: &[(String, BoundExpr)],
     ctx: &mut ExecContext<'a>,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> SqlResult<ExecOutcome> {
     if ctx.cancelled() {
         return Ok(ExecOutcome::Cancelled);

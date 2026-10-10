@@ -22,7 +22,7 @@ use crate::row::{EvaluatedExecArg, ExecOutcome};
 
 /// Evaluates `stmt` and answers what the session runs next.
 ///
-/// Nothing is handed to a [`RowSink`]: the caller keeps the sink unchanged.
+/// Nothing is handed to a [`StatementSink`](crate::StatementSink): the caller keeps the sink unchanged.
 pub(crate) fn execute(stmt: &BoundExecute, ctx: &mut ExecContext<'_>) -> SqlResult<ExecOutcome> {
     match &stmt.target {
         BoundExecTarget::Dynamic(expr) => {

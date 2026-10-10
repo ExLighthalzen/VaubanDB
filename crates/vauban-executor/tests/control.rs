@@ -270,7 +270,7 @@ fn select_assign_keeps_the_last_row() {
     let (outcome, sink) = run(&mut session, &stmt);
 
     assert!(matches!(outcome, ExecOutcome::NoRows));
-    assert!(sink.schema.is_none(), "the assignment published no schema");
+    assert!(sink.columns.is_none(), "the assignment published no schema");
     assert!(sink.rows.is_empty());
     assert_eq!(session.variables.get("@x"), Some(&Value::I32(3)));
 }
@@ -949,7 +949,7 @@ fn a_goto_answers_the_label_it_names_and_a_label_runs_nothing() {
         },
     );
     assert!(matches!(outcome, ExecOutcome::NoRows), "{outcome:?}");
-    assert!(sink.schema.is_none(), "a label announces no column");
+    assert!(sink.columns.is_none(), "a label announces no column");
 }
 
 /// A `BEGIN … END` stops at the `GOTO` it holds and hands its label up: the statement

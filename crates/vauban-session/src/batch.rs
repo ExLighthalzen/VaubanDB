@@ -8,7 +8,7 @@
 //! `run_batch` prepares each statement through `parser::parse_batch` -> `binder::bind` ->
 //! `planner::plan` -> `executor::compile` before executing the first one, then turns
 //! execution into `ResultSink` calls: the executor collects the rows of a statement and
-//! this layer sends them, until [`ResultSink`] implements `executor::RowSink` itself. A
+//! this layer sends them through the adapter of `executor::StatementSink`. A
 //! statement the binder refuses with 208 is the exception: it is kept as text and goes
 //! through the same three steps when the batch reaches it (`PreparedStatement::Deferred`,
 //! `Session::run_deferred`).
@@ -149,7 +149,7 @@ use crate::fake_engine;
 use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
 use crate::server::Engine;
 use crate::set_options::{SetOutcome, apply_set_statement};
-use crate::sink::{ResultSink, RowSinkAdapter};
+use crate::sink::{ResultSink, StatementSinkAdapter};
 use crate::state::SessionState;
 use crate::statements::{
     INTERNAL_ERROR, INVALID_OBJECT_NAME, at_statement, batch_labels, declare_variables_of,
@@ -163,10 +163,10 @@ use vauban_binder::{
 };
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
-use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSink};
+use vauban_executor::{EnvironmentChange, ExecContext, ExecOutcome, ExecSession, StatementSink};
 use vauban_parser::{Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
-use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
+use vauban_tds::{ColumnFlags, ColumnMeta};
 use vauban_txn::IsolationLevel;
 
 /// Default schema of a login, `dbo` until `catalog` knows better.
@@ -767,7 +767,7 @@ impl Session {
         if let PreparedStatement::Execute { stmt, line } = prepared {
             self.exec.identity_updated = false;
             self.exec.rowcount = 0;
-            let mut adapter = RowSinkAdapter::new(sink);
+            let mut adapter = StatementSinkAdapter::new(sink);
             let (result, txn) = self.execute_bound_in_a_transaction(stmt, &mut adapter);
             let succeeded = result.is_ok();
             txn_session::finish_statement(
@@ -777,7 +777,7 @@ impl Session {
                 txn,
                 txn_session::TxnKind::Other,
                 succeeded,
-                sink,
+                adapter.tds(),
             )?;
             return match result {
                 Ok(ExecOutcome::CallProcedure {
@@ -795,7 +795,7 @@ impl Session {
                         return_into.as_deref(),
                         exec_line,
                         more,
-                        sink,
+                        adapter.tds(),
                     )?;
                     if !outcome.failed {
                         self.state.rowcount = outcome.rowcount;
@@ -806,8 +806,13 @@ impl Session {
                     text,
                     line: exec_line,
                 }) => {
-                    let (flow, outcome) =
-                        crate::procedures::run_batch_dynamic(self, &text, exec_line, more, sink)?;
+                    let (flow, outcome) = crate::procedures::run_batch_dynamic(
+                        self,
+                        &text,
+                        exec_line,
+                        more,
+                        adapter.tds(),
+                    )?;
                     if !outcome.failed {
                         self.state.rowcount = outcome.rowcount;
                     }
@@ -816,12 +821,13 @@ impl Session {
                 Err(err) => {
                     let err = at_statement(err, *line);
                     self.state.last_error = err.number;
-                    sink.error(&err)?;
+                    adapter.error(&err)?;
                     let continues = more
                         && !self.state.options.xact_abort
                         && err.number != 0
                         && err.batch_scope() == BatchErrorScope::Statement;
-                    sink.done(None, continues)?;
+                    adapter.set_more(continues);
+                    adapter.done(None)?;
                     self.state.rowcount = self.exec.rowcount;
                     apply_exec_session(&mut self.state, &self.exec, true, false);
                     self.exec.identity_updated = false;
@@ -836,7 +842,7 @@ impl Session {
                         "run_prepared: execute_bound answered {outcome:?}, which this layer does \
                          not handle"
                     )));
-                    self.fail(&err, sink).map(|()| Flow::Stop)
+                    self.fail(&err, adapter.tds()).map(|()| Flow::Stop)
                 }
             };
         }
@@ -862,13 +868,15 @@ impl Session {
             }
         };
 
-        // The adapter wraps the caller's sink and counts rows for the DONE. The
-        // executor calls `RowSink::columns` during execution, which the adapter
-        // converts to `ResultSink::columns` — COLMETADATA therefore goes out when
-        // the statement starts to run, not while it is prepared.
+        // The adapter wraps the caller's sink: the executor calls
+        // `StatementSink::columns` during execution, which the adapter converts to
+        // `ResultSink::columns`, so COLMETADATA goes out when the statement starts to
+        // run, not while it is prepared. The end of the statement and its error go
+        // through the adapter too, with the `more` this layer computes.
         self.exec.identity_updated = false;
         self.exec.rowcount = 0;
-        let mut adapter = RowSinkAdapter::new(sink);
+        let mut adapter = StatementSinkAdapter::new(sink);
+        adapter.set_more(more);
         let (result, txn) = self.execute_in_a_transaction(bound, &mut adapter);
         let succeeded = result.is_ok();
         // The ENVCHANGE of an opening or a closing transaction goes out before the DONE of
@@ -880,7 +888,7 @@ impl Session {
             txn,
             txn_session::kind_of(bound),
             succeeded,
-            sink,
+            adapter.tds(),
         )?;
         match result {
             Ok(ExecOutcome::Rows(count)) => {
@@ -901,7 +909,7 @@ impl Session {
                 } else {
                     Some(count)
                 };
-                sink.done(reported, more)?;
+                adapter.done(reported)?;
                 // `@@ROWCOUNT` is posted **after** the statement and read by the next one:
                 // `SELECT 1; SELECT @@ROWCOUNT` answers 1, and so it does under `NOCOUNT
                 // ON`: the option touches the DONE, not the variable.
@@ -912,15 +920,15 @@ impl Session {
             }
             // The DDL and `USE` answer `NoRows` (`executor`, `ddl.rs`); a `SELECT`
             // answers `Rows`. A `NoRows` sent no COLMETADATA (the executor does not call
-            // `RowSink::columns` for these), so the DONE closes a statement with no result
+            // `StatementSink::columns` for these), so the DONE closes a statement with no result
             // set, and it carries no row count, the shape of `CREATE TABLE`, `DROP TABLE`
             // and `USE`. `NOCOUNT` is not read here: those DONEs carry no count under `SET
             // NOCOUNT OFF` either.
             Ok(ExecOutcome::NoRows) => {
                 if let Some(database) = target {
-                    self.switch_database(database, line, sink)?;
+                    self.switch_database(database, line, &mut adapter)?;
                 }
-                sink.done(None, more)?;
+                adapter.done(None)?;
                 // A top-level `DECLARE` or `WHILE` sets `@@ROWCOUNT` by its own rule, over
                 // what nested execution left in `self.exec.rowcount` (`next_rowcount`).
                 self.state.rowcount = next_rowcount(bound, self.state.rowcount, self.exec.rowcount);
@@ -937,7 +945,8 @@ impl Session {
             // control of flow have no statement to produce them yet: each is reported as
             // an internal error rather than mapped to a DONE this layer cannot justify.
             Ok(ExecOutcome::Return(_)) => {
-                sink.done(None, false)?;
+                adapter.set_more(false);
+                adapter.done(None)?;
                 self.state.rowcount = 0;
                 Ok(Flow::Stop)
             }
@@ -959,7 +968,7 @@ impl Session {
                     return_into.as_deref(),
                     line,
                     more,
-                    sink,
+                    adapter.tds(),
                 )?;
                 if !outcome.failed {
                     self.state.rowcount = outcome.rowcount;
@@ -968,7 +977,7 @@ impl Session {
             }
             Ok(ExecOutcome::RunDynamic { text, line }) => {
                 let (flow, outcome) =
-                    crate::procedures::run_batch_dynamic(self, &text, line, more, sink)?;
+                    crate::procedures::run_batch_dynamic(self, &text, line, more, adapter.tds())?;
                 if !outcome.failed {
                     self.state.rowcount = outcome.rowcount;
                 }
@@ -980,7 +989,8 @@ impl Session {
             // the label runs after it, so this is not the last DONE of the response
             // (`tests/run_batch_pipeline.rs`, `a_goto_written_last_still_leaves_more_on_its_done`).
             Ok(ExecOutcome::Goto(label)) => {
-                sink.done(None, true)?;
+                adapter.set_more(true);
+                adapter.done(None)?;
                 self.state.rowcount = next_rowcount(bound, self.state.rowcount, self.exec.rowcount);
                 apply_exec_session(
                     &mut self.state,
@@ -996,14 +1006,15 @@ impl Session {
                     "run_prepared: the executor answered {outcome:?}, which this layer does \
                      not handle"
                 )));
-                self.fail(&err, sink).map(|()| Flow::Stop)
+                self.fail(&err, adapter.tds()).map(|()| Flow::Stop)
             }
             // A batch-scoped error: sent like a run-time error, and the batch stops.
             Ok(ExecOutcome::BatchAbort(err)) => {
                 let err = at_statement(err, line);
                 self.state.last_error = err.number;
-                sink.error(&err)?;
-                sink.done(None, false)?;
+                adapter.error(&err)?;
+                adapter.set_more(false);
+                adapter.done(None)?;
                 Ok(Flow::Stop)
             }
             // A run-time error stops its statement. Its catalogued scope and XACT_ABORT decide
@@ -1022,11 +1033,12 @@ impl Session {
                     _ => at_statement(err, line),
                 };
                 self.state.last_error = err.number;
-                sink.error(&err)?;
+                adapter.error(&err)?;
                 let continues = more
                     && !self.state.options.xact_abort
                     && err.batch_scope() == BatchErrorScope::Statement;
-                sink.done(None, continues)?;
+                adapter.set_more(continues);
+                adapter.done(None)?;
                 Ok(if continues {
                     Flow::Continue
                 } else {
@@ -1056,10 +1068,10 @@ impl Session {
         &mut self,
         database: &str,
         line: u32,
-        sink: &mut dyn ResultSink,
+        sink: &mut dyn StatementSink,
     ) -> SqlResult<()> {
         let old = std::mem::replace(&mut self.state.database, database.to_owned());
-        sink.env_change(&EnvChange::Database {
+        sink.env_change(&EnvironmentChange::Database {
             old,
             new: database.to_owned(),
         })?;
@@ -1102,7 +1114,7 @@ impl Session {
     fn execute_in_a_transaction(
         &mut self,
         bound: &PhysicalStatement,
-        sink: &mut dyn RowSink,
+        sink: &mut dyn StatementSink,
     ) -> (SqlResult<ExecOutcome>, StatementTxn) {
         txn_session::execute_in_a_transaction(
             &self.state,
@@ -1119,7 +1131,7 @@ impl Session {
     fn execute_bound_in_a_transaction(
         &mut self,
         stmt: &BoundExecute,
-        sink: &mut dyn RowSink,
+        sink: &mut dyn StatementSink,
     ) -> (SqlResult<ExecOutcome>, StatementTxn) {
         let txn = match txn_session::statement_txn(&self.state, &self.engine, &mut self.exec) {
             Ok(txn) => txn,
@@ -1194,7 +1206,7 @@ impl Session {
 /// `fCaseSen`, `fIdentity` and `fComputed` have no meaning outside one.
 ///
 /// Used by the tests and kept for its documentation; the live path goes through
-/// [`RowSinkAdapter::columns`].
+/// [`StatementSinkAdapter`].
 #[cfg_attr(not(test), allow(dead_code))]
 fn column_metadata(schema: &OutputSchema) -> Vec<ColumnMeta> {
     schema

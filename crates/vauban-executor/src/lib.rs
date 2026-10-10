@@ -5,22 +5,24 @@
 //!
 //! [`execute`] takes the [`PhysicalStatement`](vauban_planner::PhysicalStatement) the
 //! planner built, runs it against an [`ExecContext`], and hands each row of a query to a
-//! [`RowSink`] as the operator tree produces it: `columns` once, `row` per row, `info`
-//! for the messages the statement queued. The tree is made of [`Operator`]s, one per node
+//! [`StatementSink`] as the operator tree produces it: `columns` once, `row` per row,
+//! `info` for the messages the statement queued. The tree is made of [`Operator`]s, one per node
 //! of the physical plan, opened once, pulled row by row and closed once
 //! ([`build_operator`], `operator.rs`).
 //!
-//! [`RowSink`] is defined here and implemented by `session`, because `session` depends on
-//! this crate and its own sink speaks of `tds::ColumnMeta`, which the synchronous engine
-//! must not depend on. For the same reason the state of the session the executor writes,
+//! [`StatementSink`] is defined here (`sink.rs`) and speaks the engine's own types: a
+//! column is a [`ResultColumn`] (name, `TypeInfo`, nullability), a change of the session
+//! is an [`EnvironmentChange`]. `session` adapts it to the tokens of its client
+//! connection; this crate does not depend on the protocol crate. For the same reason the state of the session the executor writes,
 //! variables, `@@ROWCOUNT`, `@@TRANCOUNT`, the open transaction, is an [`ExecSession`]
 //! defined here and lent through the context, and [`ExecContext`] holds neither an
 //! `Engine` nor a `SessionState`: it carries the engine parts side by side, storage,
 //! transaction manager, catalogue and statement snapshot.
 //!
 //! [`execute_collect`] runs a statement with a [`CollectSink`] and answers the rows as a
-//! materialised [`RowSet`]: what the tests read, and what `session` streams from until
-//! its own sink implements [`RowSink`].
+//! materialised [`RowSet`]: what the tests read. [`CollectSink`] keeps the calls it
+//! receives in order, so a sequence of statements can run into it without a session
+//! (`sink::tests::a_batch_runs_into_the_collect_sink_without_a_session`).
 //!
 //! # Cancellation
 //!
@@ -52,7 +54,8 @@
 //!
 //! | File(s) | Holds |
 //! |---|---|
-//! | `context.rs`, `row.rs`, this file | the context, the token, the session state, the sinks, the result types |
+//! | `context.rs`, `row.rs`, this file | the context, the token, the session state, the result types |
+//! | `sink.rs` | the results sink, its neutral types, the in-memory sink |
 //! | `operator.rs` | the `Operator` trait, `build_operator`, the hashing helpers |
 //! | `ops/` | one file per operator (`ops/mod.rs`) |
 //! | `expr.rs` | the evaluation of a bound expression |
@@ -90,14 +93,16 @@ pub mod ops;
 mod pattern;
 mod plan;
 mod row;
+mod sink;
 mod statement;
 pub mod txn_exec;
 
 pub use compile::compile;
-pub use context::{CancelToken, CollectSink, ExecContext, ExecSession, RowSink};
+pub use context::{CancelToken, ExecContext, ExecSession};
 pub use expr::eval_expr;
 pub use operator::{Operator, bucket_hash, build_operator, keys_equal};
 pub use row::{EvaluatedExecArg, ExecOutcome, Row, RowSet};
+pub use sink::{CollectSink, EnvironmentChange, ResultColumn, SinkEvent, StatementSink};
 pub use statement::{execute, execute_collect};
 
 use vauban_binder::BoundExecute;
@@ -114,7 +119,7 @@ use vauban_errors::SqlResult;
 pub fn execute_bound(
     stmt: &BoundExecute,
     ctx: &mut ExecContext<'_>,
-    _sink: &mut dyn RowSink,
+    _sink: &mut dyn StatementSink,
 ) -> SqlResult<ExecOutcome> {
     txn_exec::begin_statement(ctx)?;
     let result = execute::execute(stmt, ctx);

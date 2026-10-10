@@ -6,7 +6,9 @@ use std::sync::Arc;
 use vauban_binder::{BatchVariables, BindContext, BoundStatement, DdlStatement};
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{BatchErrorScope, InternalError, SqlError, SqlResult};
-use vauban_executor::{EvaluatedExecArg, ExecContext, ExecOutcome, ExecSession, RowSink};
+use vauban_executor::{
+    EnvironmentChange, EvaluatedExecArg, ExecContext, ExecOutcome, ExecSession, StatementSink,
+};
 use vauban_parser::{Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
@@ -20,7 +22,7 @@ use crate::login::{DATABASE_CONTEXT_STATE_USE, changed_database_context};
 use crate::procedures::{exec_args_to_proc_args, resolve_call_database};
 use crate::rpc::{ProcAction, ProcArg, ProcParam, StaticResultColumn};
 use crate::set_options::{SetOutcome, apply_set_statement, sync_exec_session};
-use crate::sink::{ResultSink, RowSinkAdapter};
+use crate::sink::{ResultSink, StatementSinkAdapter};
 use crate::state::SessionState;
 use crate::statements::{
     INTERNAL_ERROR, at_statement, batch_labels, declare_variables_of, first_undeclared_goto,
@@ -614,7 +616,7 @@ impl Session {
 
         self.exec_mut().identity_updated = false;
         self.exec_mut().rowcount = 0;
-        let mut adapter = RowSinkAdapter::new(sink);
+        let mut adapter = StatementSinkAdapter::in_proc(sink);
         let (result, txn) = self.execute_nested_in_a_transaction(bound, nested_state, &mut adapter);
         let succeeded = result.is_ok();
         {
@@ -627,7 +629,7 @@ impl Session {
                 txn,
                 txn_session::kind_of(bound),
                 succeeded,
-                sink,
+                adapter.tds(),
             )?;
         }
         match result {
@@ -638,7 +640,7 @@ impl Session {
                 } else {
                     Some(count)
                 };
-                sink.done_in_proc(reported, true)?;
+                adapter.done(reported)?;
                 nested_state.rowcount = count as i64;
                 apply_exec_session(nested_state, self.exec(), true, true);
                 self.exec_mut().identity_updated = false;
@@ -646,9 +648,9 @@ impl Session {
             }
             Ok(ExecOutcome::NoRows) => {
                 if let Some(database) = target {
-                    self.switch_nested_database(database, line, nested_state, sink)?;
+                    self.switch_nested_database(database, line, nested_state, &mut adapter)?;
                 }
-                sink.done_in_proc(None, true)?;
+                adapter.done(None)?;
                 // Same rule as the top-level batch (`batch.rs`, `run_prepared`): `next_rowcount`
                 // decides `@@ROWCOUNT` for a `DECLARE` or a `WHILE`.
                 nested_state.rowcount =
@@ -687,17 +689,24 @@ impl Session {
                 exec_line,
                 more,
                 nested_state,
-                sink,
+                adapter.tds(),
                 outcome,
             ),
             Ok(ExecOutcome::RunDynamic {
                 text,
                 line: exec_line,
-            }) => self.run_nested_dynamic(&text, exec_line, more, nested_state, sink, outcome),
+            }) => self.run_nested_dynamic(
+                &text,
+                exec_line,
+                more,
+                nested_state,
+                adapter.tds(),
+                outcome,
+            ),
             // As in the top-level batch (`batch.rs`, `run_prepared`): the name travels
             // to the loop that holds the labels of this text.
             Ok(ExecOutcome::Goto(label)) => {
-                sink.done_in_proc(None, true)?;
+                adapter.done(None)?;
                 nested_state.rowcount =
                     next_rowcount(bound, nested_state.rowcount, self.exec().rowcount);
                 apply_exec_session(
@@ -714,13 +723,13 @@ impl Session {
                     "run_nested_prepared: the executor answered {flow:?}, which this layer does \
                      not handle"
                 )));
-                self.fail_nested_statement(&err, sink, outcome)
+                self.fail_nested_statement(&err, adapter.tds(), outcome)
                     .map(|()| Flow::Stop)
             }
             Ok(ExecOutcome::BatchAbort(err)) => {
                 let err = at_statement(err, line);
                 nested_state.last_error = err.number;
-                sink.error(&err)?;
+                adapter.error(&err)?;
                 outcome.failed = true;
                 outcome.return_status = err.number as i32;
                 nested_state.rowcount = 0;
@@ -729,7 +738,7 @@ impl Session {
             Err(err) => {
                 let err = at_statement(err, line);
                 nested_state.last_error = err.number;
-                sink.error(&err)?;
+                adapter.error(&err)?;
                 outcome.failed = true;
                 nested_state.rowcount = 0;
                 let continues = more
@@ -739,7 +748,7 @@ impl Session {
                     // The rest of the text still runs: a `RETURN` or a later error, not this
                     // one, decides the status this call leaves
                     // (`tests/nested.rs`, `return_status_is_zero_after_a_statement_scoped_error_the_text_recovers_from`).
-                    sink.done_in_proc(None, true)?;
+                    adapter.done(None)?;
                     Ok(Flow::Continue)
                 } else {
                     outcome.return_status = err.number as i32;
@@ -753,7 +762,7 @@ impl Session {
         &mut self,
         bound: &PhysicalStatement,
         nested_state: &SessionState,
-        sink: &mut dyn RowSink,
+        sink: &mut dyn StatementSink,
     ) -> (SqlResult<ExecOutcome>, StatementTxn) {
         let engine = Arc::clone(self.engine());
         let cancel = self.cancel_handle();
@@ -766,10 +775,10 @@ impl Session {
         database: &str,
         line: u32,
         nested_state: &mut SessionState,
-        sink: &mut dyn ResultSink,
+        sink: &mut dyn StatementSink,
     ) -> SqlResult<()> {
         let old = std::mem::replace(&mut nested_state.database, database.to_owned());
-        sink.env_change(&EnvChange::Database {
+        sink.env_change(&EnvironmentChange::Database {
             old,
             new: database.to_owned(),
         })?;

@@ -10,7 +10,9 @@ use vauban_binder::{
     SessionOptions, SortKey,
 };
 use vauban_catalog::ColumnId;
-use vauban_executor::{CancelToken, CollectSink, ExecContext, ExecOutcome, Row, RowSink, execute};
+use vauban_executor::{
+    CancelToken, CollectSink, ExecContext, ExecOutcome, Row, StatementSink, execute,
+};
 use vauban_planner::{PhysicalPlan, PhysicalStatement};
 use vauban_storage::{MemoryStorage, Row as StorageRow, Storage, TableId, TableShape};
 use vauban_sysfn::StaticContext;
@@ -111,7 +113,7 @@ fn sort_key(index: usize, desc: bool) -> SortKey {
 
 fn run_scalar(
     plan: &PhysicalPlan,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> Result<ExecOutcome, vauban_errors::SqlResult<ExecOutcome>> {
     let eval = StaticContext::default();
     let mut ctx = ExecContext::scalar(&eval, SessionOptions::default());

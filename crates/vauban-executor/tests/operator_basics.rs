@@ -17,8 +17,8 @@ use vauban_binder::{
 use vauban_catalog::ColumnId;
 use vauban_errors::{InfoMessage, SqlResult};
 use vauban_executor::{
-    CancelToken, CollectSink, ExecContext, ExecOutcome, Operator, Row, RowSink, build_operator,
-    execute, ops::limit::Limit,
+    CancelToken, CollectSink, ExecContext, ExecOutcome, Operator, Row, StatementSink,
+    build_operator, execute, ops::limit::Limit,
 };
 use vauban_planner::{PhysicalPlan, PhysicalStatement};
 use vauban_storage::{MemoryStorage, Row as StorageRow, Snapshot, Storage, TableId, TableShape};
@@ -78,7 +78,7 @@ impl Fixture {
         &self,
         plan: &PhysicalPlan,
         token: &CancelToken,
-        sink: &mut dyn RowSink,
+        sink: &mut dyn StatementSink,
     ) -> SqlResult<ExecOutcome> {
         let eval = StaticContext::default();
         let snap = self.snapshot();
@@ -93,7 +93,7 @@ impl Fixture {
 fn run_scalar(
     plan: &PhysicalPlan,
     token: &CancelToken,
-    sink: &mut dyn RowSink,
+    sink: &mut dyn StatementSink,
 ) -> SqlResult<ExecOutcome> {
     let eval = StaticContext::default();
     let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_cancel(token);
@@ -145,10 +145,10 @@ impl EventSink {
     }
 }
 
-impl RowSink for EventSink {
-    fn columns(&mut self, schema: &OutputSchema) -> SqlResult<()> {
+impl StatementSink for EventSink {
+    fn columns(&mut self, columns: &[vauban_executor::ResultColumn]) -> SqlResult<()> {
         self.events.push(Event::Columns(
-            schema.columns.iter().map(|c| c.name.clone()).collect(),
+            columns.iter().map(|c| c.name.clone()).collect(),
         ));
         Ok(())
     }
@@ -165,6 +165,18 @@ impl RowSink for EventSink {
 
     fn info(&mut self, message: &InfoMessage) -> SqlResult<()> {
         self.events.push(Event::Info(message.number));
+        Ok(())
+    }
+
+    fn done(&mut self, _rowcount: Option<u64>) -> SqlResult<()> {
+        Ok(())
+    }
+
+    fn error(&mut self, _error: &vauban_errors::SqlError) -> SqlResult<()> {
+        Ok(())
+    }
+
+    fn env_change(&mut self, _change: &vauban_executor::EnvironmentChange) -> SqlResult<()> {
         Ok(())
     }
 }
@@ -380,7 +392,7 @@ fn values_operator() {
         run_scalar(&values(&[7, 8]), &CancelToken::never(), &mut sink).expect("the values run");
     assert!(matches!(outcome, ExecOutcome::Rows(2)), "{outcome:?}");
     assert_eq!(sink.rows, vec![vec![Value::I32(7)], vec![Value::I32(8)]]);
-    let schema = sink.schema.expect("the columns were announced");
+    let schema = sink.schema().expect("the columns were announced");
     assert_eq!(schema.columns.len(), 1);
     assert_eq!(schema.columns[0].name, "v");
 }

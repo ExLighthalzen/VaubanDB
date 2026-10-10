@@ -1,6 +1,6 @@
 //! What the executor needs besides the statement it runs, and what it hands back while
-//! it runs: the context, the cancellation token, the session state it writes, the sink
-//! the rows go to.
+//! it runs: the context, the cancellation token, the session state it writes. The sink
+//! the results go to is `sink.rs`.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -8,8 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use vauban_binder::SubqueryId;
-use vauban_binder::{ColumnBinding, OutputSchema, SessionOptions};
+use vauban_binder::{ColumnBinding, SessionOptions, SubqueryId};
 use vauban_catalog::{Catalog, ColumnId};
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
 use vauban_planner::SubPlan;
@@ -282,80 +281,6 @@ impl Default for ExecSession {
             isolation: IsolationLevel::ReadCommitted,
             lock_timeout: LockTimeout::Infinite,
         }
-    }
-}
-
-/// Where the rows of a statement go, one call per row.
-///
-/// Defined here and implemented by `session`, which turns each call into the matching
-/// token of the wire. The executor calls [`RowSink::columns`] once before the first row of
-/// a result set, then [`RowSink::row`] per row, then [`RowSink::info`] for each message
-/// the statement queued through [`ExecContext::emit_info`] (`statement.rs`).
-pub trait RowSink {
-    /// The columns of the result set that follows, sent once before its first row.
-    ///
-    /// # Errors
-    ///
-    /// The error the sink raises when it cannot take the metadata; the statement stops
-    /// there.
-    fn columns(&mut self, schema: &OutputSchema) -> SqlResult<()>;
-
-    /// One row, of the width of the schema announced by [`RowSink::columns`].
-    ///
-    /// # Errors
-    ///
-    /// The error the sink raises when it cannot take the row; the statement stops there.
-    fn row(&mut self, row: &[Value]) -> SqlResult<()>;
-
-    /// An informational message the statement produced.
-    ///
-    /// # Errors
-    ///
-    /// The error the sink raises when it cannot take the message.
-    fn info(&mut self, message: &InfoMessage) -> SqlResult<()>;
-}
-
-/// A [`RowSink`] that keeps what it is given, for the tests and for
-/// [`execute_collect`](crate::execute_collect).
-///
-/// A row handed over before the columns is refused with the internal error 50000: the
-/// order of the calls is part of what a test reads on this sink
-/// (`context::tests::a_row_before_the_columns_is_refused`).
-#[derive(Debug, Clone, Default)]
-pub struct CollectSink {
-    /// The schema announced by [`RowSink::columns`], `None` until then.
-    pub schema: Option<OutputSchema>,
-    /// The rows, in the order they were handed over.
-    pub rows: Vec<Row>,
-    /// The messages, in the order they were handed over.
-    pub infos: Vec<InfoMessage>,
-}
-
-impl CollectSink {
-    /// An empty sink.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl RowSink for CollectSink {
-    fn columns(&mut self, schema: &OutputSchema) -> SqlResult<()> {
-        self.schema = Some(schema.clone());
-        Ok(())
-    }
-
-    fn row(&mut self, row: &[Value]) -> SqlResult<()> {
-        if self.schema.is_none() {
-            return Err(bug("CollectSink: a row was handed over before the columns"));
-        }
-        self.rows.push(row.to_vec());
-        Ok(())
-    }
-
-    fn info(&mut self, message: &InfoMessage) -> SqlResult<()> {
-        self.infos.push(message.clone());
-        Ok(())
     }
 }
 
@@ -821,8 +746,8 @@ impl<'a> ExecContext<'a> {
     /// table's own column is `ColumnId(position)` from 0
     /// (`crates/vauban-binder/src/join.rs::derived_source`), so a nested derived table
     /// whose projection has the width of the frame is read one column to the left
-    /// (`tests/subquery.rs`,
-    /// `correlated_exists_over_a_derived_table_nested_under_a_projection_of_the_same_width`).
+    /// (`tests/subquery.rs`, the correlated `EXISTS` over a nested derived table whose
+    /// projection has the width of the frame).
     pub(crate) fn read_local_column(&self, row: &Row, binding: &ColumnBinding) -> SqlResult<Value> {
         if binding.index < row.len() {
             return row.get(binding.index).cloned().ok_or_else(|| {

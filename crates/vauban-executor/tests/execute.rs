@@ -7,7 +7,7 @@ use vauban_binder::{
 };
 use vauban_errors::SqlResult;
 use vauban_executor::{
-    ExecContext, ExecOutcome, ExecSession, RowSink, eval_expr, execute, execute_bound,
+    ExecContext, ExecOutcome, ExecSession, StatementSink, eval_expr, execute, execute_bound,
 };
 use vauban_parser::{Ident, ObjectName, Span};
 use vauban_planner::PhysicalStatement;
@@ -83,8 +83,8 @@ struct CountingSink {
     infos: usize,
 }
 
-impl RowSink for CountingSink {
-    fn columns(&mut self, _schema: &vauban_binder::OutputSchema) -> SqlResult<()> {
+impl StatementSink for CountingSink {
+    fn columns(&mut self, _columns: &[vauban_executor::ResultColumn]) -> SqlResult<()> {
         self.columns += 1;
         Ok(())
     }
@@ -96,6 +96,18 @@ impl RowSink for CountingSink {
 
     fn info(&mut self, _message: &vauban_errors::InfoMessage) -> SqlResult<()> {
         self.infos += 1;
+        Ok(())
+    }
+
+    fn done(&mut self, _rowcount: Option<u64>) -> SqlResult<()> {
+        Ok(())
+    }
+
+    fn error(&mut self, _error: &vauban_errors::SqlError) -> SqlResult<()> {
+        Ok(())
+    }
+
+    fn env_change(&mut self, _change: &vauban_executor::EnvironmentChange) -> SqlResult<()> {
         Ok(())
     }
 }
