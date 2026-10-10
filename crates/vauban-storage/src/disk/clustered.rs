@@ -98,8 +98,9 @@
 //!   (`a_leaf_shared_by_two_txns_loses_its_flag_at_the_first_commit`). A `rollback` lifts the
 //!   flag the same way, leaving in `data` the entry of the transaction that goes on
 //!   (`a_rollback_lets_the_leaf_of_a_running_txn_reach_data`). A clustered table holds the
-//!   versions of its transactions in the same leaves, so this is the ordinary shape, and
-//!   answering it — undo at recovery, or a flag held per transaction — is not implemented;
+//!   versions of its transactions in the same leaves, so this is the ordinary shape. The
+//!   recovery answers it: what a transaction without a `Commit` left in the tree is taken out
+//!   before the writes of the winners are replayed ([`ClusteredTable::take_back_losers`]);
 //! - the pages of the overflow chain of a long row carry no flag: what
 //!   [`ClusteredTable::note_page`] marks is the page of the overflow heap that takes the record
 //!   of the columns, and a record past [`super::heap::MAX_INLINE_LEN`] is continued on pages
@@ -123,6 +124,8 @@
 //! the same order, so a `seek` on it could be answered from this tree rather than from a
 //! second one; this build shares nothing with [`super::index`] yet.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use vauban_errors::InternalError;
 use vauban_types::{Len, SqlType, TypeInfo, Value};
 
@@ -136,10 +139,14 @@ use super::version::{
     NO_XMAX, TableState, UndoEntry, VERSION_PREFIX_LEN, VersionHeader, VersionView,
 };
 use super::wal::WalRecordKind;
-use super::wal_payload::RowChange;
+use super::wal_payload::{Release, RowChange, SlotRelease};
 use crate::{
     Direction, KeyColumn, KeyRange, Row, RowId, Snapshot, TableId, TableShape, TxnId, TxnStatus,
 };
+
+/// The changes [`ClusteredTable::take_back_losers`] finds a record for in the journal, by
+/// `(RowId, seq, Release as u8)` of the version, with the number of that record.
+pub(crate) type TakenBack = BTreeMap<(RowId, u64, u8), Lsn>;
 
 /// Offset, in the payload of an entry, of the length of the key of the previous version.
 const OFF_PREV_LEN: usize = VERSION_PREFIX_LEN;
@@ -441,9 +448,12 @@ impl<'storage> ClusteredTable<'storage> {
     /// directory lost with the pool; the redo replays what the journal adds on top of it, and
     /// `replay_one` uses the directory to tell a version already in the tree from one the
     /// journal adds.
+    ///
+    /// A directory entry whose row has no version left in the tree leaves the directory: the
+    /// leaf of the directory reached `data` and the leaf of the version did not, or the version
+    /// was the one of a loser [`ClusteredTable::take_back_losers`] took out.
     fn rebuild_directory_from_tree(&mut self) -> Result<(), InternalError> {
-        let mut newest: std::collections::BTreeMap<RowId, (u64, Vec<Value>)> =
-            std::collections::BTreeMap::new();
+        let mut newest: BTreeMap<RowId, (u64, Vec<Value>)> = BTreeMap::new();
         for (key, payload_bytes) in self.tree.seek(&KeyRange::Full, Direction::Forward)? {
             let payload = VersionPayload::decode(&payload_bytes)?;
             let entry = newest
@@ -453,10 +463,118 @@ impl<'storage> ClusteredTable<'storage> {
                 *entry = (payload.header.seq, key.clone());
             }
         }
+        for (key, payload) in self.directory.seek(&KeyRange::Full, Direction::Forward)? {
+            let row = RowId(key.first().map_or(Ok(0), tie_number)?);
+            if !newest.contains_key(&row) {
+                self.directory.delete(&key, &payload)?;
+            }
+        }
         for (row, (_, key)) in newest {
             self.set_directory(row, &key)?;
         }
         Ok(())
+    }
+
+    /// Takes out of the tree what the transactions of `losers` left there, and answers how many
+    /// versions it changed: a version a loser created leaves the tree, and an `xmax` a loser
+    /// set on the version of another writer is unset. The directory is then rebuilt, so each
+    /// row names the newest version left.
+    ///
+    /// Such entries are in the tree when a leaf a loser wrote reached `data` through a leaf
+    /// shared with a transaction that ended first (the shapes of the module documentation).
+    /// Left there, the version of a loser is the newest of its row and an `xmax` of a loser
+    /// marks the row stale, so a later `update` or `delete` of the row is refused
+    /// (`a_clustered_row_a_loser_wrote_takes_writes_and_rollbacks_after_recovery`).
+    ///
+    /// Each change is journalled first: one [`WalRecordKind::Compensation`] under the loser,
+    /// the payload a heap table writes ([`SlotRelease`]), its slot naming the head page of the
+    /// overflow heap and slot 0, which the redo does not read for a clustered table. The
+    /// journal is `sync_all`ed before the first entry changes, and each page the change
+    /// rewrites takes the number of its record. A change the journal already holds a record
+    /// for, in `journalled`, is made again under that record, not journalled a second time:
+    /// a recovery whose changes stayed in the pool of the instance that crashed is finished by
+    /// the next one, and the journal takes its records once
+    /// (`a_clustered_take_back_lost_with_the_pool_is_made_again_under_its_records`).
+    ///
+    /// The columns of a long row of a loser stay in the overflow heap: the record its stub
+    /// names may not be the one the loser wrote when the overflow page missed `data`, so it is
+    /// left where it is rather than freed.
+    ///
+    /// # Errors
+    ///
+    /// Those of the journal, of [`BTree::seek`], [`BTree::delete`] and [`BTree::insert`].
+    pub(crate) fn take_back_losers(
+        &mut self,
+        losers: &[TxnId],
+        journalled: &TakenBack,
+    ) -> Result<usize, InternalError> {
+        let losers: BTreeSet<TxnId> = losers.iter().copied().collect();
+        let mut doomed = Vec::new();
+        for entry in self.tree.seek(&KeyRange::Full, Direction::Forward)? {
+            let stored = StoredVersion::read(entry)?;
+            if losers.contains(&stored.header.xmin) {
+                doomed.push((stored.header.xmin, stored, Release::Removed));
+            } else if let Some(writer) = stored.header.xmax
+                && losers.contains(&writer)
+            {
+                doomed.push((writer, stored, Release::XmaxCleared));
+            }
+        }
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        let at = Rid {
+            page: self.first_page(),
+            slot: 0,
+        };
+        let mut records = Vec::with_capacity(doomed.len());
+        for (writer, stored, release) in &doomed {
+            let change = (stored.header.row, stored.header.seq, *release as u8);
+            if let Some(&lsn) = journalled.get(&change) {
+                records.push(lsn);
+                continue;
+            }
+            let payload = SlotRelease {
+                table: self.table,
+                header: stored.header,
+                at,
+                release: *release,
+            }
+            .encode();
+            records.push(self.storage.wal.append(
+                WalRecordKind::Compensation,
+                *writer,
+                &payload,
+            )?);
+        }
+        self.storage.wal.flush()?;
+        let mut last = Lsn(0);
+        for ((_, stored, release), lsn) in doomed.iter().zip(records) {
+            self.hold_trees(lsn);
+            last = lsn;
+            match release {
+                Release::Removed => self.remove_entry(stored, false)?,
+                Release::XmaxCleared => self.set_xmax(stored, None)?,
+            }
+        }
+        self.hold_trees(last);
+        self.rebuild_directory_from_tree()?;
+        // The journal is durable past each record: the pages may reach `data` from here, and
+        // the trees go back to the unmarked writes of the redo that follows.
+        let mut pages = self.tree.take_held_pages();
+        pages.extend(self.directory.take_held_pages());
+        for page in pages {
+            self.storage.pool.set_in_progress(page, false)?;
+        }
+        let (columns, types) = Self::tree_key(&self.shape, self.table)?;
+        self.tree = BTree::open(self.storage, self.tree.root(), &columns, &types)?;
+        self.directory = BTree::open(
+            self.storage,
+            self.directory.root(),
+            &Self::directory_key(),
+            &[tie_type()],
+        )?;
+        Ok(doomed.len())
     }
 
     /// [`BTree::open`] on `root`, after formatting it as an empty leaf when the page is
@@ -1623,20 +1741,19 @@ impl<'storage> ClusteredTable<'storage> {
         // The version a winner created. The chain link it carries is the key of the version
         // that came before it, which the directory names when the replay is ordered — the
         // journal hands the records in the order of their `lsn`, and a version is created
-        // after the one it replaces. A version the tree already holds — an earlier
-        // open redid it and a checkpoint put the page on `data` — is skipped, which is what
-        // makes the replay idempotent.
+        // after the one it replaces. A row whose newest version is `seq` or a later one is
+        // skipped: the version is in the tree, which makes the replay idempotent, or it was
+        // replaced and then taken away by a `vacuum`, or replaced on a leaf that reached
+        // `data` without it, and a version a winner replaced is read by no snapshot of the
+        // reopened instance (`a_clustered_row_whose_old_versions_a_vacuum_took_reopens`).
         let row = decode_row(&change.columns)?;
-        let mut current = self.directory_entry(id)?;
-        while let Some(key) = current {
-            let stored = self.entry_at(&key, id)?;
-            if stored.header.seq == seq {
-                return Ok(false);
-            }
-            let payload = stored.parsed()?;
-            current = (!payload.prev.is_empty()).then_some(payload.prev);
+        let head = self.directory_entry(id)?;
+        if let Some(key) = &head
+            && self.entry_at(key, id)?.header.seq >= seq
+        {
+            return Ok(false);
         }
-        let prev = self.directory_entry(id)?.unwrap_or_default();
+        let prev = head.unwrap_or_default();
         let key = self.key_of(&row, id, seq)?;
         let mut columns = Vec::new();
         encode_row(&row, &mut columns);
@@ -1712,25 +1829,33 @@ impl<'storage> ClusteredTable<'storage> {
     }
 
     /// The key of the entry of the version `(id, seq)` of this table, `None` when the tree
-    /// holds this version.
+    /// does not hold this version.
     ///
     /// The tree key of a version ends with its `seq` as a tie column, so a seek on the point
     /// range of the directory's current key does not find an older version whose key the
-    /// update moved: the walk starts at the oldest entry and follows the directory's chain
+    /// update moved: the walk starts at the newest entry and follows the directory's chain
     /// back. This is what makes a delete of a version already replaced a skip rather than a
-    /// rewrite of a version that an update already replaced.
+    /// rewrite of a version that an update already replaced. The walk stops at a link the tree
+    /// does not hold, the old end of a chain a `vacuum` took away, as
+    /// [`ClusteredTable::chain`] does.
     fn current_key_of(&self, id: RowId, seq: u64) -> Result<Option<Vec<Value>>, InternalError> {
         let mut key = match self.directory_entry(id)? {
             Some(key) => key,
             None => return Ok(None),
         };
         loop {
-            let stored = self.entry_at(&key, id)?;
+            let found = self
+                .tree
+                .seek(&KeyRange::Point(key.clone()), Direction::Forward)?;
+            let Some(entry) = found.into_iter().next() else {
+                return Ok(None);
+            };
+            let stored = StoredVersion::read(entry)?;
             if stored.header.seq == seq {
                 return Ok(Some(key));
             }
             let payload = stored.parsed()?;
-            if payload.prev.is_empty() {
+            if payload.prev.is_empty() || stored.header.seq < seq {
                 return Ok(None);
             }
             key = payload.prev;

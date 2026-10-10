@@ -101,15 +101,15 @@
 //!
 //! # Losers
 //!
-//! A loser is not replayed, and the redo runs no undo of its own beyond the compensation records
-//! the journal holds: under no-steal the page of a running
+//! A loser is not replayed, and on a heap the redo runs no undo of its own beyond the
+//! compensation records the journal holds: under no-steal the page of a running
 //! transaction is held back, so what it wrote is usually left in the pool a crash threw away.
 //! Usually, not in one case: two transactions that write the same page share it, and the
 //! commit of the first clears the `in_progress` flag of that page
 //! (`a_page_shared_by_two_txns_loses_its_flag_at_the_first_commit` in
 //! [`super::version`]), after which a flush may write the version of the second one to `data`.
 //! A loser that rolled back before the crash journalled its undo, and the redo takes its
-//! versions out (above). The writes of a loser that neither a `ROLLBACK TO` nor a rollback the
+//! versions out (above). On a heap, the writes of a loser that neither a `ROLLBACK TO` nor a rollback the
 //! crash cut short had undone are taken back after the redo, when the table is first reached:
 //! [`super::version::HeapTable::resume_after_recovery`] marks the losers `Aborted`, which
 //! [`crate::Snapshot::is_visible`] reads (`a_loser_whose_page_reached_data_is_invisible`), then
@@ -119,6 +119,17 @@
 //! (`a_row_a_loser_updated_then_deleted_takes_an_update_and_its_rollback`), and the next
 //! recovery replays those compensations as it replays the ones of a rollback
 //! (`a_loser_taken_back_by_a_recovery_cut_short_is_taken_back_by_the_next`).
+//!
+//! A clustered table is taken back here rather than at its first call, in the pass that
+//! replays it, and before its winners: [`super::clustered::ClusteredTable::take_back_losers`]
+//! takes out of the tree each version a loser created and unsets each `xmax` a loser set, each
+//! by a compensation appended and synced before the entry changes, and rebuilds the directory.
+//! The order matters: a winner that wrote a row after a loser rolled it back links its version
+//! to the newest one of the row, which would be the version of the loser if it were still there
+//! (`a_clustered_row_a_loser_wrote_takes_writes_and_rollbacks_after_recovery`). A compensation
+//! of a clustered table the journal already holds is made again under its own record, so a
+//! recovery whose changes stayed in the pool of the instance that crashed adds no record the
+//! next time (`a_clustered_take_back_lost_with_the_pool_is_made_again_under_its_records`).
 //!
 //! The `in_progress` flag itself is a field of a frame of the pool
 //! ([`super::buffer::BufferPool::set_in_progress`] writes it on the frame of a pinned page),
@@ -153,7 +164,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use vauban_errors::InternalError;
 
 use super::DiskStorage;
-use super::clustered::ClusteredTable;
+use super::clustered::{ClusteredTable, TakenBack};
 use super::heap::{Heap, Rid};
 use super::meta::{Catalogue, IndexEntry, TableEntry};
 use super::page::{Lsn, PageId};
@@ -521,7 +532,8 @@ impl Scan {
 /// A clustered table is left out of this pass for the row redo: the pages of its tree reach
 /// `data` at a checkpoint. The recovery rebuilds the trees at the `open` by walking the
 /// versions the DDL phase installed on the catalogue: each winner record is inserted into the
-/// tree of its clustered table in a separate pass.
+/// tree of its clustered table in a separate pass, after what the losers left in that tree has
+/// been taken out ([`ClusteredTable::take_back_losers`]).
 fn redo(
     storage: &DiskStorage,
     records: &[WalRecord],
@@ -544,13 +556,25 @@ fn redo(
         }
     }
     let mut clustered_changes: BTreeMap<TableId, Vec<(WalRecordKind, RowChange)>> = BTreeMap::new();
+    let mut taken_back: BTreeMap<TableId, TakenBack> = BTreeMap::new();
     for record in records {
         let kind = record.kind;
         if matches!(kind, WalRecordKind::Compensation | WalRecordKind::Purge) {
             let release = SlotRelease::decode(&record.payload)?;
-            // A heap the catalogue no longer holds, or a clustered table, which journals no
-            // such record: nothing to take out.
-            if let Some(redo) = heaps.get_mut(&release.table)
+            // A clustered table journals the versions of losers an earlier recovery took back
+            // ([`ClusteredTable::take_back_losers`]), which takes them back again under these
+            // records; a heap the catalogue no longer holds has nothing to take out.
+            if clustered_tables.contains(&release.table) {
+                let change = (
+                    release.header.row,
+                    release.header.seq,
+                    release.release as u8,
+                );
+                taken_back
+                    .entry(release.table)
+                    .or_default()
+                    .insert(change, record.lsn);
+            } else if let Some(redo) = heaps.get_mut(&release.table)
                 && redo.release(record, &release)?
             {
                 recovery.released += 1;
@@ -610,6 +634,12 @@ fn redo(
             (tree, directory),
             entry.shape.clone(),
         )?;
+        // What the losers left in the tree leaves it before the winners are replayed: a winner
+        // that wrote a row after the rollback of a loser links its version to the one the
+        // directory names, which is the version of the loser while it is there
+        // (`a_clustered_row_a_loser_wrote_takes_writes_and_rollbacks_after_recovery`).
+        let journalled = taken_back.remove(&table).unwrap_or_default();
+        clustered.take_back_losers(&recovery.losers, &journalled)?;
         for (kind, change) in changes {
             // The record of an update names the version it creates; the version it replaces
             // takes its `xmax` first, as [`RedoHeap::hide_previous`] does on a heap, so that a

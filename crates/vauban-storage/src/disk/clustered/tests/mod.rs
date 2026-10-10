@@ -884,3 +884,216 @@ fn versions_of_key_compares_under_collation() {
     );
     assert!(message.contains("clustered columns"), "{message}");
 }
+
+// --- Losers at recovery -----------------------------------------------------------------
+
+/// A snapshot that settles each transaction below `u64::MAX - 1`.
+fn settled() -> Snapshot {
+    snap(0, u64::MAX - 1, &[])
+}
+
+/// What a scan of `table` answers through the trait, as `(RowId, first, second)`.
+fn rows_of(storage: &DiskStorage, table: TableId) -> Vec<(RowId, Option<i32>, Option<i32>)> {
+    let rows: Vec<(RowId, Row)> = crate::Storage::scan(storage, &settled(), table)
+        .expect("scan")
+        .map(|row| row.expect("a row of the scan"))
+        .collect();
+    let (first, second) = (column(&rows, 0), column(&rows, 1));
+    rows.iter()
+        .zip(first.into_iter().zip(second))
+        .map(|((id, _), (a, b))| (*id, a, b))
+        .collect()
+}
+
+/// An instance in `dir` with a heap table and a clustered table of five committed rows each,
+/// then a transaction that updates row 0 of both (and deletes it when `delete` says so) and
+/// updates row 1, a second one that inserts a row in both and commits, a checkpoint, and a
+/// drop with the first one still running. Answers the two tables and the `RowId`s of the
+/// five rows of each.
+fn a_loser_wrote_both_tables(dir: &TempDir, delete: bool) -> Vec<(TableId, Vec<RowId>)> {
+    use crate::Storage;
+    let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+    let db = Storage::create_database(&storage, "a").expect("database");
+    let heap_shape = TableShape {
+        clustered_key: None,
+        ..pair_shape()
+    };
+    let tables = [
+        Storage::create_table(&storage, db, &heap_shape).expect("heap table"),
+        Storage::create_table(&storage, db, &pair_shape()).expect("clustered table"),
+    ];
+    Storage::checkpoint(&storage).expect("checkpoint");
+    let first = TxnId(Storage::next_txn_id(&storage));
+    let rows: Vec<(TableId, Vec<RowId>)> = tables
+        .iter()
+        .map(|&table| {
+            let ids = (0..5)
+                .map(|k| {
+                    Storage::insert(&storage, first, table, &pair(k, 100 + k)).expect("insert")
+                })
+                .collect();
+            (table, ids)
+        })
+        .collect();
+    Storage::commit(&storage, first).expect("commit the rows");
+    let loser = TxnId(Storage::next_txn_id(&storage));
+    for (table, ids) in &rows {
+        Storage::update(&storage, loser, *table, ids[0], &pair(0, 999)).expect("update");
+        if delete {
+            Storage::delete(&storage, loser, *table, ids[0]).expect("delete");
+        }
+        Storage::update(&storage, loser, *table, ids[1], &pair(1, 998)).expect("update");
+    }
+    let winner = TxnId(Storage::next_txn_id(&storage));
+    for &table in &tables {
+        Storage::insert(&storage, winner, table, &pair(500, 50)).expect("insert");
+    }
+    Storage::commit(&storage, winner).expect("commit the winner");
+    Storage::checkpoint(&storage).expect("checkpoint with the loser running");
+    rows
+}
+
+/// The versions the tree of `table` holds whose `xmin` or `xmax` is `txn`.
+fn versions_of_txn(storage: &DiskStorage, table: TableId, txn: TxnId) -> usize {
+    let entry = storage
+        .lock_catalogue()
+        .expect("catalogue")
+        .table(table)
+        .cloned()
+        .expect("the table");
+    let roots = (
+        entry.tree_root.expect("tree"),
+        entry.directory_root.expect("dir"),
+    );
+    let clustered = ClusteredTable::open(storage, table, entry.first_page, roots, entry.shape)
+        .expect("open the table");
+    entries(&clustered)
+        .iter()
+        .filter(|payload| payload.header.xmin == txn || payload.header.xmax == Some(txn))
+        .count()
+}
+
+#[test]
+fn a_clustered_row_a_loser_wrote_takes_writes_and_rollbacks_after_recovery() {
+    use crate::Storage;
+    for delete in [false, true] {
+        let dir = TempDir::created("clustered-loser");
+        let rows = a_loser_wrote_both_tables(&dir, delete);
+        let (table, ids) = (rows[1].0, rows[1].1.clone());
+        let mut expected: Vec<(RowId, Option<i32>, Option<i32>)> = ids
+            .iter()
+            .zip(0..)
+            .map(|(id, k)| (*id, Some(k), Some(100 + k)))
+            .collect();
+        let mut loser = None;
+        for life in 0..3 {
+            let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+            // The transactions the later lives roll back are losers too.
+            let loser = *loser.get_or_insert(storage.recovery().losers[0]);
+            assert!(storage.recovery().losers.contains(&loser), "life {life}");
+            assert_eq!(versions_of_txn(&storage, table, loser), 0, "life {life}");
+            if life == 1 {
+                // The heap table first, the clustered one on a later call.
+                assert_eq!(rows_of(&storage, rows[0].0).len(), 6, "delete {delete}");
+            }
+            let got = rows_of(&storage, table);
+            let committed: Vec<_> = got
+                .iter()
+                .filter(|row| row.1 != Some(500))
+                .copied()
+                .collect();
+            assert_eq!(committed, expected, "delete {delete}, life {life}");
+            assert_eq!(got.len(), 6, "delete {delete}, life {life}");
+            for &id in &ids[..2] {
+                let txn = TxnId(Storage::next_txn_id(&storage));
+                Storage::update(&storage, txn, table, id, &pair(7, 7))
+                    .unwrap_or_else(|e| panic!("delete {delete}, life {life}: update {id}: {e:?}"));
+                Storage::rollback(&storage, txn).expect("rollback the update");
+                let txn = TxnId(Storage::next_txn_id(&storage));
+                Storage::delete(&storage, txn, table, id)
+                    .unwrap_or_else(|e| panic!("delete {delete}, life {life}: delete {id}: {e:?}"));
+                Storage::rollback(&storage, txn).expect("rollback the delete");
+            }
+            assert_eq!(
+                rows_of(&storage, table),
+                got,
+                "delete {delete}, life {life}"
+            );
+            let txn = TxnId(Storage::next_txn_id(&storage));
+            Storage::update(&storage, txn, table, ids[0], &pair(0, life))
+                .unwrap_or_else(|e| panic!("delete {delete}, life {life}: update: {e:?}"));
+            Storage::commit(&storage, txn).expect("commit the update");
+            expected[0].2 = Some(life);
+            if life == 1 {
+                Storage::checkpoint(&storage).expect("checkpoint");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_clustered_take_back_lost_with_the_pool_is_made_again_under_its_records() {
+    let dir = TempDir::created("clustered-loser-twice");
+    let rows = a_loser_wrote_both_tables(&dir, true);
+    let table = rows[1].0;
+    let compensations = |storage: &DiskStorage| {
+        journal(storage)
+            .iter()
+            .filter(|record| record.kind == WalRecordKind::Compensation)
+            .count()
+    };
+    let first = {
+        // No checkpoint: the pages the recovery changed stay in the pool and are lost.
+        let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+        compensations(&storage)
+    };
+    // Two versions the loser created, rows 0 and 1, and the two `xmax` it set on the versions
+    // they replaced; the heap table takes back its own at its first call, which none makes
+    // here.
+    assert_eq!(first, 4);
+    for pass in 0..2 {
+        let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+        assert_eq!(compensations(&storage), first, "reopen {pass}");
+        let loser = storage.recovery().losers[0];
+        assert_eq!(versions_of_txn(&storage, table, loser), 0, "reopen {pass}");
+        assert_eq!(rows_of(&storage, table).len(), 6, "reopen {pass}");
+        if pass == 0 {
+            crate::Storage::checkpoint(&storage).expect("checkpoint");
+        }
+    }
+}
+
+#[test]
+fn a_clustered_row_whose_old_versions_a_vacuum_took_reopens() {
+    use crate::Storage;
+    let dir = TempDir::created("clustered-vacuum-reopen");
+    let (id, kept) = {
+        let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+        let db = Storage::create_database(&storage, "a").expect("database");
+        let table = Storage::create_table(&storage, db, &pair_shape()).expect("table");
+        let id = Storage::insert(&storage, TxnId(10), table, &pair(1, 1)).expect("insert");
+        let kept = Storage::insert(&storage, TxnId(10), table, &pair(2, 2)).expect("insert");
+        Storage::commit(&storage, TxnId(10)).expect("commit");
+        Storage::update(&storage, TxnId(11), table, id, &pair(3, 3)).expect("update");
+        Storage::commit(&storage, TxnId(11)).expect("commit");
+        Storage::delete(&storage, TxnId(12), table, kept).expect("delete");
+        Storage::commit(&storage, TxnId(12)).expect("commit");
+        Storage::vacuum(&storage, TxnId(13)).expect("vacuum");
+        Storage::checkpoint(&storage).expect("checkpoint");
+        (id, kept)
+    };
+    for pass in 0..2 {
+        let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+        let table = Storage::tables(&storage, Storage::databases(&storage).expect("dbs")[0].0)
+            .expect("tables")[0]
+            .0;
+        assert_eq!(
+            rows_of(&storage, table),
+            vec![(id, Some(3), Some(3))],
+            "reopen {pass}: row {kept} stays deleted"
+        );
+        let txn = TxnId(Storage::next_txn_id(&storage));
+        Storage::update(&storage, txn, table, id, &pair(4, 4)).expect("update");
+        Storage::rollback(&storage, txn).expect("rollback");
+    }
+}
