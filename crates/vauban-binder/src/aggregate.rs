@@ -295,7 +295,7 @@ impl Grouping {
                 }
                 SelectItem::Expr { expr, alias, .. } => {
                     let rewritten = self.rewrite(expr, Clause::SelectList, spec, scope, ctx)?;
-                    let bound = bind_expr(&rewritten, ctx, &self.slot_scope(ctx))?;
+                    let bound = bind_expr(&rewritten, ctx, &self.slot_scope(ctx, scope))?;
                     let name = column_name(expr, &bound, alias.as_ref());
                     projections.push(BoundProjection { expr: bound, name });
                 }
@@ -315,7 +315,7 @@ impl Grouping {
         ctx: &BindContext<'_>,
     ) -> SqlResult<BoundExpr> {
         let rewritten = self.rewrite(condition, Clause::Having, spec, scope, ctx)?;
-        bind_condition(&rewritten, ctx, &self.slot_scope(ctx))
+        bind_condition(&rewritten, ctx, &self.slot_scope(ctx, scope))
     }
 
     /// Binds a key of the `ORDER BY` written as an expression above the `Aggregate`: its
@@ -329,7 +329,7 @@ impl Grouping {
         ctx: &BindContext<'_>,
     ) -> SqlResult<BoundExpr> {
         let rewritten = self.rewrite(written, Clause::OrderBy, spec, scope, ctx)?;
-        let mut bound = bind_expr(&rewritten, ctx, &self.slot_scope(ctx))?;
+        let mut bound = bind_expr(&rewritten, ctx, &self.slot_scope(ctx, scope))?;
         name_slots(&mut bound, &self.schema());
         Ok(bound)
     }
@@ -398,6 +398,13 @@ impl Grouping {
                 let bound = bind_expr(e, ctx, scope)?;
                 if let Some(index) = self.key_index(&bound) {
                     return Ok(slot_column(index, span_of(e)));
+                }
+                // A column of an enclosing query is one value per evaluation of this
+                // query, which grouping leaves alone: `HAVING w > g`, `g` read outside.
+                if let BoundExprKind::ColumnRef(binding) = &bound.kind
+                    && binding.depth > 0
+                {
+                    return Ok(e.clone());
                 }
                 if let BoundExprKind::ColumnRef(binding) = &bound.kind {
                     return Err(column_outside_group_by(
@@ -640,8 +647,9 @@ impl Grouping {
 
     /// The scope an extracted expression binds against: one source holding the columns
     /// of the `Aggregate` under the names [`slot_column`] writes, and nothing of the
-    /// `FROM`.
-    fn slot_scope(&self, ctx: &BindContext<'_>) -> Scope {
+    /// `FROM`, chained to the queries that enclose `scope`, so that a column of an
+    /// enclosing query left in place by [`Grouping::rewrite`] binds as it did there.
+    fn slot_scope(&self, ctx: &BindContext<'_>, scope: &Scope) -> Scope {
         let columns: Vec<ColumnBinding> = self
             .schema()
             .columns
@@ -655,13 +663,17 @@ impl Grouping {
                 depth: 0,
             })
             .collect();
-        Scope::over(Source::new(
+        let slots = Scope::over(Source::new(
             "",
             None,
             &columns,
             ctx.default_schema,
             ctx.database,
-        ))
+        ));
+        match scope.parent() {
+            Some(parent) => slots.inside(parent.clone()),
+            None => slots,
+        }
     }
 
     /// A bound reference to column `index` of the `Aggregate`, as [`bind_expr`] builds it

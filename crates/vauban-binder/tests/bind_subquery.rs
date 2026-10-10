@@ -1,9 +1,9 @@
 //! Binder tests: subqueries — `EXISTS`, `IN (SELECT …)`, scalar subquery, correlated
 //! subquery, derived table.
 //!
-//! Each test binds against a [`CatalogView`] double that knows two tables,
-//! `a (k int not null, c int)` and `b (k int, c int)`, under the schema `dbo` of the
-//! current database. No row is necessary: the binder reads nothing from storage.
+//! Each test binds against a [`CatalogView`] double that knows three tables,
+//! `a (k int not null, c int)`, `b (k int, c int)` and `o (k int, v int)`, under the schema
+//! `dbo` of the current database. No row is necessary: the binder reads nothing from storage.
 
 use vauban_binder::{
     BindContext, BoundExprKind, BoundStatement, CatalogView, CompareOp, LogicalPlan, NoVariables,
@@ -15,7 +15,8 @@ use vauban_parser::{ObjectName, ParseOptions, parse_batch};
 use vauban_sysfn::register_builtins;
 use vauban_types::{SqlType, TypeInfo, Value};
 
-/// Two tables, `dbo.a (k int not null, c int)` and `dbo.b (k int, c int)`.
+/// Three tables, `dbo.a (k int not null, c int)`, `dbo.b (k int, c int)` and
+/// `dbo.o (k int, v int)`, whose `v` neither of the other two carries.
 struct TwoTables;
 
 impl CatalogView for TwoTables {
@@ -28,9 +29,14 @@ impl CatalogView for TwoTables {
         let object = match name.name.value.as_str() {
             "a" | "A" => 1,
             "b" | "B" => 2,
+            "o" | "O" => 3,
             _ => return None,
         };
         let columns = match name.name.value.as_str() {
+            "o" | "O" => vec![
+                binding(ColumnId(1), 0, "k", SqlType::Int, true),
+                binding(ColumnId(2), 1, "v", SqlType::Int, true),
+            ],
             "a" | "A" => vec![
                 binding(ColumnId(1), 0, "k", SqlType::Int, false),
                 binding(ColumnId(2), 1, "c", SqlType::Int, true),
@@ -389,6 +395,100 @@ fn a_subquery_without_a_from_counts_as_one_level() {
     assert_eq!(column_depths(&plan), vec![("k".to_owned(), 1)], "{plan:#?}");
     let plan = bind_with("SELECT (SELECT (SELECT x.k)) FROM a x").expect("binds");
     assert_eq!(column_depths(&plan), vec![("k".to_owned(), 2)], "{plan:#?}");
+}
+
+/// A bare name the `FROM` of the subquery does not carry is read from the enclosing query,
+/// with `depth` 1, in the `WHERE`, the select list and the `HAVING` of the subquery and in
+/// a branch of a set operation. The counter-proof is the 207 of a name no level carries.
+#[test]
+fn an_unqualified_name_absent_from_the_subquery_reads_the_enclosing_query() {
+    for (text, expected) in [
+        (
+            "SELECT k FROM o WHERE EXISTS (SELECT 1 FROM b WHERE b.k = v)",
+            vec![("k", 0), ("k", 0), ("v", 1)],
+        ),
+        (
+            "SELECT (SELECT b.k + v FROM b) FROM o",
+            vec![("k", 0), ("v", 1)],
+        ),
+        (
+            "SELECT k FROM o WHERE EXISTS \
+             (SELECT 1 FROM b WHERE b.k = 9 UNION SELECT 1 FROM b WHERE b.k = v)",
+            vec![("k", 0), ("k", 0), ("k", 0), ("v", 1)],
+        ),
+    ] {
+        let plan = bind_with(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+        let expected: Vec<(String, u8)> = expected
+            .into_iter()
+            .map(|(name, depth)| (name.to_owned(), depth))
+            .collect();
+        assert_eq!(column_depths(&plan), expected, "{text}: {plan:#?}");
+    }
+    bind_with("SELECT k FROM o WHERE EXISTS (SELECT b.k FROM b GROUP BY b.k HAVING b.k = v)")
+        .expect("a bare outer name binds in the HAVING");
+    bind_with("SELECT k FROM o WHERE EXISTS (SELECT b.k FROM b GROUP BY b.k HAVING b.k = o.v)")
+        .expect("a qualified outer name binds in the HAVING");
+    bind_with("SELECT (SELECT b.k + v FROM b GROUP BY b.k) FROM o")
+        .expect("a bare outer name binds in a grouped select list");
+    // A column of the grouped query itself that is no key stays 8121.
+    let error =
+        error_of("SELECT k FROM o WHERE EXISTS (SELECT b.k FROM b GROUP BY b.k HAVING b.c = 1)");
+    assert_eq!(error.number, 8121, "{}", error.message);
+    let error = error_of("SELECT k FROM o WHERE EXISTS (SELECT 1 FROM b WHERE b.k = nosuch)");
+    assert_eq!(error.number, 207, "{}", error.message);
+}
+
+/// The nearest level that carries the name answers: `k` of the subquery hides `k` of the
+/// enclosing query, and in three nested queries `v` is read two levels up while `c` is
+/// read from the middle one rather than from the innermost `o`, which has none.
+#[test]
+fn the_nearest_level_that_carries_a_bare_name_wins() {
+    let plan =
+        bind_with("SELECT v FROM o WHERE EXISTS (SELECT 1 FROM a WHERE k = 1)").expect("binds");
+    assert_eq!(
+        column_depths(&plan),
+        vec![("v".to_owned(), 0), ("k".to_owned(), 0)],
+        "{plan:#?}"
+    );
+    let plan = bind_with(
+        "SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM a WHERE EXISTS \
+         (SELECT 1 FROM b WHERE b.k = v AND b.c = c))",
+    )
+    .expect("binds");
+    assert_eq!(
+        column_depths(&plan),
+        vec![
+            ("k".to_owned(), 0),
+            ("v".to_owned(), 2),
+            ("c".to_owned(), 0),
+            ("c".to_owned(), 0),
+        ],
+        "{plan:#?}"
+    );
+}
+
+/// A bare name two sources of the first level that carries it hold is 209, even when
+/// that level is the enclosing query; a deeper level that carries it once answers first.
+#[test]
+fn a_bare_name_two_outer_sources_carry_is_209() {
+    let error = error_of("SELECT 1 FROM o, o AS p WHERE EXISTS (SELECT 1 FROM b WHERE b.k = v)");
+    assert_eq!(error.number, 209, "{}", error.message);
+    bind_with("SELECT 1 FROM o, o AS p WHERE EXISTS (SELECT 1 FROM o AS q WHERE q.k = v)")
+        .expect("the subquery carries v once");
+}
+
+/// The `ON` of a join inside a subquery reads the enclosing query too, bare or qualified.
+#[test]
+fn the_on_of_a_join_in_a_subquery_reads_the_enclosing_query() {
+    for text in [
+        "SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM a JOIN b ON a.k = v)",
+        "SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM a JOIN b ON a.k = o.v)",
+    ] {
+        bind_with(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+    }
+    // At the top level there is no enclosing query: the bare name is still 207.
+    let error = error_of("SELECT 1 FROM a JOIN b ON a.k = v");
+    assert_eq!(error.number, 207, "{}", error.message);
 }
 
 // ---------------------------------------------------------------------------------------

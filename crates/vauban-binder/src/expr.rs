@@ -461,6 +461,11 @@ fn contains_invalid_niladic(expr: &Expr) -> bool {
 ///    the reference — including a name reached through a qualifier that *does* name the
 ///    source, which SQL Server answers 207 to and not 4104.
 ///
+/// A bare name is resolved level by level: the sources of the reader first, then those of
+/// each enclosing query outwards. The first level that carries the name answers, with 209
+/// when two of its sources do; a level that does not carry it hands the name to the next
+/// one (`an_unqualified_name_absent_from_the_subquery_reads_the_enclosing_query`).
+///
 /// Error **209** is the fourth door: it wants two columns of one name in scope, which one
 /// table of the catalogue cannot hold (2705 refuses them at creation) and which a join
 /// does (`join.rs`; `tests/bind_join.rs`, `an_ambiguous_unqualified_column_is_209`). The
@@ -508,6 +513,14 @@ fn bind_column(column: &ColumnRef, scope: &Scope) -> SqlResult<BoundExpr> {
                 }),
                 line,
             }),
+            // A bare name no source of this level carries is looked up one level out:
+            // `WHERE EXISTS (SELECT 1 FROM b WHERE w = v)` reads `v` of the enclosing
+            // query when `b` has no `v`. The 207 stands once no level carries it.
+            Lookup::Absent if column.qualifier.is_none() => {
+                current = sc.parent();
+                depth = depth.saturating_add(1);
+                continue;
+            }
             Lookup::Absent => {
                 Err(SqlError::invalid_column_name(&column.name.value).with_line(line))
             }

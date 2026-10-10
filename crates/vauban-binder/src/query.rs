@@ -190,7 +190,7 @@ fn bind_query_spec(
         // `join.rs` hands back the scope with the plan: the sources of a join are not
         // read off its root.
         from => {
-            let (plan, scope) = join::bind_from(from, line_of(&stmt.span), ctx)?;
+            let (plan, scope) = join::bind_from_within(from, line_of(&stmt.span), ctx, parent)?;
             (plan, Some(scope))
         }
     };

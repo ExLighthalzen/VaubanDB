@@ -121,14 +121,36 @@ pub(crate) fn bind_from(
     statement_line: u32,
     ctx: &BindContext<'_>,
 ) -> SqlResult<(LogicalPlan, Scope)> {
+    bind_from_within(from, statement_line, ctx, &Scope::empty())
+}
+
+/// [`bind_from`] for the `FROM` of a query nested in `parent`: the `ON` of each join binds
+/// a name its sources do not carry against the enclosing queries, the way the `WHERE` of
+/// that query does (`expr.rs`, `bind_column`). `SELECT k FROM o WHERE EXISTS (SELECT 1
+/// FROM a JOIN b ON a.k = v)` reads `v` of `o`. The scope handed back is not chained to
+/// `parent`: `query.rs` chains it.
+pub(crate) fn bind_from_within(
+    from: &[TableRef],
+    statement_line: u32,
+    ctx: &BindContext<'_>,
+    parent: &Scope,
+) -> SqlResult<(LogicalPlan, Scope)> {
     let mut bound: Option<Bound> = None;
     for reference in from {
-        let next = bind_reference(reference, statement_line, ctx)?;
+        let next = bind_reference(reference, statement_line, ctx, parent)?;
         bound = Some(match bound {
             None => next,
             // The comma pairs each row of what came before with each row of the next
             // reference: the same node as a `CROSS JOIN`, without an `ON`.
-            Some(left) => join(left, next, JoinKind::Cross, None, statement_line, ctx)?,
+            Some(left) => join(
+                left,
+                next,
+                JoinKind::Cross,
+                None,
+                statement_line,
+                ctx,
+                parent,
+            )?,
         });
     }
     let Bound { plan, sources, .. } =
@@ -142,6 +164,7 @@ fn bind_reference(
     reference: &TableRef,
     statement_line: u32,
     ctx: &BindContext<'_>,
+    parent: &Scope,
 ) -> SqlResult<Bound> {
     match reference {
         TableRef::Join {
@@ -151,8 +174,8 @@ fn bind_reference(
             on,
             ..
         } => {
-            let left = bind_reference(left, statement_line, ctx)?;
-            let right = bind_reference(right, statement_line, ctx)?;
+            let left = bind_reference(left, statement_line, ctx, parent)?;
+            let right = bind_reference(right, statement_line, ctx, parent)?;
             join(
                 left,
                 right,
@@ -160,6 +183,7 @@ fn bind_reference(
                 on.as_ref(),
                 statement_line,
                 ctx,
+                parent,
             )
         }
         TableRef::Derived { alias, .. } | TableRef::Values { alias, .. } => {
@@ -227,6 +251,7 @@ fn join(
     on: Option<&Expr>,
     statement_line: u32,
     ctx: &BindContext<'_>,
+    parent: &Scope,
 ) -> SqlResult<Bound> {
     check_exposed_names(&left, &right, statement_line)?;
     let (left_padded, right_padded) = match kind {
@@ -252,7 +277,9 @@ fn join(
             .chain(padded_columns(right.plan.schema(), right_padded))
             .collect(),
     };
-    let scope = Scope::over_all(sources.clone());
+    // Chained like the scope of the query itself (`query.rs`): one link per query, so
+    // that a column of the enclosing query carries `depth` 1 in the `ON` as in the `WHERE`.
+    let scope = Scope::over_all(sources.clone()).inside(parent.unwrapped().clone());
     let on = match (kind, on) {
         (JoinKind::Cross, None) => None,
         (JoinKind::Cross, Some(_)) => {
