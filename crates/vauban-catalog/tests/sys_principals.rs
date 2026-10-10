@@ -5,17 +5,17 @@
 //!
 //! These tests know the public API only, as those of `tests/sys_object_kinds.rs` do: the names
 //! of the internal tables are `pub(crate)`, so this file hardcodes the strings
-//! (`vauban_sys_principals`, `vauban_sys_role_members`) rather than importing them. `name`
-//! being a `CASE` on `principal_id` rather than a stored column (`src/views/sys_principals.rs`,
-//! section "Fixed rows, `name` included"), the text of the two `_principals` definitions is
-//! read to check every fixed name is there; the unit tests of `src/views/sys_principals.rs`
-//! check the exact select list that carries it.
+//! (`vauban_sys_principals`, `vauban_sys_role_members`) rather than importing them. `name` is
+//! a column of the principals table, so the fixed names are read from its rows, and a row
+//! written there is read back through the text of the view
+//! (`a_row_written_in_the_principals_table_is_a_row_of_the_view`).
 
 use std::sync::Arc;
 
 use vauban_catalog::Catalog;
-use vauban_storage::{MemoryStorage, Storage, TableId};
+use vauban_storage::{MemoryStorage, Row, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager, TxnHandle};
+use vauban_types::SqlString;
 use vauban_types::Value;
 
 /// A bootstrapped catalogue over a fresh `MemoryStorage`, with its storage and transaction
@@ -161,13 +161,22 @@ fn the_role_members_table_carries_dbo_in_db_owner_and_sa_in_sysadmin() {
     );
 }
 
-/// Every fixed name of the `_principals` views is a `THEN N'<name>'` branch of the `CASE`
-/// their definition carries for `name` (`src/views/sys_principals.rs`).
+/// The names the principals table carries for each `kind`: `D` for
+/// `sys.database_principals`, `S` for `sys.server_principals`.
+fn names_of_kind(rows: &[Vec<Value>], kind: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|row| is_text(&row[0], kind))
+        .map(|row| match &row[2] {
+            Value::String(name) => name.text.clone(),
+            other => panic!("name is a string: {other:?}"),
+        })
+        .collect()
+}
+
 #[test]
-fn the_definitions_name_every_fixed_principal() {
-    let (catalog, _storage, txn) = instance();
-    let handle = begin(&txn);
-    let snapshot = catalog.snapshot(&handle);
+fn the_principals_table_carries_every_fixed_name() {
+    let (catalog, storage, txn) = instance();
+    let all = principal_rows(&catalog, &storage, &txn);
     let database_names = [
         "public",
         "dbo",
@@ -195,6 +204,67 @@ fn the_definitions_name_every_fixed_principal() {
         "dbcreator",
         "bulkadmin",
     ];
+    assert_eq!(names_of_kind(&all, "D"), database_names);
+    assert_eq!(names_of_kind(&all, "S"), server_names);
+}
+
+/// The rows the view whose text is `definition` reads from `table`, a view of
+/// `views/sys_principals.rs`: each item of the select list that is a bare column name is read
+/// from the column of that name, the others (literals the view casts) are left out, and the
+/// `WHERE <column> = '<text>'` filter keeps the rows it names. Returns `(column, value)` pairs.
+fn evaluate(
+    definition: &str,
+    columns: &[String],
+    rows: &[Vec<Value>],
+) -> Vec<Vec<(String, Value)>> {
+    let select_list = definition
+        .strip_prefix("SELECT ")
+        .and_then(|rest| rest.split("\n  FROM ").next())
+        .expect("SELECT … FROM");
+    let read: Vec<(String, usize)> = select_list
+        .split(",\n")
+        .map(str::trim)
+        .filter(|item| !item.contains(' '))
+        .map(|item| {
+            let position = columns
+                .iter()
+                .position(|column| column == item)
+                .unwrap_or_else(|| panic!("`{item}` is a column of the table"));
+            (item.to_owned(), position)
+        })
+        .collect();
+    let filter = definition
+        .split("\n WHERE ")
+        .nth(1)
+        .expect("a WHERE clause");
+    let (column, literal) = filter.split_once(" = ").expect("<column> = '<text>'");
+    let kind_position = columns
+        .iter()
+        .position(|name| name == column.trim())
+        .expect("the filter column is a column of the table");
+    let kind = literal.trim().trim_matches('\'');
+    rows.iter()
+        .filter(|row| is_text(&row[kind_position], kind))
+        .map(|row| {
+            read.iter()
+                .map(|(name, position)| (name.clone(), row[*position].clone()))
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn a_row_written_in_the_principals_table_is_a_row_of_the_view() {
+    let (catalog, storage, txn) = instance();
+    let handle = begin(&txn);
+    let snapshot = catalog.snapshot(&handle);
+    let object = snapshot
+        .resolve_object("master", Some("dbo"), "vauban_sys_principals", "dbo")
+        .expect("master.dbo.vauban_sys_principals resolves");
+    let meta = snapshot
+        .table(object.id)
+        .expect("vauban_sys_principals is a table of the snapshot")
+        .clone();
     let definition_of = |view: &str| -> String {
         let object = snapshot
             .resolve_object("master", Some("sys"), view, "dbo")
@@ -206,16 +276,55 @@ fn the_definitions_name_every_fixed_principal() {
     };
     let database_principals = definition_of("database_principals");
     let server_principals = definition_of("server_principals");
-    for name in database_names {
-        assert!(
-            database_principals.contains(&format!("N'{name}'")),
-            "sys.database_principals: {name}"
-        );
-    }
-    for name in server_names {
-        assert!(
-            server_principals.contains(&format!("N'{name}'")),
-            "sys.server_principals: {name}"
-        );
-    }
+    let columns: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+    let mut written = vec![Value::Null; columns.len()];
+    let mut set = |column: &str, value: Value| {
+        let position = columns
+            .iter()
+            .position(|name| name == column)
+            .unwrap_or_else(|| panic!("`{column}` is a column of the table"));
+        written[position] = value;
+    };
+    let text = |s: &str| Value::String(SqlString { text: s.to_owned() });
+    set("kind", text("D"));
+    set("principal_id", Value::I32(5));
+    set("name", text("app_reader"));
+    set("type", text("S"));
+    set("type_desc", text("SQL_USER"));
+    set("is_fixed_role", Value::Bit(false));
+    set("default_schema_name", text("dbo"));
+    storage
+        .insert(handle.id, meta.storage_id, &Row(written))
+        .expect("insert into the principals table");
+    txn.commit(handle).expect("commit of the insert");
+
+    let all = rows(&storage, &txn, meta.storage_id);
+    let database_view = evaluate(&database_principals, &columns, &all);
+    let added: Vec<&Vec<(String, Value)>> = database_view
+        .iter()
+        .filter(|row| row.contains(&("principal_id".to_owned(), Value::I32(5))))
+        .collect();
+    assert_eq!(added.len(), 1, "{database_view:?}");
+    assert!(
+        added[0].contains(&("name".to_owned(), text("app_reader"))),
+        "{added:?}"
+    );
+    assert!(
+        added[0].contains(&("type_desc".to_owned(), text("SQL_USER"))),
+        "{added:?}"
+    );
+    assert_eq!(
+        database_view.len(),
+        14,
+        "thirteen fixed rows and the added one"
+    );
+
+    let server_view = evaluate(&server_principals, &columns, &all);
+    assert_eq!(server_view.len(), 10, "{server_view:?}");
+    assert!(
+        server_view
+            .iter()
+            .all(|row| !row.contains(&("name".to_owned(), text("app_reader")))),
+        "a row of kind D is not a row of sys.server_principals"
+    );
 }

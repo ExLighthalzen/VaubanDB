@@ -17,22 +17,22 @@
 //! technique `views/dm_exec.rs` uses to read `sys.dm_exec_sessions` and `sys.dm_exec_requests`
 //! off a single table (module documentation of that file).
 //!
-//! # Fixed rows, `name` included
+//! # Seeded rows, `name` included
 //!
 //! No `CREATE LOGIN`, `CREATE USER` or `ALTER ROLE … ADD MEMBER` writes here yet: the rows are
-//! the ones a fresh installation already carries. `sys.database_principals` holds `public`,
-//! `dbo`, `guest`, `INFORMATION_SCHEMA`, `sys` and the eight fixed database roles beneath
-//! them (`server_functions.rs` of the `compat` crate names the same nine, `public` included).
+//! the ones a fresh installation already carries, written by the bootstrap like the rows of
+//! any other internal table. `sys.database_principals` holds `public`, `dbo`, `guest`,
+//! `INFORMATION_SCHEMA`, `sys` and the eight fixed database roles beneath them
+//! (`server_functions.rs` of the `compat` crate names the same nine, `public` included).
 //! `sys.server_principals` holds `sa` and the eight fixed server roles beneath `public`. The
 //! two membership views hold one couple each: `dbo` in `db_owner`, `sa` in `sysadmin`.
 //!
-//! `name` is the one column [`PRINCIPALS_TABLE`] does not carry as a value: it is a `CASE` on
-//! `principal_id`, built by [`name_case`] from the pairs above and cast to the published
-//! `sysname` width, the same technique `sys_core.rs` uses for
-//! `sys.databases.snapshot_isolation_state_desc`. `principal_id` already tells every row
-//! apart, so a `name` column here would only repeat one of the fixed strings above — `dbo`,
-//! `sys` and `INFORMATION_SCHEMA` among them, three names a database of this catalogue
-//! already carries as schemas (`bootstrap::SYSTEM_SCHEMAS`).
+//! `name` is a column of [`PRINCIPALS_TABLE`] like the others, and each view reads it as it
+//! reads `principal_id`: a row written in the table is a row of the view whose `kind` it
+//! carries, its name included (integration test
+//! `a_row_written_in_the_principals_table_is_a_row_of_the_view`, `tests/sys_principals.rs`).
+//! The text of the views names no principal (unit test
+//! `no_definition_names_a_principal`).
 //!
 //! # Columns without a matching fact
 //!
@@ -79,57 +79,24 @@ const VIEW_SCHEMA: &str = "sys";
 const SYSNAME: SqlType = SqlType::NVarChar(Len::Fixed(128));
 const KIND_TYPE: SqlType = SqlType::Char(Len::Fixed(1));
 
-/// `(principal_id, name)` of each row of `sys.database_principals`, in the order
-/// [`principal_rows`] writes them; read by [`name_case`] to build the `name` column of the
-/// view (module documentation, section "Fixed rows, `name` included").
-const DATABASE_PRINCIPAL_NAMES: [(i32, &str); 13] = [
-    (0, "public"),
-    (1, "dbo"),
-    (2, "guest"),
-    (3, "INFORMATION_SCHEMA"),
-    (4, "sys"),
-    (16_384, "db_owner"),
-    (16_385, "db_accessadmin"),
-    (16_386, "db_securityadmin"),
-    (16_387, "db_ddladmin"),
-    (16_390, "db_datareader"),
-    (16_391, "db_datawriter"),
-    (16_392, "db_denydatareader"),
-    (16_393, "db_denydatawriter"),
-];
-
-/// `(principal_id, name)` of each row of `sys.server_principals`, same rule as
-/// [`DATABASE_PRINCIPAL_NAMES`].
-const SERVER_PRINCIPAL_NAMES: [(i32, &str); 10] = [
-    (1, "sa"),
-    (2, "public"),
-    (3, "sysadmin"),
-    (4, "securityadmin"),
-    (5, "serveradmin"),
-    (6, "setupadmin"),
-    (7, "processadmin"),
-    (8, "diskadmin"),
-    (9, "dbcreator"),
-    (10, "bulkadmin"),
-];
-
-/// Where each column of [`PRINCIPALS_TABLE`] sits in a [`Row`]. `name` is not one of them
-/// (module documentation).
+/// Where each column of [`PRINCIPALS_TABLE`] sits in a [`Row`].
 pub(crate) mod principals_columns {
     /// `D` for a row of `sys.database_principals`, `S` for `sys.server_principals`.
     pub(crate) const KIND: usize = 0;
     pub(crate) const PRINCIPAL_ID: usize = 1;
-    pub(crate) const SID: usize = 2;
-    pub(crate) const TYPE: usize = 3;
-    pub(crate) const TYPE_DESC: usize = 4;
-    pub(crate) const IS_FIXED_ROLE: usize = 5;
-    pub(crate) const OWNING_PRINCIPAL_ID: usize = 6;
-    pub(crate) const DEFAULT_SCHEMA_NAME: usize = 7;
-    pub(crate) const DEFAULT_DATABASE_NAME: usize = 8;
-    pub(crate) const DEFAULT_LANGUAGE_NAME: usize = 9;
-    pub(crate) const IS_DISABLED: usize = 10;
+    /// `name sysname`: the name of the principal.
+    pub(crate) const NAME: usize = 2;
+    pub(crate) const SID: usize = 3;
+    pub(crate) const TYPE: usize = 4;
+    pub(crate) const TYPE_DESC: usize = 5;
+    pub(crate) const IS_FIXED_ROLE: usize = 6;
+    pub(crate) const OWNING_PRINCIPAL_ID: usize = 7;
+    pub(crate) const DEFAULT_SCHEMA_NAME: usize = 8;
+    pub(crate) const DEFAULT_DATABASE_NAME: usize = 9;
+    pub(crate) const DEFAULT_LANGUAGE_NAME: usize = 10;
+    pub(crate) const IS_DISABLED: usize = 11;
     /// Width of a row of the table.
-    pub(crate) const WIDTH: usize = 11;
+    pub(crate) const WIDTH: usize = 12;
 }
 
 /// Where each column of [`ROLE_MEMBERS_TABLE`] sits in a [`Row`].
@@ -143,9 +110,9 @@ pub(crate) mod role_members_columns {
 }
 
 /// The select list of `sys.database_principals`: `(column, expression)`, in the published
-/// order. `name`'s expression is filled in by [`database_principals_definition`].
+/// order.
 const DATABASE_PRINCIPALS_VIEW: [(&str, &str); 16] = [
-    ("name", ""),
+    ("name", "name"),
     ("principal_id", "principal_id"),
     ("type", "type"),
     ("type_desc", "type_desc"),
@@ -182,9 +149,9 @@ const PUBLISHED_DATABASE_PRINCIPALS_COLUMNS: [&str; 16] = [
 ];
 
 /// The select list of `sys.server_principals`: `(column, expression)`, in the published
-/// order. `name`'s expression is filled in by [`server_principals_definition`].
+/// order.
 const SERVER_PRINCIPALS_VIEW: [(&str, &str); 14] = [
-    ("name", ""),
+    ("name", "name"),
     ("principal_id", "principal_id"),
     ("sid", "sid"),
     ("type", "type"),
@@ -250,49 +217,17 @@ pub(crate) fn internal_tables() -> Vec<InternalTableDef> {
     ]
 }
 
-/// A `CAST(CASE principal_id WHEN … THEN N'…' … END AS nvarchar(128))` over `pairs`: the
-/// `name` column of a view of this file (module documentation, section "Fixed rows, `name`
-/// included").
-fn name_case(pairs: &[(i32, &str)]) -> String {
-    let mut text = String::from("CAST(CASE principal_id");
-    for (id, name) in pairs {
-        text.push_str(&format!(" WHEN {id} THEN N'{name}'"));
-    }
-    text.push_str(" END AS nvarchar(128))");
-    text
-}
-
-/// [`DATABASE_PRINCIPALS_VIEW`], its `name` expression filled in.
-fn database_principals_select_list() -> Vec<(&'static str, String)> {
-    let mut items: Vec<(&'static str, String)> = DATABASE_PRINCIPALS_VIEW
-        .iter()
-        .map(|&(name, expr)| (name, expr.to_owned()))
-        .collect();
-    items[0].1 = name_case(&DATABASE_PRINCIPAL_NAMES);
-    items
-}
-
-/// [`SERVER_PRINCIPALS_VIEW`], its `name` expression filled in.
-fn server_principals_select_list() -> Vec<(&'static str, String)> {
-    let mut items: Vec<(&'static str, String)> = SERVER_PRINCIPALS_VIEW
-        .iter()
-        .map(|&(name, expr)| (name, expr.to_owned()))
-        .collect();
-    items[0].1 = name_case(&SERVER_PRINCIPAL_NAMES);
-    items
-}
-
 fn database_principals_definition() -> String {
-    definition(
-        &database_principals_select_list(),
+    definition_of_static(
+        &DATABASE_PRINCIPALS_VIEW,
         PRINCIPALS_TABLE,
         &format!("kind = '{DATABASE_KIND}'"),
     )
 }
 
 fn server_principals_definition() -> String {
-    definition(
-        &server_principals_select_list(),
+    definition_of_static(
+        &SERVER_PRINCIPALS_VIEW,
         PRINCIPALS_TABLE,
         &format!("kind = '{SERVER_KIND}'"),
     )
@@ -367,6 +302,7 @@ fn principals_table_columns() -> Vec<InternalColumnDef> {
     vec![
         column("kind", KIND_TYPE, false),
         column("principal_id", SqlType::Int, false),
+        column("name", SYSNAME, false),
         column("sid", SqlType::VarBinary(Len::Fixed(85)), true),
         column("type", SqlType::Char(Len::Fixed(1)), false),
         column("type_desc", SqlType::NVarChar(Len::Fixed(60)), false),
@@ -410,11 +346,10 @@ fn sid_byte(principal_id: i32) -> Value {
 }
 
 /// A row of `sys.database_principals`: `public` (0) through the eight fixed database roles.
-/// `name` is not a field here (module documentation, section "Fixed rows, `name` included");
-/// `principal_id` is the key [`DATABASE_PRINCIPAL_NAMES`] reads back.
 #[allow(clippy::too_many_arguments)]
 fn database_principal_row(
     principal_id: i32,
+    name: &str,
     type_: &str,
     type_desc: &str,
     is_fixed_role: bool,
@@ -424,6 +359,7 @@ fn database_principal_row(
     let mut row = vec![Value::Null; principals_columns::WIDTH];
     row[principals_columns::KIND] = text(DATABASE_KIND);
     row[principals_columns::PRINCIPAL_ID] = Value::I32(principal_id);
+    row[principals_columns::NAME] = text(name);
     row[principals_columns::SID] = Value::Null;
     row[principals_columns::TYPE] = text(type_);
     row[principals_columns::TYPE_DESC] = text(type_desc);
@@ -436,11 +372,11 @@ fn database_principal_row(
     Row(row)
 }
 
-/// A row of `sys.server_principals`: `sa` (1) through the eight fixed server roles. `name` is
-/// not a field here, same reason as [`database_principal_row`].
+/// A row of `sys.server_principals`: `sa` (1) through the eight fixed server roles.
 #[allow(clippy::too_many_arguments)]
 fn server_principal_row(
     principal_id: i32,
+    name: &str,
     type_: &str,
     type_desc: &str,
     is_fixed_role: bool,
@@ -452,6 +388,7 @@ fn server_principal_row(
     let mut row = vec![Value::Null; principals_columns::WIDTH];
     row[principals_columns::KIND] = text(SERVER_KIND);
     row[principals_columns::PRINCIPAL_ID] = Value::I32(principal_id);
+    row[principals_columns::NAME] = text(name);
     row[principals_columns::SID] = sid_byte(principal_id);
     row[principals_columns::TYPE] = text(type_);
     row[principals_columns::TYPE_DESC] = text(type_desc);
@@ -466,21 +403,86 @@ fn server_principal_row(
 
 fn principal_rows() -> Vec<Row> {
     vec![
-        database_principal_row(0, "R", "DATABASE_ROLE", false, Some(1), None),
-        database_principal_row(1, "S", "SQL_USER", false, None, Some("dbo")),
-        database_principal_row(2, "S", "SQL_USER", false, None, Some("guest")),
-        database_principal_row(3, "S", "SQL_USER", false, None, None),
-        database_principal_row(4, "S", "SQL_USER", false, None, None),
-        database_principal_row(16_384, "R", "DATABASE_ROLE", true, Some(1), None),
-        database_principal_row(16_385, "R", "DATABASE_ROLE", true, Some(1), None),
-        database_principal_row(16_386, "R", "DATABASE_ROLE", true, Some(1), None),
-        database_principal_row(16_387, "R", "DATABASE_ROLE", true, Some(1), None),
-        database_principal_row(16_390, "R", "DATABASE_ROLE", true, Some(1), None),
-        database_principal_row(16_391, "R", "DATABASE_ROLE", true, Some(1), None),
-        database_principal_row(16_392, "R", "DATABASE_ROLE", true, Some(1), None),
-        database_principal_row(16_393, "R", "DATABASE_ROLE", true, Some(1), None),
+        database_principal_row(0, "public", "R", "DATABASE_ROLE", false, Some(1), None),
+        database_principal_row(1, "dbo", "S", "SQL_USER", false, None, Some("dbo")),
+        database_principal_row(2, "guest", "S", "SQL_USER", false, None, Some("guest")),
+        database_principal_row(3, "INFORMATION_SCHEMA", "S", "SQL_USER", false, None, None),
+        database_principal_row(4, "sys", "S", "SQL_USER", false, None, None),
+        database_principal_row(
+            16_384,
+            "db_owner",
+            "R",
+            "DATABASE_ROLE",
+            true,
+            Some(1),
+            None,
+        ),
+        database_principal_row(
+            16_385,
+            "db_accessadmin",
+            "R",
+            "DATABASE_ROLE",
+            true,
+            Some(1),
+            None,
+        ),
+        database_principal_row(
+            16_386,
+            "db_securityadmin",
+            "R",
+            "DATABASE_ROLE",
+            true,
+            Some(1),
+            None,
+        ),
+        database_principal_row(
+            16_387,
+            "db_ddladmin",
+            "R",
+            "DATABASE_ROLE",
+            true,
+            Some(1),
+            None,
+        ),
+        database_principal_row(
+            16_390,
+            "db_datareader",
+            "R",
+            "DATABASE_ROLE",
+            true,
+            Some(1),
+            None,
+        ),
+        database_principal_row(
+            16_391,
+            "db_datawriter",
+            "R",
+            "DATABASE_ROLE",
+            true,
+            Some(1),
+            None,
+        ),
+        database_principal_row(
+            16_392,
+            "db_denydatareader",
+            "R",
+            "DATABASE_ROLE",
+            true,
+            Some(1),
+            None,
+        ),
+        database_principal_row(
+            16_393,
+            "db_denydatawriter",
+            "R",
+            "DATABASE_ROLE",
+            true,
+            Some(1),
+            None,
+        ),
         server_principal_row(
             1,
+            "sa",
             "S",
             "SQL_LOGIN",
             false,
@@ -489,15 +491,105 @@ fn principal_rows() -> Vec<Row> {
             Some("master"),
             Some("us_english"),
         ),
-        server_principal_row(2, "R", "SERVER_ROLE", false, false, Some(1), None, None),
-        server_principal_row(3, "R", "SERVER_ROLE", true, false, Some(1), None, None),
-        server_principal_row(4, "R", "SERVER_ROLE", true, false, Some(1), None, None),
-        server_principal_row(5, "R", "SERVER_ROLE", true, false, Some(1), None, None),
-        server_principal_row(6, "R", "SERVER_ROLE", true, false, Some(1), None, None),
-        server_principal_row(7, "R", "SERVER_ROLE", true, false, Some(1), None, None),
-        server_principal_row(8, "R", "SERVER_ROLE", true, false, Some(1), None, None),
-        server_principal_row(9, "R", "SERVER_ROLE", true, false, Some(1), None, None),
-        server_principal_row(10, "R", "SERVER_ROLE", true, false, Some(1), None, None),
+        server_principal_row(
+            2,
+            "public",
+            "R",
+            "SERVER_ROLE",
+            false,
+            false,
+            Some(1),
+            None,
+            None,
+        ),
+        server_principal_row(
+            3,
+            "sysadmin",
+            "R",
+            "SERVER_ROLE",
+            true,
+            false,
+            Some(1),
+            None,
+            None,
+        ),
+        server_principal_row(
+            4,
+            "securityadmin",
+            "R",
+            "SERVER_ROLE",
+            true,
+            false,
+            Some(1),
+            None,
+            None,
+        ),
+        server_principal_row(
+            5,
+            "serveradmin",
+            "R",
+            "SERVER_ROLE",
+            true,
+            false,
+            Some(1),
+            None,
+            None,
+        ),
+        server_principal_row(
+            6,
+            "setupadmin",
+            "R",
+            "SERVER_ROLE",
+            true,
+            false,
+            Some(1),
+            None,
+            None,
+        ),
+        server_principal_row(
+            7,
+            "processadmin",
+            "R",
+            "SERVER_ROLE",
+            true,
+            false,
+            Some(1),
+            None,
+            None,
+        ),
+        server_principal_row(
+            8,
+            "diskadmin",
+            "R",
+            "SERVER_ROLE",
+            true,
+            false,
+            Some(1),
+            None,
+            None,
+        ),
+        server_principal_row(
+            9,
+            "dbcreator",
+            "R",
+            "SERVER_ROLE",
+            true,
+            false,
+            Some(1),
+            None,
+            None,
+        ),
+        server_principal_row(
+            10,
+            "bulkadmin",
+            "R",
+            "SERVER_ROLE",
+            true,
+            false,
+            Some(1),
+            None,
+            None,
+        ),
     ]
 }
 
@@ -526,11 +618,9 @@ mod tests {
             .strip_prefix("SELECT ")
             .and_then(|rest| rest.split("\n  FROM").next())
             .expect("a definition starts with SELECT and has a FROM clause");
-        // A `CASE` expression carries its own commas (`WHEN … THEN N'…'` pairs do not), but a
-        // parenthesised argument list could; a plain split on `,` at top level is enough here
-        // (test `the_columns_of_the_four_views_are_the_published_ones` below, on the actual
-        // definitions this file builds). The `name` column is first, so this does not need to
-        // look inside it.
+        // A parenthesised argument list could carry its own commas; a plain split on `,` is
+        // enough here (test `the_columns_of_the_four_views_are_the_published_ones` below, on
+        // the actual definitions this file builds).
         select_list
             .split(',')
             .map(|piece| {
@@ -669,39 +759,63 @@ mod tests {
     }
 
     #[test]
-    fn every_principal_id_of_a_row_has_a_name_in_its_case() {
-        let rows = principal_rows();
-        for row in &rows {
-            let id = match row.0[principals_columns::PRINCIPAL_ID] {
-                Value::I32(id) => id,
-                ref other => panic!("{other:?}"),
-            };
-            let names = if row.0[principals_columns::KIND] == text(DATABASE_KIND) {
-                &DATABASE_PRINCIPAL_NAMES[..]
-            } else {
-                &SERVER_PRINCIPAL_NAMES[..]
-            };
-            assert!(
-                names.iter().any(|&(named_id, _)| named_id == id),
-                "principal_id {id} has no name"
-            );
-        }
+    fn each_row_of_the_principals_table_carries_its_name() {
+        let names: Vec<(Value, Value, Value)> = principal_rows()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.0[principals_columns::KIND].clone(),
+                    row.0[principals_columns::PRINCIPAL_ID].clone(),
+                    row.0[principals_columns::NAME].clone(),
+                )
+            })
+            .collect();
+        assert!(names.contains(&(text(DATABASE_KIND), Value::I32(1), text("dbo"))));
+        assert!(names.contains(&(
+            text(DATABASE_KIND),
+            Value::I32(16_393),
+            text("db_denydatawriter")
+        )));
+        assert!(names.contains(&(text(SERVER_KIND), Value::I32(1), text("sa"))));
+        assert!(names.contains(&(text(SERVER_KIND), Value::I32(10), text("bulkadmin"))));
+        assert!(
+            names
+                .iter()
+                .all(|(_, _, name)| matches!(name, Value::String(_))),
+            "{names:?}"
+        );
     }
 
     #[test]
-    fn no_row_of_the_principals_table_carries_the_text_of_a_system_schema() {
-        // `bootstrap.rs`'s `schemas_table` finds the internal table of the schemas by the
-        // presence of `dbo`, `sys` and `INFORMATION_SCHEMA` among its rows; this table must
-        // not carry all three, `name` not being one of its columns (module documentation).
+    fn the_name_of_a_principal_is_the_name_column_of_the_table() {
+        let columns = principals_table_columns();
+        assert_eq!(columns[principals_columns::NAME].name, "name");
+        assert_eq!(columns.len(), principals_columns::WIDTH);
+        assert_eq!(DATABASE_PRINCIPALS_VIEW[0], ("name", "name"));
+        assert_eq!(SERVER_PRINCIPALS_VIEW[0], ("name", "name"));
+    }
+
+    #[test]
+    fn no_definition_names_a_principal() {
         let rows = principal_rows();
-        let schema_names = ["dbo", "sys", "INFORMATION_SCHEMA"];
-        let carried = schema_names
-            .iter()
-            .filter(|schema| {
-                rows.iter()
-                    .any(|row| row.0.iter().any(|value| *value == text(schema)))
-            })
-            .count();
-        assert!(carried < schema_names.len(), "{carried}");
+        for text_of_view in [
+            database_principals_definition(),
+            server_principals_definition(),
+        ] {
+            assert!(
+                !text_of_view.to_ascii_uppercase().contains("CASE"),
+                "{text_of_view}"
+            );
+            for row in &rows {
+                let Value::String(name) = &row.0[principals_columns::NAME] else {
+                    panic!("name is a string");
+                };
+                assert!(
+                    !text_of_view.contains(&format!("'{}'", name.text)),
+                    "{} in {text_of_view}",
+                    name.text
+                );
+            }
+        }
     }
 }

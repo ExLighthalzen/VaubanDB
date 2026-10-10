@@ -53,13 +53,15 @@ fn rows(
     rows
 }
 
-/// The internal table of the schemas: the table of `master` that holds a row for each of
-/// `dbo`, `sys` and `INFORMATION_SCHEMA`.
+/// The internal table of the schemas: the table of `master`, 4 values wide, that holds a row
+/// for each of `dbo`, `sys` and `INFORMATION_SCHEMA`.
 ///
 /// Read through `Storage::scan` rather than through a `CatalogSnapshot`, so that the test
 /// depends on the storage alone. A row with the text `dbo` alone is not enough to single out
 /// this table: `master.dbo` carries tables of its own, published under that same schema name
-/// wherever a table lists the schema it belongs to.
+/// wherever a table lists the schema it belongs to. The three names alone are not enough
+/// either: the table of the principals carries a row for each, `dbo`, `sys` and
+/// `INFORMATION_SCHEMA` being database users too, in rows wider than 4 values.
 fn schemas_table(
     storage: &Arc<dyn Storage>,
     txn: &Arc<TransactionManager>,
@@ -71,7 +73,7 @@ fn schemas_table(
         if SYSTEM_SCHEMAS.iter().all(|schema| {
             content
                 .iter()
-                .any(|row| row.iter().any(|v| is_text(v, schema)))
+                .any(|row| row.len() == 4 && row.iter().any(|v| is_text(v, schema)))
         }) {
             found.push(content);
         }
@@ -79,7 +81,7 @@ fn schemas_table(
     assert_eq!(
         found.len(),
         1,
-        "one table of master holds a row for each of dbo, sys and INFORMATION_SCHEMA"
+        "one table of master, 4 values wide, holds a row for each of dbo, sys and INFORMATION_SCHEMA"
     );
     found.pop().unwrap_or_default()
 }
