@@ -404,42 +404,95 @@ fn parse_option_word(p: &mut Parser) -> SqlResult<String> {
 /// the `;` and the `ELSE` before the outer one ever looks for either. On the server, `IF
 /// 1 = 1 IF 2 = 3 PRINT 'x' ELSE PRINT 'y'` prints `y`.
 ///
+/// # An `ELSE IF` chain is read in a loop
+///
+/// An `IF` written right after an `ELSE` is read by this same call rather than through
+/// `parse_statement`, so a chain `IF … ELSE IF … ELSE IF …` costs one level of
+/// [`Parser::nested`] whatever its length, and the links are folded into the nested
+/// [`Statement::If`] nodes the recursive reading built: the AST is unchanged
+/// (`tests::an_else_if_chain_builds_the_same_tree_as_nested_ifs`). Each `ELSE` is counted
+/// by [`Parser::open_else`] instead, against [`MAX_ELSE_CHAIN`], together with the `ELSE`
+/// of the enclosing chains and the statements that enclose this one; the `ELSE` past that
+/// budget is refused with 191 on its own line
+/// (`tests::the_else_past_the_chain_limit_is_refused_on_its_line`). The count is given
+/// back when the chain ends, whether it parsed or not
+/// (`tests::the_else_of_a_refused_chain_is_given_back`).
+///
+/// [`MAX_ELSE_CHAIN`]: crate::parser::MAX_ELSE_CHAIN
+///
 /// # Errors
 ///
-/// The syntax error that stopped the parse.
+/// The syntax error that stopped the parse, or 191 on an `ELSE` past the budget.
 pub(crate) fn parse_if(p: &mut Parser) -> SqlResult<Statement> {
-    let start = p.mark();
-    p.expect_keyword(Keyword::If)?;
-    let condition = parse_expr(p)?;
-    let then_branch = Box::new(stmt::parse_statement(p, false)?);
-    let mut semicolons = 0usize;
-    while matches!(
-        p.peek_at(semicolons).kind,
-        TokenKind::Punct(Punct::Semicolon)
-    ) {
-        semicolons += 1;
-    }
-    if semicolons > 0
-        && matches!(
+    let mut elses = 0u32;
+    let parsed = parse_if_chain(p, &mut elses);
+    p.close_elses(elses);
+    parsed
+}
+
+/// The body of [`parse_if`]: reads the chain and counts in `elses` each `ELSE` it opened
+/// with [`Parser::open_else`], so that the caller gives them back.
+///
+/// # Errors
+///
+/// As [`parse_if`].
+fn parse_if_chain(p: &mut Parser, elses: &mut u32) -> SqlResult<Statement> {
+    // One entry per `IF` of the chain: where it starts, its condition and its branch.
+    let mut links: Vec<(usize, Expr, Statement)> = Vec::new();
+    let last_else = loop {
+        let start = p.mark();
+        p.expect_keyword(Keyword::If)?;
+        let condition = parse_expr(p)?;
+        let then_branch = stmt::parse_statement(p, false)?;
+        links.push((start, condition, then_branch));
+        let mut semicolons = 0usize;
+        while matches!(
             p.peek_at(semicolons).kind,
-            TokenKind::Keyword(Keyword::Else)
-        )
-    {
-        for _ in 0..semicolons {
-            p.advance();
+            TokenKind::Punct(Punct::Semicolon)
+        ) {
+            semicolons += 1;
         }
-    }
-    let else_branch = if p.eat_keyword(Keyword::Else) {
-        Some(Box::new(stmt::parse_statement(p, false)?))
-    } else {
-        None
+        if semicolons > 0
+            && matches!(
+                p.peek_at(semicolons).kind,
+                TokenKind::Keyword(Keyword::Else)
+            )
+        {
+            for _ in 0..semicolons {
+                p.advance();
+            }
+        }
+        if !p.at_keyword(Keyword::Else) {
+            break None;
+        }
+        p.open_else()?;
+        *elses += 1;
+        p.advance();
+        if !p.at_keyword(Keyword::If) {
+            break Some(stmt::parse_statement(p, false)?);
+        }
     };
-    Ok(Statement::If {
-        condition,
-        then_branch,
-        else_branch,
-        span: p.span_from(start),
-    })
+    // Fold from the innermost `IF` outwards; each span ends where the chain ends.
+    let mut else_branch = last_else.map(Box::new);
+    let mut folded = None;
+    while let Some((start, condition, then_branch)) = links.pop() {
+        let node = Statement::If {
+            condition,
+            then_branch: Box::new(then_branch),
+            else_branch,
+            span: p.span_from(start),
+        };
+        if links.is_empty() {
+            folded = Some(node);
+            break;
+        }
+        else_branch = Some(Box::new(node));
+    }
+    match folded {
+        Some(statement) => Ok(statement),
+        // The loop pushes one link before it can leave, so the fold ends on a node.
+        None => unreachable!("an IF chain holds at least one IF"),
+    }
 }
 
 /// Parses a `WHILE` statement, starting on its `WHILE` keyword.

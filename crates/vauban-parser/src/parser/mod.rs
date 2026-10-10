@@ -245,6 +245,20 @@ static PAST_THE_END: Token = Token {
 /// This gap is a deliberate difference from SQL Server.
 pub(crate) const MAX_NESTING_DEPTH: u32 = 220;
 
+/// How many `ELSE` keywords an `IF … ELSE IF … ELSE …` chain written at the top of a
+/// batch may hold, the last plain `ELSE` included.
+///
+/// `flow::parse_if` reads such a chain in a loop, so its links spend no unit of
+/// [`MAX_NESTING_DEPTH`]; [`Parser::open_else`] counts them against this budget instead.
+/// At the top of a batch, the chain of 253 `ELSE` runs and the 254th `ELSE` is answered
+/// with 191 on its own line (`tests/nesting_depth.rs`,
+/// `else_if_chain_stops_at_its_own_limit`). The budget is shared: the `ELSE` of the
+/// chains that enclose this one count, and so does each enclosing statement level, at
+/// half the weight of an `ELSE` (`tests/nesting_depth.rs`,
+/// `nested_else_if_chains_share_one_budget`). Without that sharing, chains nested through
+/// `ELSE BEGIN … END` would build a tree as deep as their total length.
+pub(crate) const MAX_ELSE_CHAIN: u32 = 253;
+
 /// A cursor over the tokens of one batch, with the helpers every grammar rule shares.
 ///
 /// The token vector always ends with [`TokenKind::Eof`] and `pos` never goes past it, so
@@ -258,6 +272,8 @@ pub(crate) struct Parser<'a> {
     depth: u32,
     /// How many `CASE` expressions the cursor is inside; see [`Parser::nested_case`].
     case_depth: u32,
+    /// How many `ELSE` of `IF` chains enclose the cursor; see [`Parser::open_else`].
+    else_links: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -275,6 +291,7 @@ impl<'a> Parser<'a> {
             opts,
             depth: 0,
             case_depth: 0,
+            else_links: 0,
         })
     }
 
@@ -309,6 +326,31 @@ impl<'a> Parser<'a> {
         let parsed = rule(self);
         self.depth -= 1;
         parsed
+    }
+
+    /// Counts one more `ELSE` of an `IF` chain against [`MAX_ELSE_CHAIN`], or refuses it.
+    ///
+    /// The budget is reckoned in halves: an `ELSE` costs two, each level of
+    /// [`Parser::nested`] the cursor is inside costs one, and the total may not pass
+    /// `2 * MAX_ELSE_CHAIN + 1`. The statement level of a chain at the top of a batch is
+    /// that `+ 1`, so such a chain holds exactly [`MAX_ELSE_CHAIN`] `ELSE`.
+    ///
+    /// # Errors
+    ///
+    /// Error 191 on the token the cursor sits on, the `ELSE` itself, when the budget is
+    /// spent; the count is then left as it was.
+    pub(crate) fn open_else(&mut self) -> SqlResult<()> {
+        let spent = 2 * (self.else_links + 1) + self.depth;
+        if spent > 2 * MAX_ELSE_CHAIN + 1 {
+            return Err(self.nested_too_deeply());
+        }
+        self.else_links += 1;
+        Ok(())
+    }
+
+    /// Gives back `count` `ELSE` opened by [`Parser::open_else`] when their chain ends.
+    pub(crate) fn close_elses(&mut self, count: u32) {
+        self.else_links = self.else_links.saturating_sub(count);
     }
 
     /// How many `CASE` expressions enclose the token the cursor sits on.

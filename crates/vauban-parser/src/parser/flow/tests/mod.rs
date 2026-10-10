@@ -208,3 +208,148 @@ fn a_gap_before_the_colon_is_not_a_label() {
         assert_eq!(error.message, "Syntax error near 'l'.", "{text}");
     }
 }
+
+/// The `PRINT` values of an `ELSE IF` chain, walked down its `else_branch` links, and the
+/// length of every node's span.
+fn chain_shape(statement: &Statement) -> (Vec<String>, Vec<u32>) {
+    let mut values = Vec::new();
+    let mut lengths = Vec::new();
+    let mut current = Some(statement);
+    while let Some(node) = current {
+        match node {
+            Statement::If {
+                then_branch,
+                else_branch,
+                span,
+                ..
+            } => {
+                values.push(printed_value(then_branch).to_owned());
+                lengths.push(span.len);
+                current = else_branch.as_deref();
+            }
+            other => {
+                values.push(printed_value(other).to_owned());
+                current = None;
+            }
+        }
+    }
+    (values, lengths)
+}
+
+#[test]
+fn an_else_if_chain_builds_the_same_tree_as_nested_ifs() {
+    let text =
+        "IF @i = 1 PRINT 'a' ELSE IF @i = 2 PRINT 'b'; ELSE IF @i = 3 PRINT 'c' ELSE PRINT 'd'";
+    let chain = one(text);
+    let (values, lengths) = chain_shape(&chain);
+    assert_eq!(values, ["a", "b", "c", "d"]);
+    // Every node ends where the chain ends, so each span is the tail of the text.
+    let expected: Vec<u32> = ["IF @i = 1", "IF @i = 2", "IF @i = 3"]
+        .iter()
+        .map(|head| (text.len() - text.find(head).expect("head in text")) as u32)
+        .collect();
+    assert_eq!(lengths, expected);
+    // The same tree as an `ELSE` whose statement is an `IF` reached by recursion: a
+    // `BEGIN … END` around the inner `IF` is the only difference that remains.
+    let nested = one(
+        "IF @i = 1 PRINT 'a' ELSE IF @i = 2 PRINT 'b' ELSE BEGIN IF @i = 3 PRINT 'c' ELSE PRINT 'd' END",
+    );
+    match (&chain, &nested) {
+        (Statement::If { else_branch: a, .. }, Statement::If { else_branch: b, .. }) => {
+            match (a.as_deref(), b.as_deref()) {
+                (
+                    Some(Statement::If {
+                        else_branch: Some(inner_a),
+                        ..
+                    }),
+                    Some(Statement::If {
+                        else_branch: Some(inner_b),
+                        ..
+                    }),
+                ) => match inner_b.as_ref() {
+                    Statement::Block { statements, .. } => assert_eq!(**inner_a, statements[0]),
+                    other => unreachable!("a block was expected, got {other:?}"),
+                },
+                other => unreachable!("two links were expected, got {other:?}"),
+            }
+        }
+        other => unreachable!("two IF were expected, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_if_nested_in_a_link_keeps_its_nearest_else() {
+    // `ELSE 'y'` belongs to the `IF @j` inside the second link, and `ELSE 'z'` to the link.
+    let chain =
+        one("IF @i = 1 PRINT 'a' ELSE IF @i = 2 IF @j = 1 PRINT 'x' ELSE PRINT 'y' ELSE PRINT 'z'");
+    let Statement::If {
+        else_branch: Some(link),
+        ..
+    } = chain
+    else {
+        unreachable!("an IF with an ELSE was expected");
+    };
+    let Statement::If {
+        then_branch,
+        else_branch: Some(last),
+        ..
+    } = *link
+    else {
+        unreachable!("the second link has an ELSE");
+    };
+    assert_eq!(printed_value(&last), "z");
+    let (values, _) = chain_shape(&then_branch);
+    assert_eq!(values, ["x", "y"]);
+}
+
+/// `IF … SET @r = 0`, then `links` lines `ELSE IF … SET @r = k`, then an optional `ELSE`.
+fn chain_text(links: usize, final_else: bool) -> String {
+    let mut text = "IF @i = 0 SET @r = 0\n".to_owned();
+    for k in 1..=links {
+        text.push_str(&format!("ELSE IF @i = {k} SET @r = {k}\n"));
+    }
+    if final_else {
+        text.push_str("ELSE SET @r = -1\n");
+    }
+    text
+}
+
+#[test]
+fn the_else_past_the_chain_limit_is_refused_on_its_line() {
+    p(&chain_text(253, false));
+    p(&chain_text(252, true));
+    for (links, final_else) in [(254, false), (253, true), (1_000, false)] {
+        let error = p_err(&chain_text(links, final_else));
+        assert_eq!(
+            (error.number, error.line),
+            (191, 255),
+            "{links} {final_else}"
+        );
+    }
+    // One line for the whole chain puts the error on that line.
+    let error = p_err(&chain_text(300, true).replace('\n', " "));
+    assert_eq!((error.number, error.line), (191, 1));
+}
+
+#[test]
+fn a_chain_inside_a_block_holds_one_else_less() {
+    p(&format!("BEGIN\n{}END", chain_text(252, false)));
+    let error = p_err(&format!("BEGIN\n{}END", chain_text(252, true)));
+    assert_eq!((error.number, error.line), (191, 255));
+}
+
+#[test]
+fn the_else_of_a_refused_chain_is_given_back() {
+    // The first chain fails on a syntax error after 200 ELSE; the second, in the next
+    // batch parsed by a fresh cursor and in the same batch after it, still holds 253.
+    assert_eq!(
+        p_err(&format!("{}ELSE IF", chain_text(200, false))).number,
+        102
+    );
+    let two = format!(
+        "{}SELECT 1\n{}",
+        chain_text(253, false),
+        chain_text(253, false)
+    );
+    assert_eq!(p(&two).statements.len(), 3);
+}

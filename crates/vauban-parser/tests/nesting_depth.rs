@@ -76,7 +76,8 @@
 //! Two shapes were tried and are **not** here, both because they are green without the
 //! iterative destructor and an axis that is already green adds nothing: a batch of 200 000 `PRINT 1`
 //! (breadth, which a `Vec` frees in a loop already) and `IF … ELSE IF …` 200 000 deep,
-//! which the statement dispatch counts and refuses with 191 long before.
+//! which the `IF` rule counts and refuses with 191 at its 254th `ELSE`
+//! ([`else_if_chain_stops_at_its_own_limit`]).
 
 use std::thread;
 
@@ -971,4 +972,110 @@ fn the_parser_still_works_after_walking_a_comb_in_a_call() {
     assert_eq!(links, COMB_LEVELS);
     let batch = parse_on_reference_stack("SELECT 1".to_owned()).expect("an ordinary batch");
     assert_eq!(batch.to_string(), "SELECT 1");
+}
+
+/// `IF @i = 0 … ELSE IF @i = k …`, one `ELSE IF` per line from line 2, then a plain
+/// `ELSE` when `final_else` says so.
+fn else_if_chain(links: usize, final_else: bool) -> String {
+    let mut text = "IF @i = 0 SET @r = 0\n".to_owned();
+    for k in 1..=links {
+        text.push_str(&format!("ELSE IF @i = {k} SET @r = {k}\n"));
+    }
+    if final_else {
+        text.push_str("ELSE SET @r = -1\n");
+    }
+    text
+}
+
+/// How many `IF` nodes an `ELSE IF` chain was folded into, walked in a loop.
+fn else_links(statement: &Statement) -> usize {
+    let mut count = 0;
+    let mut current = Some(statement);
+    while let Some(Statement::If { else_branch, .. }) = current {
+        count += 1;
+        current = else_branch.as_deref();
+    }
+    count
+}
+
+/// A chain at the top of a batch holds 253 `ELSE`, the last plain one included, and the
+/// 254th is a 191 on its own line. Under 200 enclosing `BEGIN` the chain still holds 153
+/// `ELSE`, where the statement guard alone used to stop it after 19.
+#[test]
+fn else_if_chain_stops_at_its_own_limit() {
+    for (links, final_else) in [(253, false), (252, true)] {
+        let batch = parse_on_reference_stack(else_if_chain(links, final_else))
+            .expect("a chain of 253 ELSE parses");
+        assert_eq!(else_links(&batch.statements[0]), links + 1);
+    }
+    for (links, final_else, line) in [(254, false, 255), (253, true, 255), (10_000, true, 255)] {
+        let error = refused(else_if_chain(links, final_else));
+        assert_is_191(&error);
+        assert_eq!(error.line, line, "the 254th ELSE is on line 255");
+    }
+    let enclosed = |links| {
+        format!(
+            "{}{}{}",
+            "BEGIN\n".repeat(200),
+            else_if_chain(links, false),
+            "END\n".repeat(200)
+        )
+    };
+    let batch = parse_on_reference_stack(enclosed(153)).expect("153 ELSE under 200 blocks");
+    let mut statement = &batch.statements[0];
+    for _ in 0..200 {
+        match statement {
+            Statement::Block { statements, .. } => statement = &statements[0],
+            other => unreachable!("a block was expected, got {other:?}"),
+        }
+    }
+    assert_eq!(else_links(statement), 154);
+    let error = refused(enclosed(154));
+    assert_is_191(&error);
+    assert_eq!(error.line, 355, "the 154th ELSE is on line 355");
+}
+
+/// `chains` chains of `links` `ELSE IF` each, the plain `ELSE` of each opening a
+/// `BEGIN … END` that holds the next chain.
+fn nested_else_if_chains(chains: usize, links: usize) -> String {
+    let mut text = String::new();
+    for _ in 0..chains {
+        text.push_str(&else_if_chain(links, false));
+        text.push_str("ELSE BEGIN\n");
+    }
+    text.push_str("SET @r = -2\n");
+    text.push_str(&"END\n".repeat(chains));
+    text
+}
+
+/// Chains nested through `ELSE BEGIN … END` spend one budget: two chains of 125 parse,
+/// two of 126 do not, and twenty chains of 50 -- a thousand links, which used to build a
+/// tree a thousand `IF` deep -- are a 191. The deepest tree the budget lets through, a
+/// full chain whose last `ELSE` holds 217 nested blocks, is printed and freed on the
+/// reference stack.
+#[test]
+fn nested_else_if_chains_share_one_budget() {
+    parse_on_reference_stack(nested_else_if_chains(2, 125)).expect("two chains of 125 parse");
+    for (chains, links) in [(2, 126), (4, 250), (20, 50)] {
+        assert_is_191(&refused(nested_else_if_chains(chains, links)));
+    }
+    let deepest = format!(
+        "{}ELSE {}SET @r = 1\n{}",
+        else_if_chain(252, false),
+        "BEGIN\n".repeat(217),
+        "END\n".repeat(217)
+    );
+    let worker = thread::Builder::new()
+        .stack_size(REFERENCE_STACK)
+        .spawn(move || {
+            let batch = parse_batch(&deepest, &ParseOptions::default())
+                .unwrap_or_else(|error| unreachable!("the deepest tree parses: {error:?}"));
+            let printed = batch.to_string();
+            let links = else_links(&batch.statements[0]);
+            drop(batch);
+            (links, printed.matches("BEGIN").count())
+        })
+        .expect("the test can spawn a thread");
+    let (links, blocks) = worker.join().expect("the tree was printed and freed");
+    assert_eq!((links, blocks), (253, 217));
 }
