@@ -207,14 +207,13 @@ use crate::statements::{
 };
 use crate::txn_session::{self, StatementTxn};
 use vauban_binder::{
-    BatchVariables, BindContext, BoundExecute, BoundExpr, BoundStatement, DdlStatement,
-    OutputSchema,
+    BatchVariables, BindContext, BoundExecute, BoundStatement, DdlStatement, OutputSchema,
 };
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{ErrorScope, InfoMessage, InternalError, SqlError, SqlResult, error_behavior};
 use vauban_executor::{
     Call, EnvironmentChange, ExecContext, ExecOutcome, ExecSession, Host, Program, ProgramEnd, Ran,
-    Site, StatementSink, eval_expr,
+    Site, StatementSink,
 };
 use vauban_parser::{SetOptionStatement, Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, SnapshotIndexes};
@@ -1318,13 +1317,13 @@ impl Host for BatchHost<'_> {
 
     fn condition(
         &mut self,
-        condition: &BoundExpr,
         site: Site,
+        evaluate: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<Value>,
     ) -> SqlResult<Result<bool, SqlError>> {
         let mut value = None;
         let opened = self.session.within_a_transaction(
             &mut |ctx: &mut ExecContext<'_>| {
-                value = Some(eval_expr(condition, None, ctx));
+                value = Some(evaluate(ctx));
                 Ok(())
             },
             &mut *self.sink,

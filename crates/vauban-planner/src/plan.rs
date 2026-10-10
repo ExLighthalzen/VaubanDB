@@ -12,11 +12,11 @@
 //! [`sort::try_top_n`], answer `Ok(None)` when their rule does not apply, and this file
 //! then builds the operator it would have built anyway.
 
-use vauban_binder::{BoundStatement, LogicalPlan};
+use vauban_binder::{BoundExpr, BoundStatement, LogicalPlan};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 
 use crate::context::PlanContext;
-use crate::physical::{PhysicalDeclaration, PhysicalPlan, PhysicalStatement};
+use crate::physical::{PhysicalDeclaration, PhysicalPlan, PhysicalStatement, StatementExpr};
 use crate::{aggregate, dml, setop, sort, subquery};
 
 /// Turns a bound statement into the physical statement the `executor` runs.
@@ -84,13 +84,13 @@ pub fn plan(stmt: BoundStatement, ctx: &PlanContext<'_>) -> SqlResult<PhysicalSt
                 None => None,
             };
             Ok(PhysicalStatement::If {
-                condition,
+                condition: statement_expr(condition, ctx)?,
                 then_,
                 else_,
             })
         }
         BoundStatement::While { condition, body } => Ok(PhysicalStatement::While {
-            condition,
+            condition: statement_expr(condition, ctx)?,
             body: Box::new(plan(*body, ctx)?),
         }),
         BoundStatement::Block(statements) => {
@@ -102,7 +102,9 @@ pub fn plan(stmt: BoundStatement, ctx: &PlanContext<'_>) -> SqlResult<PhysicalSt
         }
         BoundStatement::Break => Ok(PhysicalStatement::Break),
         BoundStatement::Continue => Ok(PhysicalStatement::Continue),
-        BoundStatement::Return(expr) => Ok(PhysicalStatement::Return(expr)),
+        BoundStatement::Return(expr) => Ok(PhysicalStatement::Return(
+            expr.map(|expr| statement_expr(expr, ctx)).transpose()?,
+        )),
         BoundStatement::Goto { label } => Ok(PhysicalStatement::Goto { label }),
         BoundStatement::Label { name } => Ok(PhysicalStatement::Label { name }),
         BoundStatement::Print(expr) => Ok(PhysicalStatement::Print(expr)),
@@ -112,6 +114,14 @@ pub fn plan(stmt: BoundStatement, ctx: &PlanContext<'_>) -> SqlResult<PhysicalSt
         // once it is (`vauban_executor`, `control.rs`).
         BoundStatement::Deferred(deferred) => Ok(PhysicalStatement::Deferred(deferred)),
     }
+}
+
+/// Plans the subqueries of an expression a statement evaluates outside any plan, as the
+/// value of a `SET` has them planned (`tests/subquery.rs`,
+/// `an_if_condition_carries_the_plans_of_its_subqueries`).
+fn statement_expr(expr: BoundExpr, ctx: &PlanContext<'_>) -> SqlResult<StatementExpr> {
+    let subplans = subquery::plan_statement_subplans(&expr, ctx)?;
+    Ok(StatementExpr { expr, subplans })
 }
 
 /// Plans one node of the logical plan and its children.

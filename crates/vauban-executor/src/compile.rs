@@ -285,7 +285,7 @@ pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult
             then_,
             else_,
         } => {
-            compile_expr(condition, ctx)?;
+            compile_expr(&condition.expr, ctx)?;
             compile(then_, ctx)?;
             match else_ {
                 Some(else_) => compile(else_, ctx),
@@ -293,7 +293,7 @@ pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult
             }
         }
         PhysicalStatement::While { condition, body } => {
-            compile_expr(condition, ctx)?;
+            compile_expr(&condition.expr, ctx)?;
             compile(body, ctx)
         }
         PhysicalStatement::Block(statements) => {
@@ -309,9 +309,8 @@ pub fn compile(stmt: &PhysicalStatement, ctx: &mut ExecContext<'_>) -> SqlResult
         | PhysicalStatement::Return(None)
         | PhysicalStatement::Transaction(_)
         | PhysicalStatement::Execute(_) => Ok(()),
-        PhysicalStatement::Return(Some(expr)) | PhysicalStatement::Print(expr) => {
-            compile_expr(expr, ctx)
-        }
+        PhysicalStatement::Return(Some(value)) => compile_expr(&value.expr, ctx),
+        PhysicalStatement::Print(expr) => compile_expr(expr, ctx),
     }
 }
 

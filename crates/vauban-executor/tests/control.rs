@@ -438,7 +438,7 @@ fn if_takes_the_true_branch() {
         subplans: Vec::new(),
     };
     let if_stmt = PhysicalStatement::If {
-        condition: eq(int_lit(1), int_lit(1)),
+        condition: eq(int_lit(1), int_lit(1)).into(),
         then_: Box::new(then_stmt),
         else_: Some(Box::new(else_stmt)),
     };
@@ -471,7 +471,7 @@ fn if_takes_else_on_unknown() {
     };
     let null_cond = lit(Value::Null, bit_ty());
     let if_stmt = PhysicalStatement::If {
-        condition: null_cond,
+        condition: null_cond.into(),
         then_: Box::new(then_stmt),
         else_: Some(Box::new(else_stmt)),
     };
@@ -512,13 +512,13 @@ fn while_loops_and_break_exits() {
         subplans: Vec::new(),
     };
     let break_if_three = PhysicalStatement::If {
-        condition: eq(var_ref("@i"), int_lit(3)),
+        condition: eq(var_ref("@i"), int_lit(3)).into(),
         then_: Box::new(PhysicalStatement::Break),
         else_: None,
     };
     let body = PhysicalStatement::Block(vec![inc, break_if_three]);
     let while_stmt = PhysicalStatement::While {
-        condition: lt(var_ref("@i"), int_lit(5)),
+        condition: lt(var_ref("@i"), int_lit(5)).into(),
         body: Box::new(body),
     };
 
@@ -531,7 +531,7 @@ fn while_loops_and_break_exits() {
 fn infinite_loop_is_cancellable() {
     let mut session = new_session();
     let while_stmt = PhysicalStatement::While {
-        condition: eq(int_lit(1), int_lit(1)),
+        condition: eq(int_lit(1), int_lit(1)).into(),
         body: Box::new(PhysicalStatement::Block(vec![])),
     };
 
@@ -741,7 +741,7 @@ fn deferred(text: &str) -> PhysicalStatement {
 /// An `IF` over `taken` whose branch holds `stmt`.
 fn if_over(taken: bool, stmt: PhysicalStatement) -> PhysicalStatement {
     PhysicalStatement::If {
-        condition: eq(int_lit(1), int_lit(if taken { 1 } else { 0 })),
+        condition: eq(int_lit(1), int_lit(if taken { 1 } else { 0 })).into(),
         then_: Box::new(stmt),
         else_: None,
     }
@@ -780,7 +780,7 @@ fn a_deferred_statement_in_a_loop_runs_on_every_turn() {
     let mut session = new_session();
     declare(&mut session, "@i", int_ty(), Some(int_lit(0)));
     let stmt = PhysicalStatement::While {
-        condition: lt(var_ref("@i"), int_lit(3)),
+        condition: lt(var_ref("@i"), int_lit(3)).into(),
         body: Box::new(PhysicalStatement::Block(vec![
             PhysicalStatement::SetVariable {
                 name: "@i".to_owned(),
@@ -982,7 +982,7 @@ fn a_goto_out_of_a_statement_run_alone_is_133_before_anything_runs() {
     let shapes = [
         PhysicalStatement::Block(vec![set(int_lit(1)), goto(), set(int_lit(99))]),
         PhysicalStatement::While {
-            condition: lt(var_ref("@i"), int_lit(5)),
+            condition: lt(var_ref("@i"), int_lit(5)).into(),
             body: Box::new(PhysicalStatement::Block(vec![
                 set(add(var_ref("@i"), int_lit(1))),
                 goto(),

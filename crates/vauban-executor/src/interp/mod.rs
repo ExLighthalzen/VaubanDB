@@ -91,9 +91,9 @@ pub(crate) use single::run_alone;
 
 use std::collections::HashMap;
 
-use vauban_binder::BoundExpr;
 use vauban_errors::{ErrorScope, SqlError, SqlResult};
 use vauban_planner::PhysicalStatement;
+use vauban_types::Value;
 
 use crate::context::ExecContext;
 use crate::row::{EvaluatedExecArg, ExecOutcome};
@@ -359,16 +359,24 @@ pub trait Host {
     /// An error that ends the run at once (module documentation of [`Program::run_hosted`]).
     fn statement(&mut self, stmt: Option<&PhysicalStatement>, site: Site) -> SqlResult<Ran>;
 
-    /// Evaluates the condition of an `IF` or of a `WHILE` written at `site`: `Ok(true)`
-    /// when it is true, `Ok(false)` when it is false or unknown, `Err` with the error the
-    /// evaluation raised, on the line the client reads it at and unsent, as for
-    /// [`Ran::Failed`].
+    /// Evaluates the condition of an `IF` or of a `WHILE` written at `site` by running
+    /// `evaluate` in a context opened for it: `Ok(true)` when it is true, `Ok(false)` when
+    /// it is false or unknown, `Err` with the error the evaluation raised, on the line the
+    /// client reads it at and unsent, as for [`Ran::Failed`].
+    ///
+    /// `evaluate` is the interpreter's: it installs the plans of the subqueries the
+    /// condition holds while it reads it, as for the value of a `SET`
+    /// (`tests/subquery.rs`, `an_if_reads_an_exists_nested_in_an_exists`), and answers an
+    /// error on the line the condition starts on.
     ///
     /// # Errors
     ///
     /// An error that ends the run at once.
-    fn condition(&mut self, condition: &BoundExpr, site: Site)
-    -> SqlResult<Result<bool, SqlError>>;
+    fn condition(
+        &mut self,
+        site: Site,
+        evaluate: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<Value>,
+    ) -> SqlResult<Result<bool, SqlError>>;
 
     /// Runs `step` in a context opened for it, then closes that context: the value of a
     /// `RETURN`, the binding of a statement left unbound, the opening and the closing of

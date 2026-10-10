@@ -2,18 +2,16 @@
 //! [`Program::run`](super::Program::run), and of a statement that holds others when it is
 //! run alone through [`crate::execute`].
 
-use vauban_binder::BoundExpr;
 use vauban_errors::{ErrorScope, InfoMessage, SqlError, SqlResult};
 use vauban_planner::PhysicalStatement;
 use vauban_types::Value;
 
 use crate::context::ExecContext;
-use crate::expr::eval_expr;
 use crate::row::ExecOutcome;
 use crate::sink::{EnvironmentChange, ResultColumn, StatementSink};
 
 use super::compile::{Labels, compile};
-use super::run::{End, bug, condition_error, escape_error, run};
+use super::run::{End, bug, escape_error, run};
 use super::{Call, CallHandler, Host, ProgramEnd, Ran, Site};
 
 /// A [`Host`] over one context, one sink and one [`CallHandler`].
@@ -66,14 +64,15 @@ impl Host for SingleContext<'_, '_> {
         }
     }
 
+    // The error comes back on the line the condition starts on, which `evaluate` gave it.
     fn condition(
         &mut self,
-        condition: &BoundExpr,
         _site: Site,
+        evaluate: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<Value>,
     ) -> SqlResult<Result<bool, SqlError>> {
-        match eval_expr(condition, None, self.ctx) {
+        match evaluate(self.ctx) {
             Ok(value) => Ok(Ok(matches!(value, Value::Bit(true)))),
-            Err(err) => Ok(Err(condition_error(err, condition.line))),
+            Err(err) => Ok(Err(err)),
         }
     }
 

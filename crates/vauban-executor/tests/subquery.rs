@@ -1554,3 +1554,46 @@ fn a_set_reads_an_exists_and_an_in_subquery_in_the_same_position() {
     run_statement(&mut session, &in_value).expect("the IN runs");
     assert_eq!(session.variables.get("@x"), Some(&Value::I32(1)));
 }
+
+/// The condition of an `IF` reads a subquery nested in a subquery, correlated on the row of
+/// the one that holds it, as a query does.
+#[test]
+fn an_if_reads_an_exists_nested_in_an_exists() {
+    let f = seeded();
+    let rows = f.run(
+        "IF EXISTS (SELECT 1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)) \
+         SELECT 7 ELSE SELECT 0;",
+    );
+    assert_eq!(rows, i32s(&[&[7]]));
+    let rows = f.run(
+        "IF EXISTS (SELECT 1 FROM t1 WHERE a = 3 AND EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)) \
+         SELECT 7 ELSE SELECT 0;",
+    );
+    assert_eq!(rows, i32s(&[&[0]]));
+}
+
+/// The subquery of the condition is not read through a plan the condition does not carry:
+/// the form with no table at all answers its branch.
+#[test]
+fn an_if_reads_an_exists_nested_in_an_exists_without_a_table() {
+    let f = SqlFixture::new();
+    let rows = f.run("IF EXISTS (SELECT 1 WHERE EXISTS (SELECT 1 WHERE 1 = 1)) SELECT 7;");
+    assert_eq!(rows, i32s(&[&[7]]));
+}
+
+/// Three levels in the condition, an `IN` and a scalar subquery, each level correlated on
+/// the one above it.
+#[test]
+fn an_if_reads_three_levels_of_correlated_subqueries() {
+    let f = seeded();
+    let rows = f.run(
+        "IF 2 IN (SELECT a FROM t1 WHERE a IN (SELECT a FROM t2 WHERE EXISTS \
+         (SELECT 1 FROM t3 WHERE t3.k = t2.a))) SELECT 1 ELSE SELECT 0;",
+    );
+    assert_eq!(rows, i32s(&[&[1]]));
+    let rows = f.run(
+        "IF (SELECT COUNT(*) FROM t1 WHERE (SELECT COUNT(*) FROM t2 WHERE t2.a = t1.a AND \
+         (SELECT v FROM t3 WHERE t3.k = t2.a) > 10) = 1) = 1 SELECT 1 ELSE SELECT 0;",
+    );
+    assert_eq!(rows, i32s(&[&[1]]));
+}

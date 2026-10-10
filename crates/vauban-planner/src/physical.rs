@@ -30,9 +30,10 @@ use vauban_types::{SqlType, TypeInfo};
 ///
 /// The variants that carry no relational plan — DDL, `USE`, the transaction statements —
 /// hold the payload the binder built, unchanged: planning has nothing to choose for them,
-/// and `plan.rs` moves them across. A `DECLARE` and a `SET` carry, beside that payload,
-/// the plan of each subquery their expression holds ([`SubPlan`]), since an expression
-/// evaluated outside a plan has no operator to hang one on.
+/// and `plan.rs` moves them across. A `DECLARE`, a `SET`, the condition of an `IF` or of a
+/// `WHILE` and a `RETURN` carry, beside their expression, the plan of each subquery it
+/// holds ([`SubPlan`], [`StatementExpr`]), since an expression evaluated outside a plan has
+/// no operator to hang one on.
 #[derive(Debug, Clone)]
 pub enum PhysicalStatement {
     /// A `SELECT` and its physical plan.
@@ -84,8 +85,9 @@ pub enum PhysicalStatement {
     /// `IF p stmt [ELSE stmt]`, both branches planned.
     If {
         /// The condition, which satisfies
-        /// [`BoundExpr::is_predicate`](vauban_binder::BoundExpr::is_predicate).
-        condition: BoundExpr,
+        /// [`BoundExpr::is_predicate`](vauban_binder::BoundExpr::is_predicate), with the
+        /// plans of the subqueries it holds.
+        condition: StatementExpr,
         /// The statement run when the condition is true, named as in the bound statement.
         then_: Box<PhysicalStatement>,
         /// The statement of the `ELSE`, `None` for an `IF` written without that clause.
@@ -94,8 +96,9 @@ pub enum PhysicalStatement {
     /// `WHILE p stmt`, body planned.
     While {
         /// The condition, which satisfies
-        /// [`BoundExpr::is_predicate`](vauban_binder::BoundExpr::is_predicate).
-        condition: BoundExpr,
+        /// [`BoundExpr::is_predicate`](vauban_binder::BoundExpr::is_predicate), with the
+        /// plans of the subqueries it holds.
+        condition: StatementExpr,
         /// The body of the loop.
         body: Box<PhysicalStatement>,
     },
@@ -106,7 +109,7 @@ pub enum PhysicalStatement {
     /// `CONTINUE`.
     Continue,
     /// `RETURN [e]`, the expression being `None` for a bare `RETURN`.
-    Return(Option<BoundExpr>),
+    Return(Option<StatementExpr>),
     /// `GOTO label`, the name carried across from the bound statement: there is nothing to
     /// plan, since where the jump lands is a position in a list of statements neither this
     /// crate nor the executor holds.
@@ -355,8 +358,36 @@ pub struct PhysicalDeclaration {
     pub subplans: Vec<SubPlan>,
 }
 
-/// One subquery of a [`PhysicalPlan::SubqueryEval`], or of the value of a `SET` or a
-/// `DECLARE`.
+/// An expression a statement evaluates outside any plan — the condition of an `IF` or of a
+/// `WHILE`, the value of a `RETURN` — and the plans of the subqueries it holds.
+///
+/// The bound expression is carried across unchanged; `subplans` is what planning adds, one
+/// plan per subquery written directly in `expr`, in the order
+/// [`SubqueryEval`](PhysicalPlan::SubqueryEval) lists them. A subquery nested in one of
+/// those is planned inside the plan of its parent, as it is in a query.
+#[derive(Debug, Clone)]
+pub struct StatementExpr {
+    /// The expression, as the binder bound it.
+    pub expr: BoundExpr,
+    /// One plan per subquery `expr` holds, empty for `IF 1 = 1`
+    /// (`tests/subquery.rs`, `an_if_condition_without_a_subquery_carries_no_subplan`).
+    pub subplans: Vec<SubPlan>,
+}
+
+impl From<BoundExpr> for StatementExpr {
+    /// An expression planned with no subquery plan, which is what an expression that holds
+    /// no subquery is planned into.
+    fn from(expr: BoundExpr) -> Self {
+        Self {
+            expr,
+            subplans: Vec::new(),
+        }
+    }
+}
+
+/// One subquery of a [`PhysicalPlan::SubqueryEval`], or of an expression a statement
+/// evaluates outside any plan ([`PhysicalDeclaration`], [`StatementExpr`],
+/// [`PhysicalStatement::SetVariable`]).
 #[derive(Debug, Clone)]
 pub struct SubPlan {
     /// The identity of the bound node this plan was built from; the executor finds the

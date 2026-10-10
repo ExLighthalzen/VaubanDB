@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use vauban_binder::{BindContext, BoundExpr, CatalogView, SessionOptions, VariableScope, bind};
+use vauban_binder::{BindContext, CatalogView, SessionOptions, VariableScope, bind};
 use vauban_catalog::Catalog;
 use vauban_errors::{ErrorScope, SqlError, SqlResult};
 use vauban_parser::{ParseOptions, parse_batch};
@@ -519,10 +519,10 @@ impl Host for Reaches<'_, '_> {
 
     fn condition(
         &mut self,
-        condition: &BoundExpr,
         site: Site,
+        evaluate: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<Value>,
     ) -> SqlResult<Result<bool, SqlError>> {
-        self.inner.condition(condition, site)
+        self.inner.condition(site, evaluate)
     }
 
     fn within(

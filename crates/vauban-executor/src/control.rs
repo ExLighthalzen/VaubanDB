@@ -323,8 +323,9 @@ fn walk_assignments<'a>(
 }
 
 /// Evaluates an expression a statement holds outside any plan — the value of a `SET`, the
-/// initial value of a `DECLARE` — with the plans of its subqueries installed while it is
-/// read, and taken back after, the error path included.
+/// initial value of a `DECLARE`, the condition of an `IF` or of a `WHILE`, the value of a
+/// `RETURN` — with the plans of its subqueries installed while it is read, and taken back
+/// after, the error path included.
 ///
 /// A subquery answers `NULL` over an empty source, its single column over one row, and
 /// 512 beyond, as it does in a select list (`tests/subquery.rs`,
@@ -332,7 +333,7 @@ fn walk_assignments<'a>(
 /// `a_set_from_a_subquery_of_one_row_takes_its_value`,
 /// `a_set_whose_subquery_returns_two_rows_answers_512`). An expression with no subquery
 /// carries no plan and is read as it was before.
-fn eval_statement_expr(
+pub(crate) fn eval_statement_expr(
     expr: &BoundExpr,
     subplans: &[SubPlan],
     ctx: &mut ExecContext<'_>,

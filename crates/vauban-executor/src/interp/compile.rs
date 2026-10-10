@@ -6,9 +6,8 @@
 
 use std::collections::HashMap;
 
-use vauban_binder::BoundExpr;
 use vauban_errors::{SqlError, SqlResult};
-use vauban_planner::PhysicalStatement;
+use vauban_planner::{PhysicalStatement, StatementExpr};
 
 use super::{Program, Site};
 
@@ -34,8 +33,8 @@ pub(crate) enum Instr<'s> {
     /// Evaluates `condition` and goes to `otherwise` when it is not true, to the next
     /// instruction when it is.
     Test {
-        /// The condition of the `IF` or of the `WHILE`.
-        condition: &'s BoundExpr,
+        /// The condition of the `IF` or of the `WHILE`, with the plans of its subqueries.
+        condition: &'s StatementExpr,
         /// Where the program goes when the condition is false or unknown.
         otherwise: usize,
         /// The test heads a loop: the cancellation token is read before it.
@@ -55,7 +54,7 @@ pub(crate) enum Instr<'s> {
     /// `RETURN`, with its value.
     Return {
         /// The value, `None` for a bare `RETURN`.
-        value: Option<&'s BoundExpr>,
+        value: Option<&'s StatementExpr>,
         /// Where the `RETURN` sits in the body.
         site: Site,
     },

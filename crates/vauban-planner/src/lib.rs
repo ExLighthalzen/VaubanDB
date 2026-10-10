@@ -90,7 +90,7 @@ pub use context::{NoIndexes, PlanCatalog, PlanContext, SnapshotIndexes, StorageI
 pub use explain::explain;
 pub use physical::{
     KeyRangeExpr, PhysicalDeclaration, PhysicalDelete, PhysicalInsert, PhysicalJoinKind,
-    PhysicalPlan, PhysicalSelectInto, PhysicalStatement, PhysicalUpdate, ROW_ID_NAME, SubPlan,
-    row_id_binding, row_id_table,
+    PhysicalPlan, PhysicalSelectInto, PhysicalStatement, PhysicalUpdate, ROW_ID_NAME,
+    StatementExpr, SubPlan, row_id_binding, row_id_table,
 };
 pub use plan::plan;

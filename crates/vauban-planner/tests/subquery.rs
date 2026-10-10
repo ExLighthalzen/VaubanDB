@@ -1318,3 +1318,73 @@ fn a_scalar_subquery_over_a_correlated_set_operation_is_not_cached() {
         "expected correlated: true, got {planned:?}"
     );
 }
+
+/// `EXISTS (SELECT k FROM a WHERE EXISTS (SELECT k FROM b))`: two levels of subquery, the
+/// inner one planned inside the plan of the outer one.
+fn nested_exists() -> BoundExpr {
+    exists(LogicalPlan::Filter {
+        input: Box::new(project_scan(scan_a())),
+        predicate: exists(project_scan(scan_b())),
+    })
+}
+
+/// The plan of the one subquery written directly in a statement expression reads both
+/// tables: the nested subquery travels inside it, not beside it.
+fn assert_nested_plans(planned: &vauban_planner::StatementExpr) {
+    assert_eq!(planned.subplans.len(), 1);
+    assert!(contains_table(&planned.subplans[0].plan, TABLE_A));
+    assert!(contains_table(&planned.subplans[0].plan, TABLE_B));
+}
+
+/// `IF EXISTS (SELECT … WHERE EXISTS (…))`: the condition carries the plan of its subquery,
+/// as the value of a `SET` does.
+#[test]
+fn an_if_condition_carries_the_plans_of_its_subqueries() {
+    let planned = planned_statement(BoundStatement::If {
+        condition: nested_exists(),
+        then_: Box::new(BoundStatement::Break),
+        else_: None,
+    });
+    let PhysicalStatement::If { condition, .. } = &planned else {
+        panic!("expected an IF, got {planned:?}");
+    };
+    assert_nested_plans(condition);
+}
+
+/// `WHILE EXISTS (SELECT … WHERE EXISTS (…))`: the same for the condition of a loop.
+#[test]
+fn a_while_condition_carries_the_plans_of_its_subqueries() {
+    let planned = planned_statement(BoundStatement::While {
+        condition: nested_exists(),
+        body: Box::new(BoundStatement::Break),
+    });
+    let PhysicalStatement::While { condition, .. } = &planned else {
+        panic!("expected a WHILE, got {planned:?}");
+    };
+    assert_nested_plans(condition);
+}
+
+/// `RETURN (SELECT …)` carries the plan of its subquery.
+#[test]
+fn a_return_carries_the_plan_of_its_subquery() {
+    let planned = planned_statement(BoundStatement::Return(Some(scalar(project_scan(scan_a())))));
+    let PhysicalStatement::Return(Some(returned)) = &planned else {
+        panic!("expected a RETURN, got {planned:?}");
+    };
+    assert_eq!(returned.subplans.len(), 1);
+    assert!(contains_table(&returned.subplans[0].plan, TABLE_A));
+}
+
+/// `IF 1 = 1`: no subquery, no plan attached.
+#[test]
+fn an_if_condition_without_a_subquery_carries_no_subplan() {
+    let planned = planned_statement(BoundStatement::If {
+        condition: compare(CompareOp::Eq, literal(1), literal(1)),
+        then_: Box::new(BoundStatement::Break),
+        else_: None,
+    });
+    let PhysicalStatement::If { condition, .. } = &planned else {
+        panic!("expected an IF, got {planned:?}");
+    };
+    assert!(condition.subplans.is_empty());
+}

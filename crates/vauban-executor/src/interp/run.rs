@@ -1,16 +1,15 @@
 //! The program counter: runs the instructions of a [`Program`] through a [`Host`] (module
 //! documentation of `interp`).
 
-use vauban_binder::{BoundExpr, DeferredStatement};
+use vauban_binder::DeferredStatement;
 use vauban_errors::{ErrorScope, InternalError, SqlError, SqlResult, error_behavior};
-use vauban_planner::PhysicalStatement;
+use vauban_planner::{PhysicalStatement, StatementExpr};
 use vauban_types::{SqlType, TypeInfo, Value, convert};
 
 use crate::compile::compile as compile_checks;
 use crate::context::ExecContext;
 use crate::control;
 use crate::errors::at;
-use crate::expr::eval_expr;
 use crate::row::ExecOutcome;
 
 use super::compile::{Escape, Instr, Labels, Placement, compile_roots};
@@ -82,7 +81,11 @@ pub(crate) fn run(program: &Program<'_>, host: &mut dyn Host) -> SqlResult<End> 
                 if *loop_head && host.cancelled() {
                     Step::Stop(End::Cancelled)
                 } else {
-                    match host.condition(condition, *site)? {
+                    let mut evaluate = |ctx: &mut ExecContext<'_>| {
+                        control::eval_statement_expr(&condition.expr, &condition.subplans, ctx)
+                            .map_err(|err| condition_error(err, condition.expr.line))
+                    };
+                    match host.condition(*site, &mut evaluate)? {
                         Ok(true) => {
                             host.control(*site)?;
                             Step::Go(pc + 1)
@@ -468,7 +471,7 @@ fn report_left(left: SqlResult<()>, site: Site, host: &mut dyn Host) -> SqlResul
 }
 
 /// The integer a `RETURN e` returns: `e` converted to `int`, `NULL` counting as 0.
-fn return_code(value: Option<&BoundExpr>, site: Site, host: &mut dyn Host) -> SqlResult<i32> {
+fn return_code(value: Option<&StatementExpr>, site: Site, host: &mut dyn Host) -> SqlResult<i32> {
     let Some(expr) = value else {
         return Ok(0);
     };
@@ -480,9 +483,11 @@ fn return_code(value: Option<&BoundExpr>, site: Site, host: &mut dyn Host) -> Sq
     Ok(code)
 }
 
-/// The value of a `RETURN e`, in the context the host opened for it.
-pub(crate) fn evaluate_return(expr: &BoundExpr, ctx: &mut ExecContext<'_>) -> SqlResult<i32> {
-    let value = eval_expr(expr, None, ctx)?;
+/// The value of a `RETURN e`, in the context the host opened for it, the plans of its
+/// subqueries installed while it is read.
+pub(crate) fn evaluate_return(value: &StatementExpr, ctx: &mut ExecContext<'_>) -> SqlResult<i32> {
+    let expr = &value.expr;
+    let value = control::eval_statement_expr(expr, &value.subplans, ctx)?;
     let int = TypeInfo::new(SqlType::Int, false);
     let converted = convert(&value, &expr.ty, &int, None).map_err(|err| at(err, expr.line))?;
     Ok(match converted {
