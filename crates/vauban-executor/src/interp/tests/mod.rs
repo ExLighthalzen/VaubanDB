@@ -90,6 +90,10 @@ impl CallHandler for Recorder {
         sink.done(Some(1))?;
         Ok(ProgramEnd::Completed)
     }
+
+    fn restore_database(&mut self, _database: &str, _ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+        Ok(())
+    }
 }
 
 /// Answers each call with the error it holds.
@@ -103,6 +107,10 @@ impl CallHandler for Failing {
         _sink: &mut dyn StatementSink,
     ) -> SqlResult<ProgramEnd> {
         Err(self.0.clone())
+    }
+
+    fn restore_database(&mut self, _database: &str, _ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+        Ok(())
     }
 }
 

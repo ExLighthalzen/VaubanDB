@@ -180,6 +180,56 @@ fn the_scope_is_case_insensitive() {
     assert_eq!(bound.len(), 2);
 }
 
+/// Names fold as the instance collation compares them: case, width and the letters a
+/// letter stands for fold, accents do not.
+#[test]
+fn the_scope_folds_names_as_the_instance_collation_does() {
+    for (declared, read) in [
+        ("@É", "@é"),
+        ("@ß", "@SS"),
+        ("@ß", "@ss"),
+        ("@Σ", "@σ"),
+        ("@σ", "@ς"),
+        ("@ÿ", "@Ÿ"),
+        ("@Œ", "@œ"),
+        ("@a", "@Ａ"),
+        ("@Ｘ", "@x"),
+        ("@Æ", "@ae"),
+    ] {
+        binds(&format!("DECLARE {declared} int = 1; SELECT {read};"));
+        assert_eq!(
+            BatchVariables::name_key(declared),
+            BatchVariables::name_key(read),
+            "{declared} and {read}"
+        );
+    }
+    for (declared, read) in [
+        ("@e", "@é"),
+        ("@İ", "@i"),
+        ("@Ѣ", "@ѣ"),
+        ("@\u{2126}", "@ω"),
+        ("@\u{212A}", "@k"),
+    ] {
+        let error = err(&format!("DECLARE {declared} int = 1; SELECT {read};"));
+        assert_eq!(error.number, 137, "{declared} and {read}");
+    }
+    for capital in [
+        '\u{0186}', '\u{0189}', '\u{0191}', '\u{01A6}', '\u{01A9}', '\u{01F6}', '\u{01F7}',
+        '\u{0220}', '\u{03F4}', '\u{0462}', '\u{04B6}', '\u{2126}', '\u{212A}',
+    ] {
+        let lower: String = capital.to_lowercase().collect();
+        binds(&format!("DECLARE @{capital} int; DECLARE @{lower} int;"));
+    }
+    let error = err("DECLARE @ss int; DECLARE @ß int;");
+    assert_eq!(error.number, 134);
+    let error = err("DECLARE @ss int, @ß int;");
+    assert_eq!(error.number, 134);
+    assert!(matches!(
+        BatchVariables::name_key("@lower_case1"),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}
+
 /// `SELECT @y;` with nothing declared is 137, severity 15, state 2, on the line of the
 /// variable, and the message of the constructor.
 #[test]

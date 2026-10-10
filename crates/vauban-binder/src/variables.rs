@@ -74,6 +74,9 @@
 //! `DECLARE @c CURSOR` as a scalar variable of a type spelled `CURSOR`, which is 2715 here;
 //! the cursor item of the AST, were it built, answers an internal error too.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
+
 use vauban_errors::{SqlError, SqlResult};
 use vauban_parser::{
     AliasStyle, AssignOp, AssignTarget, BinaryOp as AstBinaryOp, DeclareItem, DeclareStatement,
@@ -95,17 +98,24 @@ use crate::subquery;
 ///
 /// The scope the session builds for a batch: empty at the start, one entry per
 /// [`BoundDeclaration`] the session enters with [`BatchVariables::declare`] after the
-/// binder answered a [`BoundStatement::Declare`]. Names are looked up without regard to
-/// case, ASCII-wise: `@x` and `@X` are one variable (`tests/bind_variables.rs`,
-/// `the_scope_is_case_insensitive`).
+/// binder answered a [`BoundStatement::Declare`]. Names are found by their
+/// [`BatchVariables::name_key`]: `@x` and `@X` are one variable, and so are `@É` and `@é`
+/// (`tests/bind_variables.rs`, `the_scope_is_case_insensitive`,
+/// `the_scope_folds_names_as_the_instance_collation_does`).
+///
+/// Each name takes the next position when it is declared, and a lookup hashes its key to
+/// find that position rather than walking the names declared before it.
 ///
 /// The type is read through [`VariableScope`], the trait [`BindContext`] borrows; nothing
 /// here is mutable behind a shared reference, so the scope does not change while a
 /// statement is being bound.
 #[derive(Debug, Clone, Default)]
 pub struct BatchVariables {
-    /// `(name as declared, declared type)`, in declaration order.
+    /// `(name as declared, declared type)`, in declaration order: the index is the
+    /// position of the name.
     declared: Vec<(String, TypeInfo)>,
+    /// The position of each name, keyed by [`BatchVariables::name_key`].
+    positions: HashMap<String, usize>,
 }
 
 impl BatchVariables {
@@ -125,20 +135,76 @@ impl BatchVariables {
     /// caller that declares what the binder accepted does not meet this error; it stands
     /// for a caller that skips the binder.
     pub fn declare(&mut self, name: &str, ty: TypeInfo) -> SqlResult<()> {
-        if self.type_of(name).is_some() {
+        let key = Self::name_key(name).into_owned();
+        if self.positions.contains_key(&key) {
             return Err(SqlError::variable_already_declared(name));
         }
+        self.positions.insert(key, self.declared.len());
         self.declared.push((name.to_owned(), ty));
         Ok(())
+    }
+
+    /// The key a variable name is found under, so that two names the instance collation
+    /// holds equal share it.
+    ///
+    /// The collation ignores case, width and the difference between a letter and the
+    /// letters it is written as, and keeps accents. On the pairs of
+    /// `the_scope_folds_names_as_the_instance_collation_does` (`tests/bind_variables.rs`),
+    /// and on those alone: `@X` and `@x`, `@É` and `@é`, `@ß` and `@SS`, `@σ` and `@ς`,
+    /// `@Ａ` and `@a`, `@Æ` and `@ae` share a key, while `@e` and `@é`, `@İ` and `@i`,
+    /// `@Ѣ` and `@ѣ`, the ohm sign and `@ω`, the kelvin sign and `@k` do not. A few
+    /// capitals the collation does not hold equal to their lower case keep their own key
+    /// ([`KEPT_CAPITALS`]). Kana and the other ligatures are not folded here.
+    ///
+    /// A name written in lower-case ASCII is its own key, borrowed as it is.
+    #[must_use]
+    pub fn name_key(name: &str) -> Cow<'_, str> {
+        if name
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_uppercase())
+        {
+            return Cow::Borrowed(name);
+        }
+        let mut key = String::with_capacity(name.len());
+        for c in name.chars() {
+            push_folded(c, &mut key);
+        }
+        Cow::Owned(key)
+    }
+}
+
+/// Capitals the instance collation tells apart from their lower case, which keep their
+/// own key: `Ɔ Ɖ Ƒ Ʀ Ʃ Ƕ Ƿ Ƞ ϴ Ѣ Ҷ`, the ohm sign and the kelvin sign.
+const KEPT_CAPITALS: [char; 13] = [
+    '\u{0186}', '\u{0189}', '\u{0191}', '\u{01A6}', '\u{01A9}', '\u{01F6}', '\u{01F7}', '\u{0220}',
+    '\u{03F4}', '\u{0462}', '\u{04B6}', '\u{2126}', '\u{212A}',
+];
+
+/// Appends the key of `c` to `key` (see [`BatchVariables::name_key`]).
+fn push_folded(c: char, key: &mut String) {
+    if KEPT_CAPITALS.contains(&c) {
+        key.push(c);
+        return;
+    }
+    // A full-width form of an ASCII character is that character.
+    let c = match c {
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(u32::from(c) - 0xFEE0).unwrap_or(c),
+        _ => c,
+    };
+    for lower in c.to_lowercase() {
+        match lower {
+            'ß' => key.push_str("ss"),
+            'ς' => key.push('σ'),
+            'æ' => key.push_str("ae"),
+            other => key.push(other),
+        }
     }
 }
 
 impl VariableScope for BatchVariables {
     fn type_of(&self, name: &str) -> Option<TypeInfo> {
-        self.declared
-            .iter()
-            .find(|(declared, _)| declared.eq_ignore_ascii_case(name))
-            .map(|(_, ty)| ty.clone())
+        let position = *self.positions.get(Self::name_key(name).as_ref())?;
+        self.declared.get(position).map(|(_, ty)| ty.clone())
     }
 }
 
@@ -175,7 +241,7 @@ pub(crate) fn bind_declare(
         let already = ctx.variables.type_of(name).is_some()
             || declarations
                 .iter()
-                .any(|d| d.name.eq_ignore_ascii_case(name));
+                .any(|d| BatchVariables::name_key(&d.name) == BatchVariables::name_key(name));
         if already {
             return Err(SqlError::variable_already_declared(name).with_line(line));
         }

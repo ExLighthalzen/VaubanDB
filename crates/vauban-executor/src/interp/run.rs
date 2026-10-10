@@ -15,6 +15,7 @@ use crate::row::ExecOutcome;
 use crate::sink::StatementSink;
 
 use super::compile::{Escape, Instr, Labels, compile};
+use super::frame::Frame;
 use super::{Call, CallHandler, Program, ProgramEnd};
 
 /// Who runs the program, and so what becomes of an error and of a call.
@@ -199,10 +200,12 @@ fn after_statement<'a>(
     Ok(match outcome {
         ExecOutcome::Rows(count) => {
             if reports {
+                let mut nocount = false;
                 if let Some(session) = ctx.session.as_deref_mut() {
                     session.rowcount = i64::try_from(count).unwrap_or(i64::MAX);
+                    nocount = session.nocount;
                 }
-                sink.done(Some(count))?;
+                sink.done(if nocount { None } else { Some(count) })?;
             }
             if tail {
                 *answer = ExecOutcome::Rows(count);
@@ -233,11 +236,32 @@ fn after_statement<'a>(
                 let Some(call) = Call::from_outcome(call) else {
                     return Err(bug("interp: a call outcome that names no call"));
                 };
-                match handler.call(call, ctx, sink) {
-                    Ok(ProgramEnd::Completed | ProgramEnd::Returned(_)) => Step::Go(pc + 1),
-                    Ok(ProgramEnd::Cancelled) => Step::Stop(End::Cancelled),
-                    Ok(ProgramEnd::Aborted(err)) => Step::Stop(End::Aborted(err)),
-                    Err(err) => fail(err, pc + 1, ctx, sink, host)?,
+                let frame = match Frame::enter(ctx) {
+                    Ok(frame) => frame,
+                    Err(err) => return fail(err, pc + 1, ctx, sink, host),
+                };
+                let ended = handler.call(call, ctx, sink);
+                let left = frame.leave(ctx, &mut **handler);
+                match (ended, left) {
+                    (Ok(ProgramEnd::Completed | ProgramEnd::Returned(_)), Ok(())) => {
+                        Step::Go(pc + 1)
+                    }
+                    (Ok(ProgramEnd::Completed | ProgramEnd::Returned(_)), Err(err)) => {
+                        fail(err, pc + 1, ctx, sink, host)?
+                    }
+                    (Err(err), left) => {
+                        let step = fail(err, pc + 1, ctx, sink, host)?;
+                        report_left(left, ctx, sink)?;
+                        step
+                    }
+                    (Ok(ProgramEnd::Cancelled), left) => {
+                        report_left(left, ctx, sink)?;
+                        Step::Stop(End::Cancelled)
+                    }
+                    (Ok(ProgramEnd::Aborted(err)), left) => {
+                        report_left(left, ctx, sink)?;
+                        Step::Stop(End::Aborted(err))
+                    }
                 }
             }
         },
@@ -325,6 +349,20 @@ fn fail<'a>(
     } else {
         Step::Stop(End::Aborted(err))
     })
+}
+
+/// Hands the error of [`CallHandler::restore_database`] to the sink when the call already
+/// ended the program or failed itself: the caller does not lose it, and its end stays the
+/// one the call decided.
+fn report_left(
+    left: SqlResult<()>,
+    ctx: &mut ExecContext<'_>,
+    sink: &mut dyn StatementSink,
+) -> SqlResult<()> {
+    match left {
+        Ok(()) => Ok(()),
+        Err(err) => report(&err, ctx, sink),
+    }
 }
 
 /// Hands `err` to the sink and ends its statement; `@@ERROR` takes its number.

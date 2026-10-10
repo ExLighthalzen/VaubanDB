@@ -175,7 +175,7 @@ fn variable_assignment_updates_the_declared_spelling() {
     assert!(matches!(outcome, ExecOutcome::NoRows));
     assert_eq!(session.variables.len(), 1);
     assert_eq!(session.variables.get("@Nom"), Some(&Value::I32(2)));
-    assert!(!session.variables.contains_key("@NOM"));
+    assert_eq!(session.variables.keys().collect::<Vec<_>>(), ["@Nom"]);
 }
 
 #[test]

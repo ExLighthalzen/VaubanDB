@@ -47,6 +47,9 @@
 //! it ended. The program goes on with the next instruction, so a call in the body of a
 //! loop runs once per turn (`interp::tests::a_loop_that_calls_three_times_runs_three_turns`).
 //!
+//! The callee runs in a level of its own: the program sets its own variables and options
+//! aside in a frame before the handler runs, and takes them back after (`frame.rs`).
+//!
 //! # The statement tree
 //!
 //! `control.rs` runs a single `IF`, `WHILE` or `BEGIN … END` handed to [`crate::execute`]
@@ -57,7 +60,10 @@
 //! last of those callers.
 
 mod compile;
+mod frame;
 mod run;
+
+pub(crate) use frame::NameMap;
 
 use std::collections::HashMap;
 
@@ -189,6 +195,11 @@ impl Call {
 pub trait CallHandler {
     /// Runs `call` in place and answers how it ended.
     ///
+    /// The call runs in a level of its own, opened before this method is called: the
+    /// variables of `ctx` are empty, the handler enters the parameters of the callee there,
+    /// and the options are those of the caller. The level is closed after this method
+    /// returns, so a value meant for the caller is not written here.
+    ///
     /// The handler hands the results of the callee to `sink` itself. A callee that ended by
     /// an error it already handed to the sink answers [`ProgramEnd::Aborted`], and the
     /// calling program ends there too; a callee cancelled answers
@@ -205,6 +216,15 @@ pub trait CallHandler {
         ctx: &mut ExecContext<'_>,
         sink: &mut dyn StatementSink,
     ) -> SqlResult<ProgramEnd>;
+
+    /// Makes `database` the current database again once a call returned: the one the
+    /// caller had when the call was entered. A `USE` the callee ran ends with it.
+    ///
+    /// # Errors
+    ///
+    /// The error of the change of database; the interpreter hands it to the sink and
+    /// decides from its scope whether the program goes on.
+    fn restore_database(&mut self, database: &str, ctx: &mut ExecContext<'_>) -> SqlResult<()>;
 }
 
 /// Runs one `IF`, `WHILE`, `BEGIN … END`, `GOTO`, label, `BREAK`, `CONTINUE`, `RETURN` or

@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use vauban_binder::{ColumnBinding, SessionOptions, SubqueryId};
+use vauban_binder::{BatchVariables, ColumnBinding, SessionOptions, SubqueryId};
 use vauban_catalog::{Catalog, ColumnId};
 use vauban_errors::{InfoMessage, InternalError, SqlError, SqlResult};
 use vauban_planner::SubPlan;
@@ -17,6 +17,7 @@ use vauban_sysfn::EvalContext;
 use vauban_txn::{IsolationLevel, LockTimeout, LockWait, TransactionManager, TxnHandle};
 use vauban_types::{Decimal, TypeInfo, Value};
 
+use crate::interp::NameMap;
 use crate::row::Row;
 
 pub(crate) const SLOT_COLUMN_ID: ColumnId = ColumnId(0);
@@ -199,8 +200,9 @@ impl CancelToken {
 /// `BEGIN TRANSACTION` opens a new transaction, the timeout when a lock is taken.
 #[derive(Debug, Clone)]
 pub struct ExecSession {
-    /// The declared variables, keyed by name with the `@`.
-    pub variables: HashMap<String, Value>,
+    /// The variables of the running level, keyed by name with the `@`; a read hashes the
+    /// name to the position it took when it was declared (`interp/frame.rs`).
+    pub variables: NameMap<Value>,
     /// The declared type of each variable, keyed by name with the `@`. `DECLARE` writes
     /// it and the `SET` of a value the binder did not convert reads it: the value is
     /// converted to this type before it is stored.
@@ -233,41 +235,46 @@ pub struct ExecSession {
     /// The lock timeout of the session, applied when a lock is taken.
     /// Set by `SET LOCK_TIMEOUT`.
     pub lock_timeout: LockTimeout,
+    /// `SET NOCOUNT` of the running level: when set, a program hands the end of a
+    /// statement to the sink without its row count.
+    pub nocount: bool,
+    /// How many calls deep the running level is: 0 for the batch, one more for each
+    /// `EXECUTE` a program runs (`interp/frame.rs`).
+    pub nest_level: u32,
+    /// The deepest level a call may open, unbounded when `None`.
+    pub max_nest_level: Option<u32>,
 }
 
 impl ExecSession {
-    /// Reads a session variable; names match with `eq_ignore_ascii_case`.
+    /// Reads a variable of the running level; names match as the binder matches them
+    /// ([`vauban_binder::BatchVariables::name_key`]).
     pub(crate) fn variable_value(&self, name: &str) -> Option<Value> {
-        self.variables
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.clone())
+        self.variables.get(name).cloned()
     }
 
-    /// The declared type of a session variable; names match with `eq_ignore_ascii_case`.
+    /// The declared type of a variable of the running level; names match as the binder
+    /// matches them.
     pub(crate) fn variable_type(&self, name: &str) -> Option<TypeInfo> {
+        if let Some(ty) = self.variable_types.get(name) {
+            return Some(ty.clone());
+        }
+        let key = BatchVariables::name_key(name);
         self.variable_types
             .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .find(|(declared, _)| BatchVariables::name_key(declared) == key)
             .map(|(_, ty)| ty.clone())
     }
 
     /// Stores `value` under the spelling already in the session, or under `name` otherwise.
     pub(crate) fn store_variable_value(&mut self, name: &str, value: Value) {
-        let key = self
-            .variables
-            .keys()
-            .find(|key| key.eq_ignore_ascii_case(name))
-            .cloned()
-            .unwrap_or_else(|| name.to_owned());
-        self.variables.insert(key, value);
+        self.variables.insert(name.to_owned(), value);
     }
 }
 
 impl Default for ExecSession {
     fn default() -> Self {
         Self {
-            variables: HashMap::new(),
+            variables: NameMap::new(),
             variable_types: HashMap::new(),
             rowcount: 0,
             trancount: 0,
@@ -280,6 +287,9 @@ impl Default for ExecSession {
             stmt_savepoint: None,
             isolation: IsolationLevel::ReadCommitted,
             lock_timeout: LockTimeout::Infinite,
+            nocount: false,
+            nest_level: 0,
+            max_nest_level: None,
         }
     }
 }
