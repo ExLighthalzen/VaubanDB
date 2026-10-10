@@ -15,6 +15,7 @@
 //! | `sort.rs` | `Sort`, `TopN`, `Distinct` |
 //! | `subquery.rs` | `SubqueryEval` |
 //! | `setop.rs` | `Union`, `Except`, `Intersect` |
+//! | `spool.rs` | none: put over the source of a write statement by its `spool` flag |
 //!
 //! The `build` function of a file whose operator is not written yet answers the internal
 //! error 50000 ([`not_implemented`]).
@@ -31,6 +32,7 @@ pub(crate) mod scan;
 pub(crate) mod seek;
 pub(crate) mod setop;
 pub(crate) mod sort;
+pub mod spool;
 pub(crate) mod subquery;
 pub(crate) mod values;
 

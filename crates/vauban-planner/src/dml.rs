@@ -13,6 +13,7 @@ use crate::physical::{
     PhysicalStatement, PhysicalUpdate, row_id_binding, row_id_table,
 };
 use crate::plan::plan_node;
+use crate::subquery::plan_statement_subplans;
 
 /// Plans a `SELECT … INTO` into [`PhysicalStatement::SelectInto`].
 pub(crate) fn plan_select_into(
@@ -164,8 +165,9 @@ fn push_row_id(columns: &mut Vec<ColumnBinding>, table: TableId) -> SqlResult<()
 /// Halloween protection for an `UPDATE`:
 ///
 /// `spool: true` when the location plan references the target table more than once
-/// (`UPDATE … FROM`), or when an assigned column is a key column of an index the plan uses
-/// and the plan reads the target table.
+/// (`UPDATE … FROM`, or a subquery of the `WHERE` that reads the target), when a subquery
+/// of an assigned value reads the target table, or when an assigned column is a key column
+/// of an index the plan uses and the plan reads the target table.
 fn spool_for_update(
     input: &PhysicalPlan,
     assignments: &[(ColumnBinding, BoundExpr)],
@@ -175,14 +177,41 @@ fn spool_for_update(
     if count_table_references(input, table, ctx) > 1 {
         return true;
     }
+    if assignments_read_table(assignments, table, ctx) {
+        return true;
+    }
     if assigned_column_is_index_key(assignments, table, ctx) && reads_table(input, table, ctx) {
         return true;
     }
     false
 }
 
+/// True when an assigned value holds a subquery that reads `table`, at any depth of its
+/// plan (`tests/halloween.rs`, `a_set_value_reading_the_target_requires_a_spool`).
+///
+/// The values of an `UPDATE` are not planned with the statement, so their subqueries are
+/// planned here for the question alone. A value whose subqueries cannot be planned counts
+/// as reading the table: the spool costs memory, its absence a wrong result.
+fn assignments_read_table(
+    assignments: &[(ColumnBinding, BoundExpr)],
+    table: TableId,
+    ctx: &PlanContext<'_>,
+) -> bool {
+    assignments
+        .iter()
+        .any(|(_, value)| match plan_statement_subplans(value, ctx) {
+            Ok(subplans) => subplans
+                .iter()
+                .any(|subplan| reads_table(&subplan.plan, table, ctx)),
+            Err(_) => true,
+        })
+}
+
 /// True when `plan` reads `table` somewhere in its tree: a [`TableScan`] whose table
-/// matches, or an [`IndexSeek`] whose index belongs to `table`.
+/// matches, or an [`IndexSeek`] whose index belongs to `table`, including inside the plan
+/// of a subquery a [`SubqueryEval`](PhysicalPlan::SubqueryEval) evaluates, at any depth
+/// (`tests/halloween.rs`, `an_insert_whose_not_exists_reads_the_target_requires_a_spool`,
+/// `a_target_read_two_subqueries_deep_requires_a_spool`).
 fn reads_table(plan: &PhysicalPlan, table: TableId, ctx: &PlanContext<'_>) -> bool {
     match plan {
         PhysicalPlan::TableScan { table: t, .. } => *t == table,
@@ -196,8 +225,15 @@ fn reads_table(plan: &PhysicalPlan, table: TableId, ctx: &PlanContext<'_>) -> bo
         | PhysicalPlan::Top { input, .. } => reads_table(input, table, ctx),
         PhysicalPlan::Distinct(input)
         | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::TopN { input, .. }
-        | PhysicalPlan::SubqueryEval { input, .. } => reads_table(input, table, ctx),
+        | PhysicalPlan::TopN { input, .. } => reads_table(input, table, ctx),
+        PhysicalPlan::SubqueryEval {
+            input, subplans, ..
+        } => {
+            reads_table(input, table, ctx)
+                || subplans
+                    .iter()
+                    .any(|subplan| reads_table(&subplan.plan, table, ctx))
+        }
         PhysicalPlan::NestedLoopJoin { outer, inner, .. } => {
             reads_table(outer, table, ctx) || reads_table(inner, table, ctx)
         }
@@ -216,7 +252,8 @@ fn reads_table(plan: &PhysicalPlan, table: TableId, ctx: &PlanContext<'_>) -> bo
     }
 }
 
-/// Counts the times `plan` references `table`, directly or through an index.
+/// Counts the times `plan` references `table`, directly or through an index, the plans of
+/// the subqueries of a [`SubqueryEval`](PhysicalPlan::SubqueryEval) included.
 fn count_table_references(plan: &PhysicalPlan, table: TableId, ctx: &PlanContext<'_>) -> usize {
     match plan {
         PhysicalPlan::TableScan { table: t, .. } => usize::from(*t == table),
@@ -231,8 +268,16 @@ fn count_table_references(plan: &PhysicalPlan, table: TableId, ctx: &PlanContext
         | PhysicalPlan::Top { input, .. } => count_table_references(input, table, ctx),
         PhysicalPlan::Distinct(input)
         | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::TopN { input, .. }
-        | PhysicalPlan::SubqueryEval { input, .. } => count_table_references(input, table, ctx),
+        | PhysicalPlan::TopN { input, .. } => count_table_references(input, table, ctx),
+        PhysicalPlan::SubqueryEval {
+            input, subplans, ..
+        } => {
+            count_table_references(input, table, ctx)
+                + subplans
+                    .iter()
+                    .map(|subplan| count_table_references(&subplan.plan, table, ctx))
+                    .sum::<usize>()
+        }
         PhysicalPlan::NestedLoopJoin { outer, inner, .. } => {
             count_table_references(outer, table, ctx) + count_table_references(inner, table, ctx)
         }
