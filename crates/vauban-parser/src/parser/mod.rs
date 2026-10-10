@@ -29,6 +29,8 @@ mod from;
 mod query;
 mod stmt;
 
+use std::mem;
+
 use vauban_errors::{SqlError, SqlResult};
 
 use crate::ast::expr::{Ident, ObjectName};
@@ -84,6 +86,13 @@ pub fn parse_batch(text: &str, opts: &ParseOptions) -> SqlResult<Batch> {
         statements.push(stmt::parse_statement(&mut p, statements.is_empty())?);
         // A `;` after a statement is optional: it is eaten when it is there.
         let _ = p.eat_punct(Punct::Semicolon);
+    }
+    // A batch that reads to its end without a syntax error but holds a shape too deep for
+    // the engine is refused as a whole, with the first such error: a syntax error later in
+    // the text wins over it (`tests/nesting_depth.rs`,
+    // `a_syntax_error_wins_over_a_set_operator_chain_too_deep`).
+    if let Some(err) = p.too_deep.take() {
+        return Err(err);
     }
     Ok(Batch { statements })
 }
@@ -274,6 +283,14 @@ pub(crate) struct Parser<'a> {
     case_depth: u32,
     /// How many `ELSE` of `IF` chains enclose the cursor; see [`Parser::open_else`].
     else_links: u32,
+    /// The deepest set-operator tree finished in the current window; see
+    /// [`Parser::measure_set_ops`].
+    set_op_depth: u32,
+    /// The line of the statement the cursor is in; see [`Parser::in_statement`].
+    statement_line: u32,
+    /// The first error 8631 met so far, sent once the batch has no syntax error; see
+    /// [`Parser::defer_too_deep`].
+    too_deep: Option<SqlError>,
 }
 
 impl<'a> Parser<'a> {
@@ -292,7 +309,62 @@ impl<'a> Parser<'a> {
             depth: 0,
             case_depth: 0,
             else_links: 0,
+            set_op_depth: 0,
+            statement_line: 1,
+            too_deep: None,
         })
+    }
+
+    /// Runs `rule`, which parses one statement, with [`Parser::statement_line`] on the
+    /// line of the token the cursor sits on, and puts the enclosing statement's line back
+    /// afterwards, whether `rule` succeeded or failed.
+    ///
+    /// # Errors
+    ///
+    /// What `rule` returns.
+    pub(crate) fn in_statement<T>(
+        &mut self,
+        rule: impl FnOnce(&mut Self) -> SqlResult<T>,
+    ) -> SqlResult<T> {
+        let line = self.peek().span.line;
+        let outer = mem::replace(&mut self.statement_line, line);
+        let parsed = rule(self);
+        self.statement_line = outer;
+        parsed
+    }
+
+    /// Records error 8631 on the line of the current statement, to be sent when the whole
+    /// batch has been read without a syntax error. The first one is kept, a later one dropped.
+    ///
+    /// The grammar goes on after this call, so it must not build the shape that made it:
+    /// the caller drops what would have gone past its limit.
+    pub(crate) fn defer_too_deep(&mut self) {
+        if self.too_deep.is_none() {
+            self.too_deep = Some(SqlError::stack_limit_reached().with_line(self.statement_line));
+        }
+    }
+
+    /// Runs `rule` in a window of its own and returns, with what it parsed, the depth of
+    /// the deepest set-operator tree finished inside it -- through a derived table, a
+    /// subquery or parentheses as well. The depth noted by the enclosing window is put
+    /// back afterwards, whether `rule` succeeded or failed.
+    ///
+    /// # Errors
+    ///
+    /// What `rule` returns.
+    pub(crate) fn measure_set_ops<T>(
+        &mut self,
+        rule: impl FnOnce(&mut Self) -> SqlResult<T>,
+    ) -> SqlResult<(T, u32)> {
+        let outer = mem::take(&mut self.set_op_depth);
+        let parsed = rule(self);
+        let inner = mem::replace(&mut self.set_op_depth, outer);
+        parsed.map(|value| (value, inner))
+    }
+
+    /// Records that a query body of `depth` set-operator levels has just been finished.
+    pub(crate) fn record_set_op_depth(&mut self, depth: u32) {
+        self.set_op_depth = self.set_op_depth.max(depth);
     }
 
     /// Runs one **recursive** rule one level deeper, or refuses to go there at all.

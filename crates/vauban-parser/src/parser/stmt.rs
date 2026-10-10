@@ -34,7 +34,7 @@ use crate::token::{Punct, TokenKind};
 pub(crate) fn parse_statement(p: &mut Parser, first_in_batch: bool) -> SqlResult<Statement> {
     // `BEGIN…END`, `IF` and `WHILE` nest statements inside statements. The levels are
     // counted here, the one door the three come back through.
-    p.nested(|p| parse_statement_inner(p, first_in_batch))
+    p.in_statement(|p| p.nested(|p| parse_statement_inner(p, first_in_batch)))
 }
 
 /// The body of [`parse_statement`], one level deeper on the nesting counter.

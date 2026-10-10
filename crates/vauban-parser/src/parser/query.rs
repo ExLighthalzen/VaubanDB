@@ -112,12 +112,51 @@ fn parse_select(p: &mut Parser) -> SqlResult<SelectStatement> {
     })
 }
 
+/// How many set operators deep a query body may go, counted along the deepest path of
+/// its tree and through the derived tables, subqueries and parentheses it holds.
+///
+/// A chain of `INTERSECT` or of `EXCEPT` is a tree as deep as the chain is long, and the
+/// stages that walk a query (binding, planning, execution) descend it one frame per
+/// level. Past this depth the batch is refused with error 8631, severity 17, state 1, on
+/// the line of its statement, once the whole batch has been read: a syntax error further
+/// on is sent instead (`tests/nesting_depth.rs`,
+/// `set_operator_chains_stop_at_their_depth`).
+///
+/// SQL Server refuses such a chain at about this length too, with error 8621 or 8631
+/// depending on the length; 8621 is not catalogued here, 8631 stands for both. On the
+/// chains of `tests/nesting_depth.rs`, 1070 `INTERSECT` pass and the 1071st is refused,
+/// as there; a chain that alternates `UNION` and `UNION ALL` is refused at the same
+/// depth here, while SQL Server lets it run a little longer. This gap is deliberate.
+pub(crate) const MAX_SET_OP_DEPTH: u32 = 1070;
+
+/// The longest run of one `UNION` (or one `UNION ALL`) kept as written, a tree leaning
+/// left. A longer run is rebuilt as a balanced tree of the same operands in the same
+/// order.
+///
+/// `UNION` and `UNION ALL` are associative, so the balanced tree returns the same rows:
+/// for `UNION ALL`, in the same order too. Its depth grows with the logarithm of the run,
+/// so 50 000 branches take 17 levels instead of 50 000 and the run is not caught by
+/// [`MAX_SET_OP_DEPTH`] (`tests/nesting_depth.rs`, `a_long_union_all_run_is_balanced`).
+/// `Display` prints both trees the same way, flat, and reading that text back rebuilds the
+/// same tree. `EXCEPT` is not associative and `INTERSECT` is left as written, so their
+/// chains keep their shape and their limit.
+const MAX_LEFT_DEEP_UNION_RUN: usize = 32;
+
+/// One operand of a set-operator chain, with the depth of its own set-operator tree.
+struct Operand {
+    /// The operand as parsed.
+    body: QueryBody,
+    /// How many set operators deep `body` goes, see [`MAX_SET_OP_DEPTH`].
+    depth: u32,
+}
+
 /// Reads a query body and the `UNION`/`EXCEPT` operators that join several of them.
 ///
 /// The loop is what makes the two operators associate to the **left**, and calling
 /// [`parse_intersect_body`] for each operand is what makes `INTERSECT` bind tighter.
 /// `ALL` is only read after `UNION`: T-SQL has neither `EXCEPT ALL` nor `INTERSECT ALL`,
-/// and an `ALL` written there is reported where it stands.
+/// and an `ALL` written there is reported where it stands. A run of more than
+/// [`MAX_LEFT_DEEP_UNION_RUN`] operands of one `UNION` is built balanced.
 ///
 /// # Errors
 ///
@@ -134,8 +173,10 @@ fn parse_query_body(p: &mut Parser) -> SqlResult<QueryBody> {
 ///
 /// The syntax error that stopped the parse of one of the operands.
 fn parse_query_body_inner(p: &mut Parser) -> SqlResult<QueryBody> {
-    let start = p.mark();
+    let start = p.peek().span;
     let mut left = parse_intersect_body(p)?;
+    // The `UNION` run being read: its `ALL` flag and its operands after `left`.
+    let mut run: Option<(bool, Vec<Operand>)> = None;
     loop {
         let op = if p.at_keyword(Keyword::Union) {
             SetOp::Union
@@ -147,15 +188,111 @@ fn parse_query_body_inner(p: &mut Parser) -> SqlResult<QueryBody> {
         p.advance();
         let all = op == SetOp::Union && p.eat_keyword(Keyword::All);
         let right = parse_intersect_body(p)?;
-        left = QueryBody::SetOp {
+        if let Some((run_all, operands)) = &mut run
+            && op == SetOp::Union
+            && *run_all == all
+        {
+            operands.push(right);
+            continue;
+        }
+        if let Some((run_all, operands)) = run.take() {
+            left = close_union_run(p, start, left, run_all, operands);
+        }
+        if op == SetOp::Union {
+            run = Some((all, vec![right]));
+        } else {
+            left = join(p, start, SetOp::Except, false, left, right);
+        }
+    }
+    if let Some((run_all, operands)) = run.take() {
+        left = close_union_run(p, start, left, run_all, operands);
+    }
+    p.record_set_op_depth(left.depth);
+    Ok(left.body)
+}
+
+/// Joins `left` and the operands of one `UNION` run: as written when the run is short;
+/// when it is long ([`MAX_LEFT_DEEP_UNION_RUN`]), `left` is joined to a balanced tree of
+/// the run's operands, so that `left` -- the chain read so far -- sinks by one level.
+fn close_union_run(
+    p: &mut Parser,
+    start: Span,
+    left: Operand,
+    all: bool,
+    operands: Vec<Operand>,
+) -> Operand {
+    if operands.len() < MAX_LEFT_DEEP_UNION_RUN {
+        return operands.into_iter().fold(left, |left, right| {
+            join(p, start, SetOp::Union, all, left, right)
+        });
+    }
+    match balance(p, start, all, operands) {
+        Some(right) => join(p, start, SetOp::Union, all, left, right),
+        None => left,
+    }
+}
+
+/// Builds a balanced `UNION` tree over `items`, keeping their order from left to right;
+/// `None` when `items` is empty.
+///
+/// The recursion halves the slice at each level, so it is as deep as the logarithm of
+/// the run.
+fn balance(p: &mut Parser, start: Span, all: bool, mut items: Vec<Operand>) -> Option<Operand> {
+    if items.len() <= 1 {
+        return items.pop();
+    }
+    let right_items = items.split_off(items.len() / 2);
+    let left = balance(p, start, all, items)?;
+    Some(match balance(p, start, all, right_items) {
+        Some(right) => join(p, start, SetOp::Union, all, left, right),
+        None => left,
+    })
+}
+
+/// Joins two operands under one set operator, or, when the result would pass
+/// [`MAX_SET_OP_DEPTH`], records error 8631 and keeps `left` alone.
+///
+/// The node spans from `start`, the first token of the chain, to the last token of
+/// `right`, the span a chain leaning left gets at that point.
+fn join(
+    p: &mut Parser,
+    start: Span,
+    op: SetOp,
+    all: bool,
+    left: Operand,
+    right: Operand,
+) -> Operand {
+    let depth = left.depth.max(right.depth).saturating_add(1);
+    if depth > MAX_SET_OP_DEPTH {
+        p.defer_too_deep();
+        return left;
+    }
+    let end = body_span(&right.body);
+    let span = Span {
+        len: end
+            .offset
+            .saturating_add(end.len)
+            .saturating_sub(start.offset),
+        ..start
+    };
+    Operand {
+        body: QueryBody::SetOp {
             op,
             all,
-            left: Box::new(left),
-            right: Box::new(right),
-            span: p.span_from(start),
-        };
+            left: Box::new(left.body),
+            right: Box::new(right.body),
+            span,
+        },
+        depth,
     }
-    Ok(left)
+}
+
+/// The span of a query body.
+fn body_span(body: &QueryBody) -> Span {
+    match body {
+        QueryBody::Select(spec) => spec.span,
+        QueryBody::SetOp { span, .. } | QueryBody::Nested(_, span) => *span,
+    }
 }
 
 /// Reads the `INTERSECT` level, the tighter of the two.
@@ -163,18 +300,12 @@ fn parse_query_body_inner(p: &mut Parser) -> SqlResult<QueryBody> {
 /// # Errors
 ///
 /// The syntax error that stopped the parse of one of the operands.
-fn parse_intersect_body(p: &mut Parser) -> SqlResult<QueryBody> {
-    let start = p.mark();
+fn parse_intersect_body(p: &mut Parser) -> SqlResult<Operand> {
+    let start = p.peek().span;
     let mut left = parse_query_term(p)?;
     while p.eat_keyword(Keyword::Intersect) {
         let right = parse_query_term(p)?;
-        left = QueryBody::SetOp {
-            op: SetOp::Intersect,
-            all: false,
-            left: Box::new(left),
-            right: Box::new(right),
-            span: p.span_from(start),
-        };
+        left = join(p, start, SetOp::Intersect, false, left, right);
     }
     Ok(left)
 }
@@ -188,15 +319,18 @@ fn parse_intersect_body(p: &mut Parser) -> SqlResult<QueryBody> {
 /// # Errors
 ///
 /// The syntax error that stopped the parse, a missing `)` included.
-fn parse_query_term(p: &mut Parser) -> SqlResult<QueryBody> {
-    if p.at_punct(Punct::LeftParen) {
-        let start = p.mark();
-        p.advance();
-        let body = parse_query_body(p)?;
-        p.expect_punct(Punct::RightParen)?;
-        return Ok(QueryBody::Nested(Box::new(body), p.span_from(start)));
-    }
-    Ok(QueryBody::Select(Box::new(parse_query_spec(p)?)))
+fn parse_query_term(p: &mut Parser) -> SqlResult<Operand> {
+    let (body, depth) = p.measure_set_ops(|p| {
+        if p.at_punct(Punct::LeftParen) {
+            let start = p.mark();
+            p.advance();
+            let body = parse_query_body(p)?;
+            p.expect_punct(Punct::RightParen)?;
+            return Ok(QueryBody::Nested(Box::new(body), p.span_from(start)));
+        }
+        Ok(QueryBody::Select(Box::new(parse_query_spec(p)?)))
+    })?;
+    Ok(Operand { body, depth })
 }
 
 /// Parses one `SELECT` specification: from the `SELECT` keyword down to the `HAVING`.

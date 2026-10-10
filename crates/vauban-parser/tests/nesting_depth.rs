@@ -542,7 +542,7 @@ fn backtracking_does_not_leak_levels() {
 /// the infix ladder, in debug, parsing 50 000 links and forgetting the tree took 0.40 s,
 /// 100 000 took 1.43 s and 200 000 took 5.56 s, so each doubling roughly quadruples it.
 /// Where that cost sits is no business of this file; it is why the
-/// seven shapes here are written at fifty thousand and not at two hundred thousand.
+/// six shapes here are written at fifty thousand and not at two hundred thousand.
 const COMB_LEVELS: usize = 50_000;
 
 /// A shape whose links the parser reads in a loop: its name, how to write `n` of them, and
@@ -559,8 +559,11 @@ const COMB_LEVELS: usize = 50_000;
 /// process on its way to reporting the failure.
 type Comb = (&'static str, fn(usize) -> String, fn(&Batch) -> usize);
 
-/// The seven shapes, each with the operator its links are counted on.
-fn combs() -> [Comb; 7] {
+/// The six shapes, each with the operator its links are counted on.
+///
+/// A chain of `INTERSECT` is not one of them any more: past 1070 links the batch is refused
+/// with 8631 ([`set_operator_chains_stop_at_their_depth`]).
+fn combs() -> [Comb; 6] {
     [
         (
             "infix ladder",
@@ -581,11 +584,6 @@ fn combs() -> [Comb; 7] {
             "UNION ALL chain",
             |n| format!("SELECT 1{}", " UNION ALL SELECT 1".repeat(n)),
             |batch| union_all_links(&select_of(batch).body),
-        ),
-        (
-            "INTERSECT chain",
-            |n| format!("SELECT 1{}", " INTERSECT SELECT 1".repeat(n)),
-            |batch| intersect_links(&select_of(batch).body),
         ),
         (
             "CROSS JOIN chain",
@@ -773,33 +771,24 @@ fn collate_links(mut expr: &Expr) -> usize {
     links
 }
 
-/// How many `UNION ALL` the left spine of `body` carries.
-fn union_all_links(mut body: &QueryBody) -> usize {
+/// How many `UNION ALL` nodes `body` carries, wherever they stand in the tree, counted with
+/// a stack of its own rather than by recursion.
+fn union_all_links(body: &QueryBody) -> usize {
     let mut links = 0;
-    while let QueryBody::SetOp {
-        op: SetOp::Union,
-        all: true,
-        left,
-        ..
-    } = body
-    {
-        links += 1;
-        body = left;
-    }
-    links
-}
-
-/// How many `INTERSECT` the left spine of `body` carries.
-fn intersect_links(mut body: &QueryBody) -> usize {
-    let mut links = 0;
-    while let QueryBody::SetOp {
-        op: SetOp::Intersect,
-        left,
-        ..
-    } = body
-    {
-        links += 1;
-        body = left;
+    let mut pending = vec![body];
+    while let Some(body) = pending.pop() {
+        if let QueryBody::SetOp {
+            op: SetOp::Union,
+            all: true,
+            left,
+            right,
+            ..
+        } = body
+        {
+            links += 1;
+            pending.push(left);
+            pending.push(right);
+        }
     }
     links
 }
@@ -1078,4 +1067,222 @@ fn nested_else_if_chains_share_one_budget() {
         .expect("the test can spawn a thread");
     let (links, blocks) = worker.join().expect("the tree was printed and freed");
     assert_eq!((links, blocks), (253, 217));
+}
+
+/// Error 8631, the one a batch too deep for the engine is refused with.
+const STACK_LIMIT_REACHED: u32 = 8631;
+
+/// Asserts that `error` is 8631, severity 17, state 1, on `line`.
+fn assert_is_8631(error: &SqlError, line: u32) {
+    assert_eq!(
+        (error.number, error.severity, error.state, error.line),
+        (STACK_LIMIT_REACHED, 17, 1, line),
+        "{error:?}"
+    );
+}
+
+/// `SELECT 0 <op> SELECT 1 <op> SELECT 2 …`, `links` operators long, each operand
+/// with its own number so that their order can be read back.
+fn set_op_chain(op: &str, links: usize) -> String {
+    let mut text = String::from("SELECT 0");
+    for link in 1..=links {
+        text.push_str(&format!(" {op} SELECT {link}"));
+    }
+    text
+}
+
+/// The depth of the set-operator tree of `body`, walked with a stack of its own.
+fn set_op_depth(body: &QueryBody) -> usize {
+    let mut deepest = 0;
+    let mut pending = vec![(body, 0)];
+    while let Some((body, depth)) = pending.pop() {
+        match body {
+            QueryBody::SetOp { left, right, .. } => {
+                pending.push((left, depth + 1));
+                pending.push((right, depth + 1));
+            }
+            QueryBody::Nested(inner, _) => pending.push((inner, depth)),
+            QueryBody::Select(_) => deepest = deepest.max(depth),
+        }
+    }
+    deepest
+}
+
+/// The numbers the operands of `body` select, from left to right.
+fn operand_numbers(body: &QueryBody) -> Vec<String> {
+    let mut numbers = Vec::new();
+    let mut pending = vec![body];
+    while let Some(body) = pending.pop() {
+        match body {
+            QueryBody::SetOp { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            QueryBody::Nested(inner, _) => pending.push(inner),
+            QueryBody::Select(spec) => numbers.push(spec.items[0].to_string()),
+        }
+    }
+    numbers
+}
+
+/// Fifty thousand `UNION ALL` are read as a balanced tree: every link is there, the
+/// operands keep their order, the tree is 17 levels deep, and the walks that recurse once
+/// per level -- `Clone`, `PartialEq`, `Display`, `Drop` -- run on the reference stack.
+///
+/// The parser that built this chain leaning left aborts this test in `Clone`, the walk a
+/// query binder starts with.
+#[test]
+fn a_long_union_all_run_is_balanced() {
+    let text = set_op_chain("UNION ALL", COMB_LEVELS);
+    let worker = thread::Builder::new()
+        .stack_size(REFERENCE_STACK)
+        .spawn(move || {
+            let batch = parse_batch(&text, &ParseOptions::default())
+                .unwrap_or_else(|error| unreachable!("the chain parses: {error:?}"));
+            let copy = batch.clone();
+            let same = copy == batch;
+            let printed = batch.to_string();
+            let body = &select_of(&batch).body;
+            let numbers = operand_numbers(body);
+            let in_order = numbers
+                .iter()
+                .enumerate()
+                .all(|(index, number)| *number == index.to_string());
+            let summary = (
+                union_all_links(body),
+                set_op_depth(body),
+                numbers.len(),
+                in_order,
+                same,
+                printed == text,
+            );
+            drop(copy);
+            drop(batch);
+            summary
+        })
+        .expect("the test can spawn a thread");
+    let summary = worker.join().expect("the tree was walked and freed");
+    assert_eq!(
+        summary,
+        (COMB_LEVELS, 17, COMB_LEVELS + 1, true, true, true)
+    );
+}
+
+/// A run of 31 `UNION ALL` keeps the shape it was written in, leaning left; the 32nd link
+/// makes it balanced. A run of `UNION` is balanced the same way, a chain that alternates
+/// `UNION` and `UNION ALL` is not, and a chain of long runs joined by `EXCEPT` costs two
+/// levels per run.
+#[test]
+fn a_short_union_run_keeps_its_shape() {
+    let depth_of = |text: String| {
+        let batch = parse_on_reference_stack(text).expect("the chain parses");
+        set_op_depth(&select_of(&batch).body)
+    };
+    assert_eq!(depth_of(set_op_chain("UNION ALL", 31)), 31);
+    assert_eq!(depth_of(set_op_chain("UNION ALL", 32)), 6);
+    assert_eq!(depth_of(set_op_chain("UNION", 1000)), 11);
+    let alternating: String = (1..=100)
+        .map(|link| {
+            let op = if link % 2 == 0 { "UNION" } else { "UNION ALL" };
+            format!(" {op} SELECT {link}")
+        })
+        .collect();
+    assert_eq!(depth_of(format!("SELECT 0{alternating}")), 100);
+    // The chain read before a long run sinks one level under it, not the run's depth.
+    let rounds = format!(" EXCEPT SELECT 8{}", " UNION ALL SELECT 9".repeat(40)).repeat(100);
+    assert_eq!(depth_of(format!("SELECT 0{rounds}")), 7 + 2 * 99);
+}
+
+/// A balanced run reads back the same: the text `Display` prints parses into the tree it
+/// was printed from, also when the run follows an `EXCEPT` and is followed by one.
+#[test]
+fn a_balanced_run_survives_the_display_loop() {
+    let text = format!(
+        "SELECT 0 EXCEPT SELECT 1{} EXCEPT SELECT 2",
+        " UNION ALL SELECT 3 INTERSECT SELECT 4".repeat(40)
+    );
+    let batch = parse_on_reference_stack(text.clone()).expect("the chain parses");
+    assert_eq!(batch.to_string(), text);
+    let again = parse_on_reference_stack(batch.to_string()).expect("the printed text parses");
+    assert_eq!(again, batch);
+    let numbers = operand_numbers(&select_of(&batch).body);
+    assert_eq!(numbers.len(), 83);
+    assert_eq!(numbers.first().map(String::as_str), Some("0"));
+    assert_eq!(numbers.last().map(String::as_str), Some("2"));
+}
+
+/// A chain of `INTERSECT`, of `EXCEPT`, or one that alternates `UNION` and `UNION ALL`,
+/// holds 1070 operators and is refused with 8631 at the 1071st, on the line of its
+/// statement. The depth adds up across a derived table: two chains of 600 nested one
+/// inside the other are refused. Fifty thousand links are refused the same way.
+#[test]
+fn set_operator_chains_stop_at_their_depth() {
+    let alternating = |links: usize| -> String {
+        let mut text = String::from("SELECT 0");
+        for link in 1..=links {
+            let op = if link % 2 == 0 { "UNION" } else { "UNION ALL" };
+            text.push_str(&format!(" {op} SELECT {link}"));
+        }
+        text
+    };
+    for (shape, write) in [
+        (
+            "INTERSECT",
+            (|n| set_op_chain("INTERSECT", n)) as fn(usize) -> String,
+        ),
+        ("EXCEPT", |n| set_op_chain("EXCEPT", n)),
+        ("alternating UNION", alternating),
+    ] {
+        let batch = parse_on_reference_stack(write(1070))
+            .unwrap_or_else(|error| unreachable!("{shape}: 1070 links parse: {error:?}"));
+        assert_eq!(set_op_depth(&select_of(&batch).body), 1070, "{shape}");
+        for links in [1071, 3500, 10_000, COMB_LEVELS] {
+            assert_is_8631(&refused(write(links)), 1);
+        }
+    }
+    let inner = set_op_chain("EXCEPT", 600);
+    let nested = format!(
+        "SELECT 1;\nSELECT *\nFROM ({inner}) AS t{}",
+        " EXCEPT SELECT 1".repeat(600)
+    );
+    assert_is_8631(&refused(nested), 2);
+    let side_by_side = format!(
+        "SELECT * FROM ({inner}) AS t CROSS JOIN ({inner}) AS u{}",
+        " EXCEPT SELECT 1".repeat(400)
+    );
+    parse_on_reference_stack(side_by_side).expect("breadth is not depth");
+}
+
+/// The deepest set-operator tree let through is walked by `Clone`, `PartialEq`,
+/// `Display` and `Drop` on the reference stack, under 200 derived tables.
+#[test]
+fn the_deepest_set_operator_tree_is_walked_without_an_abort() {
+    let mut source = format!("({}) AS t0", set_op_chain("EXCEPT", 1069));
+    for level in 1..=200 {
+        source = format!("(SELECT * FROM {source}) AS t{level}");
+    }
+    let text = format!("SELECT * FROM {source}");
+    let worker = thread::Builder::new()
+        .stack_size(REFERENCE_STACK)
+        .spawn(move || {
+            let batch = parse_batch(&text, &ParseOptions::default())
+                .unwrap_or_else(|error| unreachable!("the tree parses: {error:?}"));
+            let copy = batch.clone();
+            let printed = batch.to_string();
+            (copy == batch, printed == text)
+        })
+        .expect("the test can spawn a thread");
+    assert_eq!(worker.join().expect("the tree was walked"), (true, true));
+}
+
+/// A syntax error anywhere in the batch is sent instead of the 8631 of a chain too deep,
+/// before or after it.
+#[test]
+fn a_syntax_error_wins_over_a_set_operator_chain_too_deep() {
+    let chain = set_op_chain("INTERSECT", 1100);
+    let after = refused(format!("{chain};\nSELECT FROM t"));
+    assert_eq!((after.number, after.line), (156, 2), "{after:?}");
+    let before = refused(format!("SELECT 1 +;\n{chain}"));
+    assert_eq!(before.number, 102, "{before:?}");
+    assert_is_8631(&refused(format!("SELECT 1;\n{chain};\nSELECT 2")), 2);
 }
