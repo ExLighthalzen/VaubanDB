@@ -30,10 +30,12 @@
 //! `container_id` of the partition it holds ([`Owner::Container`]), read from the partition
 //! rows of the table before they are deleted ([`containers`]).
 //!
-//! # Bound: what this file does not write
+//! # Restart
 //!
-//! The rows are not written again when the instance restarts — the store of `table.rs` is in
-//! memory and is not reloaded.
+//! The rows are written once per statement and read back when a catalogue opens over a
+//! storage that already holds tables: `table/reload.rs` rebuilds the store of `table.rs` from
+//! them, with the two tables of its own this file writes as well ([`reload::STORAGE_TABLE`],
+//! [`reload::COLUMNS_TABLE`]) (unit test `a_reopened_catalogue_holds_the_tables_it_wrote`).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,6 +53,7 @@ use crate::catalog::Catalog;
 use crate::ids::ObjectId;
 use crate::index::IndexStore;
 use crate::meta::{ObjectMeta, TableMeta};
+use crate::table::reload;
 use crate::views::{
     info_schema, info_schema_constraints, sys_constraints, sys_extra, sys_indexes, sys_tables,
 };
@@ -158,7 +161,7 @@ fn constraint_names_for(
 ///
 /// The list is the one both [`write`] and [`remove`] walk: a table added here is written at
 /// `CREATE` and removed at `DROP` by that single edit (unit test
-/// `every_internal_table_of_the_list_is_one_the_bootstrap_created` checks the nineteen names
+/// `every_internal_table_of_the_list_is_one_the_bootstrap_created` checks the twenty-one names
 /// against `bootstrap::internal_table_defs`). [`sys_tables::OBJECTS_TABLE`] is named twice —
 /// once for `table`'s own row, once for the rows of its constraints — which the test counts
 /// once, the two entries writing into the same physical table.
@@ -167,13 +170,12 @@ fn constraint_names_for(
 ///
 /// The error of a row constructor of `views/`.
 fn rows_of(
-    _catalog: &Catalog,
-    _txn: &TxnHandle,
     table: &TableMeta,
     indexes: &IndexStore,
     create_date: &Value,
     modify_date: &Value,
     constraint_names: &BTreeMap<ObjectId, String>,
+    watermark: i32,
 ) -> SqlResult<Vec<Rows>> {
     let one = std::slice::from_ref(table);
     Ok(vec![
@@ -361,6 +363,22 @@ fn rows_of(
                 constraint_names,
             )?,
         },
+        Rows {
+            name: reload::STORAGE_TABLE,
+            owner: Owner::Object(
+                reload::storage_columns::DATABASE_ID,
+                reload::storage_columns::OBJECT_ID,
+            ),
+            rows: reload::storage_rows(table, indexes, watermark)?,
+        },
+        Rows {
+            name: reload::COLUMNS_TABLE,
+            owner: Owner::Object(
+                reload::column_details_columns::DATABASE_ID,
+                reload::column_details_columns::OBJECT_ID,
+            ),
+            rows: reload::column_rows(table)?,
+        },
     ])
 }
 
@@ -382,13 +400,24 @@ pub(crate) fn write(
     let instant = transaction_datetime(catalog, txn)?;
     let stashed = stashed_constraint_names();
     let names = constraint_names_for(catalog, txn, table, &stashed)?;
-    for described in rows_of(catalog, txn, table, indexes, &instant, &instant, &names)? {
+    let watermark = live_watermark(table);
+    for described in rows_of(table, indexes, &instant, &instant, &names, watermark)? {
         let id = table_id(catalog, described.name)?;
         for row in &described.rows {
             catalog.storage.insert(txn.id, id, row)?;
         }
     }
-    Ok(())
+    reload::record_high_water(catalog, txn, table)
+}
+
+/// The largest `column_id` `table` holds now, `0` for a table without column.
+fn live_watermark(table: &TableMeta) -> i32 {
+    table
+        .columns
+        .iter()
+        .map(|column| column.id.0)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Deletes in `txn` the rows the internal tables of [`rows_of`] carry about `table`.
@@ -413,15 +442,7 @@ pub(crate) fn remove(
         ticks_300th: 0,
     });
     let names = stored_constraint_names(catalog, txn, table)?;
-    for described in rows_of(
-        catalog,
-        txn,
-        table,
-        indexes,
-        &placeholder,
-        &placeholder,
-        &names,
-    )? {
+    for described in rows_of(table, indexes, &placeholder, &placeholder, &names, 0)? {
         let id = table_id(catalog, described.name)?;
         for (row_id, values) in scan(catalog, txn, id)? {
             if described
@@ -456,14 +477,19 @@ pub(crate) fn rewrite(
     let create = object_create_date(catalog, txn, table)?.unwrap_or_else(|| modify.clone());
     let mut names = stored_constraint_names(catalog, txn, table)?;
     names.extend(stashed_constraint_names());
+    // The largest `column_id` handed out does not fall when that column is dropped
+    // (`table/reload.rs`, `stored_watermark`).
+    let watermark = reload::stored_watermark(catalog, txn, table)?
+        .unwrap_or(0)
+        .max(live_watermark(table));
     remove(catalog, txn, table, indexes)?;
-    for described in rows_of(catalog, txn, table, indexes, &create, &modify, &names)? {
+    for described in rows_of(table, indexes, &create, &modify, &names, watermark)? {
         let id = table_id(catalog, described.name)?;
         for row in &described.rows {
             catalog.storage.insert(txn.id, id, row)?;
         }
     }
-    Ok(())
+    reload::record_high_water(catalog, txn, table)
 }
 
 /// Deletes from the internal tables of `master` each row whose `database_id` names `database`
@@ -503,7 +529,7 @@ fn object_create_date(
 }
 
 /// Internal tables that carry a `database_id` column and the position of that column.
-const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 21] = [
+const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 23] = [
     (DATABASES_TABLE, databases_columns::DATABASE_ID),
     (SCHEMAS_TABLE, schemas_columns::DATABASE_ID),
     (
@@ -581,6 +607,11 @@ const INTERNAL_TABLE_DATABASE_COLUMNS: [(&str, usize); 21] = [
     (
         info_schema_constraints::REFERENTIAL_CONSTRAINTS_TABLE,
         info_schema_constraints::referential_constraints_columns::DATABASE_ID,
+    ),
+    (reload::STORAGE_TABLE, reload::storage_columns::DATABASE_ID),
+    (
+        reload::COLUMNS_TABLE,
+        reload::column_details_columns::DATABASE_ID,
     ),
 ];
 
@@ -802,11 +833,13 @@ mod tests {
             info_schema_constraints::TABLE_CONSTRAINTS_TABLE,
             info_schema_constraints::KEY_COLUMN_USAGE_TABLE,
             info_schema_constraints::REFERENTIAL_CONSTRAINTS_TABLE,
+            reload::STORAGE_TABLE,
+            reload::COLUMNS_TABLE,
         ];
         assert_eq!(
             listed.len(),
-            19,
-            "the nineteen distinct tables of the module list"
+            21,
+            "the twenty-one distinct tables of the module list"
         );
         for name in listed {
             assert!(

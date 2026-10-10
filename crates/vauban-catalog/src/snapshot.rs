@@ -348,6 +348,9 @@ pub(crate) const SYSTEM_OBJECT_IDS: &[(&str, &str, i32)] = &[
     (DBO, "vauban_sys_schemas", 100_038),
     (DBO, "vauban_sys_sessions", 100_039),
     (DBO, "vauban_sys_connections", 100_040),
+    (DBO, "vauban_sys_object_storage", 100_041),
+    (DBO, "vauban_sys_column_details", 100_042),
+    (DBO, "vauban_sys_object_high_water", 100_043),
 ];
 
 /// The constant [`SYSTEM_OBJECT_IDS`] gives the system object `schema.name`, `None` for a pair

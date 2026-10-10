@@ -568,8 +568,8 @@ fn two_names_that_differ_outside_ascii_are_two_tables_here() {
     assert!(table_ids(&storage, db).contains(&lower.storage_id));
 }
 
-/// A second catalogue over the same storage hands out identifiers clear of the first one's,
-/// so a `drop_table` with an identifier of the first catalogue destroys nothing.
+/// A second catalogue over the same storage reads back the table the first one committed,
+/// under its identifier and its storage table, and hands out identifiers clear of it.
 #[test]
 fn a_second_catalogue_hands_out_other_object_ids() {
     let (first, storage, txn) = instance();
@@ -583,16 +583,16 @@ fn a_second_catalogue_hands_out_other_object_ids() {
 
     let second = Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn)).expect("restart");
     let handle = begin(&txn);
+    assert_eq!(second.snapshot(&handle).table(old.id), Some(&old));
     let new = second
         .create_table(&handle, &two_columns("t2"))
         .expect("create t2");
     assert_ne!(old.id, new.id, "the counter was raised past the first run");
-    let err = second
+    second
         .drop_table(&handle, old.id)
-        .expect_err("the second catalogue holds no such object");
-    assert_eq!(err.number, 3701);
+        .expect("the second catalogue holds t1");
     txn.commit(handle).expect("commit");
-    assert!(table_ids(&storage, db).contains(&old.storage_id));
+    assert!(!table_ids(&storage, db).contains(&old.storage_id));
     assert!(table_ids(&storage, db).contains(&new.storage_id));
 }
 

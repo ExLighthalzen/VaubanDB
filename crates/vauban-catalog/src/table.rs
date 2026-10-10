@@ -24,7 +24,10 @@
 //!
 //! In [`TableStore`], behind the `tables` field of [`Catalog`]; the internal tables of
 //! `storage` that the `sys.objects` and `sys.columns` views read are written from it
-//! (`sys_rows.rs`). What follows from that: the map is in memory and is not versioned, so
+//! (`sys_rows.rs`), and a catalogue opened over a storage that already holds tables rebuilds
+//! the store from those rows ([`reload`], unit test
+//! `a_reopened_catalogue_holds_the_tables_it_wrote`). What follows from that: the map is in
+//! memory and is not versioned, so
 //! `storage` — which is versioned — stays the reference on the question "does this table
 //! still exist" ([`refresh`]). What that costs is written where it bites: a `DROP` undone by
 //! a `ROLLBACK TRANSACTION <savepoint>` keeps its mark ([`drop_table`]), and two names that
@@ -41,14 +44,18 @@
 //! its own, from [`FIRST_USER_OBJECT_ID`], one more at each table (`tests/table.rs`,
 //! `the_object_id_is_not_the_table_id`).
 //!
-//! A second [`Catalog`] built over the same storage starts with an empty map, so its counter
-//! is raised past the identifiers the first one handed out before it gives any
-//! ([`TableStore::raise_counter_above`], `tests/table.rs`,
+//! A second [`Catalog`] built over the same storage reads back the tables the first one
+//! committed, and its counter is raised past the identifiers those rows hold ([`reload`]) and
+//! past the [`TableId`]s of `storage` ([`TableStore::raise_counter_above`], `tests/table.rs`,
 //! `a_second_catalogue_hands_out_other_object_ids`).
 //!
-//! An identifier freed by a `DROP` or by a rolled-back `CREATE` is not handed out again: the
-//! counter moves forward, as `OBJECT_ID` does in SQL Server after a `DROP TABLE` or a rolled
-//! back `CREATE TABLE` (`tests/table.rs`, `create_table_assigns_stable_object_id`).
+//! Within one catalogue, an identifier freed by a `DROP` or by a rolled-back `CREATE` is not
+//! handed out again: the counter moves forward, as `OBJECT_ID` does in SQL Server after a
+//! `DROP TABLE` or a rolled back `CREATE TABLE` (`tests/table.rs`,
+//! `create_table_assigns_stable_object_id`). Across a reopen, the identifier of a committed
+//! `CREATE` stays taken after its `DROP`, the largest one being stored ([`reload`], unit test
+//! `the_counter_starts_past_every_stored_identifier`); the identifier of a rolled-back
+//! `CREATE` leaves no row and can come back after a reopen.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{MutexGuard, PoisonError};
@@ -62,6 +69,9 @@ use crate::catalog::Catalog;
 use crate::def::{ConstraintDef, TableDef};
 use crate::ids::{ColumnId, ObjectId};
 use crate::meta::{ColumnMeta, TableMeta};
+
+pub(crate) mod reload;
+
 /// The [`ObjectId`] of the first table a catalogue creates.
 ///
 /// The value is ours: a client reads an `object_id` through `sys.objects` and compares
@@ -169,17 +179,10 @@ impl TableStore {
     /// Moves the counter past the identifiers a previous catalogue on this storage may have
     /// handed out, `live` being the tables `storage` holds.
     ///
-    /// A [`Catalog`] built a second time over the same storage starts with an empty map (the
-    /// store is not reloaded), so its counter would start again at
-    /// [`FIRST_USER_OBJECT_ID`] and give a new table the identifier of a table the first
-    /// catalogue created. Each table costs one [`TableId`] and one [`ObjectId`], and a
-    /// `TableId` is not reused, so keeping the counter above
-    /// `FIRST_USER_OBJECT_ID + largest TableId` keeps the new identifiers clear of the old
-    /// ones (`tests/table.rs`, `a_second_catalogue_hands_out_other_object_ids`).
-    ///
-    /// What this does not cover: an identifier whose table was dropped before the second
-    /// catalogue started can be handed out again, since a dropped table leaves no `TableId`
-    /// behind for the count to see.
+    /// A floor beside the one [`reload`] sets from the stored identifiers: each table costs
+    /// one [`TableId`] and at least one [`ObjectId`], and a `TableId` is not reused, so the
+    /// counter stays above `FIRST_USER_OBJECT_ID + largest TableId` (`tests/table.rs`,
+    /// `a_second_catalogue_hands_out_other_object_ids`).
     fn raise_counter_above(&mut self, live: &BTreeSet<TableId>) {
         let Some(largest) = live.iter().next_back() else {
             return;

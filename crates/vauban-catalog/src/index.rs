@@ -115,6 +115,19 @@ pub(crate) struct IndexEntry {
     dropped_by: Option<TxnId>,
 }
 
+impl IndexEntry {
+    /// The entry of an index `storage` already holds, rebuilt at start-up from the rows of the
+    /// internal tables (`table/reload.rs`), with no pending `DROP`.
+    pub(crate) fn reloaded(table: ObjectId, storage_table: TableId, meta: IndexMeta) -> Self {
+        IndexEntry {
+            table,
+            storage_table,
+            meta,
+            dropped_by: None,
+        }
+    }
+}
+
 impl IndexStore {
     /// The indexes of the table `table` that no `DROP` has claimed, by increasing
     /// [`IndexId`].

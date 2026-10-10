@@ -1495,6 +1495,7 @@ dependencies = [
 name = "vauban-catalog"
 version = "0.0.5"
 dependencies = [
+ "tracing",
  "vauban-errors",
  "vauban-parser",
  "vauban-storage",

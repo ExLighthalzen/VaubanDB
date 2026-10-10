@@ -26,7 +26,9 @@ use crate::table::{self, TableStore};
 ///
 /// The watermark of the entry outlives the columns it counted, so an `ADD COLUMN` after a
 /// `DROP COLUMN` does not hand the freed id out again (`tests/alter.rs`,
-/// `drop_last_column_then_add_uses_high_water`).
+/// `drop_last_column_then_add_uses_high_water`). It is stored with the rows of the table and
+/// read back when the catalogue reopens, so the rule holds across a restart as well
+/// (`table/reload.rs`, unit test `the_column_watermark_survives_a_dropped_column_and_a_reopen`).
 fn max_column_id_used(store: &TableStore, table: &TableMeta) -> i32 {
     let live_max = table
         .columns
@@ -62,7 +64,7 @@ struct AlterPlan {
 ///   (`tests/alter.rs`, `drop_column_used_by_an_index_is_refused`,
 ///   `add_column_default_then_drop_is_5074`);
 /// - 3728 when a constraint name is unknown on `DROP CONSTRAINT`
-///   (`tests/alter.rs`, `drop_unknown_constraint_is_3728`);
+///   (`tests/alter.rs`);
 /// - what [`crate::index::table_keys`], [`crate::index::apply_table_keys`] and
 ///   [`crate::constraints::apply_table_constraints`] answer;
 /// - the error of `storage` or of the transaction manager otherwise.

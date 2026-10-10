@@ -11,8 +11,9 @@
 //!    whose name is [`DEFAULT_COLLATION_NAME`];
 //! 2. in `master`, the registry of the internal tables ([`REGISTRY_TABLE`], section below),
 //!    then the internal tables: those [`crate::views::internal_tables`] describes, then the
-//!    ones the bootstrap owns, [`DATABASES_TABLE`] and [`SCHEMAS_TABLE`] first, dropped when a
-//!    file of `views/` already describes a table of that name;
+//!    ones the bootstrap owns, [`DATABASES_TABLE`] and [`SCHEMAS_TABLE`] first, then the three
+//!    of `table/reload.rs`, dropped when a file of `views/` already describes a table of that
+//!    name;
 //! 3. the rows each description carries: one per database in [`DATABASES_TABLE`], one per
 //!    (database, schema) pair in [`SCHEMAS_TABLE`], which is 4 and 12 rows on a fresh
 //!    `MemoryStorage` (unit test `a_fresh_bootstrap_writes_four_and_twelve_rows`);
@@ -58,7 +59,9 @@
 //! rows and registers them; the tables already registered keep their [`TableId`] and their
 //! rows (unit test `a_table_described_in_front_on_reopen_shifts_no_other_table`). With nothing
 //! missing, the call creates nothing and gives back the same [`DbId`]s (integration tests
-//! `bootstrap_is_idempotent` and `restart_finds_master`, `tests/bootstrap.rs`). A `master`
+//! `bootstrap_is_idempotent` and `restart_finds_master`, `tests/bootstrap.rs`). It then
+//! rebuilds the tables of the instance from the committed rows of the internal tables
+//! (`table/reload.rs`). A `master`
 //! that holds tables and no registry in first place is refused with
 //! [`InternalError::Bug`]: the bootstrap cannot tell which of those tables is which (unit test
 //! `a_master_without_registry_is_refused`).
@@ -350,6 +353,9 @@ fn open(
             .map_err(internal)?;
     }
     install_missing(&catalog, &databases, declared, fresh)?;
+    if !fresh {
+        crate::table::reload::reload(&catalog)?;
+    }
     Ok(catalog)
 }
 
@@ -707,7 +713,10 @@ fn internal_tables(
     instant: &Value,
 ) -> Result<Vec<InternalTableDef>, InternalError> {
     let mut tables = views::internal_tables();
-    for own in bootstrap_tables(databases, instant)? {
+    let own_tables = bootstrap_tables(databases, instant)?
+        .into_iter()
+        .chain(crate::table::reload::internal_tables());
+    for own in own_tables {
         if !tables
             .iter()
             .any(|table| table.name.eq_ignore_ascii_case(&own.name))
@@ -945,7 +954,7 @@ fn registry_table(catalog: &Catalog) -> Result<Option<TableId>, InternalError> {
 /// was not listed is seen too, which the registry tolerates since its rows are written once
 /// and left unchanged afterwards. `TxnId(0)`, an identifier `begin` does not hand out, reads
 /// the committed rows alone.
-fn registry_snapshot(catalog: &Catalog, own: TxnId) -> Snapshot {
+pub(crate) fn registry_snapshot(catalog: &Catalog, own: TxnId) -> Snapshot {
     let mut active: Vec<TxnId> = catalog
         .txn
         .active_sessions()
@@ -1294,8 +1303,8 @@ mod tests {
 
     #[test]
     fn the_tables_of_master_are_the_ones_the_files_describe() {
-        // The tables of the files of `views/` come first, then the two tables of the
-        // bootstrap; `views/mod.rs` puts the table of objects first.
+        // The tables of the files of `views/` come first, then the tables of the bootstrap
+        // and the three of `table/reload.rs`; `views/mod.rs` puts the table of objects first.
         let mut expected: Vec<String> = views::internal_tables()
             .into_iter()
             .map(|def| def.name)
@@ -1309,6 +1318,9 @@ mod tests {
             SCHEMAS_TABLE.to_owned(),
             SESSIONS_TABLE.to_owned(),
             CONNECTIONS_TABLE.to_owned(),
+            crate::table::reload::STORAGE_TABLE.to_owned(),
+            crate::table::reload::COLUMNS_TABLE.to_owned(),
+            crate::table::reload::HIGH_WATER_TABLE.to_owned(),
         ]);
         let names: Vec<String> = internal_table_defs()
             .unwrap()
