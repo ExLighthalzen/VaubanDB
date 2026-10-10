@@ -39,6 +39,20 @@ pub trait EvalContext {
     /// `None` when the object does not exist.
     fn object_id(&self, name: &str) -> Option<i32>;
 
+    /// What `OBJECT_ID` answers for `name`: [`EvalContext::object_id`] once the context has
+    /// waited for a change of that object another transaction has not ended yet.
+    ///
+    /// The default waits for nothing. The session overrides it: a table another session
+    /// creates, alters or drops without having committed is answered once that session has
+    /// ended its transaction.
+    ///
+    /// # Errors
+    ///
+    /// The error of the wait: 1222 when the `SET LOCK_TIMEOUT` of the session runs out.
+    fn object_id_when_stable(&self, name: &str) -> vauban_errors::SqlResult<Option<i32>> {
+        Ok(self.object_id(name))
+    }
+
     /// Resolves an `object_id` to its name through the catalogue (`OBJECT_NAME`),
     /// `None` when no object has this id.
     fn object_name(&self, id: i32) -> Option<String>;

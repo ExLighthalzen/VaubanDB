@@ -120,5 +120,6 @@ pub use info::{LockInfo, LockStatus, TxnInfo, TxnState};
 pub use isolation::{LockIntent, ReadAccess};
 pub use lock::{LockManager, LockMode, LockOutcome, LockResource, LockWait};
 pub use manager::TransactionManager;
+pub use schema_lock::SchemaHold;
 pub use snapshot_modes::{VersioningMode, VersioningOptions};
 pub use table_lock::{ESCALATION_THRESHOLD, TableLockDecision};

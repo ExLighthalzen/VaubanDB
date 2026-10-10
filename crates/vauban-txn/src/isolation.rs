@@ -33,7 +33,11 @@
 //! `xlock_blocks_a_reader`, `updlock_under_read_uncommitted_still_takes_the_u`). Before an
 //! `S` on a row the table takes an `IS`, before a `U` or an `X` an `IX`, and those intent
 //! locks are given back at the end of the transaction (`tests/isolation.rs`,
-//! `intent_locks_are_taken`, `end_row_read_keeps_the_intent_lock`). `READPAST` turns a row
+//! `intent_locks_are_taken`, `end_row_read_keeps_the_intent_lock`), save the `IS` of a
+//! level that gives its row locks back with the row: [`TransactionManager::end_statement`]
+//! gives that one back at the end of the statement, once no row lock of the table is left
+//! (`tests/isolation.rs`, `the_is_of_a_read_committed_read_goes_with_the_statement`,
+//! `the_is_of_a_repeatable_read_stays_to_the_end`). `READPAST` turns a row
 //! lock that cannot be had at once into [`ReadAccess::Skip`] instead of an error, and
 //! `NOWAIT` asks for [`LockTimeout::NoWait`], which `deadlock.rs` reports as 1222.
 //!
@@ -428,6 +432,80 @@ impl TransactionManager {
         // back (`tests/isolation.rs`, `a_row_converted_to_x_keeps_its_lock`, which stays
         // green when this line is removed).
         take_row_read(txn.id, table, row);
+        Ok(())
+    }
+
+    /// Gives back, at the end of one statement of `txn`, the table locks that were to end
+    /// with it, and keeps the others.
+    ///
+    /// Two kinds go, table by table, when they are what `txn` holds on the table:
+    /// - the `IS` of a read at a level whose row locks end with the row (`ReadUncommitted`,
+    ///   `ReadCommitted`, `Snapshot`, [`releases_at_end_of_row`]), when no row lock of the
+    ///   table is held any more: a writer of a row still holds its `IX`, a read under a
+    ///   `REPEATABLEREAD` hint still holds the `S` of its rows, and both keep the table;
+    /// - the `Sch-S` [`TransactionManager::hold_schema_stability`] took for the statement,
+    ///   one of `held_for_the_statement`.
+    ///
+    /// A table where the transaction also holds an `IX`, an `S`, an `X` or a `Sch-M` keeps
+    /// its two modes to the end of the transaction: the lock manager gives back the two
+    /// families of a resource together, and what stays stands in the way of a `Sch-M` of
+    /// another transaction as the `Sch-S` did (`tests/isolation.rs`,
+    /// `the_is_of_a_read_committed_read_goes_with_the_statement`,
+    /// `the_is_of_a_repeatable_read_stays_to_the_end`,
+    /// `a_written_table_keeps_its_locks_at_the_end_of_the_statement`).
+    ///
+    /// A read under a `REPEATABLEREAD` or `HOLDLOCK` hint in a `ReadCommitted` transaction
+    /// that found no row leaves no row lock behind, so its `IS` goes too: the stronger hint
+    /// is told apart by the row locks it keeps.
+    ///
+    /// # Errors
+    ///
+    /// The error of [`crate::lock::LockManager::unlock`], a caller bug.
+    pub fn end_statement(
+        &self,
+        txn: &TxnHandle,
+        held_for_the_statement: &[TableId],
+    ) -> SqlResult<()> {
+        let held = self.locks().held(txn.id);
+        let reads_end_with_the_row = releases_at_end_of_row(txn.isolation);
+        let mut tables: Vec<TableId> = held
+            .iter()
+            .filter_map(|(resource, _)| match resource {
+                LockResource::Table(table) => Some(*table),
+                LockResource::Row(..) => None,
+            })
+            .collect();
+        tables.dedup();
+        for table in tables {
+            let resource = LockResource::Table(table);
+            let mut data = None;
+            let mut schema = None;
+            for (res, mode) in &held {
+                if *res == resource {
+                    if mode.is_data() {
+                        data = Some(*mode);
+                    } else {
+                        schema = Some(*mode);
+                    }
+                }
+            }
+            let rows_held = held
+                .iter()
+                .any(|(res, _)| matches!(res, LockResource::Row(t, _) if *t == table));
+            let data_goes = match data {
+                None => true,
+                Some(LockMode::IS) => reads_end_with_the_row && !rows_held,
+                Some(_) => false,
+            };
+            let schema_goes = match schema {
+                None => true,
+                Some(LockMode::SchS) => held_for_the_statement.contains(&table),
+                Some(_) => false,
+            };
+            if data_goes && schema_goes {
+                self.locks().unlock(txn.id, resource)?;
+            }
+        }
         Ok(())
     }
 

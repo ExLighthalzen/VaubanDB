@@ -34,7 +34,7 @@ use vauban_storage::testsuite::int_table_shape;
 use vauban_storage::{DbId, MemoryStorage, RowId, Storage, TableId, TxnId};
 use vauban_txn::{
     CommitAction, IsolationLevel, LockIntent, LockManager, LockMode, LockResource, LockTimeout,
-    LockWait, ReadAccess, TransactionManager, TxnHandle,
+    LockWait, ReadAccess, SchemaHold, TransactionManager, TxnHandle,
 };
 
 /// How long a test waits for something it expects to happen — the two seconds a blocked
@@ -513,4 +513,113 @@ fn a_wait_at_binding_leaves_the_locks_already_held() {
         .expect("the IX of the write");
     assert!(!waited);
     assert_eq!(table_modes(&mgr, &writer), vec![LockMode::IX]);
+}
+
+/// The `Sch-S` a statement holds for its execution makes a `Sch-M` of another transaction
+/// wait for the end of the statement, and not for the end of the transaction: the reader is
+/// still open when the `DDL` is granted.
+#[test]
+fn a_held_sch_s_makes_a_ddl_wait_for_the_end_of_the_statement() {
+    let mgr = manager();
+    let reader = mgr.begin(IsolationLevel::ReadCommitted);
+    let hold = mgr
+        .hold_schema_stability(&reader, T, LockTimeout::Infinite, &LockWait::none())
+        .expect("the table is free");
+    assert_eq!(
+        hold,
+        SchemaHold {
+            taken: true,
+            waited: false
+        }
+    );
+    assert_eq!(table_modes(&mgr, &reader), vec![LockMode::SchS]);
+
+    let ddl = mgr.begin(IsolationLevel::ReadCommitted);
+    let rx = modify_in_background(&mgr, &ddl);
+    await_waiter(mgr.locks(), ddl.id);
+    still_waiting(&rx, "the Sch-M");
+    mgr.end_statement(&reader, &[T])
+        .expect("end of the statement");
+    assert_eq!(rx.recv_timeout(SOON).expect("granted"), Ok(()));
+    assert!(table_modes(&mgr, &reader).is_empty());
+    mgr.commit(ddl).expect("commit");
+    mgr.commit(reader).expect("commit");
+}
+
+/// A statement that holds its `Sch-S` gives it back with the statement; the end of a
+/// statement that did not take it leaves a `Sch-S` taken for the transaction alone.
+#[test]
+fn a_held_sch_s_goes_with_the_end_of_the_statement() {
+    let mgr = manager();
+    let reader = mgr.begin(IsolationLevel::Serializable);
+    mgr.hold_schema_stability(&reader, T, LockTimeout::NoWait, &LockWait::none())
+        .expect("the table is free");
+    mgr.end_statement(&reader, &[T])
+        .expect("end of the statement");
+    assert!(mgr.locks().held(reader.id).is_empty());
+
+    mgr.schema_stability_lock(&reader, T)
+        .expect("the table is free");
+    mgr.end_statement(&reader, &[])
+        .expect("end of the statement");
+    assert_eq!(table_modes(&mgr, &reader), vec![LockMode::SchS]);
+}
+
+/// The `Sch-S` of a statement waits for the `Sch-M` another transaction holds, answers that
+/// it waited, and is held once that transaction ends; under a timeout it is 1222 state 56.
+#[test]
+fn a_held_sch_s_waits_for_the_ddl_then_holds() {
+    let mgr = manager();
+    let ddl = mgr.begin(IsolationLevel::ReadCommitted);
+    mgr.schema_modify_lock(&ddl, T).expect("the table is free");
+    let reader = mgr.begin(IsolationLevel::ReadCommitted);
+    let err = mgr
+        .hold_schema_stability(&reader, T, LockTimeout::Millis(50), &LockWait::none())
+        .expect_err("the Sch-M is in the way");
+    assert_eq!((err.number, err.state), (1222, 56));
+    assert!(mgr.locks().held(reader.id).is_empty());
+
+    let rx = {
+        let (mgr, reader) = (Arc::clone(&mgr), reader.clone());
+        in_background(move || {
+            mgr.hold_schema_stability(&reader, T, LockTimeout::Infinite, &LockWait::none())
+                .map_err(|e| e.number)
+        })
+    };
+    await_waiter(mgr.locks(), reader.id);
+    mgr.commit(ddl).expect("commit");
+    assert_eq!(
+        rx.recv_timeout(SOON).expect("the wait ends"),
+        Ok(SchemaHold {
+            taken: true,
+            waited: true
+        })
+    );
+    assert_eq!(table_modes(&mgr, &reader), vec![LockMode::SchS]);
+}
+
+/// A transaction that already holds a mode on the table takes no `Sch-S` for the statement,
+/// and the end of the statement leaves what it held: the `IX` of a write, its own `Sch-M`.
+#[test]
+fn a_held_sch_s_is_not_taken_over_a_mode_already_held() {
+    let mgr = manager();
+    let writer = mgr.begin(IsolationLevel::ReadCommitted);
+    mgr.write_lock(&writer, T, R, &LockIntent::default(), &LockWait::none())
+        .expect("the row is free");
+    let hold = mgr
+        .hold_schema_stability(&writer, T, LockTimeout::NoWait, &LockWait::none())
+        .expect("the IX of the write");
+    assert_eq!(hold, SchemaHold::default());
+    mgr.end_statement(&writer, &[T])
+        .expect("end of the statement");
+    assert_eq!(table_modes(&mgr, &writer), vec![LockMode::IX]);
+    mgr.commit(writer).expect("commit");
+
+    let ddl = mgr.begin(IsolationLevel::ReadCommitted);
+    mgr.hold_schema_stability(&ddl, T, LockTimeout::NoWait, &LockWait::none())
+        .expect("the table is free");
+    mgr.schema_modify_lock(&ddl, T)
+        .expect("its own Sch-S converts");
+    mgr.end_statement(&ddl, &[T]).expect("end of the statement");
+    assert_eq!(table_modes(&mgr, &ddl), vec![LockMode::SchM]);
 }

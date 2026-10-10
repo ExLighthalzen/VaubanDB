@@ -11,7 +11,7 @@ use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{DataType, ParameterDeclaration, Statement, parse_batch};
 use vauban_planner::{PhysicalPlan, PhysicalStatement, PlanContext, SnapshotIndexes};
 use vauban_tds::RpcParam;
-use vauban_txn::IsolationLevel;
+use vauban_txn::{IsolationLevel, TxnHandle};
 use vauban_types::{
     Collation, Len, SqlString, SqlType, TypeFamily, TypeInfo, Value, convert, implicit_result_type,
 };
@@ -23,7 +23,7 @@ use crate::procedures::{BatchProcOutcome, ProcFinish};
 use crate::rpc::{DescribeKind, ProcAction, ProcParam};
 use crate::sink::ResultSink;
 use crate::state::SessionState;
-use crate::statements::{statement_fragment, statement_line};
+use crate::statements::{at_statement, statement_fragment, statement_line};
 
 const DEFAULT_SCHEMA: &str = "dbo";
 
@@ -353,12 +353,11 @@ fn validate_prepared_text(
         batch_variables.declare(&decl.name, ty.clone())?;
     }
     let binding = session.engine().txn.begin(IsolationLevel::ReadCommitted);
-    let snapshot = crate::batch::binding_snapshot(session.engine(), state, &binding);
     let result = bind_prepared_statements(
         session,
         text,
         &batch.statements,
-        &snapshot,
+        &binding,
         state,
         &mut batch_variables,
     );
@@ -366,17 +365,26 @@ fn validate_prepared_text(
     result.map(|_| ())
 }
 
-/// Binds the statements of `text` in order and answers the columns of the first one that
-/// produces a result set, `None` for a batch without a result set.
+/// Binds the statements of `text` in order, against the catalogue `binding` reads, and
+/// answers the columns of the first one that produces a result set, `None` for a batch
+/// without a result set.
+///
+/// Each statement waits, as the statement of a batch does, for the `Sch-M` another
+/// transaction holds on a user table it names, and is bound again once the wait is over
+/// (`Session::wait_for_schema`): a `sp_prepare` of a statement whose table another session
+/// is altering waits for that session, and answers 1222 state 56 on the line of the
+/// statement under `SET LOCK_TIMEOUT` (`tests/ddl_visibility.rs`,
+/// `a_prepared_or_dynamic_statement_waits_for_an_uncommitted_alter`).
 fn bind_prepared_statements(
     session: &Session,
     text: &str,
     statements: &[Statement],
-    snapshot: &CatalogSnapshot,
+    binding: &TxnHandle,
     state: &SessionState,
     batch_variables: &mut BatchVariables,
 ) -> SqlResult<Option<Vec<DescribedColumn>>> {
     let mut first: Option<Vec<DescribedColumn>> = None;
+    let mut snapshot = crate::batch::binding_snapshot(session.engine(), state, binding);
     for (index, original) in statements.iter().enumerate() {
         if matches!(original, Statement::SetOption(_)) {
             continue;
@@ -384,42 +392,70 @@ fn bind_prepared_statements(
         let line = statement_line(original);
         let source = statement_fragment(text, original, statements.get(index + 1));
         let padded = format!("{}{}", "\n".repeat(line.saturating_sub(1) as usize), source);
-        let reparsed = parse_batch(&padded, &state.options.parse_options())?;
-        let [statement] = reparsed.statements.as_slice() else {
-            return Err(SqlError::from(InternalError::Bug(
-                "one statement reparsed as a different statement count".to_owned(),
-            )));
-        };
-        let options = state.binder_options();
-        let ctx = BindContext {
-            text: &padded,
-            catalog: Some(snapshot),
-            database: &state.database,
-            default_schema: DEFAULT_SCHEMA,
-            variables: batch_variables,
-            options,
-        };
-        let bound = vauban_binder::bind(statement, &ctx)?;
-        if let BoundStatement::Declare(declarations) = &bound {
-            for declaration in declarations {
-                batch_variables.declare(&declaration.name, declaration.ty.clone())?;
+        loop {
+            let variables_before = batch_variables.clone();
+            let _ = snapshot.take_resolved_tables(false);
+            let physical = bind_prepared_one(session, &padded, &snapshot, state, batch_variables);
+            let tables = snapshot.take_resolved_tables(false);
+            match session.wait_for_schema(binding, &tables) {
+                Ok(false) => {
+                    if first.is_none()
+                        && let PhysicalStatement::Query(plan) = &physical?
+                    {
+                        first = Some(described_columns(plan));
+                    }
+                    break;
+                }
+                Ok(true) => {
+                    *batch_variables = variables_before;
+                    snapshot = crate::batch::binding_snapshot(session.engine(), state, binding);
+                }
+                Err(err) => return Err(at_statement(err, line)),
             }
-        }
-        let indexes = SnapshotIndexes {
-            storage: session.engine().storage.as_ref(),
-            snapshot,
-        };
-        let physical = vauban_planner::plan(bound, &PlanContext { catalog: &indexes })?;
-        let eval = SessionEvalContext::new(state, Some(snapshot));
-        let mut exec = vauban_executor::ExecContext::scalar(&eval, state.options.to_binder());
-        vauban_executor::compile(&physical, &mut exec)?;
-        if first.is_none()
-            && let PhysicalStatement::Query(plan) = &physical
-        {
-            first = Some(described_columns(plan));
         }
     }
     Ok(first)
+}
+
+/// Reparses, binds, plans and compile-checks the one statement of `padded` against
+/// `snapshot`, for [`bind_prepared_statements`].
+fn bind_prepared_one(
+    session: &Session,
+    padded: &str,
+    snapshot: &CatalogSnapshot,
+    state: &SessionState,
+    batch_variables: &mut BatchVariables,
+) -> SqlResult<PhysicalStatement> {
+    let reparsed = parse_batch(padded, &state.options.parse_options())?;
+    let [statement] = reparsed.statements.as_slice() else {
+        return Err(SqlError::from(InternalError::Bug(
+            "one statement reparsed as a different statement count".to_owned(),
+        )));
+    };
+    let options = state.binder_options();
+    let ctx = BindContext {
+        text: padded,
+        catalog: Some(snapshot),
+        database: &state.database,
+        default_schema: DEFAULT_SCHEMA,
+        variables: batch_variables,
+        options,
+    };
+    let bound = vauban_binder::bind(statement, &ctx)?;
+    if let BoundStatement::Declare(declarations) = &bound {
+        for declaration in declarations {
+            batch_variables.declare(&declaration.name, declaration.ty.clone())?;
+        }
+    }
+    let indexes = SnapshotIndexes {
+        storage: session.engine().storage.as_ref(),
+        snapshot,
+    };
+    let physical = vauban_planner::plan(bound, &PlanContext { catalog: &indexes })?;
+    let eval = SessionEvalContext::new(state, Some(snapshot));
+    let mut exec = vauban_executor::ExecContext::scalar(&eval, state.options.to_binder());
+    vauban_executor::compile(&physical, &mut exec)?;
+    Ok(physical)
 }
 
 /// One column of the result set a described batch would produce.
@@ -466,12 +502,11 @@ pub(crate) fn describe_batch(
     }
     let mut batch_variables = BatchVariables::new();
     let binding = session.engine().txn.begin(IsolationLevel::ReadCommitted);
-    let snapshot = crate::batch::binding_snapshot(session.engine(), &state, &binding);
     let described = bind_prepared_statements(
         session,
         text,
         &batch.statements,
-        &snapshot,
+        &binding,
         &state,
         &mut batch_variables,
     );

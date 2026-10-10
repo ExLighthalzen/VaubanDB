@@ -81,12 +81,14 @@ use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vauban_catalog::{Catalog, CatalogSnapshot, ObjectId};
+use vauban_errors::SqlResult;
 use vauban_executor::ExecSession;
 use vauban_sysfn::EvalContext;
-use vauban_txn::TxnHandle;
+use vauban_txn::{LockWait, TransactionManager, TxnHandle};
 use vauban_types::calendar::days_from_civil;
 use vauban_types::{Collation, Date, DateTime2, Decimal, Time, Value};
 
+use crate::set_options::lock_timeout_from_ms;
 use crate::state::SessionState;
 
 /// Copies what the executor wrote in `exec` into `state` after a statement that succeeded.
@@ -149,7 +151,15 @@ pub(crate) struct SessionEvalContext<'a> {
     /// Where the metadata functions read their catalogue, `None` for a context built without
     /// one (module documentation): they then answer `NULL`.
     catalog: Option<CatalogSource<'a>>,
+    /// The lock manager `OBJECT_ID` waits through for a table another transaction is
+    /// changing, with the cancellation of the request; `None` for a context that does not
+    /// wait ([`SessionEvalContext::with_schema_waits`]).
+    schema_waits: Option<(&'a TransactionManager, LockWait)>,
 }
+
+/// The state of the 1222 `OBJECT_ID` raises when its wait runs out, where a table read
+/// raises 56.
+const LOCK_TIMEOUT_STATE_OF_A_METADATA_FUNCTION: u8 = 51;
 
 /// The catalogue of a statement, ready or still to be read.
 ///
@@ -196,6 +206,7 @@ impl<'a> SessionEvalContext<'a> {
             state,
             now: read_clock(),
             catalog: catalog.map(CatalogSource::Ready),
+            schema_waits: None,
         }
     }
 
@@ -215,7 +226,23 @@ impl<'a> SessionEvalContext<'a> {
                 txn,
                 built: OnceCell::new(),
             }),
+            schema_waits: None,
         }
+    }
+
+    /// The same context, whose `OBJECT_ID` waits through `manager` for a table another
+    /// transaction creates, alters or drops without having committed, under the
+    /// `SET LOCK_TIMEOUT` of the session, and answers once that transaction has ended
+    /// (`tests/ddl_visibility.rs`,
+    /// `object_id_waits_for_an_uncommitted_create_or_drop_of_its_table`). A context whose
+    /// catalogue is a snapshot already read does not wait.
+    pub(crate) fn with_schema_waits(
+        mut self,
+        manager: &'a TransactionManager,
+        wait: LockWait,
+    ) -> Self {
+        self.schema_waits = Some((manager, wait));
+        self
     }
 
     /// The catalogue of the statement, `None` for a context built without one.
@@ -231,6 +258,7 @@ impl<'a> SessionEvalContext<'a> {
             state,
             now,
             catalog: None,
+            schema_waits: None,
         }
     }
 }
@@ -360,6 +388,26 @@ fn split_parts(text: &str) -> Option<Vec<String>> {
 ///
 /// A clock before 1970 (system time set backwards) yields the epoch rather than a panic:
 /// `panic!` is forbidden on the path of a query.
+/// The identifier `snapshot` holds for the name `name` written in `OBJECT_ID`, read from
+/// the database `current` when the name does not name one; `None` for a name it resolves
+/// nothing for (module documentation, table of forms).
+fn object_id_in(snapshot: &CatalogSnapshot, current: &str, name: &str) -> Option<i32> {
+    let written = WrittenName::parse(name)?;
+    if written.server.is_some() {
+        // A four-part name names a linked server, which no snapshot serves: the rule
+        // of `binder/catalog_view.rs`, and `NULL` on SQL Server.
+        return None;
+    }
+    let database = written.database.as_deref().unwrap_or(current);
+    let object = snapshot.resolve_object(
+        database,
+        written.schema.as_deref(),
+        &written.object,
+        DEFAULT_SCHEMA,
+    )?;
+    Some(object.id.0)
+}
+
 fn read_clock() -> DateTime2 {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -491,21 +539,50 @@ impl EvalContext for SessionEvalContext<'_> {
     /// `ObjectId` is an `i32` in the catalogue as well, so the answer loses nothing on the
     /// way.
     fn object_id(&self, name: &str) -> Option<i32> {
-        let catalog = self.catalog()?;
-        let written = WrittenName::parse(name)?;
-        if written.server.is_some() {
-            // A four-part name names a linked server, which no snapshot serves: the rule
-            // of `binder/catalog_view.rs`, and `NULL` on SQL Server.
-            return None;
+        object_id_in(self.catalog()?, &self.state.database, name)
+    }
+
+    /// [`EvalContext::object_id`], once each user table the name reaches, and the table of
+    /// that name another transaction creates or drops, is out of the `Sch-M` of another
+    /// transaction; resolved again on the catalogue of that moment when one had to be waited
+    /// for (`tests/ddl_visibility.rs`,
+    /// `object_id_waits_for_an_uncommitted_create_or_drop_of_its_table`). Under
+    /// `SET LOCK_TIMEOUT` the wait ends with 1222 state 51.
+    fn object_id_when_stable(&self, name: &str) -> SqlResult<Option<i32>> {
+        let (
+            Some((manager, wait)),
+            Some(CatalogSource::Deferred {
+                catalog,
+                txn,
+                built,
+            }),
+        ) = (&self.schema_waits, &self.catalog)
+        else {
+            return Ok(self.object_id(name));
+        };
+        let snapshot = built.get_or_init(|| catalog.snapshot(txn));
+        let _ = snapshot.take_resolved_tables(false);
+        let found = object_id_in(snapshot, &self.state.database, name);
+        let timeout = lock_timeout_from_ms(self.state.options.lock_timeout);
+        let mut waited = false;
+        for table in snapshot.take_resolved_tables(false) {
+            waited |= manager
+                .wait_for_schema_stability(txn, table, timeout, wait)
+                .map_err(|mut err| {
+                    if err.number == crate::batch::LOCK_REQUEST_TIMEOUT {
+                        err.state = LOCK_TIMEOUT_STATE_OF_A_METADATA_FUNCTION;
+                    }
+                    err
+                })?;
         }
-        let database = written.database.as_deref().unwrap_or(&self.state.database);
-        let object = catalog.resolve_object(
-            database,
-            written.schema.as_deref(),
-            &written.object,
-            DEFAULT_SCHEMA,
-        )?;
-        Some(object.id.0)
+        if !waited {
+            return Ok(found);
+        }
+        Ok(object_id_in(
+            &catalog.snapshot(txn),
+            &self.state.database,
+            name,
+        ))
     }
 
     /// The object part of the name the catalogue holds for `id`, `None` without a catalogue

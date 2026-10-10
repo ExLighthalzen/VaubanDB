@@ -152,7 +152,7 @@ fn numbers_and_states(events: &[Event]) -> Vec<(u32, u8)> {
 
 /// A `CREATE TABLE` another session has not committed: a `SELECT` and an `INSERT` of the
 /// table wait for its end, and answer 208 once it is rolled back; the rows of another table
-/// are left alone. `OBJECT_ID` answers at once.
+/// are left alone.
 #[test]
 fn a_table_whose_create_is_not_committed_is_not_resolved_by_another_session() {
     let engine = engine();
@@ -168,8 +168,6 @@ fn a_table_whose_create_is_not_committed_is_not_resolved_by_another_session() {
         "BEGIN TRANSACTION; CREATE TABLE dbo.x (a int); INSERT INTO dbo.x VALUES (5);",
     );
     assert_eq!(ints(&run(&mut a, "SELECT a FROM dbo.x;")), vec![5]);
-    let object_id = run(&mut b, "SELECT OBJECT_ID('dbo.x');");
-    assert_eq!(object_id, vec![Event::Row(vec![Value::Null])]);
     assert_eq!(
         ints(&run(&mut b, "SELECT a FROM dbo.b_own ORDER BY a;")),
         vec![1, 2],
@@ -572,9 +570,346 @@ fn a_read_does_not_wait_for_the_tables_a_write_would_check() {
     assert_eq!(ints(&run(&mut a, "SELECT id FROM dbo.x;")), vec![1]);
 }
 
+/// Runs `text` on `session` on a thread of its own, without checking that it waits; the
+/// batches below open with a `WAITFOR` that keeps their statements bound and not yet run.
+struct Delayed {
+    done: mpsc::Receiver<()>,
+    thread: thread::JoinHandle<(Session, Vec<Event>)>,
+}
+
+impl Delayed {
+    fn start(mut session: Session, text: &'static str) -> Self {
+        let (sender, done) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let events = run_on(&mut session, text);
+            let _ = sender.send(());
+            (session, events)
+        });
+        // The batch is bound by now and sits in its `WAITFOR`.
+        thread::sleep(Duration::from_millis(150));
+        Delayed { done, thread }
+    }
+
+    /// `true` when the batch has not answered within `ms` milliseconds.
+    fn still_running_after(&self, ms: u64) -> bool {
+        self.done.recv_timeout(Duration::from_millis(ms)).is_err()
+    }
+
+    fn finish(self) -> (Session, Vec<Event>) {
+        let _ = self.done.recv_timeout(Duration::from_secs(10));
+        self.thread.join().expect("thread of the delayed session")
+    }
+}
+
+/// An `INSERT` bound before another session starts an `ALTER TABLE` of its table, and run
+/// while that `ALTER` is not committed, waits for it, then writes its row in the table the
+/// `ALTER` left; once the `ALTER` is rolled back, in the table as it was.
+#[test]
+fn an_insert_bound_before_an_alter_waits_and_keeps_its_row() {
+    for (end, expected) in [("COMMIT", vec![1, 2]), ("ROLLBACK", vec![1, 2])] {
+        let engine = engine();
+        let mut a = session(&engine, 61);
+        let b = session(&engine, 62);
+        run(
+            &mut a,
+            "CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1);",
+        );
+        let delayed = Delayed::start(
+            b,
+            "WAITFOR DELAY '00:00:00.400'; INSERT INTO dbo.t (a) VALUES (2);",
+        );
+        run(&mut a, "BEGIN TRANSACTION; ALTER TABLE dbo.t ADD c int;");
+        assert!(
+            delayed.still_running_after(900),
+            "{end}: the INSERT waits for the ALTER"
+        );
+        run(&mut a, &format!("{end} TRANSACTION;"));
+        let (_b, events) = delayed.finish();
+        assert!(errors(&events).is_empty(), "{end}: {events:#?}");
+        assert_eq!(
+            ints(&run(&mut a, "SELECT a FROM dbo.t ORDER BY a;")),
+            expected,
+            "{end}"
+        );
+    }
+}
+
+/// A statement bound before another session commits an `ALTER TABLE` or a `DROP TABLE` of
+/// its table, and run after that commit, is bound again: the `INSERT` writes its row in the
+/// altered table, and a read of the dropped table answers 208.
+#[test]
+fn an_insert_bound_before_a_committed_alter_is_bound_again() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1); \
+         CREATE TABLE dbo.y (a int); INSERT INTO dbo.y VALUES (1);",
+    );
+    let delayed = Delayed::start(
+        b,
+        "WAITFOR DELAY '00:00:00.400'; INSERT INTO dbo.t (a) VALUES (2); SELECT a FROM dbo.t ORDER BY a;",
+    );
+    run(&mut a, "ALTER TABLE dbo.t ADD c int;");
+    let (b, events) = delayed.finish();
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(ints(&events), vec![1, 2]);
+    assert_eq!(
+        run(&mut a, "SELECT c FROM dbo.t WHERE a = 2;"),
+        vec![Event::Row(vec![Value::Null])]
+    );
+
+    let delayed = Delayed::start(
+        b,
+        "WAITFOR DELAY '00:00:00.400'; SELECT a FROM dbo.y; SELECT 7;",
+    );
+    run(&mut a, "DROP TABLE dbo.y;");
+    let (_b, events) = delayed.finish();
+    assert_eq!(errors(&events), vec![208], "{events:#?}");
+}
+
+/// A statement held by an `IF` is bound with the `IF`, and not alone: when its table is
+/// rebuilt by an `ALTER TABLE` another session commits while the statement waits, it fails
+/// with the internal error 50000 rather than write its row in the table the `ALTER` dropped.
+/// The same statement written at the top level writes its row
+/// (`an_insert_bound_before_an_alter_waits_and_keeps_its_row`).
+#[test]
+fn a_held_statement_whose_table_went_fails_instead_of_writing_nowhere() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1);",
+    );
+    let delayed = Delayed::start(
+        b,
+        "WAITFOR DELAY '00:00:00.400'; IF 1 = 1 INSERT INTO dbo.t (a) VALUES (2);",
+    );
+    run(&mut a, "BEGIN TRANSACTION; ALTER TABLE dbo.t ADD c int;");
+    assert!(delayed.still_running_after(900), "the INSERT waits");
+    run(&mut a, "COMMIT TRANSACTION;");
+    let (_b, events) = delayed.finish();
+    assert_eq!(errors(&events), vec![50000], "{events:#?}");
+    assert_eq!(ints(&run(&mut a, "SELECT a FROM dbo.t;")), vec![1]);
+}
+
+/// A transaction that has read a table in `READ COMMITTED`, its statement over, does not
+/// hold back an `ALTER TABLE` of another session; one that read it in `REPEATABLE READ`, or
+/// wrote a row of it, does, until it ends. The reading transaction goes on, and reads the
+/// altered table.
+#[test]
+fn a_read_committed_read_does_not_hold_back_a_ddl_once_its_statement_ended() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1);",
+    );
+
+    run(&mut a, "BEGIN TRANSACTION; SELECT a FROM dbo.t;");
+    let (done, finished) = mpsc::channel();
+    let altering = thread::spawn(move || {
+        let mut b = b;
+        let events = run_on(&mut b, "ALTER TABLE dbo.t ADD c int;");
+        let _ = done.send(());
+        (b, events)
+    });
+    assert!(
+        finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "the ALTER goes through while the reader is open"
+    );
+    let (mut b, events) = altering.join().expect("the altering session");
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(
+        run(&mut a, "SELECT c FROM dbo.t; COMMIT TRANSACTION;"),
+        vec![Event::Row(vec![Value::Null])]
+    );
+
+    for (level, statement, ddl) in [
+        (
+            "REPEATABLE READ",
+            "SELECT a FROM dbo.t;",
+            "ALTER TABLE dbo.t ADD d int;",
+        ),
+        (
+            "READ COMMITTED",
+            "INSERT INTO dbo.t (a) VALUES (2);",
+            "ALTER TABLE dbo.t ADD e int;",
+        ),
+    ] {
+        run(
+            &mut a,
+            &format!("SET TRANSACTION ISOLATION LEVEL {level}; BEGIN TRANSACTION; {statement}"),
+        );
+        let waiting = Waiting::start(b, ddl);
+        run(&mut a, "ROLLBACK TRANSACTION;");
+        let (back, events) = waiting.finish();
+        assert!(errors(&events).is_empty(), "{level}: {events:#?}");
+        b = back;
+    }
+}
+
+/// The 1222 of a wait at binding carries the line its statement starts on.
+#[test]
+fn a_wait_at_binding_that_times_out_carries_the_line_of_its_statement() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let mut b = session(&engine, 62);
+    run(&mut a, "CREATE TABLE dbo.y (a int);");
+    run(&mut b, "SET LOCK_TIMEOUT 100;");
+    run(&mut a, "BEGIN TRANSACTION; DROP TABLE dbo.y;");
+    let events = run_on(&mut b, "SELECT 1;\n\nSELECT a FROM dbo.y;");
+    let lines: Vec<(u32, u32)> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Error(err) => Some((err.number, err.line)),
+            Event::Row(_) => None,
+        })
+        .collect();
+    assert_eq!(lines, vec![(1222, 3)]);
+    run(&mut a, "ROLLBACK TRANSACTION;");
+}
+
+/// A dynamic text, the body `sp_executesql` and `sp_execute` run, waits as a batch does for
+/// an `ALTER TABLE` another session has not committed, then writes its row; under
+/// `SET LOCK_TIMEOUT 100` it answers 1222 state 56.
+#[test]
+fn a_prepared_or_dynamic_statement_waits_for_an_uncommitted_alter() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let mut b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1);",
+    );
+    run(&mut a, "BEGIN TRANSACTION; ALTER TABLE dbo.t ADD c int;");
+    run(&mut b, "SET LOCK_TIMEOUT 100;");
+    let mut sink = Recording::default();
+    b.run_nested("INSERT INTO dbo.t (a) VALUES (2);", &[], &mut sink)
+        .expect("the text answers");
+    assert_eq!(numbers_and_states(&sink.0), vec![(1222, 56)]);
+
+    run(&mut b, "SET LOCK_TIMEOUT -1;");
+    let (done, finished) = mpsc::channel();
+    let waiting = thread::spawn(move || {
+        let mut sink = Recording::default();
+        b.run_nested("INSERT INTO dbo.t (a) VALUES (3);", &[], &mut sink)
+            .expect("the text answers");
+        let _ = done.send(());
+        sink.0
+    });
+    assert!(
+        finished.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the text waits for the ALTER"
+    );
+    run(&mut a, "COMMIT TRANSACTION;");
+    let events = waiting.join().expect("the waiting session");
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(
+        ints(&run(&mut a, "SELECT a FROM dbo.t ORDER BY a;")),
+        vec![1, 3]
+    );
+}
+
+/// `OBJECT_ID` of a table another session creates or drops without having committed waits
+/// for that session, then answers what it left: `NULL` after a rolled back `CREATE`, the
+/// identifier after a committed one, the identifier after a rolled back `DROP`. Under
+/// `SET LOCK_TIMEOUT 100` it answers 1222 state 51; `OBJECT_ID` of another table answers at
+/// once.
+#[test]
+fn object_id_waits_for_an_uncommitted_create_or_drop_of_its_table() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.y (a int); CREATE TABLE dbo.other (a int);",
+    );
+    let id_of_y = run(&mut a, "SELECT OBJECT_ID('dbo.y');");
+
+    run(&mut a, "BEGIN TRANSACTION; CREATE TABLE dbo.x (a int);");
+    let waiting = Waiting::start(b, "SELECT OBJECT_ID('dbo.x');");
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (b, events) = waiting.finish();
+    assert_eq!(events, vec![Event::Row(vec![Value::Null])]);
+
+    run(&mut a, "BEGIN TRANSACTION; CREATE TABLE dbo.x (a int);");
+    let created = run(&mut a, "SELECT OBJECT_ID('dbo.x');");
+    let waiting = Waiting::start(b, "SELECT OBJECT_ID('dbo.x');");
+    run(&mut a, "COMMIT TRANSACTION;");
+    let (mut b, events) = waiting.finish();
+    assert_eq!(events, created);
+
+    run(&mut b, "SET LOCK_TIMEOUT 100;");
+    run(&mut a, "BEGIN TRANSACTION; DROP TABLE dbo.y;");
+    let events = run_on(&mut b, "SELECT OBJECT_ID('dbo.y');");
+    assert_eq!(numbers_and_states(&events), vec![(1222, 51)]);
+    assert_eq!(
+        run(
+            &mut b,
+            "SELECT CASE WHEN OBJECT_ID('dbo.other') IS NULL THEN 0 ELSE 1 END;"
+        ),
+        vec![Event::Row(vec![Value::I32(1)])]
+    );
+    run(&mut b, "SET LOCK_TIMEOUT -1;");
+    let waiting = Waiting::start(b, "SELECT OBJECT_ID('dbo.y');");
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (_b, events) = waiting.finish();
+    assert_eq!(events, id_of_y);
+}
+
+/// A block that alters or drops a table goes on with the statements it holds after the
+/// `DDL`, in autocommit and in a transaction the block commits: a table the block itself
+/// dropped or rebuilt does not make them fail.
+#[test]
+fn a_block_goes_on_after_its_own_alter() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.n (a int); CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1); \
+         CREATE TABLE dbo.u (a int); CREATE TABLE dbo.v (a int);",
+    );
+    run(
+        &mut a,
+        "IF 1 = 1 BEGIN ALTER TABLE dbo.n ADD c int; PRINT 'altered'; END",
+    );
+    assert_eq!(
+        ints(&run(
+            &mut a,
+            "IF 1 = 1 BEGIN ALTER TABLE dbo.t ADD c int; SELECT 7; END"
+        )),
+        vec![7]
+    );
+    assert_eq!(
+        ints(&run(
+            &mut a,
+            "IF 1 = 1 BEGIN BEGIN TRANSACTION; ALTER TABLE dbo.v ADD c int; \
+             COMMIT TRANSACTION; SELECT 8; END"
+        )),
+        vec![8]
+    );
+    assert_eq!(
+        ints(&run(&mut a, "BEGIN DROP TABLE dbo.u; SELECT 9; END")),
+        vec![9]
+    );
+    assert_eq!(
+        run(&mut a, "SELECT c FROM dbo.t;"),
+        vec![Event::Row(vec![Value::Null])]
+    );
+}
+
 /// The names of the indexes of `dbo.t` in `sys.indexes`, by `index_id`, the heap left out.
-const INDEX_NAMES: &str = "SELECT name FROM sys.indexes \
-     WHERE object_id = OBJECT_ID('dbo.t') AND index_id > 0 ORDER BY index_id;";
+///
+/// The table is found by its name in `sys.tables` rather than by `OBJECT_ID`, which waits
+/// for a `DDL` another session has not committed on the table
+/// (`object_id_waits_for_an_uncommitted_create_or_drop_of_its_table`).
+const INDEX_NAMES: &str = "SELECT i.name FROM sys.indexes AS i \
+     JOIN sys.tables AS t ON t.object_id = i.object_id \
+     WHERE t.name = 't' AND i.index_id > 0 ORDER BY i.index_id;";
 
 /// The indexes of `dbo.t` a plan may seek through, as a transaction of its own sees them,
 /// next to the ones `storage` holds.

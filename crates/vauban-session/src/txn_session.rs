@@ -18,22 +18,110 @@
 //! it, and [`finish_statement`] reads back what the executor left, emits the ENVCHANGE and
 //! updates [`SessionState`]. The copy is what lets the executor's `BEGIN`/`COMMIT`/`ROLLBACK`
 //! change the session transaction without knowing the session.
+//!
+//! # The schema a statement runs on
+//!
+//! A statement is bound before it runs, the statements of a batch all at once, and another
+//! transaction may alter or drop a table it names in between. [`execute_in_a_transaction`]
+//! takes the `Sch-S` of each user table the binding named ([`SchemaStamp`]) in the
+//! transaction that runs the statement, waiting for a `DDL` another transaction has not
+//! ended, then looks each table up in `storage`. A `DROP TABLE` and an `ALTER TABLE` that
+//! rebuilds its table drop the storage table the binding read when they commit, so a table
+//! no longer there sends the statement back to be bound again ([`Executed::Rebind`])
+//! instead of running a plan written for it; the tables still there keep their `Sch-S`
+//! until the statement ends, so a `DDL` started meanwhile waits for that end
+//! (`tests/ddl_visibility.rs`, `an_insert_bound_before_an_alter_waits_and_keeps_its_row`,
+//! `an_insert_bound_before_a_committed_alter_is_bound_again`). In the session transaction,
+//! the end of the statement gives back that `Sch-S` and the `IS` of its `READ COMMITTED`
+//! reads (`vauban_txn::TransactionManager::end_statement`); a one-statement transaction
+//! gives back everything when it ends.
 
-use vauban_binder::TxnStatement;
+use std::sync::Arc;
+
+use vauban_binder::{DdlStatement, TxnStatement};
+use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_executor::{ExecContext, ExecOutcome, ExecSession, StatementSink};
 use vauban_planner::PhysicalStatement;
+use vauban_storage::{DbId, Storage, TableId};
 use vauban_tds::EnvChange;
 use vauban_txn::TxnHandle;
 
 use crate::Engine;
+use crate::batch::{LOCK_REQUEST_TIMEOUT, LOCK_TIMEOUT_STATE_OF_A_CREATE};
 use crate::cancel::CancelHandle;
 use crate::eval_context::SessionEvalContext;
 use crate::set_options::{
-    apply_deadlock_priority, begin_autocommit_txn, guard_snapshot_table_read, sync_exec_session,
+    apply_deadlock_priority, begin_autocommit_txn, guard_snapshot_table_read, lock_timeout_from_ms,
+    sync_exec_session,
 };
 use crate::sink::ResultSink;
 use crate::state::SessionState;
+
+/// The user tables the binding of a statement reached, each with the database of the
+/// version the binding read (module documentation, "The schema a statement runs on").
+///
+/// A table the binding did not find, the name another open transaction was creating or
+/// dropping, comes without a database: its `Sch-S` is waited for and its presence is not
+/// looked up.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SchemaStamp(Arc<Vec<(TableId, Option<DbId>)>>);
+
+impl SchemaStamp {
+    /// The stamp of a binding against `snapshot` that reached `tables`.
+    pub(crate) fn of(snapshot: &CatalogSnapshot, tables: &[TableId]) -> Self {
+        Self(Arc::new(
+            tables
+                .iter()
+                .map(|table| {
+                    let database = snapshot.table_by_storage(*table).map(|meta| meta.database);
+                    (*table, database)
+                })
+                .collect(),
+        ))
+    }
+
+    /// The storage tables the binding read that are no longer in `storage`.
+    ///
+    /// One listing per database, its tables sorted by identifier; a database that is gone
+    /// counts as its tables gone.
+    pub(crate) fn gone_tables(&self, storage: &dyn Storage) -> Vec<TableId> {
+        let mut listed: Vec<(DbId, Option<Vec<TableId>>)> = Vec::new();
+        let mut gone = Vec::new();
+        for (table, database) in self.0.iter() {
+            let Some(database) = database else { continue };
+            let position = match listed.iter().position(|(db, _)| db == database) {
+                Some(position) => position,
+                None => {
+                    let tables = storage
+                        .tables(*database)
+                        .ok()
+                        .map(|tables| tables.into_iter().map(|(id, _)| id).collect());
+                    listed.push((*database, tables));
+                    listed.len() - 1
+                }
+            };
+            let present = listed[position]
+                .1
+                .as_ref()
+                .is_some_and(|tables: &Vec<TableId>| tables.binary_search(table).is_ok());
+            if !present {
+                gone.push(*table);
+            }
+        }
+        gone
+    }
+}
+
+/// What [`execute_in_a_transaction`] did with a statement.
+#[derive(Debug)]
+pub(crate) enum Executed {
+    /// It ran, or failed before or while it ran, with this result.
+    Ran(SqlResult<ExecOutcome>),
+    /// A storage table it was bound against is no longer there: nothing of it ran, and it
+    /// is to be bound again.
+    Rebind,
+}
 
 /// The transaction a `BEGIN TRANSACTION` opened, as the session holds it between statements.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,14 +196,19 @@ pub(crate) fn statement_txn(
 /// Runs one bound statement in a transaction of its own, committed on success and rolled back
 /// on failure (autocommit: `@@TRANCOUNT` stays 0), or in the session transaction when one is
 /// open.
+///
+/// `stamp` is what the binding of the statement read (module documentation, "The schema a
+/// statement runs on"); a table of `went_by_this_session`, one an earlier statement of the
+/// same batch dropped or rebuilt, does not send the statement back.
 pub(crate) fn execute_in_a_transaction(
     state: &SessionState,
     engine: &Engine,
     exec: &mut ExecSession,
     cancel: &CancelHandle,
     bound: &PhysicalStatement,
+    (stamp, went_by_this_session): (&SchemaStamp, &[TableId]),
     sink: &mut dyn StatementSink,
-) -> (SqlResult<ExecOutcome>, StatementTxn) {
+) -> (Executed, StatementTxn) {
     if let Err(err) = guard_snapshot_table_read(state, &engine.storage, &engine.txn, bound) {
         sync_exec_session(state, exec);
         let txn = match &state.txn {
@@ -131,11 +224,11 @@ pub(crate) fn execute_in_a_transaction(
             }
             None => StatementTxn::Skipped,
         };
-        return (Err(err), txn);
+        return (Executed::Ran(Err(err)), txn);
     }
     let txn = match statement_txn(state, engine, exec) {
         Ok(txn) => txn,
-        Err(err) => return (Err(err), StatementTxn::Skipped),
+        Err(err) => return (Executed::Ran(Err(err)), StatementTxn::Skipped),
     };
     let handle = match &txn {
         StatementTxn::Explicit => state
@@ -147,14 +240,40 @@ pub(crate) fn execute_in_a_transaction(
     };
     let Some(handle) = handle else {
         return (
-            Err(SqlError::from(InternalError::Bug(
+            Executed::Ran(Err(SqlError::from(InternalError::Bug(
                 "execute_in_a_transaction: the session transaction has no handle".to_owned(),
-            ))),
+            )))),
             txn,
         );
     };
+    let explicit = matches!(txn, StatementTxn::Explicit);
+    let held = match hold_schema(state, engine, cancel, &handle, stamp) {
+        Ok((held, gone))
+            if gone
+                .iter()
+                .any(|table| !went_by_this_session.contains(table)) =>
+        {
+            if explicit {
+                let _ = engine.txn.end_statement(&handle, &held);
+            }
+            return (Executed::Rebind, txn);
+        }
+        Ok((held, _)) => held,
+        Err(mut err) => {
+            if err.number == LOCK_REQUEST_TIMEOUT
+                && matches!(
+                    bound,
+                    PhysicalStatement::Ddl(DdlStatement::CreateTable { .. })
+                )
+            {
+                err.state = LOCK_TIMEOUT_STATE_OF_A_CREATE;
+            }
+            return (Executed::Ran(Err(err)), txn);
+        }
+    };
     let snap = engine.txn.statement_snapshot(&handle);
-    let eval = SessionEvalContext::deferred(state, &engine.catalog, &handle);
+    let eval = SessionEvalContext::deferred(state, &engine.catalog, &handle)
+        .with_schema_waits(&engine.txn, cancel.token().lock_wait());
     let token = cancel.token();
     let mut exec_ctx = ExecContext::scalar(&eval, state.options.to_binder())
         .with_engine(engine.storage.as_ref(), &engine.txn, &snap)
@@ -162,7 +281,51 @@ pub(crate) fn execute_in_a_transaction(
         .with_handle(&handle)
         .with_cancel(&token)
         .with_session(exec);
-    (vauban_executor::execute(bound, &mut exec_ctx, sink), txn)
+    let mut result = vauban_executor::execute(bound, &mut exec_ctx, sink);
+    if explicit
+        && let Err(err) = engine.txn.end_statement(&handle, &held)
+        && result.is_ok()
+    {
+        result = Err(err);
+    }
+    (Executed::Ran(result), txn)
+}
+
+/// Takes the `Sch-S` of each table of `stamp` in `handle`, under the `SET LOCK_TIMEOUT` of
+/// the session, then looks them up in `storage`; answers the tables whose `Sch-S` it took,
+/// and the ones that are gone.
+///
+/// A refused `Sch-S` gives back the ones taken before it, in a session transaction that
+/// outlives the statement.
+fn hold_schema(
+    state: &SessionState,
+    engine: &Engine,
+    cancel: &CancelHandle,
+    handle: &TxnHandle,
+    stamp: &SchemaStamp,
+) -> SqlResult<(Vec<TableId>, Vec<TableId>)> {
+    let timeout = lock_timeout_from_ms(state.options.lock_timeout);
+    let wait = cancel.token().lock_wait();
+    let mut held = Vec::new();
+    for (table, _) in stamp.0.iter() {
+        match engine
+            .txn
+            .hold_schema_stability(handle, *table, timeout, &wait)
+        {
+            Ok(hold) => {
+                if hold.taken {
+                    held.push(*table);
+                }
+            }
+            Err(err) => {
+                if state.txn.is_some() {
+                    let _ = engine.txn.end_statement(handle, &held);
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok((held, stamp.gone_tables(engine.storage.as_ref())))
 }
 
 /// Reads back what the executor left, emits the ENVCHANGE an opening or a closing statement

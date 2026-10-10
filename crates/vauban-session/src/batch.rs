@@ -114,9 +114,15 @@
 //! a `CREATE TABLE`. A wait that closes a cycle with the open transaction of the session is a
 //! deadlock, and its victim is rolled back as at run time.
 //!
-//! The `Sch-S` is given back once the binding is over: a `DROP` or an `ALTER TABLE` that
-//! another session starts after a statement was bound and before it runs is met by the
-//! statement when it locks a row, and not before.
+//! The `Sch-S` of the binding is given back once the binding is over, and taken again when
+//! the statement runs, until its end (`txn_session.rs`, "The schema a statement runs on"): a
+//! statement whose table another session dropped in between, or rebuilt by an
+//! `ALTER TABLE`, is bound again before it runs ([`BatchHost::run_bound`]). A statement
+//! held by an `IF`, a `WHILE` or a `BEGIN … END` is bound with the statement that holds it
+//! and is not bound alone: when one of its tables is gone by the time it runs, it fails
+//! with the internal error 50000 rather than run a plan written for that table
+//! (`tests/ddl_visibility.rs`,
+//! `a_held_statement_whose_table_went_fails_instead_of_writing_nowhere`).
 //!
 //! # Where the column metadata of a statement goes out
 //!
@@ -205,7 +211,7 @@ use crate::statements::{
     next_rowcount, statement_clears_last_error, statement_fragment, statement_line, statement_text,
     use_name_line,
 };
-use crate::txn_session::{self, StatementTxn};
+use crate::txn_session::{self, Executed, SchemaStamp, StatementTxn};
 use vauban_binder::{
     BatchVariables, BindContext, BoundExecute, BoundStatement, DdlStatement, OutputSchema,
 };
@@ -217,7 +223,7 @@ use vauban_executor::{
 };
 use vauban_parser::{SetOptionStatement, Statement, parse_batch};
 use vauban_planner::{PhysicalStatement, PlanContext, SnapshotIndexes};
-use vauban_storage::TableId;
+use vauban_storage::{Storage, TableId};
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
 use vauban_txn::{IsolationLevel, TxnHandle};
 use vauban_types::{TypeInfo, Value};
@@ -236,11 +242,15 @@ const CREATE_INDEX_MISSING_TABLE: u32 = 1088;
 const ALTER_TABLE_MISSING_TABLE: u32 = 4902;
 
 /// Number of the error a lock wait answers once `SET LOCK_TIMEOUT` has run out.
-const LOCK_REQUEST_TIMEOUT: u32 = 1222;
+pub(crate) const LOCK_REQUEST_TIMEOUT: u32 = 1222;
 
 /// State of the 1222 a `CREATE TABLE` answers when the wait of its binding runs out, where
 /// the other statements answer state 56.
-const LOCK_TIMEOUT_STATE_OF_A_CREATE: u8 = 47;
+pub(crate) const LOCK_TIMEOUT_STATE_OF_A_CREATE: u8 = 47;
+
+/// How many times in a row one statement is bound again because another transaction
+/// changed its tables before it ran ([`BatchHost::run_rebound`]).
+const MAX_REBINDS: u32 = 16;
 
 /// Number of the error a `GOTO` answers when no label of the text carries its name.
 const GOTO_LABEL_NOT_DECLARED: u32 = 133;
@@ -323,8 +333,11 @@ enum PreparedStatement {
     /// A statement the binder does not bind, still served by the deliberately narrow fallback.
     Fallback { text: String, error: SqlError },
     /// A bound, planned and compile-checked statement, ready to execute without another
-    /// compilation pass.
-    Bound { statement: PhysicalStatement },
+    /// compilation pass, with the tables its binding read.
+    Bound {
+        statement: PhysicalStatement,
+        stamp: SchemaStamp,
+    },
     /// A `USE` whose target was **found** in the catalogue while the batch was bound: a
     /// name that is not there raises 911 at that moment and no statement of the batch
     /// runs, which is where SQL Server raises it too ([`Session::bind_batch`]).
@@ -560,10 +573,11 @@ impl Session {
         } = batch;
         let lazy = slots.iter().any(|slot| matches!(slot, Slot::Unbound));
         let mut in_program: Vec<Option<PhysicalStatement>> = Vec::with_capacity(slots.len());
-        for (slot, statement) in slots.iter_mut().zip(statements) {
+        let mut held_stamps = vec![SchemaStamp::default(); slots.len()];
+        for (index, (slot, statement)) in slots.iter_mut().zip(statements).enumerate() {
             let mut in_place = false;
             if let Slot::Ready(prepared) = &*slot
-                && let PreparedStatement::Bound { statement } = prepared.as_ref()
+                && let PreparedStatement::Bound { statement, .. } = prepared.as_ref()
             {
                 declare_variables_held_by(statement, &mut self.exec);
                 in_place = compiled_in_place(statement);
@@ -571,7 +585,10 @@ impl Session {
             let compiled = if in_place {
                 match std::mem::replace(slot, Slot::InProgram) {
                     Slot::Ready(prepared) => match *prepared {
-                        PreparedStatement::Bound { statement } => Some(statement),
+                        PreparedStatement::Bound { statement, stamp } => {
+                            held_stamps[index] = stamp;
+                            Some(statement)
+                        }
                         _ => None,
                     },
                     _ => None,
@@ -623,6 +640,9 @@ impl Session {
                 bound,
                 bind_state,
                 batch_variables,
+                held_stamps,
+                rebinds: 0,
+                went_by_this_body: Vec::new(),
                 outputs: Vec::new(),
                 refused_rowcount: None,
             };
@@ -742,7 +762,7 @@ impl Session {
             // time reads the options it sets. An `EXECUTE` counts, so the statement after it
             // is bound once its text has run.
             let counts = match &one {
-                PreparedStatement::Bound { statement } => {
+                PreparedStatement::Bound { statement, .. } => {
                     !matches!(statement, PhysicalStatement::SetOption(_))
                 }
                 PreparedStatement::Deferred { .. } | PreparedStatement::Execute { .. } => true,
@@ -852,6 +872,7 @@ impl Session {
 
         Ok(PreparedStatement::Bound {
             statement: physical,
+            stamp: SchemaStamp::default(),
         })
     }
 
@@ -921,18 +942,30 @@ impl Session {
                 Ok(PreparedStatement::Bound {
                     statement: PhysicalStatement::Insert(_)
                         | PhysicalStatement::Update(_)
-                        | PhysicalStatement::Delete(_)
+                        | PhysicalStatement::Delete(_),
+                    ..
                 })
             );
             let tables = snapshot.take_resolved_tables(writes);
             match self.wait_for_schema(binding, &tables) {
-                Ok(false) => return bound,
+                Ok(false) => {
+                    return bound.map(|prepared| match prepared {
+                        PreparedStatement::Bound { statement, .. } => PreparedStatement::Bound {
+                            statement,
+                            stamp: SchemaStamp::of(snapshot, &tables),
+                        },
+                        other => other,
+                    });
+                }
                 Ok(true) => {}
                 Err(mut err) => {
                     if err.number == LOCK_REQUEST_TIMEOUT && creates_a_table(&bound) {
                         err.state = LOCK_TIMEOUT_STATE_OF_A_CREATE;
                     }
-                    return Err(err);
+                    // The wait is an error of the statement: it carries the line the
+                    // statement starts on, which the padding of its text counts.
+                    let line = padded.bytes().take_while(|byte| *byte == b'\n').count() + 1;
+                    return Err(at_statement(err, u32::try_from(line).unwrap_or(u32::MAX)));
                 }
             }
             *state = state_before;
@@ -948,7 +981,11 @@ impl Session {
     /// cycle it closes is a deadlock the lock manager sees, and in `binding` otherwise,
     /// which holds nothing else. Its limit is the `SET LOCK_TIMEOUT` of the live session,
     /// not the one a `SET` earlier in the same batch has given the binding state.
-    fn wait_for_schema(&self, binding: &TxnHandle, tables: &[TableId]) -> SqlResult<bool> {
+    pub(crate) fn wait_for_schema(
+        &self,
+        binding: &TxnHandle,
+        tables: &[TableId],
+    ) -> SqlResult<bool> {
         let owner = self
             .state
             .txn
@@ -1033,12 +1070,14 @@ impl Session {
     /// The transaction is the session one when a `BEGIN TRANSACTION` opened it, and a
     /// one-statement transaction otherwise; what to do with it is
     /// [`txn_session::finish_statement`]'s decision, which is why the [`StatementTxn`] is
-    /// handed back with the outcome.
+    /// handed back with the outcome, or with [`Executed::Rebind`] when a table of `stamp`
+    /// went before the statement ran.
     fn execute_in_a_transaction(
         &mut self,
         bound: &PhysicalStatement,
+        stamp: (&SchemaStamp, &[TableId]),
         sink: &mut dyn StatementSink,
-    ) -> (SqlResult<ExecOutcome>, StatementTxn) {
+    ) -> (Executed, StatementTxn) {
         self.exec.nocount = self.state.options.nocount;
         txn_session::execute_in_a_transaction(
             &self.state,
@@ -1046,6 +1085,7 @@ impl Session {
             &mut self.exec,
             &self.cancel,
             bound,
+            stamp,
             sink,
         )
     }
@@ -1099,7 +1139,8 @@ impl Session {
             );
         };
         let snap = self.engine.txn.statement_snapshot(&handle);
-        let eval = SessionEvalContext::deferred(&self.state, &self.engine.catalog, &handle);
+        let eval = SessionEvalContext::deferred(&self.state, &self.engine.catalog, &handle)
+            .with_schema_waits(&self.engine.txn, self.cancel.token().lock_wait());
         let token = self.cancel.token();
         let mut exec_ctx = ExecContext::scalar(&eval, self.state.options.to_binder())
             .with_engine(self.engine.storage.as_ref(), &self.engine.txn, &snap)
@@ -1165,7 +1206,8 @@ fn within_a_transaction(
     };
     let result = {
         let snap = engine.txn.statement_snapshot(&handle);
-        let eval = SessionEvalContext::deferred(state, &engine.catalog, &handle);
+        let eval = SessionEvalContext::deferred(state, &engine.catalog, &handle)
+            .with_schema_waits(&engine.txn, cancel.token().lock_wait());
         let token = cancel.token();
         let mut ctx = ExecContext::scalar(&eval, state.options.to_binder())
             .with_engine(engine.storage.as_ref(), &engine.txn, &snap)
@@ -1174,6 +1216,11 @@ fn within_a_transaction(
             .with_cancel(&token)
             .with_session(exec);
         step(&mut ctx)
+    };
+    // The `IS` of a `READ COMMITTED` read the step made goes with it, as with a statement.
+    let result = match (&txn, result) {
+        (StatementTxn::Explicit, Ok(())) => engine.txn.end_statement(&handle, &[]),
+        (_, result) => result,
     };
     txn_session::finish_statement(
         state,
@@ -1293,6 +1340,17 @@ struct BatchHost<'h> {
     bound: usize,
     bind_state: SessionState,
     batch_variables: BatchVariables,
+    /// What the binding of each statement written at the top level read, for the statements
+    /// it holds: a statement held by an `IF`, a `WHILE` or a `BEGIN … END` runs on the
+    /// tables its root was bound against.
+    held_stamps: Vec<SchemaStamp>,
+    /// How many times in a row the running statement was sent back to be bound again
+    /// ([`BatchHost::run_rebound`]).
+    rebinds: u32,
+    /// The storage tables a `DROP TABLE` or an `ALTER TABLE` of this body dropped: a
+    /// statement held by the same block was bound against them, and does not count them as
+    /// gone ([`note_tables_this_body_dropped`]).
+    went_by_this_body: Vec<TableId>,
     /// The values a call wrote for its caller, written into the caller's level once the
     /// level of the call is closed ([`Host::leave_call`]).
     outputs: Vec<(String, Value)>,
@@ -1310,7 +1368,10 @@ impl Host for BatchHost<'_> {
         // on (`tests/run_batch_pipeline.rs`, `a_batch_that_loops_on_a_goto_answers_the_cancellation`).
         self.session.cancel.check()?;
         match stmt {
-            Some(stmt) => self.run_bound(stmt, site, None),
+            Some(stmt) => {
+                let stamp = self.held_stamps.get(site.root).cloned().unwrap_or_default();
+                self.run_bound(stmt, site, None, (&stamp, false))
+            }
             None => self.run_root(site),
         }
     }
@@ -1554,7 +1615,7 @@ impl BatchHost<'_> {
                 break;
             }
             for prepared in tail {
-                if let PreparedStatement::Bound { statement } = &prepared {
+                if let PreparedStatement::Bound { statement, .. } = &prepared {
                     declare_variables_held_by(statement, &mut self.session.exec);
                 }
                 if let Some(slot) = self.slots.get_mut(self.bound)
@@ -1582,12 +1643,20 @@ impl BatchHost<'_> {
             PreparedStatement::Use {
                 statement,
                 database,
-            } => self.run_bound(statement, site, Some(database)),
+            } => self.run_bound(
+                statement,
+                site,
+                Some(database),
+                (&SchemaStamp::default(), false),
+            ),
             PreparedStatement::Execute { stmt, line } => self.run_execute(stmt, *line),
-            PreparedStatement::Bound { statement } if compiled_in_place(statement) => {
+            PreparedStatement::Bound { statement, stamp } if compiled_in_place(statement) => {
+                self.hold_stamp(site, stamp);
                 Ok(Ran::Holds(Box::new(statement.clone())))
             }
-            PreparedStatement::Bound { statement } => self.run_bound(statement, site, None),
+            PreparedStatement::Bound { statement, stamp } => {
+                self.run_bound(statement, site, None, (stamp, true))
+            }
         }
     }
 
@@ -1661,13 +1730,54 @@ impl BatchHost<'_> {
         site: Site,
     ) -> SqlResult<Ran> {
         match self.session.bind_deferred(padded, raw, variables) {
-            Ok(PreparedStatement::Bound { statement }) if compiled_in_place(&statement) => {
+            Ok(PreparedStatement::Bound { statement, stamp }) if compiled_in_place(&statement) => {
+                self.hold_stamp(site, &stamp);
                 Ok(Ran::Holds(Box::new(statement)))
             }
             Ok(prepared) => self.run_prepared(&prepared, site),
             Err(err) if self.session.cancel.is_cancelled() => Err(err),
             Err(err) => Ok(Ran::Failed(err)),
         }
+    }
+
+    /// Keeps what the binding of the statement written at `site` read, for the statements it
+    /// holds, which the program runs once the statement has handed them over.
+    fn hold_stamp(&mut self, site: Site, stamp: &SchemaStamp) {
+        if let Some(held) = self.held_stamps.get_mut(site.root) {
+            *held = stamp.clone();
+        }
+    }
+
+    /// Binds again, against the catalogue of this moment, the statement written at `site`,
+    /// whose tables another transaction altered or dropped after it was bound, then runs it.
+    ///
+    /// `rebindable` is `false` for a statement held by another one, which is not bound
+    /// alone: it fails with the internal error 50000 instead of running a plan written for
+    /// a table that is no longer there (module documentation, "A binding waits for the
+    /// schema of what it names"). A statement sent back [`MAX_REBINDS`] times in a row fails
+    /// the same way.
+    fn run_rebound(&mut self, site: Site, rebindable: bool) -> SqlResult<Ran> {
+        let Some(original) = self.statements.get(site.root) else {
+            return Err(SqlError::from(InternalError::Bug(format!(
+                "run_rebound: the batch holds no statement {}",
+                site.root
+            ))));
+        };
+        if site.nested || !rebindable || self.rebinds >= MAX_REBINDS {
+            return Ok(Ran::Failed(SqlError::from(InternalError::Bug(
+                "a table this statement was bound against was altered or dropped before it ran"
+                    .to_owned(),
+            ))));
+        }
+        let raw = statement_text(self.text, original);
+        let line = statement_line(original);
+        let source = statement_fragment(self.text, original, self.statements.get(site.root + 1));
+        let padded = format!("{}{}", "\n".repeat(line.saturating_sub(1) as usize), source);
+        let variables = self.batch_variables.clone();
+        self.rebinds += 1;
+        let ran = self.run_deferred(&padded, &raw, &variables, site);
+        self.rebinds -= 1;
+        ran
     }
 
     /// Runs a bound `EXECUTE` written at the top level: what it answers is the call the
@@ -1703,11 +1813,16 @@ impl BatchHost<'_> {
     /// Runs one bound statement that holds no other one, written at the top level or held
     /// by a statement of the program, and closes it with its DONE. `target` is the database
     /// of a `USE`.
+    ///
+    /// `schema` is what the binding of the statement read, and whether the statement can be
+    /// bound again alone when a table of it went before it ran
+    /// ([`txn_session::execute_in_a_transaction`], [`BatchHost::run_rebound`]).
     fn run_bound(
         &mut self,
         bound: &PhysicalStatement,
         site: Site,
         target: Option<&str>,
+        schema: (&SchemaStamp, bool),
     ) -> SqlResult<Ran> {
         if let PhysicalStatement::SetOption(set) = bound {
             return self.run_set(set, site);
@@ -1721,7 +1836,28 @@ impl BatchHost<'_> {
         session.exec.identity_updated = false;
         session.exec.rowcount = 0;
         let mut adapter = statement_adapter(&mut *self.sink, self.level);
-        let (result, txn) = session.execute_in_a_transaction(bound, &mut adapter);
+        let (executed, txn) = session.execute_in_a_transaction(
+            bound,
+            (schema.0, &self.went_by_this_body),
+            &mut adapter,
+        );
+        let result = match executed {
+            Executed::Ran(result) => result,
+            Executed::Rebind => {
+                // Nothing ran: the transaction of the statement is closed as a failed one,
+                // which undoes nothing, and the statement is bound again.
+                txn_session::finish_statement(
+                    &mut session.state,
+                    &session.engine,
+                    &mut session.exec,
+                    txn,
+                    txn_session::TxnKind::Other,
+                    false,
+                    adapter.tds(),
+                )?;
+                return self.run_rebound(site, schema.1);
+            }
+        };
         let succeeded = result.is_ok();
         // The ENVCHANGE of an opening or a closing transaction goes out before the DONE of
         // the statement that caused it.
@@ -1734,6 +1870,15 @@ impl BatchHost<'_> {
             succeeded,
             adapter.tds(),
         )?;
+        // After the commit of a one-statement transaction, which drops what it replaced.
+        if succeeded && let Some(stamp) = self.held_stamps.get(site.root) {
+            note_tables_this_body_dropped(
+                bound,
+                stamp,
+                session.engine.storage.as_ref(),
+                &mut self.went_by_this_body,
+            );
+        }
         match result {
             Ok(ExecOutcome::Rows(count)) => {
                 // The metadata was already sent through the adapter during execution.
@@ -1799,6 +1944,29 @@ impl BatchHost<'_> {
             // when it is internal: a cancelled request raises one, and running it again
             // would ignore the ATTENTION.
             Err(err) => Ok(Ran::Failed(self.place(err, site))),
+        }
+    }
+}
+
+/// After `bound`, a `DROP TABLE`, an `ALTER TABLE` or a `COMMIT` of a body, ran, notes in
+/// `went` the storage tables of `stamp`, what the block that holds it was bound against,
+/// that are gone: the body dropped them, and the statements the block holds after it do not
+/// count them as gone (`tests/ddl_visibility.rs`, `a_block_goes_on_after_its_own_alter`).
+fn note_tables_this_body_dropped(
+    bound: &PhysicalStatement,
+    stamp: &SchemaStamp,
+    storage: &dyn Storage,
+    went: &mut Vec<TableId>,
+) {
+    if !matches!(
+        bound,
+        PhysicalStatement::Ddl(_) | PhysicalStatement::Transaction(_)
+    ) {
+        return;
+    }
+    for table in stamp.gone_tables(storage) {
+        if !went.contains(&table) {
+            went.push(table);
         }
     }
 }
@@ -2070,6 +2238,7 @@ fn creates_a_table(bound: &SqlResult<PreparedStatement>) -> bool {
     match bound {
         Ok(PreparedStatement::Bound {
             statement: PhysicalStatement::Ddl(DdlStatement::CreateTable { .. }),
+            ..
         }) => true,
         Err(err) => err.number == 2714 && err.state == 6,
         Ok(_) => false,

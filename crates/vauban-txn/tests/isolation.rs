@@ -893,3 +893,88 @@ fn serializable_locks_the_rows_it_read_not_the_range() {
     mgr.write_lock(&writer, T, R, &nowait(), &LockWait::none())
         .expect_err("the row the reader read is held");
 }
+
+/// Whether another transaction could take the `Sch-M` of `T` at once, given back at once.
+fn a_ddl_goes_through(mgr: &TransactionManager) -> bool {
+    let ddl = mgr.begin(IsolationLevel::ReadCommitted);
+    let granted = mgr.locks().try_acquire(
+        ddl.id,
+        table_res(),
+        LockMode::SchM,
+        LockTimeout::NoWait,
+        &LockWait::none(),
+    ) == vauban_txn::LockOutcome::Granted;
+    mgr.rollback(ddl).expect("rollback");
+    granted
+}
+
+/// A `ReadCommitted` read keeps its `IS` to the end of its statement and no further: a
+/// `DDL` of another transaction goes through once the statement has ended, the reading
+/// transaction still open. `Snapshot` without its database option reads the same way.
+#[test]
+fn the_is_of_a_read_committed_read_goes_with_the_statement() {
+    for level in [IsolationLevel::ReadCommitted, IsolationLevel::Snapshot] {
+        let mgr = manager();
+        let reader = mgr.begin(level);
+        mgr.read_lock(&reader, T, R, &plain(), &LockWait::none())
+            .expect("the row is free");
+        mgr.end_row_read(&reader, T, R).expect("end of the row");
+        assert!(!a_ddl_goes_through(&mgr), "{level:?}: the IS is held");
+        mgr.end_statement(&reader, &[])
+            .expect("end of the statement");
+        assert!(mgr.locks().held(reader.id).is_empty(), "{level:?}");
+        assert!(a_ddl_goes_through(&mgr), "{level:?}");
+        mgr.commit(reader).expect("commit");
+    }
+}
+
+/// A `RepeatableRead` read, or a `ReadCommitted` one under a `REPEATABLEREAD` hint, keeps
+/// the `S` of its row, and its `IS` with it, past the end of the statement.
+#[test]
+fn the_is_of_a_repeatable_read_stays_to_the_end() {
+    let hinted = LockIntent {
+        level: Some(IsolationLevel::RepeatableRead),
+        ..LockIntent::default()
+    };
+    for (level, hints) in [
+        (IsolationLevel::RepeatableRead, plain()),
+        (IsolationLevel::Serializable, plain()),
+        (IsolationLevel::ReadCommitted, hinted),
+    ] {
+        let mgr = manager();
+        let reader = mgr.begin(level);
+        mgr.read_lock(&reader, T, R, &hints, &LockWait::none())
+            .expect("the row is free");
+        mgr.end_row_read(&reader, T, R).expect("end of the row");
+        mgr.end_statement(&reader, &[])
+            .expect("end of the statement");
+        assert_eq!(
+            mgr.locks().held(reader.id),
+            vec![(row_res(), LockMode::S), (table_res(), LockMode::IS)],
+            "{level:?}"
+        );
+        assert!(!a_ddl_goes_through(&mgr), "{level:?}");
+    }
+}
+
+/// A table the statement wrote keeps its `IX` and the `X` of its row at the end of the
+/// statement, and the `Sch-S` taken for the statement stays with them.
+#[test]
+fn a_written_table_keeps_its_locks_at_the_end_of_the_statement() {
+    let mgr = manager();
+    let writer = mgr.begin(IsolationLevel::ReadCommitted);
+    mgr.hold_schema_stability(&writer, T, LockTimeout::NoWait, &LockWait::none())
+        .expect("the table is free");
+    mgr.write_lock(&writer, T, R, &plain(), &LockWait::none())
+        .expect("the row is free");
+    mgr.end_statement(&writer, &[T])
+        .expect("end of the statement");
+    assert_eq!(
+        mgr.locks().held(writer.id),
+        vec![
+            (row_res(), LockMode::X),
+            (table_res(), LockMode::SchS),
+            (table_res(), LockMode::IX)
+        ]
+    );
+}

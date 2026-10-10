@@ -890,3 +890,73 @@ async fn jdbc_prepared_statement_replays_three_values() {
         .collect();
     assert_eq!(lines, ["11", "21", "31"]);
 }
+
+/// `sp_prepare` of a text whose statement names a table another session is altering without
+/// having committed waits for that session: under `SET LOCK_TIMEOUT 100` it answers 1222
+/// state 56 on the line of that statement, then 8180; without a timeout it prepares once the
+/// `ALTER` is committed, and `sp_execute` of the handle writes its row in the altered table.
+#[test]
+fn a_prepare_waits_for_an_uncommitted_alter_of_its_table() {
+    vauban_sysfn::register_builtins();
+    let engine = Arc::new(Engine::with_system_procedures(
+        Arc::new(MemoryStorage::new()),
+        prepare_resolver(),
+    ));
+    let mut a = Session::new(Arc::clone(&engine), SessionState::new(61));
+    let mut b = Session::new(Arc::clone(&engine), SessionState::new(62));
+    let batch = |session: &mut Session, text: &str| {
+        let mut sink = ErrorLines::default();
+        session
+            .run_batch(text, &mut sink)
+            .expect("the batch answers");
+        assert!(sink.0.is_empty(), "`{text}`: {:?}", sink.0);
+    };
+    batch(
+        &mut a,
+        "CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1);",
+    );
+    batch(&mut a, "BEGIN TRANSACTION; ALTER TABLE dbo.t ADD c int;");
+    batch(&mut b, "SET LOCK_TIMEOUT 100;");
+    let mut prepare = prepare_rpc_of("@P1 int");
+    prepare.params[2].value = nvarchar("SELECT 0;\n\nINSERT INTO dbo.t (a) VALUES (@P1);");
+
+    let mut sink = ErrorLines::default();
+    b.run_rpc(&prepare, &mut sink).expect("the prepare answers");
+    let refused: Vec<(u32, u8, u32)> = sink
+        .0
+        .iter()
+        .map(|err| (err.number, err.state, err.line))
+        .collect();
+    assert_eq!(refused[0], (1222, 56, 3), "{refused:?}");
+    assert_eq!(refused[1].0, 8180, "{refused:?}");
+
+    batch(&mut b, "SET LOCK_TIMEOUT -1;");
+    let (done, finished) = std::sync::mpsc::channel();
+    let waiting = std::thread::spawn(move || {
+        let mut sink = ErrorLines::default();
+        b.run_rpc(&prepare, &mut sink).expect("the prepare answers");
+        let _ = done.send(());
+        (b, sink.0)
+    });
+    assert!(
+        finished
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "the prepare waits for the ALTER"
+    );
+    batch(&mut a, "COMMIT TRANSACTION;");
+    let (mut b, errors) = waiting.join().expect("the waiting session");
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let mut sink = ErrorLines::default();
+    b.run_rpc(&execute_rpc(1, 2), &mut sink)
+        .expect("the execute answers");
+    assert!(sink.0.is_empty(), "{:?}", sink.0);
+    let mut rows = Recording::default();
+    a.run_batch("SELECT a FROM dbo.t ORDER BY a;", &mut rows)
+        .expect("the batch answers");
+    assert_eq!(
+        rows.0,
+        vec![Event::Columns, Event::Row(int(1)), Event::Row(int(2))]
+    );
+}

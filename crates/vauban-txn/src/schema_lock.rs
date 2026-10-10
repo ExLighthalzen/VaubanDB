@@ -15,6 +15,7 @@
 //! | the rebuild-and-copy an `ALTER TABLE` needs | `Sch-M` | the catalogue |
 //! | `CREATE INDEX`, `DROP INDEX` | `Sch-M` | the executor |
 //! | the binding of a statement, on each user table it names | `Sch-S`, given back at once | the session |
+//! | the execution of a statement, on each user table its binding named | `Sch-S`, given back at the end of the statement | the session |
 //!
 //! The calls themselves are **not** placed here: this file ships
 //! [`TransactionManager::schema_stability_lock`],
@@ -71,9 +72,11 @@
 //! Rows 1, 2 and 8 also say how long SQL Server keeps a `Sch-S`: for the statement, not for
 //! the transaction. Row 2 blocks on the shared lock a `REPEATABLE READ` keeps on the row,
 //! not on a schema lock — row 8, the same transaction with its read finished and no data
-//! lock left, lets the `DROP TABLE` through. This file holds its `Sch-S` to the end of the
-//! transaction, which is a **deliberate difference from SQL Server** and the stronger of the
-//! two: a `DROP TABLE` SQL Server lets through waits here.
+//! lock left, lets the `DROP TABLE` through. [`TransactionManager::schema_stability_lock`]
+//! holds its `Sch-S` to the end of the transaction, the stronger of the two;
+//! [`TransactionManager::hold_schema_stability`] is the one a statement takes, and
+//! [`TransactionManager::end_statement`] gives it back with the statement
+//! (`tests/schema_lock.rs`, `a_held_sch_s_goes_with_the_end_of_the_statement`).
 //!
 //! # What the schema lock does not settle
 //!
@@ -83,15 +86,28 @@
 //! `an_uncommitted_create_is_seen_by_its_transaction_alone`). The catalogue takes the `Sch-M`
 //! of the storage table a `CREATE`, `DROP` or `ALTER TABLE` works on. The binding of a
 //! statement meets that `Sch-M` through [`TransactionManager::wait_for_schema_stability`],
-//! once per user table it names, and binds again once the wait is over; the `Sch-S` is not
-//! kept for the execution, so a `DDL` that starts between the binding and the execution of a
-//! statement is met when the statement locks a row of the table, and not before.
+//! once per user table it names, and binds again once the wait is over. Its execution takes
+//! the `Sch-S` again, in the transaction that runs it, through
+//! [`TransactionManager::hold_schema_stability`], and keeps it until the statement ends
+//! ([`TransactionManager::end_statement`]): a `DDL` that another transaction starts between
+//! the binding and the execution of a statement is waited for before the statement reads or
+//! writes a row, and one it starts during the execution waits for the end of the statement
+//! (`tests/schema_lock.rs`, `a_held_sch_s_makes_a_ddl_wait_for_the_end_of_the_statement`).
 
 use vauban_errors::{SqlError, SqlResult};
 use vauban_storage::TableId;
 
 use crate::lock::{LockMode, LockOutcome, LockResource, LockWait};
 use crate::{LockTimeout, TransactionManager, TxnHandle};
+
+/// What [`TransactionManager::hold_schema_stability`] did on one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SchemaHold {
+    /// The `Sch-S` was taken by this call: the end of the statement gives it back.
+    pub taken: bool,
+    /// Another transaction held the `Sch-M` of the table, and the call waited for its end.
+    pub waited: bool,
+}
 
 /// The wait a schema lock of this transaction is given.
 ///
@@ -183,6 +199,37 @@ impl TransactionManager {
         timeout: LockTimeout,
         wait: &LockWait,
     ) -> SqlResult<bool> {
+        let hold = self.hold_schema_stability(txn, table, timeout, wait)?;
+        if hold.taken {
+            self.locks().unlock(txn.id, LockResource::Table(table))?;
+        }
+        Ok(hold.waited)
+    }
+
+    /// Takes the `Sch-S` of a statement that is about to run on `table`, waiting as
+    /// [`TransactionManager::wait_for_schema_stability`] does, and keeps it: the caller
+    /// gives it back when the statement ends, through [`TransactionManager::end_statement`].
+    ///
+    /// Nothing is taken when `txn` already holds a mode on the table, which stands in the
+    /// way of a `Sch-M` of another transaction as the `Sch-S` would (`tests/schema_lock.rs`,
+    /// `a_held_sch_s_is_not_taken_over_a_mode_already_held`); [`SchemaHold::taken`] says
+    /// whether this call took it, [`SchemaHold::waited`] whether it waited for another
+    /// transaction. A `DROP TABLE` or an `ALTER TABLE` another transaction asks for while
+    /// the `Sch-S` is held waits for its end (`tests/schema_lock.rs`,
+    /// `a_held_sch_s_makes_a_ddl_wait_for_the_end_of_the_statement`).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`TransactionManager::wait_for_schema_stability`]: 1222 state 56 when
+    /// `timeout` runs out, 1205 for a deadlock victim, the internal error of a cancelled
+    /// wait.
+    pub fn hold_schema_stability(
+        &self,
+        txn: &TxnHandle,
+        table: TableId,
+        timeout: LockTimeout,
+        wait: &LockWait,
+    ) -> SqlResult<SchemaHold> {
         let resource = LockResource::Table(table);
         if self
             .locks()
@@ -190,7 +237,7 @@ impl TransactionManager {
             .iter()
             .any(|(held, _)| *held == resource)
         {
-            return Ok(false);
+            return Ok(SchemaHold::default());
         }
         let free =
             self.locks()
@@ -203,8 +250,10 @@ impl TransactionManager {
             self.locks()
                 .lock(txn.id, resource, LockMode::SchS, timeout, wait)?;
         }
-        self.locks().unlock(txn.id, resource)?;
-        Ok(!free)
+        Ok(SchemaHold {
+            taken: true,
+            waited: !free,
+        })
     }
 
     /// Takes one schema mode on the table resource, the body the two methods above share.

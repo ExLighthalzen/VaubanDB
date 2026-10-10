@@ -179,7 +179,9 @@ fn object_id_eval(args: &EvalArgs<'_>, ctx: &dyn EvalContext) -> SqlResult<Value
         return Ok(Value::Null);
     }
     Ok(match name_argument(args, 0)? {
-        Some(name) => ctx.object_id(&name).map_or(Value::Null, Value::I32),
+        Some(name) => ctx
+            .object_id_when_stable(&name)?
+            .map_or(Value::Null, Value::I32),
         None => Value::Null,
     })
 }
