@@ -519,3 +519,108 @@ fn forty_seeds_of_writes_and_reopens_read_as_the_memory_store_reads_clustered() 
 fn forty_seeds_of_writes_and_reopens_read_as_the_memory_store_reads_heap() {
     forty_seeds(false);
 }
+
+// ---- trees handed back, then a reopen -----------------------------------------------------
+
+/// A `unique` index on the column `column`, ascending.
+fn unique_on(column: u16) -> IndexShape {
+    IndexShape {
+        unique: true,
+        ..index_on(column)
+    }
+}
+
+/// The first column of the rows a full seek of `index` reads, in the order of the seek.
+fn keys_by_seek(storage: &DiskStorage, index: IndexId) -> Vec<i32> {
+    storage
+        .seek(&settled(), index, &KeyRange::Full, Direction::Forward)
+        .expect("seek")
+        .map(|r| match r.expect("a row of the seek").1.0[0] {
+            Value::I32(key) => key,
+            ref other => panic!("a key of another type: {other:?}"),
+        })
+        .collect()
+}
+
+/// A heap table with a `unique` index of `rows` keys, taken through a checkpoint and a reopen
+/// (which hands the tree of the index back and builds it again), a `drop_index` and a
+/// `drop_table` of trees of the same size, then through new writes that take their pages from
+/// the free list, and a second checkpoint and reopen: the rows read back each time, by the
+/// scan and by the index.
+fn trees_handed_back_then_reopened(rows: i32) {
+    let dir = fresh_dir(&format!("free-tree-{rows}"));
+    let reopen = |dir: &Path| DiskStorage::open(dir, DiskOptions::default()).expect("open");
+    let (table, index) = {
+        let storage = reopen(&dir);
+        let db = storage.create_database("d").expect("db");
+        let table = storage.create_table(db, &two_ints(false)).expect("table");
+        let index = storage.create_index(table, &unique_on(0)).expect("index");
+        for key in 0..rows {
+            storage
+                .insert(TxnId(1), table, &pair(key, -key))
+                .expect("insert");
+        }
+        storage.commit(TxnId(1)).expect("commit");
+        storage.checkpoint().expect("checkpoint");
+        (table, index)
+    };
+    let expected: Vec<i32> = (0..rows).collect();
+    {
+        let storage = reopen(&dir);
+        assert_eq!(
+            keys_by_seek(&storage, index),
+            expected,
+            "{rows}: first reopen"
+        );
+        assert_eq!(scanned(&storage, &settled(), table).len(), expected.len());
+        let db = storage.create_database("e").expect("db");
+        let other = storage.create_table(db, &two_ints(false)).expect("table");
+        let dropped = storage.create_index(other, &unique_on(0)).expect("index");
+        let kept = storage.create_index(other, &unique_on(1)).expect("index");
+        for key in 0..rows {
+            storage
+                .insert(TxnId(2), other, &pair(key, key))
+                .expect("insert");
+        }
+        storage.commit(TxnId(2)).expect("commit");
+        storage.drop_index(dropped).expect("drop the index");
+        assert_eq!(
+            keys_by_seek(&storage, kept),
+            expected,
+            "{rows}: after drop_index"
+        );
+        storage.drop_table(other).expect("drop the table");
+        for key in rows..2 * rows {
+            storage
+                .insert(TxnId(3), table, &pair(key, -key))
+                .expect("insert after the drops");
+        }
+        storage.commit(TxnId(3)).expect("commit");
+        storage.checkpoint().expect("checkpoint");
+    }
+    let storage = reopen(&dir);
+    let expected: Vec<i32> = (0..2 * rows).collect();
+    assert_eq!(
+        keys_by_seek(&storage, index),
+        expected,
+        "{rows}: second reopen"
+    );
+    assert_eq!(scanned(&storage, &settled(), table).len(), expected.len());
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_unique_index_of_300_rows_reopens_after_its_tree_is_handed_back() {
+    trees_handed_back_then_reopened(300);
+}
+
+#[test]
+fn a_unique_index_of_1000_rows_reopens_after_its_tree_is_handed_back() {
+    trees_handed_back_then_reopened(1_000);
+}
+
+#[test]
+fn a_unique_index_of_10000_rows_reopens_after_its_tree_is_handed_back() {
+    trees_handed_back_then_reopened(10_000);
+}

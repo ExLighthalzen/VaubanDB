@@ -2,8 +2,8 @@
 //!
 //! Eight threads insert keys that overlap, each in transactions of its own, into a table that
 //! carries a `unique` index: each key goes in once, the other inserts of that key are refused
-//! with 2601 and with nothing else, and the table and its index agree on the rows, as does a
-//! reopen of the clustered one.
+//! with 2601 and with nothing else, and the table and its index agree on the rows, before and
+//! after a checkpoint and a reopen.
 //! The structure of the trees themselves is checked from inside the crate
 //! (`disk::btree::concurrency::eight_writers_leave_valid_trees`).
 
@@ -162,9 +162,9 @@ fn keys_of(storage: &DiskStorage, table: TableId, index: IndexId) -> Vec<i32> {
     sought
 }
 
-/// Plays the race on a table clustered or not, then, for `reopen`, takes a checkpoint and
-/// reads the rows back from a reopened instance.
-fn one_insert_per_key(label: &str, clustered: bool, reopen: bool) {
+/// Plays the race on a table clustered or not, then takes a checkpoint and reads the rows back
+/// from a reopened instance, which builds the tree of a heap's index again.
+fn one_insert_per_key(label: &str, clustered: bool) {
     let dir = fresh_dir(label);
     let (table, index) = {
         let storage = DiskStorage::open(&dir, DiskOptions::default()).expect("open");
@@ -190,24 +190,22 @@ fn one_insert_per_key(label: &str, clustered: bool, reopen: bool) {
                 .count();
             assert_eq!(rows, 1, "key {key}");
         }
-        if reopen {
-            storage.checkpoint().expect("checkpoint");
-        }
+        storage.checkpoint().expect("checkpoint");
         (table, index)
     };
-    if reopen {
-        let storage = DiskStorage::open(&dir, DiskOptions::default()).expect("reopen");
-        let keys: BTreeSet<i32> = keys_of(&storage, table, index).into_iter().collect();
-        assert_eq!(keys, (0..KEYS).collect(), "the rows after a reopen");
-    }
+    let storage = DiskStorage::open(&dir, DiskOptions::default()).expect("reopen");
+    let keys: BTreeSet<i32> = keys_of(&storage, table, index).into_iter().collect();
+    assert_eq!(keys, (0..KEYS).collect(), "the rows after a reopen");
+    drop(storage);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A heap table whose `unique` index has a tree of its own: the check and the maintenance of
-/// that tree are one section, so a second insert of a key finds the first one.
+/// that tree are one section, so a second insert of a key finds the first one; the reopen
+/// hands that tree back and builds it again from the rows.
 #[test]
 fn concurrent_inserts_of_one_key_let_one_through() {
-    one_insert_per_key("heap", false, false);
+    one_insert_per_key("heap", false);
 }
 
 /// A clustered table whose `unique` index shares the tree of the rows, whose root the splits
@@ -215,5 +213,5 @@ fn concurrent_inserts_of_one_key_let_one_through() {
 /// checkpoint and a reopen.
 #[test]
 fn concurrent_inserts_of_one_clustered_key_let_one_through() {
-    one_insert_per_key("clustered", true, true);
+    one_insert_per_key("clustered", true);
 }

@@ -42,14 +42,14 @@
 //! indexes from the versions after the redo of the rows is not implemented.
 //! [`IndexShape::included`] is kept in the shape and read by nothing here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_types::Value;
 
 use super::DiskStorage;
 use super::alloc::free;
-use super::btree::{BTree, internal_child, internal_len, leftmost_child};
+use super::btree::{BTree, internal_child, internal_len};
 use super::page::{PageId, PageKind};
 use super::version::VersionView;
 use crate::{
@@ -261,20 +261,31 @@ fn by_payload(versions: Vec<VersionView>) -> HashMap<(RowId, u64), VersionView> 
 /// `pub(crate)`: `drop_index` and `drop_table` hand the tree of an index and the two trees of
 /// a clustered table back ([`super::DiskStorage::drop_index`]).
 ///
-/// The walk reads the children of an internal page (`P0` and the pointer of each key) before
-/// it lets the pin of that page go, then frees the pages it collected: [`free`] refuses a page
-/// that carries a pin. It is what makes a [`DiskIndex::create`] refused for a duplicate key
+/// The walk reads the children of an internal page (`P0` and the pointer of each key, the
+/// `n + 1` children of a page of `n` keys) before it lets the pin of that page go, then frees
+/// the pages it collected, each one once: [`free`] refuses a page that carries a pin, and a
+/// page freed twice would be handed out twice by the free list
+/// (`tests::free_tree_hands_each_page_back_once` walks the free list after trees of one, two
+/// and three levels). It is what makes a [`DiskIndex::create`] refused for a duplicate key
 /// leave the instance as it found it (`tests::create_index_refuses_existing_duplicate` reads
 /// the free list and the page counter back).
 ///
 /// # Errors
 ///
-/// [`InternalError::Corruption`] when the walk reaches more than [`MAX_TREE_PAGES`] pages; the
-/// errors of the buffer pool and of [`free`].
+/// [`InternalError::Corruption`] when the walk reaches more than [`MAX_TREE_PAGES`] pages, or
+/// one page by two child pointers, and then it frees none of the pages it collected
+/// (`tests::free_tree_refuses_a_page_named_twice`); the errors of the buffer pool and of
+/// [`free`].
 pub(crate) fn free_tree(storage: &DiskStorage, root: PageId) -> Result<(), InternalError> {
     let mut pending = vec![root];
     let mut pages: Vec<PageId> = Vec::new();
+    let mut reached: HashSet<PageId> = HashSet::new();
     while let Some(id) = pending.pop() {
+        if !reached.insert(id) {
+            return Err(InternalError::Corruption(format!(
+                "the B+tree rooted at {root} reaches page {id} twice: two child pointers name it"
+            )));
+        }
         if pages.len() >= MAX_TREE_PAGES {
             return Err(InternalError::Corruption(format!(
                 "the B+tree rooted at {root} reaches more than {MAX_TREE_PAGES} pages: a child \
@@ -286,11 +297,11 @@ pub(crate) fn free_tree(storage: &DiskStorage, root: PageId) -> Result<(), Inter
             if page.kind()? != PageKind::BTreeInternal {
                 return Ok(Vec::new());
             }
-            let mut children = vec![leftmost_child(page)];
-            for index in 0..internal_len(page) {
-                children.push(internal_child(page, index)?);
-            }
-            Ok::<_, InternalError>(children)
+            // `internal_child(page, 0)` is `P0`: the `n + 1` children of a page of `n` keys
+            // are the indexes `0..=n`, each read once.
+            (0..=internal_len(page))
+                .map(|index| internal_child(page, index))
+                .collect::<Result<Vec<_>, _>>()
         })??;
         drop(pin);
         pages.push(id);

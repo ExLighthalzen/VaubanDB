@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::ops::Bound;
 
 use super::super::version::HeapTable;
 
 use vauban_types::{SqlType, TypeInfo};
 
+use super::super::btree::leftmost_child;
 use super::super::temp::TempDir;
 use super::super::{DiskOptions, alloc};
 use super::*;
@@ -1105,5 +1107,234 @@ fn shared_tree_uniqueness_reads_a_bounded_number_of_pages() {
     assert!(
         walk > 4 * bound,
         "a walk of the versions read {walk} pages, too few for the bound to tell it apart"
+    );
+}
+
+/// The pages of the tree rooted at `root`, each child of an internal page read by its index
+/// `0..=n`.
+fn tree_pages(storage: &DiskStorage, root: PageId) -> Vec<PageId> {
+    let mut pending = vec![root];
+    let mut pages = Vec::new();
+    while let Some(id) = pending.pop() {
+        pages.push(id);
+        let page = storage_page(storage, id);
+        if page.kind().expect("page kind") == PageKind::BTreeInternal {
+            pending.extend(
+                (0..=internal_len(&page))
+                    .map(|index| internal_child(&page, index).expect("a child")),
+            );
+        }
+    }
+    pages
+}
+
+/// A copy of the page `id`, read through the pool.
+fn storage_page(storage: &DiskStorage, id: PageId) -> super::super::page::Page {
+    let pin = storage.pool.pin(id).expect("pin a page of the tree");
+    pin.with_page(Clone::clone)
+        .expect("read a page of the tree")
+}
+
+/// Width of the text key of [`wide_row`]: about twenty entries fill a page, so a tree of three
+/// levels takes hundreds of rows rather than tens of thousands.
+const WIDE: usize = 380;
+
+/// A row of one `varchar` of [`WIDE`] characters, the digits of `value` padded with zeros so
+/// that the text order is the numeric order.
+fn wide_row(value: usize) -> Row {
+    Row(vec![Value::String(vauban_types::SqlString {
+        text: format!("{value:0WIDE$}"),
+    })])
+}
+
+/// Handing back the tree of an index of one, two and three levels puts each of its pages in
+/// the free list once, the pages the list held before staying in it; the instance then hands
+/// those pages out again to a new tree of the same rows, and the list keeps the pages that
+/// tree did not take.
+#[test]
+fn free_tree_hands_each_page_back_once() {
+    let shape = index_shape(&[(0, false)], true);
+    for (rows, levels) in [(1, 1), (60, 2), (900, 3)] {
+        let (_dir, storage) = instance("index-free-tree-once");
+        let head = alloc::allocate(&storage).expect("allocate the head page");
+        let wide = TableShape {
+            columns: vec![TypeInfo::new(
+                SqlType::VarChar(vauban_types::Len::Fixed(u16::try_from(WIDE).expect("n"))),
+                true,
+            )],
+            clustered_key: None,
+        };
+        let mut table = HeapTable::create(&storage, TABLE, head, wide).expect("table");
+        let mut index = DiskIndex::create(&storage, INDEX, &shape, &table).expect("index");
+        for value in 0..rows {
+            insert_row(&mut table, &mut index, 1, &wide_row(value)).expect("insert");
+        }
+        table.commit(TxnId(1)).expect("commit");
+        assert_eq!(tree_height(&storage, index.root()), levels, "{rows} rows");
+        let pages = tree_pages(&storage, index.root());
+        let distinct: HashSet<PageId> = pages.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            pages.len(),
+            "{rows} rows: the tree names a page twice"
+        );
+        let before = alloc::free_list(&storage).expect("the free list before");
+        free_tree(&storage, index.root()).expect("free the tree");
+        let after = alloc::free_list(&storage).expect("the free list after");
+        assert_eq!(after.len(), before.len() + pages.len(), "{rows} rows");
+        let listed: HashSet<PageId> = after.iter().copied().collect();
+        assert!(
+            distinct.is_subset(&listed),
+            "{rows} rows: a page of the tree is missing"
+        );
+        assert!(
+            before.iter().all(|id| listed.contains(id)),
+            "{rows} rows: a page listed before is missing"
+        );
+        let rebuilt = DiskIndex::create(&storage, INDEX, &shape, &table).expect("rebuild");
+        let again = tree_pages(&storage, rebuilt.root());
+        let left = alloc::free_list(&storage).expect("the free list after the rebuild");
+        assert!(
+            again.iter().all(|id| !left.contains(id)),
+            "{rows} rows: a page of the new tree is still listed as free"
+        );
+        assert_eq!(
+            seek_ids(&rebuilt, &table, &snap(2, &[]), &KeyRange::Full).len(),
+            rows
+        );
+    }
+}
+
+/// The root the catalogue of `storage` keeps for `index`.
+fn root_of(storage: &DiskStorage, index: IndexId) -> PageId {
+    let catalogue = storage.lock_catalogue().expect("the catalogue");
+    let entry = catalogue.index(index).expect("the index");
+    entry.root.expect("a root")
+}
+
+/// The free list after each path of the instance that hands a tree back: `drop_index`,
+/// `drop_table` of a heap and of a clustered table, and the rebuild of the indexes at a reopen
+/// after a checkpoint. It lists each page once, none of them a page of a live tree, and the
+/// rows read back after the reopen.
+#[test]
+fn free_list_holds_after_each_tree_handed_back() {
+    use crate::Storage;
+    let dir = TempDir::created("index-free-list-paths");
+    let open = || DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+    let settled = Snapshot {
+        xmin: TxnId(u64::MAX),
+        xmax: TxnId(u64::MAX),
+        active: Vec::new(),
+        own: TxnId(0),
+    };
+    let unique = index_shape(&[(0, false)], true);
+    let shape = |clustered: bool| TableShape {
+        columns: vec![TypeInfo::new(SqlType::Int, true); 2],
+        clustered_key: clustered.then(|| {
+            vec![KeyColumn {
+                column: 0,
+                descending: false,
+            }]
+        }),
+    };
+    let (table, index) = {
+        let storage = open();
+        let db = storage.create_database("d").expect("db");
+        let table = storage.create_table(db, &shape(false)).expect("table");
+        let index = storage.create_index(table, &unique).expect("index");
+        let dropped = storage.create_index(table, &index_shape(&[(1, false)], true));
+        let dropped = dropped.expect("index");
+        let heap = storage.create_table(db, &shape(false)).expect("table");
+        storage.create_index(heap, &unique).expect("index");
+        let clustered = storage.create_table(db, &shape(true)).expect("table");
+        storage
+            .create_index(clustered, &index_shape(&[(1, false)], true))
+            .expect("index");
+        for value in 0..1_000 {
+            for table in [table, heap, clustered] {
+                storage
+                    .insert(TxnId(1), table, &row(&[value, -value]))
+                    .expect("insert");
+            }
+        }
+        storage.commit(TxnId(1)).expect("commit");
+        let mut listed = alloc::free_list(&storage).expect("the free list").len();
+        for (what, step) in [
+            (
+                "drop_index",
+                Box::new(|| storage.drop_index(dropped)) as Box<dyn Fn() -> _>,
+            ),
+            (
+                "drop_table of a heap",
+                Box::new(|| storage.drop_table(heap)),
+            ),
+            (
+                "drop_table of a clustered table",
+                Box::new(|| storage.drop_table(clustered)),
+            ),
+        ] {
+            step().expect(what);
+            let now = alloc::free_list(&storage).expect(what).len();
+            assert!(now > listed, "{what} hands pages back");
+            listed = now;
+            let live = tree_pages(&storage, root_of(&storage, index));
+            let free: HashSet<PageId> = alloc::free_list(&storage)
+                .expect(what)
+                .into_iter()
+                .collect();
+            assert!(live.iter().all(|id| !free.contains(id)), "{what}");
+        }
+        storage.checkpoint().expect("checkpoint");
+        (table, index)
+    };
+    let storage = open();
+    let free: HashSet<PageId> = alloc::free_list(&storage)
+        .expect("the free list after the reopen")
+        .into_iter()
+        .collect();
+    let live = tree_pages(&storage, root_of(&storage, index));
+    assert!(
+        live.iter().all(|id| !free.contains(id)),
+        "the rebuilt tree is not free"
+    );
+    let keys = storage
+        .seek(&settled, index, &KeyRange::Full, Direction::Forward)
+        .expect("seek")
+        .count();
+    assert_eq!(keys, 1_000);
+    assert_eq!(storage.scan(&settled, table).expect("scan").count(), 1_000);
+}
+
+/// A tree two of whose child pointers name one page is refused before any page goes back to
+/// the free list.
+#[test]
+fn free_tree_refuses_a_page_named_twice() {
+    let (_dir, storage) = instance("index-free-tree-twice");
+    let mut table = table_of(&storage, 1);
+    let mut index = DiskIndex::create(&storage, INDEX, &index_shape(&[(0, false)], true), &table)
+        .expect("index");
+    for value in 0..600 {
+        insert_row(&mut table, &mut index, 1, &row(&[value])).expect("insert");
+    }
+    table.commit(TxnId(1)).expect("commit");
+    let root = index.root();
+    assert_eq!(tree_height(&storage, root), 2);
+    // Point `P0` of the root at its second child.
+    let pin = storage.pool.pin(root).expect("pin the root");
+    pin.with_page_mut(|page| {
+        let second = internal_child(page, 1).expect("a second child");
+        super::super::btree::set_leftmost_child(page, second);
+    })
+    .expect("write the root");
+    drop(pin);
+    let before = alloc::free_list(&storage).expect("the free list before");
+    let err = free_tree(&storage, root).expect_err("a page named twice");
+    assert!(
+        matches!(&err, InternalError::Corruption(message) if message.contains("twice")),
+        "{err:?}"
+    );
+    assert_eq!(
+        alloc::free_list(&storage).expect("the free list after"),
+        before
     );
 }

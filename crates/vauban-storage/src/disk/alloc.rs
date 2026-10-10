@@ -160,6 +160,49 @@ pub(crate) fn free(storage: &DiskStorage, id: PageId) -> Result<(), InternalErro
     Ok(())
 }
 
+/// The pages of the free list, its head first, read without changing it.
+///
+/// Each page of the list must be of kind [`PageKind::Free`] and appear once: a page listed
+/// twice would be handed out twice by [`allocate`], and a page of another kind is one a
+/// structure still uses. The walk stops at [`END_OF_FREE_LIST`], or at the first page it
+/// meets a second time, so a link that leads back up the list ends it with an error.
+///
+/// # Errors
+///
+/// [`InternalError::Corruption`] for a page listed twice, for a page of another kind, and for a
+/// link to a page the allocator has not handed out; the errors of the buffer pool.
+#[cfg(test)]
+pub(crate) fn free_list(storage: &DiskStorage) -> Result<Vec<PageId>, InternalError> {
+    let control = storage.lock_control()?;
+    let mut pages = Vec::new();
+    let mut listed = std::collections::HashSet::new();
+    let mut next = control.free_head;
+    while let Some(id) = next {
+        if id.0 >= control.next_page_id.0 {
+            return Err(InternalError::Corruption(format!(
+                "free list links to page {id}, past the {} pages handed out",
+                control.next_page_id
+            )));
+        }
+        if !listed.insert(id) {
+            return Err(InternalError::Corruption(format!(
+                "free list lists page {id} twice"
+            )));
+        }
+        let pin = storage.pool.pin(id)?;
+        let (kind, link) = pin.with_page(|page| (page.kind(), next_free(page)))?;
+        let kind = kind?;
+        if kind != PageKind::Free {
+            return Err(InternalError::Corruption(format!(
+                "free list lists page {id}, whose kind is {kind:?}"
+            )));
+        }
+        pages.push(id);
+        next = link;
+    }
+    Ok(pages)
+}
+
 /// Detaches the head of the free list and answers what it pointed at.
 fn detach_head(storage: &DiskStorage, head: PageId) -> Result<Option<PageId>, InternalError> {
     let pin = storage.pool.pin(head)?;
