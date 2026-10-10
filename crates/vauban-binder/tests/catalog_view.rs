@@ -666,3 +666,92 @@ fn an_insert_over_a_default_the_binder_does_not_bind_still_binds() {
     };
     assert!(update.target.checks.is_empty());
 }
+
+/// A client statement that writes an internal table of the catalogue is refused, a read of
+/// it binds: `INSERT`, `UPDATE` and `DELETE` answer 259 once bound, with a message that does
+/// not name the table, `TRUNCATE TABLE` 4701 and `ALTER TABLE` 4902, the numbers of a table
+/// that does not exist. The same statements bind against a user table.
+#[test]
+fn a_write_of_an_internal_table_is_refused() {
+    let fixture = Fixture::with(KEYS);
+    let snapshot = fixture.snapshot();
+    let databases = ObjectName {
+        database: Some(Ident {
+            value: "master".to_owned(),
+            quoted: false,
+        }),
+        ..name("vauban_sys_databases")
+    };
+    let resolved = snapshot
+        .resolve_table(&databases, "master", "dbo")
+        .expect("master.dbo.vauban_sys_databases resolves");
+    let storage = resolved.table.expect("a table");
+    assert!(CatalogView::is_internal_table(&snapshot, storage));
+    let column = &resolved.columns[0].name;
+
+    let bind_first = |text: &str| {
+        let batch = parse_batch(text, &ParseOptions::default()).expect("parse");
+        bind(&batch.statements[0], &ctx(text, &snapshot))
+    };
+    let refused = [
+        ("DELETE FROM master.dbo.vauban_sys_objects;", (259, 16, 1)),
+        (
+            "DELETE FROM dbo.vauban_sys_principals WHERE 1 = 0;",
+            (259, 16, 1),
+        ),
+        (
+            "DELETE d FROM master.dbo.vauban_sys_databases AS d WHERE 1 = 0;",
+            (259, 16, 1),
+        ),
+        (
+            "INSERT INTO master.dbo.vauban_sys_databases \
+             SELECT * FROM master.dbo.vauban_sys_databases;",
+            (259, 16, 1),
+        ),
+        (
+            &format!("UPDATE master.dbo.vauban_sys_databases SET {column} = {column};"),
+            (259, 16, 1),
+        ),
+        (
+            "TRUNCATE TABLE master.dbo.vauban_sys_objects;",
+            (4701, 16, 1),
+        ),
+        (
+            "ALTER TABLE master.dbo.vauban_sys_objects ADD c int;",
+            (4902, 16, 1),
+        ),
+    ];
+    for (text, expected) in refused {
+        let text = format!("\n{text}");
+        let error = bind_first(&text).expect_err(&text);
+        assert_eq!(number_state(&error), expected, "{text}");
+        assert_eq!(error.line, 2, "{text}");
+        if expected.0 == 259 {
+            assert!(!error.message.contains("vauban"), "{}", error.message);
+        }
+    }
+
+    // An error of the statement itself comes before 259.
+    let error = bind_first("DELETE FROM master.dbo.vauban_sys_objects WHERE nosuch = 1;")
+        .expect_err("nosuch is not a column");
+    assert_eq!(error.number, 207);
+
+    // A read of an internal table, and a system view over one, still bind.
+    for text in [
+        "SELECT COUNT(*) FROM master.dbo.vauban_sys_objects;",
+        "SELECT name FROM sys.tables;",
+        "INSERT INTO pk SELECT 1, 1 FROM master.dbo.vauban_sys_databases WHERE 1 = 0;",
+    ] {
+        bind_first(text).unwrap_or_else(|err| panic!("{text}: {err:?}"));
+    }
+    // A user table is written as before.
+    for text in [
+        "DELETE FROM pk;",
+        "UPDATE pk SET v = 1;",
+        "INSERT INTO pk VALUES (1, 1);",
+        "TRUNCATE TABLE r;",
+        "ALTER TABLE r ADD c int;",
+    ] {
+        bind_first(text).unwrap_or_else(|err| panic!("{text}: {err:?}"));
+    }
+}

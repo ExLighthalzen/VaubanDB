@@ -65,8 +65,16 @@ pub(crate) fn bind_alter_table(
 ) -> SqlResult<BoundStatement> {
     let catalog = ctx.catalog.ok_or_else(from_needs_the_catalogue)?;
     let table = table_name(&stmt.name, ctx).map_err(|err| on_statement(err, &stmt.span))?;
+    // An internal table of the catalogue answers as a table that does not exist, as SQL
+    // Server answers `ALTER TABLE sys.objects ADD c int` (`tests/catalog_view.rs`,
+    // `a_write_of_an_internal_table_is_refused`).
     let resolved = catalog
         .resolve_table(&stmt.name, ctx.database, ctx.default_schema)
+        .filter(|resolved| {
+            !resolved
+                .table
+                .is_some_and(|storage| catalog.is_internal_table(storage))
+        })
         .ok_or_else(|| {
             SqlError::cannot_find_object_to_alter_table(&qualified(&table))
                 .with_line(stmt.span.line)

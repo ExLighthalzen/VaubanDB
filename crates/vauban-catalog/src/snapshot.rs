@@ -160,6 +160,12 @@
 //!   the number without a change: an identifier its store does not hold is a `cannot_drop`
 //!   (`tests/snapshot.rs`,
 //!   `an_internal_table_cannot_be_dropped`).
+//! - **Read, not written.** A client reads one by name, which is how the binder expands
+//!   the definition of a system view. [`CatalogSnapshot::is_internal_table`] flags it, and
+//!   the binder refuses an `INSERT`, an `UPDATE` or a `DELETE` of its rows with 259, and
+//!   answers a `TRUNCATE TABLE` or an `ALTER TABLE` of it as it answers a table that does
+//!   not exist (`tests/snapshot.rs`, `an_internal_table_is_flagged_internal`; in `binder`,
+//!   `tests/catalog_view.rs`, `a_write_of_an_internal_table_is_refused`).
 //!
 //! # What the table half of a snapshot follows
 //!
@@ -673,6 +679,22 @@ impl CatalogSnapshot {
         self.tables
             .values()
             .find(|meta| meta.storage_id == storage_id)
+    }
+
+    /// Whether the table whose storage identifier is `storage_id` is one of the internal
+    /// tables of `master` (module documentation, section "The internal tables of
+    /// `master`"), which a client statement does not write.
+    ///
+    /// The flag is the line of [`SYSTEM_OBJECT_IDS`] the table carries in the schema
+    /// [`INTERNAL_TABLE_SCHEMA`]. `false` for a user table, for a storage identifier this
+    /// snapshot does not hold and for an empty snapshot (`tests/snapshot.rs`,
+    /// `an_internal_table_is_flagged_internal`).
+    pub fn is_internal_table(&self, storage_id: TableId) -> bool {
+        SYSTEM_OBJECT_IDS
+            .iter()
+            .filter(|(schema, _, _)| *schema == DBO)
+            .filter_map(|&(_, _, id)| self.tables.get(&ObjectId(id)))
+            .any(|meta| meta.storage_id == storage_id)
     }
 
     /// The T-SQL text of the view of identifier `id`, `None` when `id` is not a view.

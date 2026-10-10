@@ -625,7 +625,7 @@ pub(crate) fn bind_drop_table(
 ///
 /// # Errors
 ///
-/// - 4701 when the target is not in the catalogue;
+/// - 4701 when the target is not in the catalogue, or is one of its internal tables;
 /// - the internal 50000 for a view, a temporary table or a four-part name.
 pub(crate) fn bind_truncate(
     table: &ObjectName,
@@ -634,8 +634,16 @@ pub(crate) fn bind_truncate(
 ) -> SqlResult<BoundStatement> {
     let catalog = ctx.catalog.ok_or_else(from_needs_the_catalogue)?;
     let name = table_name(table, ctx).map_err(|err| on_statement(err, &span))?;
+    // An internal table of the catalogue answers as a table that does not exist, as SQL
+    // Server answers `TRUNCATE TABLE sys.objects` (`tests/catalog_view.rs`,
+    // `a_write_of_an_internal_table_is_refused`).
     let resolved = catalog
         .resolve_table(table, ctx.database, ctx.default_schema)
+        .filter(|resolved| {
+            !resolved
+                .table
+                .is_some_and(|storage| catalog.is_internal_table(storage))
+        })
         .ok_or_else(|| {
             SqlError::cannot_find_object_to_truncate(&table.name.value).with_line(span.line)
         })?;

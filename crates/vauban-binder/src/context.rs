@@ -51,10 +51,11 @@ impl<'a> BindContext<'a> {
 
 /// The view of the catalogue the binder needs.
 ///
-/// One method has a default body, [`CatalogView::object_expressions`], which answers as a
-/// table without object expressions; each other method is answered by the implementation
-/// itself, so a question the production implementation leaves out does not compile instead
-/// of answering as an empty catalogue would. `catalog_view.rs` implements the trait for a
+/// Two methods have a default body: [`CatalogView::object_expressions`], which answers as a
+/// table without object expressions, and [`CatalogView::is_internal_table`], which answers
+/// `false`; each other method is answered by the implementation itself, so a question the
+/// production implementation leaves out does not compile instead of answering as an empty
+/// catalogue would. `catalog_view.rs` implements the trait for a
 /// [`CatalogSnapshot`](vauban_catalog::CatalogSnapshot), which is what `session` hands over
 /// in production, and `tests/catalog_view.rs` asks each method of it over a catalogue built
 /// by [`Catalog::bootstrap`](vauban_catalog::Catalog::bootstrap).
@@ -117,6 +118,19 @@ pub trait CatalogView {
     fn object_expressions(&self, object: ObjectId) -> ObjectExpressionTexts {
         let _ = object;
         ObjectExpressionTexts::default()
+    }
+
+    /// Whether the table of storage identifier `table` is an internal table of the catalogue,
+    /// whose rows a client statement reads and does not write: an `INSERT`, an `UPDATE` or a
+    /// `DELETE` of it is refused with 259 once bound (`statement.rs`), a `TRUNCATE TABLE` or
+    /// an `ALTER TABLE` of it answers as for a table that does not exist (`ddl.rs`,
+    /// `alter.rs`; `tests/catalog_view.rs`, `a_write_of_an_internal_table_is_refused`).
+    ///
+    /// The default answers `false`, for a view of the catalogue that holds user tables
+    /// alone.
+    fn is_internal_table(&self, table: vauban_catalog::TableId) -> bool {
+        let _ = table;
+        false
     }
 
     /// Classifies the written name in the current database and default schema.

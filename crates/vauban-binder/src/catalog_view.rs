@@ -229,6 +229,11 @@ impl CatalogView for CatalogSnapshot {
         })
     }
 
+    /// The flag of [`CatalogSnapshot::is_internal_table`].
+    fn is_internal_table(&self, table: vauban_catalog::TableId) -> bool {
+        CatalogSnapshot::is_internal_table(self, table)
+    }
+
     /// [`ResolvedTableKind::Table`] or [`ResolvedTableKind::View`] behind the name gives
     /// [`TableReferenceKind::Table`]; nothing gives `Unknown`. A snapshot knows no
     /// table-valued function.

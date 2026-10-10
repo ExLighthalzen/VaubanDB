@@ -1626,6 +1626,36 @@ fn an_internal_table_cannot_be_dropped() {
     assert!(snapshot.table(internal).is_some());
 }
 
+/// `is_internal_table` flags each internal table of `master` by its storage identifier, and
+/// neither a user table, nor a storage identifier the snapshot does not hold, nor anything of
+/// an empty snapshot.
+#[test]
+fn an_internal_table_is_flagged_internal() {
+    let (catalog, manager) = instance();
+    let user = table(&catalog, &manager, &def("master", "dbo", "t"));
+    let snapshot = catalog.snapshot(&begin(&manager));
+
+    for name in [
+        "vauban_sys_objects",
+        "vauban_sys_databases",
+        "vauban_sys_principals",
+    ] {
+        let internal = snapshot
+            .resolve_object("master", Some("dbo"), name, "dbo")
+            .and_then(|object| snapshot.table(object.id))
+            .unwrap_or_else(|| panic!("master.dbo.{name} resolves to a table"));
+        assert!(snapshot.is_internal_table(internal.storage_id), "{name}");
+    }
+    let internal_count = snapshot
+        .tables()
+        .filter(|meta| snapshot.is_internal_table(meta.storage_id))
+        .count();
+    assert!(internal_count > 3, "{internal_count}");
+    assert!(!snapshot.is_internal_table(user.storage_id));
+    assert!(!snapshot.is_internal_table(TableId(u32::MAX)));
+    assert!(!vauban_catalog::CatalogSnapshot::default().is_internal_table(user.storage_id));
+}
+
 /// What `take_resolved_tables` hands back: the storage table of each user table a name
 /// reached, each once, nothing for a system view or a name that resolves to nothing, and an
 /// empty list once drained. With the foreign keys, `child` brings `parent`, which its key

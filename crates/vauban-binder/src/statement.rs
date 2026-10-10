@@ -11,7 +11,7 @@
 //! else.
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_parser::{QueryBody, Statement};
+use vauban_parser::{QueryBody, Span, Statement};
 
 use crate::alter::bind_alter_table;
 use crate::bound::BoundStatement;
@@ -88,9 +88,12 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
         Statement::AlterDatabase(alter) => bind_alter_database(alter, ctx),
         Statement::AlterTable(alter) => bind_alter_table(alter, ctx),
         Statement::Truncate { table, span } => bind_truncate(table, *span, ctx),
-        Statement::Insert(insert) => bind_insert(insert, ctx),
-        Statement::Update(update) => bind_update(update, ctx),
-        Statement::Delete(delete) => bind_delete(delete, ctx),
+        Statement::Insert(insert) => bind_insert(insert, ctx)
+            .and_then(|bound| refuse_internal_write(bound, insert.span, ctx)),
+        Statement::Update(update) => bind_update(update, ctx)
+            .and_then(|bound| refuse_internal_write(bound, update.span, ctx)),
+        Statement::Delete(delete) => bind_delete(delete, ctx)
+            .and_then(|bound| refuse_internal_write(bound, delete.span, ctx)),
         Statement::Declare(declare) => bind_declare(declare, ctx),
         Statement::Set(set) => bind_set_variable(set, ctx),
         Statement::If {
@@ -120,6 +123,40 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
         other => Err(unsupported(other)),
     }
 }
+
+/// Refuses a bound `INSERT`, `UPDATE` or `DELETE` whose target is an internal table of the
+/// catalogue ([`CatalogView::is_internal_table`](crate::CatalogView::is_internal_table)):
+/// error 259, severity 16, state 1, on the line of the statement.
+///
+/// The check runs once the statement is bound, so an error of the statement itself comes
+/// first: `DELETE FROM sys.objects WHERE nosuch = 1` answers 207 before 259 in SQL Server,
+/// and the same order holds here (`tests/catalog_view.rs`,
+/// `a_write_of_an_internal_table_is_refused`). The message does not name the table.
+fn refuse_internal_write(
+    bound: BoundStatement,
+    span: Span,
+    ctx: &BindContext<'_>,
+) -> SqlResult<BoundStatement> {
+    let target = match &bound {
+        BoundStatement::Insert(plan) => plan.table,
+        BoundStatement::Update(plan) => plan.table,
+        BoundStatement::Delete(plan) => plan.table,
+        _ => return Ok(bound),
+    };
+    match ctx.catalog {
+        Some(catalog) if catalog.is_internal_table(target) => Err(SqlError::new(
+            AD_HOC_CATALOG_UPDATE_259,
+            16,
+            1,
+            "Direct changes to the system catalogue are refused.",
+        )
+        .with_line(span.line)),
+        _ => Ok(bound),
+    }
+}
+
+/// The number SQL Server answers a client statement that writes a system catalogue with.
+const AD_HOC_CATALOG_UPDATE_259: u32 = 259;
 
 /// The `INTO` target of a top-level `SELECT`, when the statement writes one.
 fn select_into_target(
