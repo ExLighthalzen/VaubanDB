@@ -150,6 +150,16 @@ impl SessionState {
         self.next_transaction_descriptor = descriptor.checked_add(1).unwrap_or(0);
         Some(descriptor)
     }
+
+    /// Takes over the transaction `level`, the state of a level this one called, ended
+    /// with: its handle, `@@TRANCOUNT`, its descriptor, and the descriptors it allocated, so
+    /// that a later `BEGIN TRANSACTION` does not announce one of them again.
+    pub(crate) fn take_transaction_of(&mut self, level: &SessionState) {
+        self.txn.clone_from(&level.txn);
+        self.trancount = level.trancount;
+        self.transaction_descriptor = level.transaction_descriptor;
+        self.next_transaction_descriptor = level.next_transaction_descriptor;
+    }
 }
 
 #[cfg(test)]

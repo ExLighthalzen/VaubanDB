@@ -28,8 +28,6 @@
 //! `an_error_of_the_batch_two_levels_down_ends_the_response_with_one_done`,
 //! `xact_abort_set_by_a_callee_ends_the_batch_on_its_error`).
 
-use std::sync::Arc;
-
 use crate::rpc::{DescribeKind, ProcAction, ProcArg, ProcParam, StaticResultColumn};
 use vauban_errors::{SqlError, SqlResult};
 use vauban_executor::{EvaluatedExecArg, ExecSession, ProgramEnd};
@@ -41,7 +39,6 @@ use crate::batch::{Level, Session, cancelled};
 use crate::eval_context::apply_exec_session;
 use crate::prepared::returned_output;
 use crate::sink::ResultSink;
-use crate::txn_session;
 
 /// One parameter of a called level, declared before its text is bound.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,7 +112,9 @@ impl Session {
 /// `a_qualified_call_leaves_the_caller_database_and_sends_no_context_change`).
 ///
 /// A transaction count the text left different from the one it found is 266, sent after
-/// the text when no other error was, and the transaction is rolled back.
+/// the text when no other error was; the transaction the text ended in stays open for the
+/// caller, its count included (`tests/exec_reopens_transaction.rs`,
+/// `a_callee_that_opens_one_more_transaction_leaves_it_to_its_caller`).
 ///
 /// # Errors
 ///
@@ -157,16 +156,14 @@ fn run_level(
     if !in_program {
         exec.nest_level = exec.nest_level.saturating_sub(1);
     }
-    let mut level_state = std::mem::replace(session.state_mut(), caller_state);
-    // A transaction the called level closed is closed for its caller too: the victim of a
-    // deadlock inside `EXEC('…')` leaves its caller with `@@TRANCOUNT` at 0
-    // (`tests/deadlock_victim.rs`), not with the handle of a transaction already gone.
-    if level_state.txn.is_none() && session.state().txn.is_some() {
-        let caller = session.state_mut();
-        caller.txn = None;
-        caller.trancount = 0;
-        caller.transaction_descriptor = 0;
-    }
+    let level_state = std::mem::replace(session.state_mut(), caller_state);
+    // The transaction belongs to the connection, not to a level: the caller goes on in the
+    // one its callee ended with. A transaction the called level closed is closed for its
+    // caller too (the victim of a deadlock inside `EXEC('…')` leaves `@@TRANCOUNT` at 0,
+    // `tests/deadlock_victim.rs`), and one it committed and opened again is the caller's,
+    // with its locks, for the caller's `ROLLBACK` or `COMMIT` to end
+    // (`tests/exec_reopens_transaction.rs`).
+    session.state_mut().take_transaction_of(&level_state);
     let (mut end, track) = ran?;
     // A body refused before it ran leaves its error unsent for the program that called it
     // (`vauban_executor::ProgramEnd::Refused`); the text of an RPC has no such program, and
@@ -193,11 +190,13 @@ fn run_level(
             i64::from(trancount_before),
             i64::from(level_state.trancount),
         );
+        // The transaction stays open as the callee left it, its count included
+        // (`tests/exec_reopens_transaction.rs`,
+        // `a_callee_that_opens_one_more_transaction_leaves_it_to_its_caller`).
         if !outcome.failed {
             sink.error(&err)?;
             outcome.failed = true;
         }
-        txn_session::rollback_all(&mut level_state, &Arc::clone(session.engine()))?;
     }
     Ok((outcome, end))
 }
