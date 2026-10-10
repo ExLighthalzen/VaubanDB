@@ -269,8 +269,7 @@ impl Graph {
     }
 }
 
-/// The error a [`LockOutcome`] other than [`LockOutcome::Granted`] is reported as, and the
-/// release of the locks of a victim.
+/// The error a [`LockOutcome`] other than [`LockOutcome::Granted`] is reported as.
 ///
 /// - [`LockOutcome::TimedOut`] → 1222, in the state of the granularity waited for: 51 on a
 ///   row, 56 on the object. SQL Server sends state 51 to a statement held back on a row and
@@ -278,18 +277,25 @@ impl Graph {
 ///   `SELECT … WITH (TABLOCKX)` or an `ALTER TABLE … ADD`, which is why the granularity of
 ///   the resource picks the constructor rather than the kind of statement
 ///   (`tests/deadlock.rs`, `timeout_state_follows_the_granularity`).
-/// - [`LockOutcome::Deadlock`] → 1205 for the victim, whose locks are given back **before**
-///   the error goes up, so that the other branch of the cycle is granted without a second
-///   pass of detection (`tests/deadlock.rs`, `victim_releases_before_returning`). The `%d`
-///   of the message carries the transaction identifier: the session identifier the client
-///   sees lives in `session`, and nothing hands it to this crate yet.
+/// - [`LockOutcome::Deadlock`] → 1205 for the victim, which **keeps** the locks it holds:
+///   the wait it gave up has left the queue, which breaks the cycle, and the rest goes back
+///   when the caller rolls the transaction back ([`TransactionManager::rollback`] releases
+///   after `storage` has undone the writes and the compensations have run). The other
+///   branch of the cycle is therefore granted on a state where the victim's writes and
+///   objects are already gone (`tests/deadlock.rs`,
+///   `the_survivor_reads_the_rows_of_the_victim_as_they_were`,
+///   `the_survivor_finds_the_table_of_the_victim_compensated`). The `%d` of the message
+///   carries the transaction identifier: the session identifier the client sees lives in
+///   `session`, and nothing hands it to this crate yet.
 /// - [`LockOutcome::Granted`] is an `InternalError::Bug`: the caller asked for the error of
 ///   a wait that succeeded.
 /// - [`LockOutcome::Cancelled`] is an `InternalError::Bug` too: an ATTENTION cancels the
 ///   request instead of reporting an error, and what the client is told there belongs to
 ///   the session.
+///
+/// `_locks` is the table the refused wait was made on; no outcome changes it here.
 pub(crate) fn to_error(
-    locks: &LockManager,
+    _locks: &LockManager,
     outcome: LockOutcome,
     resource: LockResource,
 ) -> SqlError {
@@ -302,7 +308,6 @@ pub(crate) fn to_error(
             LockResource::Table(..) => SqlError::lock_request_timeout_on_object(),
         },
         LockOutcome::Deadlock { victim } => {
-            locks.release_all(victim);
             SqlError::deadlock_victim(process_id(victim), DEADLOCK_RESOURCE_KIND)
         }
         LockOutcome::Cancelled => InternalError::Bug(

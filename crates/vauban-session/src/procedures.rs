@@ -32,8 +32,10 @@
 //! `an_error_of_the_batch_two_levels_down_ends_the_response_with_one_done`,
 //! `xact_abort_set_by_a_callee_ends_the_batch_on_its_error`).
 
+use std::sync::Arc;
+
 use crate::rpc::{DescribeKind, ProcAction, ProcArg, ProcParam, StaticResultColumn};
-use vauban_errors::{SqlError, SqlResult};
+use vauban_errors::{SqlError, SqlResult, error_behavior};
 use vauban_executor::{EvaluatedExecArg, ExecSession, ProgramEnd};
 use vauban_tds::{ColumnFlags, ColumnMeta, RpcParam};
 use vauban_txn::IsolationLevel;
@@ -43,6 +45,7 @@ use crate::batch::{Level, Session, cancelled, error_status};
 use crate::eval_context::apply_exec_session;
 use crate::prepared::returned_output;
 use crate::sink::ResultSink;
+use crate::txn_session;
 
 /// One parameter of a called level, declared before its text is bound.
 #[derive(Debug, Clone, PartialEq)]
@@ -212,9 +215,14 @@ fn run_level(
     let (mut end, track) = ran?;
     // A body refused before it ran leaves its error unsent for the program that called it
     // (`vauban_executor::ProgramEnd::Refused`); the text of an RPC has no such program, and
-    // sends it here.
+    // sends it here. An error whose catalogue entry rolls the transaction back, the 1205 of
+    // a binding chosen as a deadlock victim, does so after its ERROR token, as in a batch
+    // (`tests/deadlock_victim.rs`, `a_victim_at_binding_under_an_rpc_is_rolled_back`).
     if !in_program && let ProgramEnd::Refused(err) = end {
         sink.error(&err)?;
+        if error_behavior(err.number).rolls_back_transaction {
+            roll_back_after_refusal(session, sink)?;
+        }
         end = ProgramEnd::ended_by(err, level_state.options.xact_abort);
     }
     if end == ProgramEnd::Cancelled {
@@ -258,6 +266,19 @@ fn past_the_nesting_limit(exec: &ExecSession, added: u32, body: Body) -> Option<
         Some(procedure) => err.with_procedure(procedure),
         None => err,
     })
+}
+
+/// Rolls the session transaction back for a text refused before it ran, with the ENVCHANGE
+/// that announces it ([`txn_session::roll_back_after_error`]).
+pub(crate) fn roll_back_after_refusal(
+    session: &mut Session,
+    sink: &mut dyn ResultSink,
+) -> SqlResult<()> {
+    let engine = Arc::clone(session.engine());
+    let mut exec = std::mem::take(session.exec_mut());
+    let rolled = txn_session::roll_back_after_error(session.state_mut(), &engine, &mut exec, sink);
+    *session.exec_mut() = exec;
+    rolled
 }
 
 /// A level refused before its text ran: the error stays unsent for the program that made
@@ -723,6 +744,12 @@ fn fail_proc(
         ProcFinish::Rpc { .. } => {
             session.state_mut().last_error = err.number;
             sink.error(&err)?;
+            // The 1205 of a binding chosen as a deadlock victim rolls the session
+            // transaction back after its ERROR token (`tests/deadlock_victim.rs`,
+            // `a_victim_at_binding_under_an_rpc_describe_is_rolled_back`).
+            if error_behavior(err.number).rolls_back_transaction {
+                roll_back_after_refusal(session, sink)?;
+            }
             sink.done_proc(None)?;
             Ok((Err(err.clone()), refused_outcome(&err)))
         }

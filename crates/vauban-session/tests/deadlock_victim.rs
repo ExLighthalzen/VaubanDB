@@ -15,10 +15,13 @@ use std::thread;
 use std::time::Duration;
 
 use vauban_errors::{InfoMessage, SqlError, SqlResult};
-use vauban_session::{Engine, ResultSink, Session, SessionState};
+use vauban_session::{
+    DescribeKind, Engine, ProcAction, ProcArg, ResultSink, Session, SessionState,
+    SystemProcedureResolver,
+};
 use vauban_storage::MemoryStorage;
-use vauban_tds::{ColumnMeta, EnvChange};
-use vauban_types::{TypeInfo, Value};
+use vauban_tds::{ColumnMeta, EnvChange, ResetConnection, Rpc, RpcParam, RpcProc};
+use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
 /// What a sink receives, in order: rows, errors, the transaction ENVCHANGE and the DONE.
 #[derive(Debug, Clone, PartialEq)]
@@ -293,4 +296,168 @@ fn a_lock_timeout_stops_its_statement_and_keeps_the_transaction() {
     run(&mut a, "COMMIT TRANSACTION;");
     run(&mut b, "COMMIT TRANSACTION;");
     assert_eq!(committed(&engine), vec![vec![2], vec![1]]);
+}
+
+// ------------------------------------------------- A victim at binding, under an RPC
+
+/// The procedures of this section, reduced to what a text without parameters needs:
+/// `sp_executesql` runs its first string argument, `sp_prepexec` prepares it, answers the
+/// handle in its first argument and runs it at once, `sp_describe_first_result_set`
+/// describes it.
+fn rpc_resolver() -> Arc<SystemProcedureResolver> {
+    fn text(args: &[ProcArg<'_>]) -> String {
+        args.iter()
+            .find_map(|arg| match arg.value {
+                Value::String(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+    fn resolve(name: &str, args: &[ProcArg<'_>]) -> Option<Result<ProcAction, SqlError>> {
+        match name {
+            "sp_executesql" => Some(Ok(ProcAction::ExecuteSql {
+                statement: text(args),
+                params: Vec::new(),
+            })),
+            "sp_prepexec" => Some(Ok(ProcAction::Prepare {
+                statement: text(args),
+                params: Vec::new(),
+                handle_arg: 0,
+                execute_with: Some(Vec::new()),
+            })),
+            "sp_describe_first_result_set" => Some(Ok(ProcAction::Describe {
+                statement: text(args),
+                kind: DescribeKind::FirstResultSet,
+                columns: Vec::new(),
+            })),
+            _ => None,
+        }
+    }
+    Arc::new(resolve)
+}
+
+/// The RPC `procedure` with `text` as its statement, after the output handle for
+/// `sp_prepexec`.
+fn rpc_of(procedure: &str, text: &str) -> Rpc {
+    let statement = RpcParam {
+        name: String::new(),
+        output: false,
+        default: false,
+        ty: TypeInfo::new(SqlType::NVarChar(Len::Max), false),
+        value: Value::String(SqlString {
+            text: text.to_owned(),
+        }),
+    };
+    let handle = RpcParam {
+        name: String::new(),
+        output: true,
+        default: false,
+        ty: TypeInfo::new(SqlType::Int, false),
+        value: Value::I32(0),
+    };
+    Rpc {
+        reset: ResetConnection::None,
+        proc: RpcProc::Name(procedure.to_owned()),
+        options: 0,
+        params: if procedure == "sp_prepexec" {
+            vec![handle, statement]
+        } else {
+            vec![statement]
+        },
+        transaction_descriptor: 0,
+    }
+}
+
+/// A, under `DEADLOCK_PRIORITY LOW` and `prelude`, alters `t1` in a transaction; B alters
+/// `t2` in one. A sends the RPC `procedure` reading `t2`, whose binding waits for B; B reads
+/// `t1`, which closes the cycle. A is the victim: its RPC answers 1205 then the ENVCHANGE
+/// of the rollback, and `@@TRANCOUNT` reads 0 afterwards; B reads `t1` without waiting for
+/// anything A does next, its transaction still open.
+fn victim_at_binding_under(procedure: &str, prelude: &str) {
+    let engine = Arc::new(Engine::with_system_procedures(
+        Arc::new(MemoryStorage::new()),
+        rpc_resolver(),
+    ));
+    vauban_sysfn::register_builtins();
+    let mut setup = session(&engine, 60);
+    run(
+        &mut setup,
+        "CREATE TABLE dbo.t1 (id int PRIMARY KEY, v int); \
+         CREATE TABLE dbo.t2 (id int PRIMARY KEY, v int); \
+         INSERT INTO dbo.t1 VALUES (1, 0); INSERT INTO dbo.t2 VALUES (1, 0);",
+    );
+    let mut a = session(&engine, 61);
+    let mut b = session(&engine, 62);
+    run(
+        &mut a,
+        &format!(
+            "{prelude} SET DEADLOCK_PRIORITY LOW; BEGIN TRANSACTION; \
+             ALTER TABLE dbo.t1 ADD a1 int;"
+        ),
+    );
+    run(&mut b, "BEGIN TRANSACTION; ALTER TABLE dbo.t2 ADD b2 int;");
+
+    let rpc = rpc_of(procedure, "SELECT COUNT(*) FROM dbo.t2;");
+    let (sender, crossed) = mpsc::channel();
+    thread::spawn(move || {
+        let mut sink = Recording::default();
+        let outcome = a.run_rpc(&rpc, &mut sink);
+        let _ = sender.send((a, sink.0, outcome));
+    });
+    assert!(
+        crossed.recv_timeout(Duration::from_millis(300)).is_err(),
+        "A waits at binding for the transaction that altered t2"
+    );
+    let (sender, closed) = mpsc::channel();
+    thread::spawn(move || {
+        let events = run_on(&mut b, "SELECT COUNT(*) FROM dbo.t1; SELECT @@TRANCOUNT;");
+        let _ = sender.send((b, events));
+    });
+
+    let (mut a, a_events, outcome) = crossed
+        .recv_timeout(Duration::from_secs(5))
+        .expect("A answers");
+    assert!(outcome.is_ok(), "{outcome:?}");
+    let (mut b, b_events) = closed
+        .recv_timeout(Duration::from_secs(5))
+        .expect("B goes on without a request from A");
+    // A text `sp_prepexec` could not prepare is followed by the 8180 of a failed prepare.
+    let expected = if procedure == "sp_prepexec" {
+        vec![1205, 8180]
+    } else {
+        vec![1205]
+    };
+    assert_eq!(errors(&a_events), expected, "{a_events:#?}");
+    let error_at = a_events.iter().position(|e| *e == Event::Error(1205));
+    let rollback_at = a_events.iter().position(|e| *e == Event::Rollback);
+    assert!(
+        matches!((error_at, rollback_at), (Some(e), Some(r)) if e < r),
+        "the rollback follows the error: {a_events:#?}"
+    );
+    assert_eq!(ints(&run(&mut a, "SELECT @@TRANCOUNT;")), vec![vec![0]]);
+    assert_eq!(errors(&b_events), Vec::<u32>::new(), "{b_events:#?}");
+    assert_eq!(ints(&b_events), vec![vec![1], vec![1]]);
+    run(&mut b, "COMMIT TRANSACTION;");
+}
+
+/// The text of an `sp_executesql` RPC chosen as a deadlock victim at binding rolls the
+/// transaction back, `XACT_ABORT` OFF and ON.
+#[test]
+fn a_victim_at_binding_under_an_rpc_is_rolled_back() {
+    victim_at_binding_under("sp_executesql", "");
+    victim_at_binding_under("sp_executesql", "SET XACT_ABORT ON;");
+}
+
+/// The same for the text of an `sp_prepexec` RPC.
+#[test]
+fn a_victim_at_binding_under_a_prepexec_is_rolled_back() {
+    victim_at_binding_under("sp_prepexec", "");
+    victim_at_binding_under("sp_prepexec", "SET XACT_ABORT ON;");
+}
+
+/// The same for the text of an `sp_describe_first_result_set` RPC.
+#[test]
+fn a_victim_at_binding_under_an_rpc_describe_is_rolled_back() {
+    victim_at_binding_under("sp_describe_first_result_set", "");
+    victim_at_binding_under("sp_describe_first_result_set", "SET XACT_ABORT ON;");
 }

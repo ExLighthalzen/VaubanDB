@@ -272,6 +272,12 @@ fn prepare_failed(
     err: SqlError,
 ) -> SqlResult<BatchProcOutcome> {
     sink.error(&err)?;
+    // The 1205 of a binding chosen as a deadlock victim rolls the session transaction back
+    // after its ERROR token (`tests/deadlock_victim.rs`,
+    // `a_victim_at_binding_under_a_prepexec_is_rolled_back`).
+    if vauban_errors::error_behavior(err.number).rolls_back_transaction {
+        crate::procedures::roll_back_after_refusal(session, sink)?;
+    }
     sink.error(&SqlError::statement_could_not_be_prepared())?;
     session.state_mut().last_error = err.number;
     sink.done_proc(None)?;
