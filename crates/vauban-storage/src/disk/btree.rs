@@ -104,6 +104,21 @@
 //! of the heap (`a_held_write_marks_its_pages_and_hands_them_back`). The pages the
 //! `PageWrites` of a tree marks are the ones its own calls touch; a page another writer of the
 //! same pool flags is that writer's business.
+//!
+//! # Latches
+//!
+//! A walk pins its pages in the order of the buffer pool ([`super::buffer`], "Latches"):
+//! **parent before child** on the way down, one page at a time, and left before right in a
+//! split, which holds the page it splits while it fills the fresh page to its right, then lets
+//! it go before it reaches the leaf beyond. A change reads the page it changes inside the
+//! closure it hands to [`super::buffer::PinGuard::with_page_mut`] — the place of an entry is
+//! computed there, and [`BTree::delete`] compares the entry there — so a change that waited
+//! for a latch works on the page as it stands when the wait ends.
+//!
+//! Two writers of one tree are serialised by the lock of their table
+//! ([`super::DiskStorage::with_rows`]): the root a split moves is written back to the catalogue
+//! inside that section, so the next writer opens the tree at its root
+//! (`concurrency::eight_writers_leave_valid_trees`).
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -1955,5 +1970,8 @@ fn upper_probe(bound: &Bound<Vec<Value>>) -> Probe {
     }
 }
 
+#[cfg(test)]
+#[path = "btree/tests/concurrency.rs"]
+mod concurrency;
 #[cfg(test)]
 mod tests;

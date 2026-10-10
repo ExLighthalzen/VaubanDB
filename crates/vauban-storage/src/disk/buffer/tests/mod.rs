@@ -339,6 +339,115 @@ fn two_pins_of_one_page_are_counted_and_refuse_a_change() {
     pool.pin(PageId(1)).expect("pin page 1");
 }
 
+/// How long the tests below give a thread to reach the point they wait for. The assertions do
+/// not depend on it: it only makes the interleaving they describe the likely one.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[test]
+fn a_change_waits_for_the_pin_of_another_thread() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_dir, _file, pool) = fixture("change-waits", 1, 1, Lsn(u64::MAX));
+    let released = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reader = pool.pin(PageId(0)).expect("pin page 0 for the reader");
+        let changer = scope.spawn(|| {
+            let pin = pool.pin(PageId(0)).expect("pin page 0 for the changer");
+            pin.with_page_mut(|page| {
+                assert!(
+                    released.load(Ordering::SeqCst),
+                    "the change ran while the reader still held its pin"
+                );
+                page.0[MARK] = 7;
+            })
+        });
+        std::thread::sleep(SETTLE);
+        reader
+            .with_page(|page| assert_eq!(page.0[MARK], 0, "the change has not run"))
+            .expect("the reader reads its page");
+        released.store(true, Ordering::SeqCst);
+        drop(reader);
+        changer
+            .join()
+            .expect("the changer thread")
+            .expect("the change waits instead of failing");
+    });
+    let pin = pool.pin(PageId(0)).expect("pin page 0 again");
+    assert_eq!(pin.with_page(|page| page.0[MARK]).expect("read"), 7);
+}
+
+#[test]
+fn two_changers_holding_a_pin_each_do_not_wait_for_each_other() {
+    let (_dir, _file, pool) = fixture("two-changers", 1, 1, Lsn(u64::MAX));
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let changers: Vec<_> = (0..2u8)
+            .map(|mark| {
+                let (pool, barrier) = (&pool, &barrier);
+                scope.spawn(move || {
+                    let pin = pool.pin(PageId(0)).expect("pin page 0");
+                    // Both pins are taken before either change is asked for.
+                    barrier.wait();
+                    pin.with_page_mut(|page| page.0[MARK + usize::from(mark)] = 1)
+                })
+            })
+            .collect();
+        for changer in changers {
+            changer
+                .join()
+                .expect("the changer thread")
+                .expect("the change goes through");
+        }
+    });
+    let pin = pool.pin(PageId(0)).expect("pin page 0 again");
+    assert_eq!(
+        pin.with_page(|page| [page.0[MARK], page.0[MARK + 1]])
+            .expect("read"),
+        [1, 1]
+    );
+}
+
+#[test]
+fn eight_threads_change_one_page_without_an_exclusive_pin_error() {
+    const THREADS: u32 = 8;
+    const ROUNDS: u32 = 2_000;
+    let (_dir, _file, pool) = fixture("eight-changers", 2, 2, Lsn(u64::MAX));
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let pool = &pool;
+            scope.spawn(move || {
+                for round in 0..ROUNDS {
+                    // Parent before child: page 0, then page 1 under it.
+                    let parent = pool.pin(PageId(0)).expect("pin page 0");
+                    let child = pool.pin(PageId(1)).expect("pin page 1");
+                    if (round + thread) % 3 == 0 {
+                        parent.with_page(|page| page.0[MARK]).expect("read page 0");
+                    }
+                    for pin in [&parent, &child] {
+                        pin.with_page_mut(|page| {
+                            let mut count = [0u8; 4];
+                            count.copy_from_slice(&page.0[MARK..MARK + 4]);
+                            let next = u32::from_le_bytes(count) + 1;
+                            page.0[MARK..MARK + 4].copy_from_slice(&next.to_le_bytes());
+                        })
+                        .unwrap_or_else(|err| panic!("thread {thread}, round {round}: {err}"));
+                    }
+                }
+            });
+        }
+    });
+    for id in [PageId(0), PageId(1)] {
+        let pin = pool.pin(id).expect("pin the page again");
+        let count = pin
+            .with_page(|page| {
+                let mut count = [0u8; 4];
+                count.copy_from_slice(&page.0[MARK..MARK + 4]);
+                u32::from_le_bytes(count)
+            })
+            .expect("read");
+        assert_eq!(count, THREADS * ROUNDS, "page {id}");
+    }
+}
+
 #[test]
 fn mark_dirty_needs_a_pinned_page() {
     let (_dir, file, pool) = fixture("mark-dirty", 1, 4, Lsn(u64::MAX));

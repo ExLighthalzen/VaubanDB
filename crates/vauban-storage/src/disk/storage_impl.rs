@@ -20,6 +20,25 @@
 //! [`Storage::rollback`] then walk the tables the transaction wrote in and let each of them
 //! drop its undo log or replay it backwards.
 //!
+//! # Locks
+//!
+//! Two locks guard the rows: the one of the catalogue ([`DiskStorage::lock_catalogue`]) and
+//! the one of the state of each table ([`DiskStorage::table_state`]), taken in that order,
+//! which is the order [`DiskStorage::create_index`] takes them in too.
+//!
+//! - A **write** ([`DiskStorage::with_rows`], and through it `insert`, `update`, `delete`,
+//!   `commit` and `rollback`) holds both for the whole call: it reads the entries of the table
+//!   and of its indexes, checks the `unique` indexes, writes the version, puts the maintenance
+//!   log in the trees of the indexes and writes back a root a split moved, as one section. A
+//!   second writer of the key waits for that section and then finds the entry of the first one
+//!   (`concurrent_inserts_of_one_key_let_one_through` in `tests/disk_concurrency.rs`), and the
+//!   roots it opens are the ones the first one left.
+//! - A **read** (`get`, `scan`, `seek`, `latest_version`) holds the catalogue while it reads
+//!   the entries and locks the table, then releases it.
+//!
+//! Inside a call, the pages are protected by the latches of the buffer pool
+//! ([`super::buffer`], "Latches").
+//!
 //! # Order of the checks of a write
 //!
 //! The preconditions of the store are reported **before** the uniqueness of an index, which is
@@ -55,7 +74,7 @@ use super::DiskStorage;
 pub(crate) use super::clustered::ClusteredTable;
 use super::heap::Heap;
 use super::index::{self, DiskIndex, IndexChange, VersionSource};
-use super::meta::{self, TableEntry};
+use super::meta::{self, Catalogue, IndexEntry, TableEntry};
 use super::version::{HeapTable, TableState};
 use crate::{
     DbId, Direction, IndexId, IndexShape, KeyRange, Row, RowId, RowIter, SavepointId, Snapshot,
@@ -218,14 +237,22 @@ impl Store<'_> {
     }
 }
 
+/// What a call left of the shape of a table: its next [`RowId`] and the roots of its two trees,
+/// `(None, None)` on a heap.
+type ShapeAfter = (u64, (Option<super::PageId>, Option<super::PageId>));
+
 impl DiskStorage {
-    /// Runs `f` on the store of `table`, the state of that table locked for the call.
+    /// Runs `f` on the store of `table` as a write: the lock of the catalogue, then the state
+    /// of that table, both held for the whole call.
     ///
     /// The state is moved into the store at the entry and moved back out at the return,
     /// whether `f` answered `Ok` or `Err`: the counters and the undo logs of a refused write
     /// stay where they were, and the identifiers a refused write took are not handed out again
-    /// (`super::version::HeapTable::insert`). The lock of the cell is what serialises two
-    /// calls on one table; two calls on two tables take two different cells.
+    /// (`super::version::HeapTable::insert`).
+    ///
+    /// The catalogue entry is read under the lock the call holds to its end, so the roots the
+    /// store opens are the ones the previous writer left, and a split that moves one is written
+    /// back before the next caller reads it (module documentation, "Locks").
     ///
     /// The state of a table is rebuilt from what the recovery of the `open` found the first
     /// time it is reached ([`super::recover::Recovery`]).
@@ -239,49 +266,87 @@ impl DiskStorage {
         table: TableId,
         f: impl FnOnce(&mut Store<'_>) -> SqlResult<R>,
     ) -> SqlResult<R> {
-        let entry = self.table_entry(table)?;
+        let mut catalogue = self.lock_catalogue()?;
+        let entry = self.entry_in(&catalogue, table)?;
         let (outcome, after) = self.with_rows_of(&entry, f)?;
-        self.note_table_shape(&entry, after)?;
+        note_table_shape(&mut catalogue, &entry, after);
+        outcome
+    }
+
+    /// Runs `f` on the store of the table `pick` names, as a read: the catalogue is held while
+    /// `pick` reads it and until the state of the table is locked, then released.
+    ///
+    /// A writer holds the catalogue for the whole of its call ([`DiskStorage::with_rows`]), so
+    /// the entries `pick` reads are the ones the last writer left, and no writer starts between
+    /// that read and the lock of the table. Releasing the catalogue once the table is locked is
+    /// what lets reads of two tables, and a read of one beside a write of another, go on at the
+    /// same time.
+    ///
+    /// # Errors
+    ///
+    /// Those of `pick`, of [`DiskStorage::with_rows_of`] and of `f`.
+    fn read_rows<X, R>(
+        &self,
+        pick: impl FnOnce(&Catalogue) -> Result<(TableEntry, X), InternalError>,
+        f: impl FnOnce(&mut Store<'_>, X) -> SqlResult<R>,
+    ) -> SqlResult<R> {
+        let catalogue = self.lock_catalogue()?;
+        let (entry, picked) = pick(&catalogue)?;
+        let cell = self.table_state(entry.table);
+        let mut guard = lock_state(&cell);
+        drop(catalogue);
+        let (outcome, after) = self.run_on_state(&entry, &mut guard, |store| f(store, picked))?;
+        drop(guard);
+        if shape_changed(&entry, after) {
+            note_table_shape(&mut *self.lock_catalogue()?, &entry, after);
+        }
         outcome
     }
 
     /// Runs `f` on the store of `entry` and answers what it said together with the counters
     /// the call left, without touching the catalogue.
     ///
-    /// The caller that already holds the lock of the catalogue goes through this one:
-    /// [`DiskStorage::create_index`] does, the lock of the catalogue being what serialises two
-    /// DDL statements, and [`std::sync::Mutex`] not being re-entrant.
+    /// The caller holds the lock of the catalogue: [`DiskStorage::create_index`] and
+    /// [`DiskStorage::with_rows`] do, and [`std::sync::Mutex`] is not re-entrant. The lock of
+    /// the table is taken here, under it.
     ///
     /// # Errors
     ///
     /// The errors of [`DiskStorage::store_of`] and of the rebuild; the error of `f` is handed
     /// back inside the answer, so that the state of the table is put back either way.
-    #[allow(clippy::type_complexity)]
     pub(crate) fn with_rows_of<R>(
         &self,
         entry: &TableEntry,
         f: impl FnOnce(&mut Store<'_>) -> SqlResult<R>,
-    ) -> SqlResult<(
-        SqlResult<R>,
-        (u64, (Option<super::PageId>, Option<super::PageId>)),
-    )> {
+    ) -> SqlResult<(SqlResult<R>, ShapeAfter)> {
         let cell = self.table_state(entry.table);
         let mut guard = lock_state(&cell);
-        let state = std::mem::take(&mut *guard);
-        let mut store = match self.store_of(entry, state) {
+        self.run_on_state(entry, &mut guard, f)
+    }
+
+    /// Runs `f` on the store of `entry` built around `state`, which the caller has locked, and
+    /// puts the state back, on an `Ok` of `f` as on an `Err`.
+    fn run_on_state<R>(
+        &self,
+        entry: &TableEntry,
+        state: &mut TableState,
+        f: impl FnOnce(&mut Store<'_>) -> SqlResult<R>,
+    ) -> SqlResult<(SqlResult<R>, ShapeAfter)> {
+        let taken = std::mem::take(state);
+        let mut store = match self.store_of(entry, taken) {
             Ok(store) => store,
             // The state was moved into the call: a failure hands it back and it goes into the
             // cell again, rather than leaving a `TableState::default()` there with the undo
             // logs and the `in_progress` pages of the table lost
             // (`super::tests::a_failed_store_of_leaves_the_state_of_the_table_in_place`).
-            Err((state, err)) => {
-                *guard = state;
+            Err((taken, err)) => {
+                *state = taken;
                 return Err(err.into());
             }
         };
         let outcome = self.resume(&mut store).and_then(|()| f(&mut store));
         let after = (store.next_row_id(), store.roots());
-        *guard = store.into_state();
+        *state = store.into_state();
         Ok((outcome, after))
     }
 
@@ -365,51 +430,14 @@ impl DiskStorage {
         Ok(())
     }
 
-    /// Writes back in the catalogue what a call changed of the shape of a table: the next
-    /// [`RowId`] and, when a split moved them, the roots of a clustered table.
-    ///
-    /// The entry in memory is the one the next call reads; the chain of meta pages takes it at
-    /// the next `commit` ([`Storage::commit`]), which has a journal record to hang the write
-    /// on.
-    fn note_table_shape(
-        &self,
-        entry: &TableEntry,
-        after: (u64, (Option<super::PageId>, Option<super::PageId>)),
-    ) -> SqlResult<()> {
-        let (next_row_id, (tree_root, directory_root)) = after;
-        let clustered = entry.shape.clustered_key.is_some();
-        let roots = if clustered {
-            (tree_root, directory_root)
-        } else {
-            (entry.tree_root, entry.directory_root)
-        };
-        if entry.next_row_id == next_row_id
-            && entry.tree_root == roots.0
-            && entry.directory_root == roots.1
-        {
-            return Ok(());
-        }
-        let mut catalogue = self.lock_catalogue()?;
-        if catalogue.table(entry.table).is_none() {
-            return Ok(());
-        }
-        catalogue.add_table(TableEntry {
-            next_row_id,
-            tree_root: roots.0,
-            directory_root: roots.1,
-            ..entry.clone()
-        });
-        Ok(())
-    }
-
-    /// The catalogue entry of `table`, cloned so that the lock of the catalogue is not held
-    /// while the rows are read or written.
+    /// The catalogue entry of `table`, cloned out of `catalogue` so that the lock of the
+    /// table may be taken without it.
     ///
     /// # Errors
     ///
     /// [`InternalError::Bug`] for a table the catalogue does not hold.
-    fn table_entry(&self, table: TableId) -> Result<TableEntry, InternalError> {
-        match self.lock_catalogue()?.table(table) {
+    fn entry_in(&self, catalogue: &Catalogue, table: TableId) -> Result<TableEntry, InternalError> {
+        match catalogue.table(table) {
             Some(entry) => Ok(entry.clone()),
             None => Err(InternalError::Bug(format!(
                 "table {table} is unknown to instance {}",
@@ -425,13 +453,14 @@ impl DiskStorage {
     /// An index that shares the tree of a clustered table has no tree of its own and is
     /// checked over the versions ([`index::check_duplicate_without_tree`]).
     ///
-    /// `indexes` is read by the caller before it takes the state of the table, so that the
-    /// lock of the catalogue is not taken under the lock of a table: [`DiskStorage::create_index`]
-    /// takes them the other way round, and taking both in both orders is how two threads stop.
+    /// The caller holds the catalogue and the table from the read of `indexes` until the write
+    /// has reached the trees of the indexes ([`DiskStorage::write_row`]): a second writer of
+    /// the key waits for that lock and then finds the entry of the first one in the tree it
+    /// reads (`concurrent_inserts_of_one_key_let_one_through` in `tests/disk_concurrency.rs`).
     fn check_unique(
         &self,
         entry: &TableEntry,
-        indexes: &[super::meta::IndexEntry],
+        indexes: &[IndexEntry],
         store: &Store<'_>,
         txn: TxnId,
         row: &Row,
@@ -459,11 +488,16 @@ impl DiskStorage {
         Ok(())
     }
 
-    /// Puts `changes` in the trees of the indexes of `table`, and writes a root a split moved
-    /// back in the catalogue.
+    /// Puts `changes` in the trees of the indexes of `table`, under the lock of the catalogue
+    /// and then the one of the table, and writes a root a split moved back in the catalogue.
     ///
-    /// An index that shares the tree of a clustered table takes nothing: the rows **are** its
-    /// entries.
+    /// This is the entry point of a caller that drained the maintenance log in an earlier call
+    /// ([`DiskStorage::rollback_to`], [`DiskStorage::vacuum`]); a write of this file applies its
+    /// changes inside its own call ([`DiskStorage::apply_index_changes`]).
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Bug`] for a table the catalogue does not hold; the errors of the trees.
     pub(crate) fn maintain_indexes(
         &self,
         table: TableId,
@@ -472,16 +506,39 @@ impl DiskStorage {
         if changes.is_empty() {
             return Ok(());
         }
-        let shape = self.table_entry(table)?.shape;
-        for entry in self.index_entries(table)? {
+        let mut catalogue = self.lock_catalogue()?;
+        let entry = self.entry_in(&catalogue, table)?;
+        let indexes = indexes_in(&catalogue, table);
+        let cell = self.table_state(table);
+        let _table = lock_state(&cell);
+        self.apply_index_changes(&mut catalogue, &entry.shape, &indexes, changes)
+    }
+
+    /// Puts `changes` in the trees of `indexes`, and writes a root a split moved back in
+    /// `catalogue`.
+    ///
+    /// The caller holds the catalogue and the table; it is what keeps two writers of one table
+    /// from walking one tree at the same time, and what keeps the root a split moves from being
+    /// read stale by the next writer. An index that shares the tree of a clustered table takes
+    /// nothing: the rows **are** its entries.
+    fn apply_index_changes(
+        &self,
+        catalogue: &mut Catalogue,
+        shape: &TableShape,
+        indexes: &[IndexEntry],
+        changes: &[IndexChange],
+    ) -> SqlResult<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        for entry in indexes {
             let Some(root) = entry.root else {
                 continue;
             };
-            let mut index = DiskIndex::open(self, entry.index, &entry.shape, root, &shape)?;
+            let mut index = DiskIndex::open(self, entry.index, &entry.shape, root, shape)?;
             index.apply(changes)?;
             if index.root() != root {
-                let mut catalogue = self.lock_catalogue()?;
-                catalogue.add_index(super::meta::IndexEntry {
+                catalogue.add_index(IndexEntry {
                     root: Some(index.root()),
                     ..entry.clone()
                 });
@@ -490,39 +547,33 @@ impl DiskStorage {
         Ok(())
     }
 
-    /// The catalogue entries of the indexes of `table`, cloned as [`DiskStorage::table_entry`]
-    /// clones its own.
-    fn index_entries(&self, table: TableId) -> Result<Vec<super::meta::IndexEntry>, InternalError> {
-        Ok(self
-            .lock_catalogue()?
-            .indexes_of(table)
-            .into_iter()
-            .cloned()
-            .collect())
-    }
-
-    /// Runs one write on `table` and the index maintenance that follows it.
+    /// Runs one write on `table` and the index maintenance that follows it, as one section.
     ///
-    /// The uniqueness of the `unique` indexes is checked before `write`, the maintenance log
-    /// drained after it: a 2601 leaves neither a version nor an entry, and a write that went
-    /// through reaches the trees of the indexes of its table before the call returns
-    /// (`super::tests::index_seek_on_clustered_table` reads a `seek` after an `insert` and
-    /// after an `update`).
+    /// The catalogue and the table are locked from the read of the indexes to the write of the
+    /// roots ([`DiskStorage::with_rows`]): the uniqueness of the `unique` indexes is checked
+    /// before `write`, and the maintenance log is drained into the trees after it, before a
+    /// second writer of the table may check its own key. A 2601 leaves neither a version nor an
+    /// entry, and a write that went through reaches the trees of the indexes of its table
+    /// before the call returns (`super::tests::index_seek_on_clustered_table` reads a `seek`
+    /// after an `insert` and after an `update`).
     fn write_row<R>(
         &self,
         table: TableId,
         check: Check<'_>,
         write: impl FnOnce(&mut Store<'_>) -> SqlResult<R>,
     ) -> SqlResult<R> {
-        let entry = self.table_entry(table)?;
-        let indexes = self.index_entries(table)?;
-        let (outcome, changes) = self.with_rows(table, |store| {
+        let mut catalogue = self.lock_catalogue()?;
+        let entry = self.entry_in(&catalogue, table)?;
+        let indexes = indexes_in(&catalogue, table);
+        let (outcome, after) = self.with_rows_of(&entry, |store| {
             check(self, &entry, &indexes, store)?;
             let outcome = write(store)?;
-            Ok((outcome, store.take_index_changes()))
+            let changes = store.take_index_changes();
+            self.apply_index_changes(&mut catalogue, &entry.shape, &indexes, &changes)?;
+            Ok(outcome)
         })?;
-        self.maintain_indexes(table, &changes)?;
-        Ok(outcome)
+        note_table_shape(&mut catalogue, &entry, after);
+        outcome
     }
 
     /// Writes the catalogue to its chain of meta pages at `lsn`, so that the roots a split
@@ -534,36 +585,85 @@ impl DiskStorage {
         Ok(())
     }
 
-    /// Ends `txn` with `kind` and applies that end to each table it wrote in.
+    /// Ends `txn` with `kind` and applies that end to each table it wrote in, the index
+    /// maintenance of each table inside the section of that table ([`DiskStorage::write_row`]).
     fn end_transaction(&self, txn: TxnId, kind: super::WalRecordKind) -> SqlResult<()> {
         let status = match kind {
             super::WalRecordKind::Abort => TxnStatus::Aborted,
             _ => TxnStatus::Committed,
         };
         let lsn = self.end_txn(txn, kind)?;
-        let mut changed: Vec<(TableId, Vec<IndexChange>)> = Vec::new();
         for table in self.txn_tables(txn) {
+            let mut catalogue = self.lock_catalogue()?;
             // A table the transaction wrote in and that was dropped since is left alone:
             // `drop_table` frees its pages and takes it out of the catalogue, and its
             // in-flight writes have nothing to finish in — the same answer
             // [`crate::MemoryStorage`] gives (`table_create_drop_and_ids_not_reused`).
-            if self.lock_catalogue()?.table(table).is_none() {
+            let Some(entry) = catalogue.table(table).cloned() else {
                 continue;
-            }
-            let changes = self.with_rows(table, |store| {
+            };
+            let indexes = indexes_in(&catalogue, table);
+            let (outcome, after) = self.with_rows_of(&entry, |store| {
                 store.finish(txn, status)?;
-                Ok(store.take_index_changes())
+                let changes = store.take_index_changes();
+                self.apply_index_changes(&mut catalogue, &entry.shape, &indexes, &changes)
             })?;
-            changed.push((table, changes));
-        }
-        for (table, changes) in changed {
-            self.maintain_indexes(table, &changes)?;
+            note_table_shape(&mut catalogue, &entry, after);
+            outcome?;
         }
         if let Some(lsn) = lsn {
             self.store_catalogue(lsn)?;
         }
         Ok(())
     }
+}
+
+/// The catalogue entries of the indexes of `table`, cloned out of `catalogue`.
+fn indexes_in(catalogue: &Catalogue, table: TableId) -> Vec<IndexEntry> {
+    catalogue.indexes_of(table).into_iter().cloned().collect()
+}
+
+/// Whether a call changed the next [`RowId`] or a root of the table `entry` describes.
+fn shape_changed(entry: &TableEntry, after: ShapeAfter) -> bool {
+    let (next_row_id, roots) = after;
+    next_row_id != entry.next_row_id
+        || (entry.shape.clustered_key.is_some() && roots != (entry.tree_root, entry.directory_root))
+}
+
+/// Writes back in `catalogue` what a call changed of the shape of a table: the next [`RowId`]
+/// and, when a split moved them, the roots of a clustered table.
+///
+/// The entry is merged with the one the catalogue holds now rather than written over it: the
+/// counter takes the greater of the two, and the roots are taken from the call when that call
+/// moved them and from the catalogue otherwise, so a read that wrote its counter back after a writer moved a root leaves that root in
+/// place. The chain of meta pages takes the entry at the next `commit` ([`Storage::commit`]),
+/// which has a journal record to hang the write on.
+fn note_table_shape(catalogue: &mut Catalogue, entry: &TableEntry, after: ShapeAfter) {
+    let Some(current) = catalogue.table(entry.table) else {
+        return;
+    };
+    let (next_row_id, roots) = after;
+    let next_row_id = next_row_id.max(current.next_row_id);
+    let moved =
+        entry.shape.clustered_key.is_some() && roots != (entry.tree_root, entry.directory_root);
+    let (tree_root, directory_root) = if moved {
+        roots
+    } else {
+        (current.tree_root, current.directory_root)
+    };
+    if current.next_row_id == next_row_id
+        && current.tree_root == tree_root
+        && current.directory_root == directory_root
+    {
+        return;
+    }
+    let updated = TableEntry {
+        next_row_id,
+        tree_root,
+        directory_root,
+        ..current.clone()
+    };
+    catalogue.add_table(updated);
 }
 
 /// What [`DiskStorage::write_row`] runs before the write it guards: the preconditions of the
@@ -654,11 +754,17 @@ impl Storage for DiskStorage {
     }
 
     fn get(&self, snap: &Snapshot, table: TableId, id: RowId) -> SqlResult<Option<Row>> {
-        self.with_rows(table, |store| Ok(store.get(snap, id)?))
+        self.read_rows(
+            |catalogue| Ok((self.entry_in(catalogue, table)?, ())),
+            |store, ()| Ok(store.get(snap, id)?),
+        )
     }
 
     fn scan(&self, snap: &Snapshot, table: TableId) -> SqlResult<Box<dyn RowIter + '_>> {
-        let rows = self.with_rows(table, |store| Ok(store.scan(snap)?))?;
+        let rows = self.read_rows(
+            |catalogue| Ok((self.entry_in(catalogue, table)?, ())),
+            |store, ()| Ok(store.scan(snap)?),
+        )?;
         Ok(iter(rows))
     }
 
@@ -669,18 +775,20 @@ impl Storage for DiskStorage {
         range: &KeyRange,
         dir: Direction,
     ) -> SqlResult<Box<dyn RowIter + '_>> {
-        let entry = match self.lock_catalogue()?.index(index) {
-            Some(entry) => entry.clone(),
-            None => {
-                return Err(InternalError::Bug(format!(
-                    "index {index} is unknown to instance {}",
-                    self.dir.display()
-                ))
-                .into());
+        // The entry of the index is read under the same lock of the catalogue as the one of
+        // its table, so its root is the one the last writer left.
+        let pick = |catalogue: &Catalogue| match catalogue.index(index) {
+            Some(entry) => {
+                let table = self.entry_in(catalogue, entry.table)?;
+                let shape = table.shape.clone();
+                Ok((table, (entry.clone(), shape)))
             }
+            None => Err(InternalError::Bug(format!(
+                "index {index} is unknown to instance {}",
+                self.dir.display()
+            ))),
         };
-        let shape = self.table_entry(entry.table)?.shape;
-        let rows = self.with_rows(entry.table, |store| match entry.root {
+        let rows = self.read_rows(pick, |store, (entry, shape)| match entry.root {
             Some(root) => {
                 let tree = DiskIndex::open(self, index, &entry.shape, root, &shape)?;
                 tree.seek(store.source(), snap, range, dir)
@@ -699,7 +807,10 @@ impl Storage for DiskStorage {
     }
 
     fn latest_version(&self, table: TableId, id: RowId) -> SqlResult<Option<(TxnId, Row)>> {
-        self.with_rows(table, |store| Ok(store.latest_version(id)?))
+        self.read_rows(
+            |catalogue| Ok((self.entry_in(catalogue, table)?, ())),
+            |store, ()| Ok(store.latest_version(id)?),
+        )
     }
 
     fn commit(&self, txn: TxnId) -> SqlResult<()> {

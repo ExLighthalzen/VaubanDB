@@ -10,6 +10,34 @@
 //! [`PinGuard`] does *not* hold that lock, so a caller may hold two pins at once (the heap
 //! pins two pages).
 //!
+//! # Latches
+//!
+//! Each frame carries a read/write latch, and the pin is its read side: a [`PinGuard`] keeps
+//! the bytes of its page from being changed under it by another thread. The write side is
+//! taken by [`PinGuard::with_page_mut`] for the length of the change: it **waits** until the
+//! pins other threads hold on the page are released, then changes the bytes with the lock of
+//! the pool held, so a reader does not see half of a change
+//! (`tests::a_change_waits_for_the_pin_of_another_thread`).
+//!
+//! Two pins are not waited for. The pins of the calling thread: nothing would release them
+//! while it waits, so a second pin of the caller on the page it changes is
+//! [`InternalError::Bug`]. And the pins of a thread that is itself waiting in
+//! [`PinGuard::with_page_mut`], on this page or another: that thread reads nothing while it
+//! waits, and waiting for it would let two changers wait for each other
+//! (`tests::two_changers_holding_a_pin_each_do_not_wait_for_each_other`). A wait therefore
+//! ends once the threads it waits for, which are running, drop their pins
+//! (`tests::eight_threads_change_one_page_without_an_exclusive_pin_error`). The price is on
+//! the caller: what a changer read before its call may have been changed by the time its
+//! closure runs, so the closure reads the page again rather than trusting an earlier read,
+//! which is what the B+tree does ([`super::btree`]).
+//!
+//! Order of acquisition: a thread that holds pins on several pages took them **parent before
+//! child**, and left before right among the pages of one level, the order a descent of a
+//! B+tree and a split walk in ([`super::btree`]). Two writers of one table do not meet on a
+//! page: the lock of the table ([`super::DiskStorage::with_rows`]) serialises them, and the
+//! latches are what keeps a page consistent for a reader that holds a pin and for the pages
+//! several calls reach.
+//!
 //! # No-steal
 //!
 //! A dirty page whose transaction is still running (`in_progress`) is neither written nor
@@ -31,7 +59,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{self, ThreadId};
 
 use vauban_errors::InternalError;
 
@@ -73,6 +102,10 @@ struct Frame {
     page: Page,
     /// Number of live [`PinGuard`]s on this frame. A frame with a pin is not a victim.
     pins: u32,
+    /// The threads that hold those pins, each with its count: the read side of the latch of
+    /// the frame, which [`PinGuard::with_page_mut`] reads to tell the pins it waits for from
+    /// the pins of its own thread.
+    holders: Vec<(ThreadId, u32)>,
     /// The cached bytes differ from those of the file.
     dirty: bool,
     /// A transaction that has not finished changed this page. Under no-steal such a page is
@@ -91,6 +124,7 @@ impl fmt::Debug for Frame {
             .field("id", &self.id)
             .field("page_lsn", &self.page.lsn())
             .field("pins", &self.pins)
+            .field("holders", &self.holders.len())
             .field("dirty", &self.dirty)
             .field("in_progress", &self.in_progress)
             .field("referenced", &self.referenced)
@@ -99,16 +133,47 @@ impl fmt::Debug for Frame {
 }
 
 impl Frame {
-    /// A frame just filled by a read: pinned once, clean, not in progress, referenced.
-    fn loaded(id: PageId, page: Page) -> Self {
+    /// A frame just filled by a read: pinned once by `owner`, clean, not in progress,
+    /// referenced.
+    fn loaded(id: PageId, page: Page, owner: ThreadId) -> Self {
         Self {
             id,
             page,
             pins: 1,
+            holders: vec![(owner, 1)],
             dirty: false,
             in_progress: false,
             referenced: true,
         }
+    }
+
+    /// Counts one more pin, held by `owner`.
+    fn add_pin(&mut self, owner: ThreadId) {
+        self.pins = self.pins.saturating_add(1);
+        match self.holders.iter_mut().find(|(thread, _)| *thread == owner) {
+            Some((_, count)) => *count = count.saturating_add(1),
+            None => self.holders.push((owner, 1)),
+        }
+    }
+
+    /// Counts one pin of `owner` less.
+    fn remove_pin(&mut self, owner: ThreadId) {
+        self.pins = self.pins.saturating_sub(1);
+        if let Some(at) = self.holders.iter().position(|(thread, _)| *thread == owner) {
+            let count = &mut self.holders[at].1;
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.holders.swap_remove(at);
+            }
+        }
+    }
+
+    /// Number of pins `owner` holds on this frame.
+    fn pins_of(&self, owner: ThreadId) -> u32 {
+        self.holders
+            .iter()
+            .find(|(thread, _)| *thread == owner)
+            .map_or(0, |(_, count)| *count)
     }
 }
 
@@ -123,6 +188,9 @@ struct Inner {
     by_page: HashMap<PageId, usize>,
     /// Hand of the clock: the next frame it looks at.
     hand: usize,
+    /// The threads waiting in [`PinGuard::with_page_mut`], whose pins a change does not wait
+    /// for.
+    waiting: Vec<ThreadId>,
 }
 
 impl Inner {
@@ -130,6 +198,16 @@ impl Inner {
     ///
     /// A slot comes from `by_page` or from the clock, so it is in range at the call sites of
     /// this file; the error is what a later change would meet instead of an indexing panic.
+    fn frame(&self, slot: usize) -> Result<&Frame, InternalError> {
+        let held = self.frames.len();
+        self.frames.get(slot).ok_or_else(|| {
+            InternalError::Bug(format!(
+                "buffer pool asked for frame {slot} while it holds {held}"
+            ))
+        })
+    }
+
+    /// The frame at `slot`, to change it; the error of [`Inner::frame`].
     fn frame_mut(&mut self, slot: usize) -> Result<&mut Frame, InternalError> {
         let held = self.frames.len();
         self.frames.get_mut(slot).ok_or_else(|| {
@@ -146,8 +224,9 @@ impl Inner {
 ///
 /// [`BufferPool::pin`] answers a [`PinGuard`]: the page is in the cache and stays in its frame
 /// until the last guard on it is dropped. [`PinGuard::with_page`] reads its bytes,
-/// [`PinGuard::with_page_mut`] changes them, and asks for an exclusive pin. Changing bytes does not make the page dirty: the caller then
-/// calls [`BufferPool::mark_dirty`] with the LSN of the journal record that describes the
+/// [`PinGuard::with_page_mut`] changes them, waiting for the pins of the other threads to go
+/// (module documentation, "Latches"). Changing bytes does not make the page dirty: the caller
+/// then calls [`BufferPool::mark_dirty`] with the LSN of the journal record that describes the
 /// change, which is what ties the page to the log.
 ///
 /// Dropping the last guard does not write the page. The pool writes a dirty page at three
@@ -163,7 +242,8 @@ impl Inner {
 ///
 /// # Locking
 ///
-/// One `Mutex` around [`Inner`], taken again at each `pin`, `with_page`, `with_page_mut`,
+/// One `Mutex` around [`Inner`], and one [`Condvar`] a change waits on for the pins of the
+/// other threads to go. The lock is taken again at each `pin`, `with_page`, `with_page_mut`,
 /// `mark_dirty`, `set_in_progress`, `flush`, `flush_all` and drop of a guard. A poisoned lock
 /// is [`InternalError::Corruption`] "buffer pool lock poisoned", as in `MemoryStorage`, and
 /// the drop of a [`PinGuard`] that meets it leaves the pin count as it stands: the pool of
@@ -180,6 +260,8 @@ pub(crate) struct BufferPool {
     durable: Arc<dyn DurableLsn>,
     /// Frames and their index, behind one lock.
     inner: Mutex<Inner>,
+    /// Notified when a pin is released on a frame a change waits on.
+    unpinned: Condvar,
 }
 
 /// Checks the `buffer_pages` option before anything is created.
@@ -219,7 +301,9 @@ impl BufferPool {
                 frames: Vec::new(),
                 by_page: HashMap::new(),
                 hand: 0,
+                waiting: Vec::new(),
             }),
+            unpinned: Condvar::new(),
         })
     }
 
@@ -249,12 +333,17 @@ impl BufferPool {
     /// does not write a dirty page of a transaction in progress.
     #[must_use = "dropping the guard immediately unpins the page"]
     pub(crate) fn pin(&self, id: PageId) -> Result<PinGuard<'_>, InternalError> {
+        let owner = thread::current().id();
         let mut inner = self.lock()?;
         if let Some(&slot) = inner.by_page.get(&id) {
             let frame = inner.frame_mut(slot)?;
-            frame.pins = frame.pins.saturating_add(1);
+            frame.add_pin(owner);
             frame.referenced = true;
-            return Ok(PinGuard { pool: self, id });
+            return Ok(PinGuard {
+                pool: self,
+                id,
+                owner,
+            });
         }
 
         let page = self.file.read_page(id)?;
@@ -267,19 +356,23 @@ impl BufferPool {
         }
 
         let slot = if inner.frames.len() < self.capacity {
-            inner.frames.push(Frame::loaded(id, page));
+            inner.frames.push(Frame::loaded(id, page, owner));
             inner.frames.len() - 1
         } else {
             let victim = self.choose_victim(&mut inner, id)?;
             self.write_if_needed(&mut inner, victim)?;
             let evicted = inner.frame_mut(victim)?;
             let evicted_id = evicted.id;
-            *evicted = Frame::loaded(id, page);
+            *evicted = Frame::loaded(id, page, owner);
             inner.by_page.remove(&evicted_id);
             victim
         };
         inner.by_page.insert(id, slot);
-        Ok(PinGuard { pool: self, id })
+        Ok(PinGuard {
+            pool: self,
+            id,
+            owner,
+        })
     }
 
     /// Marks the page `id` dirty and ties it to the journal record of LSN `rec_lsn`.
@@ -481,6 +574,8 @@ pub(crate) struct PinGuard<'pool> {
     pool: &'pool BufferPool,
     /// The page that is pinned.
     id: PageId,
+    /// The thread that took the pin, whose count the drop decrements.
+    owner: ThreadId,
 }
 
 impl fmt::Debug for PinGuard<'_> {
@@ -510,7 +605,12 @@ impl PinGuard<'_> {
         Ok(read(&inner.frame_mut(slot)?.page))
     }
 
-    /// Applies `change` to the cached page.
+    /// Applies `change` to the cached page, once the other threads that read it have let it go.
+    ///
+    /// This is the write side of the latch of the frame (module documentation, "Latches"):
+    /// while threads other than the caller hold a pin on the page, and are not themselves
+    /// waiting here, the call waits for them to release it, then applies `change` with the lock
+    /// of the pool held (`tests::a_change_waits_for_the_pin_of_another_thread`).
     ///
     /// The change does not make the page dirty: the caller calls
     /// [`BufferPool::mark_dirty`] with the LSN of the journal record that describes it. A page
@@ -519,23 +619,67 @@ impl PinGuard<'_> {
     ///
     /// # Errors
     ///
-    /// [`InternalError::Bug`] when the page carries more than one pin: two callers holding
-    /// the same page may read it together, changing it asks for the only pin on it.
+    /// [`InternalError::Bug`] when the calling thread holds another pin on the page: nothing
+    /// would release it while the call waits
+    /// (`tests::two_pins_of_one_page_are_counted_and_refuse_a_change`).
     /// [`InternalError::Corruption`] for a poisoned lock.
     pub(crate) fn with_page_mut<R>(
         &self,
         change: impl FnOnce(&mut Page) -> R,
     ) -> Result<R, InternalError> {
         let mut inner = self.pool.lock()?;
-        let slot = self.slot(&inner)?;
-        let frame = inner.frame_mut(slot)?;
-        if frame.pins != 1 {
-            return Err(InternalError::Bug(format!(
-                "page {} carries {} pins; changing it asks for an exclusive pin",
-                self.id, frame.pins
-            )));
+        let mut registered = false;
+        loop {
+            let (mine, others) = match self.slot(&inner).and_then(|slot| inner.frame(slot)) {
+                Ok(frame) => (
+                    frame.pins_of(self.owner),
+                    frame
+                        .holders
+                        .iter()
+                        .filter(|(thread, _)| {
+                            *thread != self.owner && !inner.waiting.contains(thread)
+                        })
+                        .map(|(_, count)| *count)
+                        .sum::<u32>(),
+                ),
+                Err(err) => {
+                    self.stop_waiting(&mut inner, registered);
+                    return Err(err);
+                }
+            };
+            if mine > 1 {
+                self.stop_waiting(&mut inner, registered);
+                return Err(InternalError::Bug(format!(
+                    "page {} carries {mine} pins of the calling thread; changing it asks for \
+                     one pin of that thread, since the others would not be released while it \
+                     waits",
+                    self.id
+                )));
+            }
+            if others == 0 {
+                self.stop_waiting(&mut inner, registered);
+                let slot = self.slot(&inner)?;
+                return Ok(change(&mut inner.frame_mut(slot)?.page));
+            }
+            if !registered {
+                inner.waiting.push(self.owner);
+                registered = true;
+                // A thread that waits stops counting as a reader: a change that waited for its
+                // pins may go on now.
+                self.pool.unpinned.notify_all();
+            }
+            inner =
+                self.pool.unpinned.wait(inner).map_err(|_| {
+                    InternalError::Corruption("buffer pool lock poisoned".to_string())
+                })?;
         }
-        Ok(change(&mut frame.page))
+    }
+
+    /// Takes the calling thread out of the waiting list, if it `registered` there.
+    fn stop_waiting(&self, inner: &mut Inner, registered: bool) {
+        if registered {
+            inner.waiting.retain(|thread| *thread != self.owner);
+        }
     }
 
     /// The frame the pinned page sits in.
@@ -560,7 +704,10 @@ impl Drop for PinGuard<'_> {
             && let Some(&slot) = inner.by_page.get(&self.id)
             && let Ok(frame) = inner.frame_mut(slot)
         {
-            frame.pins = frame.pins.saturating_sub(1);
+            frame.remove_pin(self.owner);
+            if !inner.waiting.is_empty() {
+                self.pool.unpinned.notify_all();
+            }
         }
     }
 }
