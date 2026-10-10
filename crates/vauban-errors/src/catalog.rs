@@ -98,6 +98,14 @@ pub struct ErrorBehavior {
     /// scope (`xact_abort_stops_a_statement_scoped_runtime_error`), where this field
     /// says `false` too.
     pub xact_abort_widens: bool,
+    /// Whether the error rolls the open transaction back by itself, `SET XACT_ABORT OFF`
+    /// included: the victim of a deadlock (1205) loses its transaction and its writes, and
+    /// `@@TRANCOUNT` reads 0 afterwards (`vauban-session`, `tests/deadlock_victim.rs`). A
+    /// fatal error closes the connection, which rolls back on its own, so its default
+    /// leaves this to `false`. In the reference behaviour a `TRY…CATCH` dooms that
+    /// transaction instead, and the rollback comes when the batch ends; the session has no
+    /// `TRY…CATCH` yet.
+    pub rolls_back_transaction: bool,
 }
 
 /// An error that stops its statement while it runs: constraints, truncation, arithmetic.
@@ -106,6 +114,7 @@ const STATEMENT: ErrorBehavior = ErrorBehavior {
     phase: ErrorPhase::Execution,
     dooms_transaction: false,
     xact_abort_widens: true,
+    rolls_back_transaction: false,
 };
 
 /// A statement that fails to bind, at compilation or when the batch reaches it: a name it
@@ -117,6 +126,7 @@ const BINDING: ErrorBehavior = ErrorBehavior {
     phase: ErrorPhase::Compilation,
     dooms_transaction: false,
     xact_abort_widens: true,
+    rolls_back_transaction: false,
 };
 
 /// The default of severities 11 to 14 and 16 to 19. Entries of another severity carry it
@@ -128,6 +138,7 @@ const BATCH: ErrorBehavior = ErrorBehavior {
     phase: ErrorPhase::Execution,
     dooms_transaction: true,
     xact_abort_widens: true,
+    rolls_back_transaction: false,
 };
 
 impl ErrorBehavior {
@@ -153,18 +164,21 @@ impl ErrorBehavior {
                 phase: ErrorPhase::Execution,
                 dooms_transaction: false,
                 xact_abort_widens: false,
+                rolls_back_transaction: false,
             },
             15 => Self {
                 scope: ErrorScope::Level,
                 phase: ErrorPhase::Compilation,
                 dooms_transaction: false,
                 xact_abort_widens: false,
+                rolls_back_transaction: false,
             },
             20.. => Self {
                 scope: ErrorScope::Connection,
                 phase: ErrorPhase::Execution,
                 dooms_transaction: true,
                 xact_abort_widens: true,
+                rolls_back_transaction: false,
             },
             _ => BATCH,
         }
@@ -838,13 +852,21 @@ const CATALOG: &[ErrorDef] = &[
         number: 1205,
         severity: 13,
         template: "Process %d was chosen as the victim of a deadlock on %.*ls resources; run the transaction again.",
-        exception: None,
+        // The victim of a deadlock: its batch stops, with the procedures and dynamic texts
+        // it called, and its transaction is rolled back under `XACT_ABORT OFF` as under `ON`.
+        exception: Some(ErrorBehavior {
+            rolls_back_transaction: true,
+            ..BATCH
+        }),
     },
     ErrorDef {
         number: 1222,
         severity: 16,
         template: "The lock could not be acquired before the timeout.",
-        exception: None,
+        // A wait for a lock that ran out of time stops its statement; the transaction stays
+        // open and committable: `BEGIN TRAN; UPDATE t1 WITH (NOWAIT) SET v = 1; SELECT
+        // @@TRANCOUNT;` answers 1 while another transaction holds the row.
+        exception: Some(STATEMENT),
     },
     ErrorDef {
         number: 1750,

@@ -423,6 +423,7 @@ fn default_behaviour_follows_the_severity() {
         assert_eq!(run_time.scope, ErrorScope::Batch, "severity {severity}");
         assert_eq!(run_time.phase, ErrorPhase::Execution, "severity {severity}");
         assert!(run_time.dooms_transaction && run_time.xact_abort_widens);
+        assert!(!run_time.rolls_back_transaction, "severity {severity}");
     }
 
     for severity in [20, 25] {
@@ -465,7 +466,8 @@ fn an_uncatalogued_number_stops_the_batch() {
 }
 
 /// Scope, phase, transaction doomed under `TRY…CATCH`, widened by `XACT_ABORT ON`, for the
-/// errors whose behaviour applications rely on.
+/// errors whose behaviour applications rely on. Of these, 1205 alone rolls the transaction
+/// back by itself.
 #[test]
 fn known_errors_carry_their_behaviour() {
     use ErrorPhase::{Compilation, Execution};
@@ -500,6 +502,7 @@ fn known_errors_carry_their_behaviour() {
         (2812, Statement, Execution, false, true),
         (8134, Statement, Execution, false, true),
         (3701, Statement, Execution, false, false),
+        (1222, Statement, Execution, false, true),
         (266, Statement, Execution, true, false),
         // The batch stops.
         (127, Batch, Execution, false, true),
@@ -521,6 +524,7 @@ fn known_errors_carry_their_behaviour() {
                 phase,
                 dooms_transaction: dooms,
                 xact_abort_widens: widens,
+                rolls_back_transaction: number == 1205,
             },
             "error {number}"
         );
@@ -538,8 +542,8 @@ fn statement_scoped_entries() {
     assert_eq!(
         statement,
         [
-            220, 232, 237, 242, 244, 248, 266, 506, 512, 515, 517, 535, 536, 537, 544, 547, 2601,
-            2627, 2628, 2812, 3623, 3701, 8115, 8134, 8152, 9806, 9807, 9809, 9810,
+            220, 232, 237, 242, 244, 248, 266, 506, 512, 515, 517, 535, 536, 537, 544, 547, 1222,
+            2601, 2627, 2628, 2812, 3623, 3701, 8115, 8134, 8152, 9806, 9807, 9809, 9810,
         ]
     );
 }
@@ -557,4 +561,16 @@ fn an_exception_differs_from_the_default_of_its_severity() {
             );
         }
     }
+}
+
+/// The entries that roll the open transaction back by themselves, `XACT_ABORT OFF` included.
+#[test]
+fn the_deadlock_victim_alone_rolls_its_transaction_back() {
+    let rolling: Vec<u32> = CATALOG
+        .iter()
+        .filter(|def| def.behavior().rolls_back_transaction)
+        .map(|def| def.number)
+        .collect();
+    assert_eq!(rolling, [1205]);
+    assert!(!error_behavior(1222).rolls_back_transaction);
 }

@@ -241,6 +241,32 @@ pub(crate) fn end_of_batch(state: &SessionState, sink: &mut dyn ResultSink) -> S
     Ok(())
 }
 
+/// Rolls back the session transaction after an error whose catalogue entry says so
+/// ([`vauban_errors::ErrorBehavior::rolls_back_transaction`], the victim of a deadlock), and
+/// announces it with the ENVCHANGE of type 10, which follows the ERROR token of that error.
+/// The writes of the transaction are undone and `@@TRANCOUNT` reads 0 afterwards
+/// (`tests/deadlock_victim.rs`). Nothing is sent when no transaction is open: an autocommit
+/// statement was rolled back by [`finish_statement`], and `XACT_ABORT ON` by the executor.
+pub(crate) fn roll_back_after_error(
+    state: &mut SessionState,
+    engine: &Engine,
+    exec: &mut ExecSession,
+    sink: &mut dyn ResultSink,
+) -> SqlResult<()> {
+    exec.txn = None;
+    exec.trancount = 0;
+    exec.stmt_savepoint = None;
+    exec.savepoints.clear();
+    let Some(txn) = state.txn.take() else {
+        state.trancount = 0;
+        return Ok(());
+    };
+    state.trancount = 0;
+    state.transaction_descriptor = 0;
+    engine.txn.rollback(txn.handle)?;
+    sink.env_change(&EnvChange::RollbackTransaction(txn.descriptor))
+}
+
 /// Rolls back the session transaction, for a connection that ends.
 pub(crate) fn rollback_all(state: &mut SessionState, engine: &Engine) -> SqlResult<()> {
     if let Some(txn) = state.txn.take() {

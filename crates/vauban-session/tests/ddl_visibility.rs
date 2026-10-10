@@ -291,8 +291,9 @@ fn names(events: &[Event]) -> Vec<String> {
 }
 
 /// A creates `p`, B creates `q`, then each creates the other's name: the two waits cross,
-/// one of them is chosen as the deadlock victim (1205), and the other answers 2714 rather
-/// than a second table of the name. Both commit; `sys.tables` holds each name once.
+/// one of them is chosen as the deadlock victim (1205) and its transaction is rolled back,
+/// with the table it created, so the other creates both names without an error. Both
+/// sessions then commit what they still hold; `sys.tables` holds each name once.
 #[test]
 fn a_crossed_create_deadlock_leaves_one_table_per_name() {
     let engine = engine();
@@ -313,12 +314,14 @@ fn a_crossed_create_deadlock_leaves_one_table_per_name() {
     );
     let b_events = run_on(&mut b, "CREATE TABLE dbo.p (a int);");
     let (mut a, a_events) = crossing.join().expect("thread of A");
-    let mut answered = [errors(&a_events), errors(&b_events)].concat();
-    answered.sort_unstable();
+    let answered = [errors(&a_events), errors(&b_events)].concat();
+    assert_eq!(answered, vec![1205], "A: {a_events:#?}, B: {b_events:#?}");
+    let victim_is_a = errors(&a_events) == [1205];
+    let victim = if victim_is_a { &mut a } else { &mut b };
     assert_eq!(
-        answered,
-        vec![1205, 2714],
-        "A: {a_events:#?}, B: {b_events:#?}"
+        ints(&run(victim, "SELECT @@TRANCOUNT;")),
+        vec![0],
+        "the victim's transaction is rolled back"
     );
 
     for session in [&mut a, &mut b] {

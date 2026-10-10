@@ -192,7 +192,7 @@ use vauban_binder::{
     BatchVariables, BindContext, BoundExecute, BoundExpr, BoundStatement, OutputSchema,
 };
 use vauban_catalog::CatalogSnapshot;
-use vauban_errors::{ErrorScope, InfoMessage, InternalError, SqlError, SqlResult};
+use vauban_errors::{ErrorScope, InfoMessage, InternalError, SqlError, SqlResult, error_behavior};
 use vauban_executor::{
     Call, EnvironmentChange, ExecContext, ExecOutcome, ExecSession, Host, Program, ProgramEnd, Ran,
     Site, StatementSink, eval_expr,
@@ -1241,11 +1241,22 @@ impl Host for BatchHost<'_> {
     // The error goes to the client, and `@@ERROR` takes its number while `@@ROWCOUNT` goes
     // back to 0. In the batch its statement ends with a DONE. In a called level it ends with
     // a DONEINPROC when the level goes on after it, and with nothing when the error ends
-    // the level, whose end the call that opened it sends.
+    // the level, whose end the call that opened it sends. An error whose catalogue entry
+    // rolls the transaction back (the victim of a deadlock) does so here, after its ERROR
+    // token and before the DONE (`tests/deadlock_victim.rs`).
     fn raise(&mut self, err: &SqlError, reach: ErrorScope) -> SqlResult<()> {
         self.session.state.last_error = err.number;
         self.session.state.rowcount = self.refused_rowcount.take().unwrap_or(0);
         self.sink.error(err)?;
+        if error_behavior(err.number).rolls_back_transaction {
+            let session = &mut *self.session;
+            txn_session::roll_back_after_error(
+                &mut session.state,
+                &session.engine,
+                &mut session.exec,
+                &mut *self.sink,
+            )?;
+        }
         match self.level {
             Level::Batch => self.sink.done(None, true),
             Level::Called => {

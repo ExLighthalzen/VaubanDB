@@ -158,6 +158,15 @@ fn run_level(
         exec.nest_level = exec.nest_level.saturating_sub(1);
     }
     let mut level_state = std::mem::replace(session.state_mut(), caller_state);
+    // A transaction the called level closed is closed for its caller too: the victim of a
+    // deadlock inside `EXEC('…')` leaves its caller with `@@TRANCOUNT` at 0
+    // (`tests/deadlock_victim.rs`), not with the handle of a transaction already gone.
+    if level_state.txn.is_none() && session.state().txn.is_some() {
+        let caller = session.state_mut();
+        caller.txn = None;
+        caller.trancount = 0;
+        caller.transaction_descriptor = 0;
+    }
     let (mut end, track) = ran?;
     // A body refused before it ran leaves its error unsent for the program that called it
     // (`vauban_executor::ProgramEnd::Refused`); the text of an RPC has no such program, and
