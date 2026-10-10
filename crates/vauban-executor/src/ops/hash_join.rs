@@ -353,9 +353,11 @@ fn key_side_refs(expr: &BoundExpr, probe_width: usize) -> KeySideRefs {
 
 /// Pairs each equality as `(build-side, probe-side)` with indices relative to that row.
 ///
-/// The planner keeps the `ON` order `(left, right)` in join coordinates; the build input
-/// is the right operand and the probe input is the left one. A side that references both
-/// inputs, or neither, is not a hash key and stays in the residual predicate.
+/// The keys arrive in join coordinates, in either order; the build input is the right
+/// operand and the probe input is the left one. A member that references both inputs, or
+/// neither, and two members that reference the same input, make no hash key: the equality
+/// stays in the residual predicate, checked on the joined row
+/// (`tests/hash_join.rs`, `an_equality_between_two_probe_columns_stays_residual`).
 fn orient_hash_keys(
     left: &BoundExpr,
     right: &BoundExpr,
@@ -371,9 +373,6 @@ fn orient_hash_keys(
     if left_refs.probe_only() && right_refs.build_only() {
         Some((remap_for_build_side(right, probe_width), left.clone()))
     } else if left_refs.build_only() && right_refs.probe_only() {
-        Some((remap_for_build_side(left, probe_width), right.clone()))
-    } else if left_refs.probe_only() && right_refs.probe_only() {
-        // Unit plans may already carry build-local indices on the left operand.
         Some((remap_for_build_side(left, probe_width), right.clone()))
     } else {
         None

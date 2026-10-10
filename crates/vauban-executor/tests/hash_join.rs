@@ -209,6 +209,8 @@ impl DualFixture {
     }
 }
 
+/// A hash join of `probe` (the left operand) and `build` (the right one). The keys and the
+/// residual read the joined row: the probe columns first, then the build columns.
 fn hash_join_plan(
     build: PhysicalPlan,
     probe: PhysicalPlan,
@@ -270,7 +272,7 @@ fn hash_inner_equals_nested_loop() {
         f.build_scan(2),
         f.probe_scan(2),
         PhysicalJoinKind::Inner,
-        vec![(col(0), col(0))],
+        vec![(col(2), col(0))],
         None,
     );
 
@@ -312,7 +314,7 @@ fn hash_left_pads_the_other_side() {
         f.build_scan(1),
         f.probe_scan(1),
         PhysicalJoinKind::Left,
-        vec![(col(0), col(0))],
+        vec![(col(1), col(0))],
         None,
     );
 
@@ -336,7 +338,7 @@ fn hash_left_pads_the_other_side() {
         f.build_scan(1),
         f.probe_scan(1),
         PhysicalJoinKind::Inner,
-        vec![(col(0), col(0))],
+        vec![(col(1), col(0))],
         None,
     );
     let mut sink_inner = CollectSink::new();
@@ -365,7 +367,7 @@ fn null_key_never_matches() {
         f.build_scan(2),
         f.probe_scan(2),
         PhysicalJoinKind::Inner,
-        vec![(col(0), col(0))],
+        vec![(col(2), col(0))],
         None,
     );
 
@@ -378,7 +380,7 @@ fn null_key_never_matches() {
         f.build_scan(2),
         f.probe_scan(2),
         PhysicalJoinKind::Left,
-        vec![(col(0), col(0))],
+        vec![(col(2), col(0))],
         None,
     );
     let mut sink_left = CollectSink::new();
@@ -392,6 +394,59 @@ fn null_key_never_matches() {
     assert_eq!(null_rows.len(), 1, "one NULL probe row");
     assert_eq!(null_rows[0][2], Value::Null, "build side col0 is NULL");
     assert_eq!(null_rows[0][3], Value::Null, "build side col1 is NULL");
+}
+
+/// An equality whose two members read the probe row is no key: it is checked on the
+/// joined row. Read on the build row, `probe.c1` would be `build.c1`, which holds neither
+/// probe value.
+#[test]
+fn an_equality_between_two_probe_columns_stays_residual() {
+    let f = DualFixture::new(2, 2);
+    f.insert_build(&[1, 50]);
+    f.insert_build(&[2, 60]);
+    f.insert_probe(&[1, 1]);
+    f.insert_probe(&[2, 3]);
+
+    // Joined row: [probe.c0, probe.c1, build.c0, build.c1].
+    let keys = || vec![(col(2), col(0)), (col(1), col(0))];
+
+    let plan = hash_join_plan(
+        f.build_scan(2),
+        f.probe_scan(2),
+        PhysicalJoinKind::Inner,
+        keys(),
+        None,
+    );
+    let mut sink = CollectSink::new();
+    f.run(&plan, &mut sink);
+    assert_eq!(
+        sink.rows,
+        vec![vec![
+            Value::I32(1),
+            Value::I32(1),
+            Value::I32(1),
+            Value::I32(50)
+        ]]
+    );
+
+    let plan_left = hash_join_plan(
+        f.build_scan(2),
+        f.probe_scan(2),
+        PhysicalJoinKind::Left,
+        keys(),
+        None,
+    );
+    let mut sink_left = CollectSink::new();
+    f.run(&plan_left, &mut sink_left);
+    let mut rows = sink_left.rows.clone();
+    sort_i32_rows(&mut rows);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::I32(1), Value::I32(1), Value::I32(1), Value::I32(50)],
+            vec![Value::I32(2), Value::I32(3), Value::Null, Value::Null],
+        ]
+    );
 }
 
 /// Residual predicate filters after the key match.
@@ -428,7 +483,7 @@ fn residual_filters_after_the_key_match() {
         f.build_scan(2),
         f.probe_scan(1),
         PhysicalJoinKind::Inner,
-        vec![(col(0), col(0))],
+        vec![(col(1), col(0))],
         Some(residual),
     );
 
@@ -445,7 +500,7 @@ fn residual_filters_after_the_key_match() {
         f.build_scan(2),
         f.probe_scan(1),
         PhysicalJoinKind::Inner,
-        vec![(col(0), col(0))],
+        vec![(col(1), col(0))],
         None,
     );
     let mut sink2 = CollectSink::new();
@@ -465,7 +520,7 @@ fn duplicate_build_keys_multiply_rows() {
         f.build_scan(1),
         f.probe_scan(1),
         PhysicalJoinKind::Inner,
-        vec![(col(0), col(0))],
+        vec![(col(1), col(0))],
         None,
     );
 
@@ -485,7 +540,7 @@ fn full_hash_join_is_a_bug() {
         f.build_scan(1),
         f.probe_scan(1),
         PhysicalJoinKind::Full,
-        vec![(col(0), col(0))],
+        vec![(col(1), col(0))],
         None,
     );
     let result = build_operator(&plan);
@@ -514,7 +569,7 @@ fn cancel_stops_the_build() {
         f.build_scan(1),
         f.probe_scan(1),
         PhysicalJoinKind::Inner,
-        vec![(col(0), col(0))],
+        vec![(col(1), col(0))],
         None,
     );
 
@@ -608,7 +663,7 @@ fn case_insensitive_key_matches_under_the_default_collation() {
         build_scan,
         probe_scan,
         PhysicalJoinKind::Inner,
-        vec![(str_col(0), str_col(0))],
+        vec![(str_col(2), str_col(0))],
         None,
     );
 

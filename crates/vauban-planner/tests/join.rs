@@ -51,6 +51,15 @@ fn binding_b(name: &str, index: usize) -> ColumnBinding {
     }
 }
 
+/// A column of `b` as its scan reads it: `index` is its position in the row `storage`
+/// produces, not its position in the joined row.
+fn stored_b(name: &str, index: usize) -> ColumnBinding {
+    ColumnBinding {
+        index,
+        ..binding_b(name, index)
+    }
+}
+
 fn column_a(name: &str, index: usize) -> BoundExpr {
     BoundExpr {
         kind: BoundExprKind::ColumnRef(binding_a(name, index)),
@@ -139,7 +148,7 @@ fn scan_a() -> LogicalPlan {
 fn scan_b_with(hints: LockHints) -> LogicalPlan {
     LogicalPlan::Scan {
         table: TABLE_B,
-        columns: vec![binding_b("k", 0), binding_b("c", 1)],
+        columns: vec![stored_b("k", 0), stored_b("c", 1)],
         alias: "b".to_owned(),
         schema: schema_b(),
         hints,
@@ -565,4 +574,203 @@ fn a_join_without_equality_falls_back_to_the_loop() {
     };
     assert_eq!(*kind, PhysicalJoinKind::Inner);
     assert!(on.is_some(), "expected a remaining ON predicate");
+}
+
+/// `a.k + b.k`, typed `int`.
+fn plus(left: BoundExpr, right: BoundExpr) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Arith {
+            op: vauban_types::BinaryOp::Add,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+        ty: int_type(),
+        line: 1,
+    }
+}
+
+/// The debug text of `value`: the bound expressions do not implement `PartialEq`.
+fn debug(value: &impl std::fmt::Debug) -> String {
+    format!("{value:?}")
+}
+
+/// True when `plan` holds an `IndexSeek` anywhere below it.
+fn holds_a_seek(plan: &PhysicalPlan) -> bool {
+    explain(plan).contains("IndexSeek")
+}
+
+/// `b.k = b.k + a.k` with an index on `b.k`: the member facing `b.k` reads the inner row,
+/// so it cannot be the bound of a seek on that row; the equality stays on the join.
+#[test]
+fn a_seek_bound_that_reads_the_inner_row_is_no_seek() {
+    let catalog = FakeCatalog::new().with_index(
+        TABLE_B,
+        &[KeyColumn {
+            column: 0,
+            descending: false,
+        }],
+        true,
+    );
+    for kind in [JoinKind::Inner, JoinKind::Left] {
+        let on = compare(
+            CompareOp::Eq,
+            column_b("k", 0),
+            plus(column_b("k", 0), column_a("k", 0)),
+        );
+        let planned = plan_with(&catalog, join(kind, Some(on)));
+        assert!(!holds_a_seek(&planned), "no seek expected: {planned:?}");
+        match &planned {
+            PhysicalPlan::HashJoin { keys, residual, .. } => {
+                assert!(keys.is_empty(), "no key expected, got {keys:?}");
+                assert!(residual.is_some(), "the equality stays as residual");
+            }
+            PhysicalPlan::NestedLoopJoin { on, .. } => assert!(on.is_some()),
+            other => panic!("expected a join, got {other:?}"),
+        }
+    }
+}
+
+/// A bound that reads the outer row alone still drives the seek: `b.k = a.k + a.c`.
+#[test]
+fn a_seek_bound_that_reads_the_outer_row_alone_drives_the_seek() {
+    let catalog = FakeCatalog::new().with_index(
+        TABLE_B,
+        &[KeyColumn {
+            column: 0,
+            descending: false,
+        }],
+        true,
+    );
+    let on = compare(
+        CompareOp::Eq,
+        column_b("k", 0),
+        plus(column_a("k", 0), column_a("c", 1)),
+    );
+    let planned = plan_with(&catalog, join(JoinKind::Inner, Some(on)));
+    let PhysicalPlan::NestedLoopJoin { inner, on, .. } = &planned else {
+        panic!("expected a NestedLoopJoin, got {planned:?}")
+    };
+    assert!(on.is_none(), "the equality is consumed by the seek");
+    assert!(matches!(inner.as_ref(), PhysicalPlan::IndexSeek { .. }));
+}
+
+/// `a.k = a.c AND a.k = b.k` without an index: the first equality reads the outer row
+/// twice and stays residual; the second becomes the key, `b.k` (build) first.
+#[test]
+fn an_equality_between_two_outer_columns_is_residual() {
+    let catalog = FakeCatalog::new();
+    let planned = plan_with(
+        &catalog,
+        join(
+            JoinKind::Inner,
+            Some(and(
+                compare(CompareOp::Eq, column_a("k", 0), column_a("c", 1)),
+                compare(CompareOp::Eq, column_a("k", 0), column_b("k", 0)),
+            )),
+        ),
+    );
+    let PhysicalPlan::HashJoin { keys, residual, .. } = &planned else {
+        panic!("expected a HashJoin, got {planned:?}")
+    };
+    assert_eq!(
+        debug(keys),
+        debug(&vec![(column_b("k", 0), column_a("k", 0))])
+    );
+    assert_eq!(
+        debug(residual),
+        debug(&Some(compare(
+            CompareOp::Eq,
+            column_a("k", 0),
+            column_a("c", 1)
+        )))
+    );
+}
+
+/// `b.k = b.c AND a.k = b.k`: an equality between two inner columns stays residual too,
+/// and so does one whose member reads both rows.
+#[test]
+fn an_equality_between_two_inner_columns_or_both_rows_is_residual() {
+    let catalog = FakeCatalog::new();
+    for extra in [
+        compare(CompareOp::Eq, column_b("k", 0), column_b("c", 1)),
+        compare(
+            CompareOp::Eq,
+            plus(column_a("c", 1), column_b("c", 1)),
+            column_b("k", 0),
+        ),
+    ] {
+        let planned = plan_with(
+            &catalog,
+            join(
+                JoinKind::Inner,
+                Some(and(
+                    extra.clone(),
+                    compare(CompareOp::Eq, column_b("k", 0), column_a("k", 0)),
+                )),
+            ),
+        );
+        let PhysicalPlan::HashJoin { keys, residual, .. } = &planned else {
+            panic!("expected a HashJoin, got {planned:?}")
+        };
+        assert_eq!(
+            debug(keys),
+            debug(&vec![(column_b("k", 0), column_a("k", 0))])
+        );
+        assert_eq!(debug(residual), debug(&Some(extra)));
+    }
+}
+
+/// `b` scanned with its columns in another order than storage: `c` (stored second) first,
+/// then `k` (stored first). The index on the stored column 0 serves `b.k`, at the second
+/// position of the scan, and not `b.c`, at the first.
+#[test]
+fn the_seek_follows_the_storage_position_of_the_inner_column() {
+    let catalog = FakeCatalog::new().with_index(
+        TABLE_B,
+        &[KeyColumn {
+            column: 0,
+            descending: false,
+        }],
+        true,
+    );
+    let reordered_b = || LogicalPlan::Scan {
+        table: TABLE_B,
+        columns: vec![stored_b("c", 1), stored_b("k", 0)],
+        alias: "b".to_owned(),
+        schema: OutputSchema {
+            columns: schema_b().columns.into_iter().rev().collect(),
+        },
+        hints: LockHints::default(),
+    };
+    // In the joined row, `b.c` is at 2 and `b.k` at 3.
+    let joined_b = |name: &str, index: usize| BoundExpr {
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            index: 2 + index,
+            ..binding_b(name, 0)
+        }),
+        ty: int_type(),
+        line: 1,
+    };
+    let join_on = |on: BoundExpr| LogicalPlan::Join {
+        left: Box::new(scan_a()),
+        right: Box::new(reordered_b()),
+        kind: JoinKind::Inner,
+        on: Some(on),
+        schema: join_schema(),
+    };
+
+    let on_k = plan_with(
+        &catalog,
+        join_on(compare(CompareOp::Eq, column_a("k", 0), joined_b("k", 1))),
+    );
+    let PhysicalPlan::NestedLoopJoin { inner, .. } = &on_k else {
+        panic!("expected a NestedLoopJoin, got {on_k:?}")
+    };
+    assert!(matches!(inner.as_ref(), PhysicalPlan::IndexSeek { .. }));
+
+    let on_c = plan_with(
+        &catalog,
+        join_on(compare(CompareOp::Eq, column_a("k", 0), joined_b("c", 0))),
+    );
+    assert!(!holds_a_seek(&on_c), "no seek on b.c: {on_c:?}");
 }

@@ -90,7 +90,9 @@ pub(crate) fn plan_join(plan: &LogicalPlan, ctx: &PlanContext<'_>) -> SqlResult<
                     });
                 }
                 // Try a hash join when at least one equality is present.
-                if let Some(hash) = try_hash_join(on_pred, &left_plan, &right_plan, pk, schema) {
+                if let Some(hash) =
+                    try_hash_join(on_pred, &left_plan, &right_plan, pk, schema, left_width)
+                {
                     return Ok(hash);
                 }
             }
@@ -159,18 +161,33 @@ fn try_inner_seek(
             continue;
         };
 
-        // Determine which side is the inner column reference.
+        // One member is a column of the inner row, the other reads no inner column: the
+        // bound is evaluated before the inner row it looks for exists.
         let (inner_binding, outer_expr) = match (&left.kind, &right.kind) {
-            (BoundExprKind::ColumnRef(binding), _) if binding.index >= left_width => {
+            (BoundExprKind::ColumnRef(binding), _)
+                if is_inner_column(binding, left_width)
+                    && sides(right, left_width).outer_or_constant() =>
+            {
                 (binding, right.as_ref())
             }
-            (_, BoundExprKind::ColumnRef(binding)) if binding.index >= left_width => {
+            (_, BoundExprKind::ColumnRef(binding))
+                if is_inner_column(binding, left_width)
+                    && sides(left, left_width).outer_or_constant() =>
+            {
                 (binding, left.as_ref())
             }
             _ => continue,
         };
 
-        let inner_storage_pos = inner_binding.index - left_width;
+        // The position in the inner row is a position in the output of the scan; the
+        // index counts positions in the row `storage` produces, which the scan's column
+        // binding carries.
+        let Some(inner_storage_pos) = columns
+            .get(inner_binding.index - left_width)
+            .map(|column| column.index)
+        else {
+            continue;
+        };
 
         // Check each index for a match on this column.
         for (index_id, shape) in &indexes {
@@ -212,15 +229,19 @@ fn try_inner_seek(
 
 /// Tries to build a [`HashJoin`] from the equality conjunctions of `on`.
 ///
-/// Returns `Some(HashJoin)` when `on` has at least one equality. The equality pairs become
-/// `keys`, the rest becomes `residual`.
+/// Returns `Some(HashJoin)` when `on` has at least one equality. An equality with one
+/// member reading the left row alone and the other the right row alone becomes a key,
+/// right member first (the `build` side); the other conjunctions, equalities included,
+/// become `residual`.
 fn try_hash_join(
     on: &BoundExpr,
     left_plan: &PhysicalPlan,
     right_plan: &PhysicalPlan,
     kind: PhysicalJoinKind,
     schema: &vauban_binder::OutputSchema,
+    left_width: usize,
 ) -> Option<PhysicalPlan> {
+    let mut has_equality = false;
     let mut conjuncts = Vec::new();
     split_conjunction(on, &mut conjuncts);
 
@@ -237,11 +258,23 @@ fn try_hash_join(
             residual_conjuncts.push((*expr).clone());
             continue;
         };
+        has_equality = true;
 
-        keys.push((*(*left).clone(), *(*right).clone()));
+        let left_sides = sides(left, left_width);
+        let right_sides = sides(right, left_width);
+        if left_sides.outer_only() && right_sides.inner_only() {
+            keys.push((*(*right).clone(), *(*left).clone()));
+        } else if left_sides.inner_only() && right_sides.outer_only() {
+            keys.push((*(*left).clone(), *(*right).clone()));
+        } else {
+            // A member that reads both rows, two members that read the same row, or a
+            // constant member: the equality cannot pair the two sides through the hash
+            // table, so it is checked on each paired row.
+            residual_conjuncts.push((*expr).clone());
+        }
     }
 
-    if keys.is_empty() {
+    if !has_equality {
         return None;
     }
 
@@ -257,6 +290,103 @@ fn try_hash_join(
         residual,
         schema: schema.clone(),
     })
+}
+
+/// Which rows of a join an expression reads: the left (`outer`) one, the right (`inner`)
+/// one, and whether it holds a subquery, whose references are not walked here.
+#[derive(Clone, Copy, Default)]
+struct Sides {
+    outer: bool,
+    inner: bool,
+    subquery: bool,
+}
+
+impl Sides {
+    fn union(self, other: Self) -> Self {
+        Self {
+            outer: self.outer || other.outer,
+            inner: self.inner || other.inner,
+            subquery: self.subquery || other.subquery,
+        }
+    }
+
+    /// Reads the left row and nothing of the right one.
+    fn outer_only(self) -> bool {
+        self.outer && !self.inner && !self.subquery
+    }
+
+    /// Reads the right row and nothing of the left one.
+    fn inner_only(self) -> bool {
+        self.inner && !self.outer && !self.subquery
+    }
+
+    /// Reads nothing of the right row: an expression of the left row, or a constant.
+    fn outer_or_constant(self) -> bool {
+        !self.inner && !self.subquery
+    }
+}
+
+/// True when `binding` is a column of the right operand of a join whose left operand
+/// has `left_width` columns.
+fn is_inner_column(binding: &vauban_binder::ColumnBinding, left_width: usize) -> bool {
+    binding.depth == 0 && binding.index >= left_width
+}
+
+/// The rows of the join `expr` reads. A column of an enclosing query (`depth > 0`) is a
+/// constant for the join and reads neither row.
+fn sides(expr: &BoundExpr, left_width: usize) -> Sides {
+    let all = |exprs: &mut dyn Iterator<Item = &BoundExpr>| {
+        exprs.fold(Sides::default(), |acc, item| {
+            acc.union(sides(item, left_width))
+        })
+    };
+    match &expr.kind {
+        BoundExprKind::ColumnRef(binding) if binding.depth > 0 => Sides::default(),
+        BoundExprKind::ColumnRef(binding) => Sides {
+            outer: binding.index < left_width,
+            inner: binding.index >= left_width,
+            subquery: false,
+        },
+        BoundExprKind::Literal(_) | BoundExprKind::Variable { .. } => Sides::default(),
+        BoundExprKind::Negate(inner)
+        | BoundExprKind::BitNot(inner)
+        | BoundExprKind::Not(inner)
+        | BoundExprKind::IsNull { expr: inner, .. }
+        | BoundExprKind::Convert { expr: inner, .. }
+        | BoundExprKind::Collate { expr: inner } => sides(inner, left_width),
+        BoundExprKind::Arith { left, right, .. }
+        | BoundExprKind::Compare { left, right, .. }
+        | BoundExprKind::Logical { left, right, .. } => {
+            sides(left, left_width).union(sides(right, left_width))
+        }
+        BoundExprKind::In {
+            expr: tested, list, ..
+        } => all(&mut std::iter::once(tested.as_ref()).chain(list.iter())),
+        BoundExprKind::Like {
+            expr: tested,
+            pattern,
+            escape,
+            ..
+        } => all(&mut [tested.as_ref(), pattern.as_ref()]
+            .into_iter()
+            .chain(escape.as_deref())),
+        BoundExprKind::Case {
+            operand,
+            arms,
+            else_,
+        } => all(&mut operand
+            .as_deref()
+            .into_iter()
+            .chain(arms.iter().flat_map(|arm| [&arm.when, &arm.then]))
+            .chain(else_.as_deref())),
+        BoundExprKind::Function { args, .. } => all(&mut args.iter()),
+        BoundExprKind::Exists(_)
+        | BoundExprKind::ScalarSubquery(_)
+        | BoundExprKind::InSubquery { .. } => Sides {
+            subquery: true,
+            ..Sides::default()
+        },
+    }
 }
 
 /// Finds the bottom [`TableScan`] in a plan tree, looking through [`Filter`] nodes.
