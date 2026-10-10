@@ -164,6 +164,7 @@ fn insert_rows(
         columns: bindings.to_vec(),
         source: values_plan(rows, &types),
         spool: false,
+        target: Default::default(),
     });
     fixture.run(&stmt).expect("insert succeeds");
 }

@@ -152,6 +152,7 @@ fn update_all_rows_counts_them() {
             },
         )],
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -283,6 +284,7 @@ fn update_reads_the_old_row() {
             ),
         ],
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -427,6 +429,7 @@ fn update_via_seek_touches_one_row() {
             },
         )],
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -661,6 +664,7 @@ fn update_matching_nothing_is_zero() {
             },
         )],
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -771,6 +775,7 @@ fn halloween_spool_updates_each_row_once() {
             },
         )],
         spool: true,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -887,6 +892,7 @@ fn write_conflict_in_snapshot_is_3960() {
                 },
             )],
             spool: false,
+            target: Default::default(),
         });
         let eval = StaticContext::default();
         let mut session2 = ExecSession::default();
@@ -922,6 +928,7 @@ fn write_conflict_in_snapshot_is_3960() {
             },
         )],
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();

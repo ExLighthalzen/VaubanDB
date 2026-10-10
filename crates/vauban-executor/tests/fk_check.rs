@@ -3,14 +3,16 @@
 use std::sync::Arc;
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, ColumnBinding, LockHints, OutputColumn, OutputSchema, SessionOptions,
+    BindContext, BoundExpr, BoundExprKind, BoundStatement, ColumnBinding, LockHints, OutputColumn,
+    OutputSchema, SessionOptions, TargetExpressions, bind,
 };
 use vauban_catalog::{Catalog, ColumnDef, ConstraintDef, QualifiedName, SortedColumn, TableDef};
 use vauban_errors::SqlError;
 use vauban_executor::{ExecContext, ExecOutcome, ExecSession, execute_collect};
-use vauban_parser::{BinaryOp, ColumnRef, Expr, Ident, Literal, Span};
+use vauban_parser::{BinaryOp, ColumnRef, Expr, Ident, Literal, ParseOptions, Span, parse_batch};
 use vauban_planner::{
-    PhysicalDelete, PhysicalInsert, PhysicalPlan, PhysicalStatement, PhysicalUpdate,
+    NoIndexes, PhysicalDelete, PhysicalInsert, PhysicalPlan, PhysicalStatement, PhysicalUpdate,
+    PlanContext, plan,
 };
 use vauban_storage::Snapshot;
 use vauban_storage::{MemoryStorage, Storage, TableId};
@@ -197,8 +199,47 @@ impl Env {
             columns: bindings.to_vec(),
             source: values_plan(vec![row], &types),
             spool: false,
+            target: self.checks_of(table),
         });
         self.run(&stmt).expect("insert succeeds");
+    }
+
+    /// The `CHECK` predicates the binder puts in the plan of an `INSERT` into `table`.
+    fn checks_of(&self, table: TableId) -> TargetExpressions {
+        let snap = self.catalog.snapshot(&self.handle);
+        let meta = snap.table_by_storage(table).expect("the table is known");
+        let text = format!("INSERT INTO dbo.{} DEFAULT VALUES;", meta.name);
+        let batch = parse_batch(&text, &ParseOptions::default()).expect("the text parses");
+        let mut bind_ctx = BindContext::scalar(&text, SessionOptions::default());
+        bind_ctx.catalog = Some(&snap);
+        match bind(&batch.statements[0], &bind_ctx).expect("the INSERT binds") {
+            BoundStatement::Insert(insert) => TargetExpressions {
+                defaults: Vec::new(),
+                ..insert.target
+            },
+            _ => panic!("not an INSERT"),
+        }
+    }
+
+    /// Parses, binds, plans and runs one statement of `text`, and answers how many
+    /// catalogue snapshots its execution built, the binding left out.
+    fn run_sql(&mut self, text: &str) -> Result<(ExecOutcome, u64), SqlError> {
+        let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+        let physical = {
+            let snap = self.catalog.snapshot(&self.handle);
+            let mut bind_ctx = BindContext::scalar(text, SessionOptions::default());
+            bind_ctx.catalog = Some(&snap);
+            let bound = bind(&batch.statements[0], &bind_ctx)?;
+            plan(
+                bound,
+                &PlanContext {
+                    catalog: &NoIndexes,
+                },
+            )?
+        };
+        let before = Catalog::snapshots_built_on_this_thread();
+        let outcome = self.run(&physical)?;
+        Ok((outcome, Catalog::snapshots_built_on_this_thread() - before))
     }
 
     fn row_count(&mut self, table: TableId) -> usize {
@@ -286,6 +327,7 @@ fn insert_without_parent_is_547() {
                 &[int(false), int(true)],
             ),
             spool: false,
+            target: Default::default(),
         }))
         .expect_err("orphan insert fails");
     assert_eq!(err.number, 547);
@@ -459,6 +501,7 @@ fn check_constraint_rejects_false_only() {
             columns: bindings.clone(),
             source: values_plan(vec![vec![Value::I32(-1)]], &[int(true)]),
             spool: false,
+            target: env.checks_of(table),
         }))
         .expect_err("negative value fails");
     assert_eq!(err.number, 547);
@@ -513,6 +556,7 @@ fn update_rechecks_both_directions() {
         },
         assignments: vec![(col_binding(1, "pid", int(true)), lit(Value::I32(99)))],
         spool: false,
+        target: Default::default(),
     });
     let err = env
         .run(&child_update)
@@ -545,6 +589,7 @@ fn update_rechecks_both_directions() {
         },
         assignments: vec![(col_binding(0, "id", int(false)), lit(Value::I32(5)))],
         spool: false,
+        target: Default::default(),
     });
     let err = env
         .run(&parent_update)
@@ -552,4 +597,95 @@ fn update_rechecks_both_directions() {
     assert_eq!(err.number, 547);
     assert!(err.message.contains("FK_child_parent"));
     assert!(err.message.contains("dbo.fk_check_child"));
+}
+
+/// An `INSERT … SELECT` of 2 000 rows into a table with a `FOREIGN KEY` and a `CHECK` reads
+/// the catalogue once: the constraints are resolved before the first row, not per row.
+#[test]
+fn an_insert_select_builds_one_catalogue_snapshot() {
+    let mut env = Env::new();
+    for text in [
+        "CREATE TABLE dbo.snap_parent (id int NOT NULL PRIMARY KEY);",
+        "CREATE TABLE dbo.snap_source (id int NOT NULL, pid int NOT NULL, v int NOT NULL);",
+        "CREATE TABLE dbo.snap_child (id int NOT NULL PRIMARY KEY, \
+         pid int NULL CONSTRAINT fk_snap REFERENCES dbo.snap_parent (id), \
+         v int NULL CONSTRAINT ck_snap CHECK (v >= 0));",
+        "INSERT INTO dbo.snap_parent VALUES (1), (2), (3);",
+    ] {
+        env.run_sql(text).expect("the setup runs");
+    }
+    let source = {
+        let snap = env.catalog.snapshot(&env.handle);
+        let meta = snap
+            .resolve_object("master", Some("dbo"), "snap_source", "dbo")
+            .expect("the source resolves");
+        snap.table(meta.id)
+            .expect("the source is a table")
+            .storage_id
+    };
+    for id in 0..2_000 {
+        env.storage
+            .insert(
+                env.handle.id,
+                source,
+                &vauban_storage::Row(vec![
+                    Value::I32(id),
+                    Value::I32(1 + id % 3),
+                    Value::I32(id % 10),
+                ]),
+            )
+            .expect("a source row");
+    }
+
+    let (_, snapshots) = env
+        .run_sql("INSERT INTO dbo.snap_child (id, pid, v) SELECT id, pid, v FROM dbo.snap_source;")
+        .expect("every row satisfies both constraints");
+    assert_eq!(env.session.rowcount, 2_000);
+    assert_eq!(
+        snapshots, 1,
+        "one catalogue snapshot for the whole statement"
+    );
+
+    // The constraints are still checked on each row: the last row breaks the CHECK, the
+    // one before it the FOREIGN KEY.
+    let err = env
+        .run_sql("INSERT INTO dbo.snap_child (id, pid, v) SELECT id + 5000, pid, v - 9 FROM dbo.snap_source;")
+        .expect_err("v - 9 is negative for most rows");
+    assert_eq!(err.number, 547);
+    assert!(err.message.contains("ck_snap"), "{}", err.message);
+    let err = env
+        .run_sql("INSERT INTO dbo.snap_child (id, pid, v) SELECT id + 9000, pid + 3, v FROM dbo.snap_source;")
+        .expect_err("no parent has an id above 3");
+    assert_eq!(err.number, 547);
+    assert!(err.message.contains("fk_snap"), "{}", err.message);
+}
+
+/// A `CHECK` the plan carries no predicate for is not skipped: the row is refused with the
+/// internal error, which names the constraint.
+#[test]
+fn a_check_missing_from_the_plan_refuses_the_row() {
+    let mut env = Env::new();
+    let table = env.create(
+        "fk_check_unbound",
+        vec![ColumnDef {
+            name: "a".to_owned(),
+            ty: int(true),
+            default: None,
+            identity: None,
+            computed: None,
+        }],
+        vec![check_positive("a")],
+    );
+    let err = env
+        .run(&PhysicalStatement::Insert(PhysicalInsert {
+            table,
+            columns: vec![col_binding(0, "a", int(true))],
+            source: values_plan(vec![vec![Value::I32(1)]], &[int(true)]),
+            spool: false,
+            target: TargetExpressions::default(),
+        }))
+        .expect_err("the CHECK has no predicate in the plan");
+    assert_eq!(err.number, 50_000);
+    assert!(err.message.contains("CK_positive"), "{}", err.message);
+    assert_eq!(env.row_count(table), 0);
 }

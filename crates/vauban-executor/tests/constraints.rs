@@ -106,6 +106,7 @@ fn insert_stmt(
         columns,
         source: PhysicalPlan::Values { rows, schema },
         spool: false,
+        target: Default::default(),
     })
 }
 
@@ -453,6 +454,7 @@ fn update_into_duplicate_is_2627() {
             lit(Value::I32(1), int(true)),
         )],
         spool: false,
+        target: Default::default(),
     });
     let err = execute(
         &stmt,

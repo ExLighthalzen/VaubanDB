@@ -44,6 +44,7 @@ pub(crate) fn plan_insert(
         columns: stmt.columns.clone(),
         source,
         spool,
+        target: stmt.target.clone(),
     }))
 }
 
@@ -63,6 +64,7 @@ pub(crate) fn plan_update(
         input,
         assignments: stmt.assignments.clone(),
         spool,
+        target: stmt.target.clone(),
     }))
 }
 

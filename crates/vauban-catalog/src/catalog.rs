@@ -44,6 +44,11 @@ pub struct Catalog {
     pub(crate) tables: std::sync::Mutex<crate::table::TableStore>,
 }
 
+thread_local! {
+    /// The count behind [`Catalog::snapshots_built_on_this_thread`].
+    static SNAPSHOTS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Catalog {
     /// Opens the catalogue of `storage`, creating the system databases, their schemas and
     /// the internal tables when they are not there yet.
@@ -65,7 +70,16 @@ impl Catalog {
 
     /// The catalogue as `txn` sees it: the rows its snapshot makes visible.
     pub fn snapshot(&self, txn: &TxnHandle) -> CatalogSnapshot {
+        SNAPSHOTS_BUILT.with(|count| count.set(count.get() + 1));
         snapshot::build(self, txn)
+    }
+
+    /// How many times [`Catalog::snapshot`] has run on the calling thread, whichever the
+    /// catalogue. A statement runs on one thread, so the difference of two readings around
+    /// it counts the snapshots that statement built.
+    #[doc(hidden)]
+    pub fn snapshots_built_on_this_thread() -> u64 {
+        SNAPSHOTS_BUILT.with(std::cell::Cell::get)
     }
 
     /// Creates a database named `name`, with `collation` or the collation of the instance.

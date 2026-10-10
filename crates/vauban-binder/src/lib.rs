@@ -92,6 +92,7 @@ pub use bound::{
     OutputColumn, OutputSchema, SelectIntoPlan, SetOpKind, SortKey, SubqueryId, TxnStatement,
     UpdatePlan,
 };
+pub use bound::{BoundObjectExpression, TargetExpressions};
 pub use context::{
     BindContext, CatalogView, NoVariables, ResolvedTable, ResolvedTableKind, SessionOptions,
     TableReferenceKind, VariableScope,

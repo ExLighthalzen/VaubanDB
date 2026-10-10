@@ -42,7 +42,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
-use vauban_binder::{BoundExpr, ColumnBinding};
+use vauban_binder::{BoundExpr, BoundObjectExpression, ColumnBinding, TargetExpressions};
 use vauban_catalog::{CatalogSnapshot, TableMeta};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{
@@ -55,7 +55,8 @@ use vauban_types::Value;
 
 use crate::context::ExecContext;
 use crate::dml::assign::assign_value;
-use crate::dml::fk_check;
+use crate::dml::fk_check::WriteChecks;
+use crate::dml::insert::{by_ordinal, fill_computed};
 use crate::errors::at;
 use crate::expr::eval_expr;
 use crate::locking;
@@ -72,7 +73,7 @@ pub(crate) fn execute_update<'a>(
         stmt.table,
         &stmt.input,
         stmt.spool,
-        Some(&stmt.assignments),
+        Some((&stmt.assignments, &stmt.target)),
         ctx,
     )
 }
@@ -96,16 +97,22 @@ struct Target<'s> {
     verb: &'static str,
     /// The `SET` list; `None` for a `DELETE`.
     assignments: Option<&'s [(ColumnBinding, BoundExpr)]>,
+    /// The bound expression of each computed column, by ordinal; empty for a `DELETE`.
+    computed: Vec<Option<&'s BoundObjectExpression>>,
+    /// The constraints each written row is checked against, resolved once.
+    checks: WriteChecks,
 }
 
-/// The body of both statements; `assignments` is `None` for a `DELETE`.
+/// The body of both statements; `update` is the `SET` list and the bound expressions of
+/// the table for an `UPDATE`, `None` for a `DELETE`.
 fn write<'a>(
     table: TableId,
     input: &PhysicalPlan,
     spool: bool,
-    assignments: Option<&[(ColumnBinding, BoundExpr)]>,
+    update: Option<(&[(ColumnBinding, BoundExpr)], &TargetExpressions)>,
     ctx: &mut ExecContext<'a>,
 ) -> SqlResult<ExecOutcome> {
+    let assignments = update.map(|(assignments, _)| assignments);
     let verb = if assignments.is_some() {
         "UPDATE"
     } else {
@@ -125,6 +132,10 @@ fn write<'a>(
         meta.schema,
         meta.name
     );
+    let (checks, computed): (&[BoundObjectExpression], &[BoundObjectExpression]) = match update {
+        Some((_, expressions)) => (&expressions.checks, &expressions.computed),
+        None => (&[], &[]),
+    };
     let target = Target {
         table,
         meta,
@@ -132,6 +143,8 @@ fn write<'a>(
         name,
         verb,
         assignments,
+        computed: by_ordinal(computed, meta.columns.len()),
+        checks: WriteChecks::resolve(meta, &cat_snap, checks, verb, true, ctx)?,
     };
 
     let (source, set_subplans) = split_assignment_subqueries(input, assignments.is_some());
@@ -311,10 +324,18 @@ fn write_row<'a>(
                 })?;
                 *slot = value;
             }
-            if fk_check::referenced_columns_changed(target.meta, &old_row, &new_row, ctx)? {
-                fk_check::check_no_referencing_rows(target.meta, &old_row, "UPDATE", ctx)?;
+            fill_computed(
+                &mut new_row,
+                &target.computed,
+                &target.meta.columns,
+                &target.name,
+                "UPDATE",
+                ctx,
+            )?;
+            if target.checks.referenced_columns_changed(&old_row, &new_row) {
+                target.checks.check_no_referencing_rows(&old_row, ctx)?;
             }
-            fk_check::check_row(target.meta, &new_row, "UPDATE", ctx)?;
+            target.checks.check_row(&new_row, ctx)?;
             let stored = vauban_storage::Row(new_row);
             storage
                 .update(handle.id, target.table, id, &stored)
@@ -329,7 +350,7 @@ fn write_row<'a>(
                 })?;
         }
         _ => {
-            fk_check::check_no_referencing_rows(target.meta, &old_row, "DELETE", ctx)?;
+            target.checks.check_no_referencing_rows(&old_row, ctx)?;
             storage.delete(handle.id, target.table, id)?;
         }
     }

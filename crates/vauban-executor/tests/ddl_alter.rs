@@ -380,3 +380,78 @@ fn alter_rolls_back() {
         .rollback(reader)
         .expect("the transaction rolls back");
 }
+
+/// `ADD … NOT NULL DEFAULT <expression>` on a table that holds rows evaluates the default
+/// for each existing row: an arithmetic, `SYSDATETIME()`, and `NEWID()`, which differs from
+/// one row to the next.
+#[test]
+fn add_not_null_columns_with_non_literal_defaults_fill_existing_rows() {
+    vauban_sysfn::register_builtins();
+    let fixture = Fixture::new();
+    let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);
+    run_on(&fixture, &handle, "CREATE TABLE dbo.t (a int, b int);").expect("create");
+    insert_pairs(&fixture, &handle, "t", &[(1, 2), (3, 4)]);
+    run_on(
+        &fixture,
+        &handle,
+        "ALTER TABLE dbo.t ADD c int NOT NULL DEFAULT (1 + 1), \
+         d datetime2 NOT NULL DEFAULT SYSDATETIME(), \
+         e uniqueidentifier NOT NULL DEFAULT NEWID();",
+    )
+    .expect("alter");
+    let rows = scan_table(&fixture, &handle, "t");
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(row[2], Value::I32(2));
+        assert!(matches!(row[3], Value::DateTime2(_)), "{:?}", row[3]);
+        assert!(matches!(row[4], Value::Guid(_)), "{:?}", row[4]);
+    }
+    assert_ne!(rows[0][4], rows[1][4], "NEWID() is evaluated per row");
+    fixture
+        .txn
+        .rollback(handle)
+        .expect("the transaction rolls back");
+}
+
+/// An added `CHECK` is read over the existing rows by the evaluator of the queries:
+/// `>=`, `<=`, `BETWEEN` and a negative constant hold or fail as they do on a written row,
+/// and a row that makes the predicate false is the 547 of `ALTER TABLE`, with the
+/// constraint left out of the table.
+#[test]
+fn add_check_reads_the_existing_rows_with_the_query_evaluator() {
+    let fixture = Fixture::new();
+    let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);
+    run_on(&fixture, &handle, "CREATE TABLE dbo.t (a int, b int);").expect("create");
+    insert_pairs(&fixture, &handle, "t", &[(1, -1), (5, 0)]);
+    for (check, holds) in [
+        ("a >= 1", true),
+        ("a <= 5", true),
+        ("a BETWEEN 1 AND 5", true),
+        ("b >= -1", true),
+        ("b > -1", false),
+        ("a >= 2", false),
+        ("a <= 4", false),
+        ("a BETWEEN 2 AND 5", false),
+        ("b = -1 OR a = 5", true),
+        ("b IS NULL OR b < 0", false),
+    ] {
+        let text = format!("ALTER TABLE dbo.t ADD CONSTRAINT ck CHECK ({check});");
+        let outcome = run_on(&fixture, &handle, &text);
+        if holds {
+            outcome.unwrap_or_else(|err| panic!("{check}: {err:?}"));
+            run_on(&fixture, &handle, "ALTER TABLE dbo.t DROP CONSTRAINT ck;").expect("drop");
+        } else {
+            let err = outcome.expect_err(check);
+            assert_eq!((err.number, err.severity), (547, 16), "{check}");
+            assert!(err.message.contains("ALTER TABLE"), "{}", err.message);
+            assert!(err.message.contains("\"ck\""), "{}", err.message);
+        }
+    }
+    let snapshot = fixture.catalog.snapshot(&handle);
+    let ck = snapshot.resolve_object("master", Some("dbo"), "ck", "dbo");
+    assert!(ck.is_none(), "a refused CHECK is not added");
+    fixture
+        .txn
+        .rollback(handle)
+        .expect("the transaction rolls back");
+}

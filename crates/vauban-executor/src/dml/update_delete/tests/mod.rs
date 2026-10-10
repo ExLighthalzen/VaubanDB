@@ -69,19 +69,24 @@ fn a_cancelled_spool_cancels_the_statement() {
         )
         .expect("the table is new");
     let cat_snap = catalog.snapshot(&handle);
+    let eval = StaticContext::default();
+    let table_meta = cat_snap
+        .table_by_storage(meta.storage_id)
+        .expect("the table is in the snapshot");
+    let resolving = ExecContext::scalar(&eval, SessionOptions::default()).with_catalog(&catalog);
     let target = Target {
         table: meta.storage_id,
-        meta: cat_snap
-            .table_by_storage(meta.storage_id)
-            .expect("the table is in the snapshot"),
+        meta: table_meta,
         cat_snap: &cat_snap,
         name: "master.dbo.c".to_owned(),
         verb: "DELETE",
         assignments: None,
+        computed: Vec::new(),
+        checks: WriteChecks::resolve(table_meta, &cat_snap, &[], "DELETE", true, &resolving)
+            .expect("the constraints resolve"),
     };
     let source = PhysicalPlan::OneRow;
     let slot = TargetSlot { tail: 1, index: 0 };
-    let eval = StaticContext::default();
     let token = CancelToken::new();
     token.cancel();
     let mut ctx = ExecContext::scalar(&eval, SessionOptions::default()).with_cancel(&token);

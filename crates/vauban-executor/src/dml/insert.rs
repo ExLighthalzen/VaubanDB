@@ -1,45 +1,51 @@
 use std::collections::HashSet;
 
-use vauban_binder::ColumnBinding;
-use vauban_catalog::{Catalog, ColumnId, ColumnMeta, ObjectId};
+use vauban_binder::{BoundObjectExpression, ColumnBinding, TargetExpressions};
+use vauban_catalog::{Catalog, CatalogSnapshot, ColumnId, ColumnMeta, TableMeta};
 use vauban_errors::{SqlError, SqlResult};
-use vauban_parser::{Expr, Literal, UnaryOp};
 use vauban_planner::{PhysicalInsert, PhysicalSelectInto};
-use vauban_storage::{RowId, Storage, TableId, TxnId};
+use vauban_storage::{RowId, Storage, TxnId};
 use vauban_txn::TxnHandle;
-use vauban_types::{
-    BinaryOp, Decimal, LiteralKind, SqlType, TypeInfo, Value, eval_binary, parse_literal,
-};
+use vauban_types::{Decimal, SqlType, TypeInfo, Value};
 
 use crate::context::ExecContext;
 use crate::dml::assign::assign_value;
-use crate::dml::fk_check;
+use crate::dml::fk_check::WriteChecks;
 use crate::errors::at;
+use crate::expr::eval_expr;
 use crate::locking;
 use crate::operator::build_operator;
 use crate::row::{ExecOutcome, Row};
 
 /// Runs one `INSERT`.
+///
+/// The catalogue snapshot, the table, its constraints and the bound expressions of the plan
+/// are read once, before the first row; each row is then built and checked from them
+/// (`dml/fk_check.rs`).
 pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlResult<ExecOutcome> {
     let storage: &dyn Storage = ctx.storage()?;
     let txn_id = ctx.handle()?.id;
-
-    let (col_metas, table_name, table_obj_id, table_id, table_meta) = {
-        let catalog: &Catalog = ctx.catalog()?;
-        let handle: &TxnHandle = ctx.handle()?;
-        let snap = catalog.snapshot(handle);
-        let meta = snap
-            .table_by_storage(stmt.table)
-            .ok_or_else(|| bug("INSERT: table not found in the catalogue"))?
-            .clone();
-        let db_name: String = snap
-            .database_by_id(meta.database)
-            .map_or_else(|| "?".to_owned(), |db| db.name.clone());
-        let col_metas: Vec<ColumnMeta> = meta.columns.clone();
-        // The three-part name 515 prints, built once for the whole statement rather than
-        // per row: both loops of `write_one` need it.
-        let table_name = format!("{}.{}.{}", db_name, meta.schema, meta.name);
-        (col_metas, table_name, meta.id, stmt.table, meta)
+    let catalog: &Catalog = ctx.catalog()?;
+    let handle: &TxnHandle = ctx.handle()?;
+    let cat_snap = catalog.snapshot(handle);
+    let meta = cat_snap
+        .table_by_storage(stmt.table)
+        .ok_or_else(|| bug("INSERT: table not found in the catalogue"))?;
+    let db_name: String = cat_snap
+        .database_by_id(meta.database)
+        .map_or_else(|| "?".to_owned(), |db| db.name.clone());
+    let target = Target {
+        // The three-part name 515 prints, built once for the whole statement.
+        name: format!("{}.{}.{}", db_name, meta.schema, meta.name),
+        defaults: by_ordinal(&stmt.target.defaults, meta.columns.len()),
+        computed: by_ordinal(&stmt.target.computed, meta.columns.len()),
+        checks: WriteChecks::resolve(meta, &cat_snap, &stmt.target.checks, "INSERT", false, ctx)?,
+        meta,
+        cat_snap: &cat_snap,
+        txn_id,
+        storage,
+        catalog,
+        handle,
     };
 
     let mut root = build_operator(&stmt.source)?;
@@ -71,30 +77,13 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
         Vec::new()
     };
 
-    let catalog: &Catalog = ctx.catalog()?;
-    let handle: &TxnHandle = ctx.handle()?;
-
     let mut count: u64 = 0;
     let mut last_identity: Option<Decimal> = None;
 
     if stmt.spool {
         for row in &rows {
-            let (id, identity) = write_one(
-                row,
-                stmt,
-                &source_types,
-                &col_metas,
-                &table_name,
-                &table_meta,
-                txn_id,
-                table_id,
-                table_obj_id,
-                storage,
-                catalog,
-                handle,
-                ctx,
-            )?;
-            locking::write_lock(ctx, table_id, id)?;
+            let (id, identity) = write_one(row, stmt, &source_types, &target, ctx)?;
+            locking::write_lock(ctx, stmt.table, id)?;
             if let Some(dec) = identity {
                 last_identity = Some(dec);
             }
@@ -107,22 +96,8 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
                 root.close();
                 return Ok(ExecOutcome::Cancelled);
             }
-            let (id, identity) = write_one(
-                &row,
-                stmt,
-                &source_types,
-                &col_metas,
-                &table_name,
-                &table_meta,
-                txn_id,
-                table_id,
-                table_obj_id,
-                storage,
-                catalog,
-                handle,
-                ctx,
-            )?;
-            locking::write_lock(ctx, table_id, id)?;
+            let (id, identity) = write_one(&row, stmt, &source_types, &target, ctx)?;
+            locking::write_lock(ctx, stmt.table, id)?;
             if let Some(dec) = identity {
                 last_identity = Some(dec);
             }
@@ -139,6 +114,40 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
     Ok(ExecOutcome::NoRows)
 }
 
+/// What an `INSERT` reads once, before its first row, and reuses for each row it writes.
+struct Target<'s> {
+    meta: &'s TableMeta,
+    cat_snap: &'s CatalogSnapshot,
+    /// `database.schema.table`, for the messages that name the table.
+    name: String,
+    /// The bound `DEFAULT` of each column, by ordinal; `None` for a column the plan holds
+    /// no default for.
+    defaults: Vec<Option<&'s BoundObjectExpression>>,
+    /// The bound expression of each computed column, by ordinal.
+    computed: Vec<Option<&'s BoundObjectExpression>>,
+    checks: WriteChecks,
+    txn_id: TxnId,
+    storage: &'s dyn Storage,
+    catalog: &'s Catalog,
+    handle: &'s TxnHandle,
+}
+
+/// The entries of `expressions` placed at the ordinal of the column each one fills.
+pub(crate) fn by_ordinal(
+    expressions: &[BoundObjectExpression],
+    width: usize,
+) -> Vec<Option<&BoundObjectExpression>> {
+    let mut placed = vec![None; width];
+    for expression in expressions {
+        if let Some(column) = &expression.column
+            && let Some(slot) = placed.get_mut(column.index)
+        {
+            *slot = Some(expression);
+        }
+    }
+    placed
+}
+
 /// Builds the storage row of one source row and writes it, answering the identifier the
 /// storage gave it.
 ///
@@ -146,22 +155,20 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
 /// answers: a lock names a row, and the row has no identifier before it is written. Nothing
 /// reads the row in between — another transaction sees neither the version nor its
 /// identifier until this one commits.
-#[allow(clippy::too_many_arguments)]
+///
+/// A column the statement leaves out takes, in this order, the next `IDENTITY` value, its
+/// `DEFAULT` evaluated by [`eval_expr`] and converted as an explicit value is
+/// (`tests/insert.rs`, `a_non_literal_default_is_evaluated`), `NULL`, or the 515. The
+/// computed columns are evaluated over the row so built, then the constraints are checked.
 fn write_one(
     row: &[Value],
     stmt: &PhysicalInsert,
     source_types: &[TypeInfo],
-    col_metas: &[ColumnMeta],
-    table_name: &str,
-    table_meta: &vauban_catalog::TableMeta,
-    txn_id: TxnId,
-    table_id: TableId,
-    table_obj_id: ObjectId,
-    storage: &dyn Storage,
-    catalog: &Catalog,
-    handle: &TxnHandle,
+    target: &Target<'_>,
     ctx: &mut ExecContext<'_>,
 ) -> SqlResult<(RowId, Option<Decimal>)> {
+    let col_metas = &target.meta.columns;
+    let table_name = target.name.as_str();
     let mut output = vec![Value::Null; col_metas.len()];
     let mut covered: HashSet<usize> = HashSet::new();
     let mut generated_identity: Option<Decimal> = None;
@@ -185,23 +192,29 @@ fn write_one(
         covered.insert(ordinal);
     }
     for (ordinal, col_meta) in col_metas.iter().enumerate() {
-        if covered.contains(&ordinal) {
+        if covered.contains(&ordinal) || target.computed[ordinal].is_some() {
             continue;
         }
         if col_meta.identity.is_some() {
-            let dec = catalog.next_identity(handle, table_obj_id)?;
+            let dec = target
+                .catalog
+                .next_identity(target.handle, target.meta.id)?;
             generated_identity = Some(dec);
             output[ordinal] = identity_value(&dec, col_meta)?;
             continue;
         }
-        if let Some(ref default) = col_meta.default {
-            // The literal of the constraint follows the conversion an explicit value goes
-            // through: `eval_default` gives its own type, `assign_value` writes the column's.
-            let (value, from) = eval_default(default)?;
-            let converted =
-                assign_value(value, &from, col_meta, table_name, "INSERT").map_err(|e| at(e, 0))?;
-            output[ordinal] = converted;
+        if let Some(default) = target.defaults[ordinal] {
+            let value = eval_expr(&default.expr, None, ctx)?;
+            output[ordinal] = assign_value(value, &default.expr.ty, col_meta, table_name, "INSERT")
+                .map_err(|e| at(e, 0))?;
             continue;
+        }
+        if col_meta.default_text().is_some() {
+            return Err(bug(&format!(
+                "INSERT: the DEFAULT of column '{}' of table '{table_name}' has no bound \
+                 expression, so the row is not written",
+                col_meta.name
+            )));
         }
         if col_meta.ty.nullable {
             output[ordinal] = Value::Null;
@@ -212,115 +225,59 @@ fn write_one(
             0,
         ));
     }
-    fk_check::check_row(table_meta, &output, "INSERT", ctx)?;
+    fill_computed(
+        &mut output,
+        &target.computed,
+        col_metas,
+        table_name,
+        "INSERT",
+        ctx,
+    )?;
+    target.checks.check_row(&output, ctx)?;
     if let Some(explicit) = explicit_identity {
-        catalog.bump_identity_after_explicit(handle, table_obj_id, explicit)?;
+        target
+            .catalog
+            .bump_identity_after_explicit(target.handle, target.meta.id, explicit)?;
     }
     let stored = vauban_storage::Row(output);
-    let id = storage.insert(txn_id, table_id, &stored).map_err(|err| {
-        let snap = catalog.snapshot(handle);
-        let meta = snap
-            .table_by_storage(table_id)
-            .expect("INSERT: table not found in the catalogue");
-        crate::dml::constraints::translate_unique(err, meta, &snap, &stored.0, "INSERT")
-    })?;
+    let id = target
+        .storage
+        .insert(target.txn_id, stmt.table, &stored)
+        .map_err(|err| {
+            crate::dml::constraints::translate_unique(
+                err,
+                target.meta,
+                target.cat_snap,
+                &stored.0,
+                "INSERT",
+            )
+        })?;
     Ok((id, generated_identity))
 }
 
-/// Evaluates the literal of a `DEFAULT` constraint, with the type it is written with.
+/// Writes into `row` the value of each computed column of `computed`, evaluated over `row`
+/// and converted to the type of its column.
 ///
-/// The type is what [`assign_value`] converts from, and it is the type the same literal
-/// would carry in a `VALUES` row: `types::parse_literal` is the one place that decides it,
-/// so `DEFAULT 5` on an `int` column arrives as an `I32` typed `int` and `DEFAULT 1.25` as
-/// a `numeric(3,2)`, exactly as `VALUES (5)` and `VALUES (1.25)` do.
+/// # Errors
 ///
-/// # What counts as a literal here
-///
-/// A leading `+` or `-` and a pair of parentheses belong to the literal: `DEFAULT -5`,
-/// `DEFAULT (-5)` and `DEFAULT 0x01` are constraints a column carries, and each writes and
-/// reads back at the type of the column (`tests/insert.rs::signed_and_binary_defaults`).
-/// The sign is computed as `0 - literal` through `types::eval_binary`, which keeps the
-/// range rules and the 8115 they raise in `types` rather than restating them here.
-///
-/// Anything else is refused with the internal error: `DEFAULT (1 + 1)` and
-/// `DEFAULT GETDATE()` are expressions, not literals, and this function does not evaluate
-/// expressions (`tests/insert.rs::an_arithmetic_default_is_not_a_literal`).
-fn eval_default(expr: &Expr) -> SqlResult<(Value, TypeInfo)> {
-    match expr {
-        Expr::Literal(Literal::Null, _) => Ok((Value::Null, TypeInfo::new(SqlType::Int, true))),
-        Expr::Literal(Literal::Default, _) => Err(bug(
-            "INSERT: DEFAULT keyword in a DEFAULT constraint is a self-reference",
-        )),
-        // `DEFAULT (5)`: a pair of parentheses around the literal does not make it an
-        // expression (`tests/insert.rs::signed_and_binary_defaults`).
-        Expr::Nested(inner, _) => eval_default(inner),
-        Expr::Unary {
-            op: UnaryOp::Plus,
-            expr: inner,
-            ..
-        } => eval_default(inner),
-        Expr::Unary {
-            op: UnaryOp::Minus,
-            expr: inner,
-            ..
-        } => {
-            let (value, ty) = eval_default(inner)?;
-            let zero = zero_of(&value)?;
-            let negated = eval_binary(BinaryOp::Sub, &zero, &value, &ty)?;
-            Ok((negated, ty))
-        }
-        Expr::Literal(literal, _) => {
-            let (kind, text) = literal_payload(literal)?;
-            parse_literal(kind, text)
-        }
-        _ => Err(bug("INSERT: default expression is not a literal")),
+/// What evaluating an expression raises, and what [`assign_value`] raises.
+pub(crate) fn fill_computed(
+    row: &mut [Value],
+    computed: &[Option<&BoundObjectExpression>],
+    columns: &[ColumnMeta],
+    table_name: &str,
+    statement: &str,
+    ctx: &mut ExecContext<'_>,
+) -> SqlResult<()> {
+    for (ordinal, expression) in computed.iter().enumerate() {
+        let (Some(expression), Some(column)) = (expression, columns.get(ordinal)) else {
+            continue;
+        };
+        let value = eval_expr(&expression.expr, Some(&row.to_vec()), ctx)?;
+        row[ordinal] = assign_value(value, &expression.expr.ty, column, table_name, statement)
+            .map_err(|e| at(e, 0))?;
     }
-}
-
-/// The [`LiteralKind`] and the payload `types::parse_literal` reads for `literal`.
-///
-/// `NULL` and `DEFAULT` carry no payload and are answered by [`eval_default`] before this
-/// function is reached.
-fn literal_payload(literal: &Literal) -> SqlResult<(LiteralKind, &str)> {
-    Ok(match literal {
-        Literal::Integer(text) => (LiteralKind::Integer, text.as_str()),
-        Literal::Decimal(text) => (LiteralKind::Decimal, text.as_str()),
-        Literal::Float(text) => (LiteralKind::Float, text.as_str()),
-        Literal::Money(text) => (LiteralKind::Money, text.as_str()),
-        Literal::Binary(text) => (LiteralKind::Hex, text.as_str()),
-        Literal::Str {
-            value,
-            unicode: false,
-        } => (LiteralKind::Str, value.as_str()),
-        Literal::Str {
-            value,
-            unicode: true,
-        } => (LiteralKind::NStr, value.as_str()),
-        Literal::Null | Literal::Default => {
-            return Err(bug("INSERT: NULL and DEFAULT carry no literal payload"));
-        }
-    })
-}
-
-/// The zero a signed default subtracts its literal from, in the family of that literal.
-///
-/// `eval_binary` widens an integer to `i64` before it computes and rebuilds the result in
-/// the type it is given, so the integral variants share one zero. A character or binary
-/// literal takes no sign: `DEFAULT -0x01` and `DEFAULT -'a'` are refused here rather than
-/// given a meaning the write path would have to invent.
-fn zero_of(value: &Value) -> SqlResult<Value> {
-    match value {
-        Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_) => Ok(Value::I64(0)),
-        Value::Decimal(d) => Ok(Value::Decimal(Decimal {
-            mantissa: 0,
-            precision: d.precision,
-            scale: d.scale,
-        })),
-        Value::Money(_) => Ok(Value::Money(0)),
-        Value::F32(_) => Ok(Value::F32(0.0)),
-        Value::F64(_) => Ok(Value::F64(0.0)),
-        _ => Err(bug("INSERT: a signed default needs a numeric literal")),
-    }
+    Ok(())
 }
 
 fn identity_as_i64(value: &Value, _col_meta: &ColumnMeta) -> SqlResult<i64> {
@@ -384,6 +341,7 @@ pub(crate) fn execute_select_into(
         columns,
         source: stmt.source.clone(),
         spool: stmt.spool,
+        target: TargetExpressions::default(),
     };
     execute(&insert, ctx)
 }

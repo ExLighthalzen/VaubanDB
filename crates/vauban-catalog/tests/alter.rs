@@ -509,7 +509,44 @@ fn add_not_null_column_with_default_still_fills_existing_rows() {
     insert_rows(&storage, &handle, meta.storage_id, &[(1, 2)]);
     let mut with_default = column("c", SqlType::Int, false);
     with_default.default = Some(Expr::Literal(Literal::Integer("7".to_owned()), Span::EMPTY));
+    let mut filled = Vec::new();
     let altered = catalog
+        .alter_table_filling(
+            &handle,
+            meta.id,
+            &AlterTable::AddColumn {
+                column: Box::new(with_default.clone()),
+                default_name: None,
+            },
+            &mut |column| {
+                filled.push(column.name.clone());
+                Ok(Value::I32(7))
+            },
+        )
+        .expect("ALTER TABLE not_null_default ADD c int NOT NULL DEFAULT (7);");
+    assert_eq!(filled, vec!["c".to_owned()], "one call per existing row");
+    let rows = scan_values(&storage, &handle, &txn, altered.storage_id, 3);
+    assert_eq!(
+        rows[0][2],
+        Value::I32(7),
+        "a NOT NULL column has no row left NULL to leave alone, so it keeps filling"
+    );
+    txn.commit(handle).expect("commit");
+}
+
+#[test]
+fn add_not_null_column_with_default_without_a_fill_is_an_internal_error() {
+    // The catalogue evaluates no expression: a value for the existing rows comes from the
+    // caller of `alter_table_filling`, and plain `alter_table` has none to write.
+    let (catalog, storage, txn) = instance();
+    let handle = begin(&txn);
+    let meta = catalog
+        .create_table(&handle, &two_int_columns("not_null_no_fill"))
+        .expect("create_table");
+    insert_rows(&storage, &handle, meta.storage_id, &[(1, 2)]);
+    let mut with_default = column("c", SqlType::Int, false);
+    with_default.default = Some(Expr::Literal(Literal::Integer("7".to_owned()), Span::EMPTY));
+    let err = catalog
         .alter_table(
             &handle,
             meta.id,
@@ -518,14 +555,9 @@ fn add_not_null_column_with_default_still_fills_existing_rows() {
                 default_name: None,
             },
         )
-        .expect("ALTER TABLE not_null_default ADD c int NOT NULL DEFAULT (7);");
-    let rows = scan_values(&storage, &handle, &txn, altered.storage_id, 3);
-    assert_eq!(
-        rows[0][2],
-        Value::I32(7),
-        "a NOT NULL column has no row left NULL to leave alone, so it keeps filling"
-    );
-    txn.commit(handle).expect("commit");
+        .expect_err("no value for the existing row");
+    assert_eq!(err.number, 50000);
+    txn.rollback(handle).expect("rollback");
 }
 
 #[test]

@@ -211,6 +211,7 @@ fn update_stmt(
         input: scan(table, scan_cols),
         assignments,
         spool: false,
+        target: Default::default(),
     })
 }
 

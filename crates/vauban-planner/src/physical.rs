@@ -16,7 +16,8 @@ use std::ops::Bound;
 
 use vauban_binder::{
     AggregateCall, BoundExecute, BoundExpr, BoundProjection, BoundTop, ColumnBinding, DdlStatement,
-    DeferredStatement, JoinKind, LockHints, OutputSchema, SortKey, SubqueryId, TxnStatement,
+    DeferredStatement, JoinKind, LockHints, OutputSchema, SortKey, SubqueryId, TargetExpressions,
+    TxnStatement,
 };
 use vauban_catalog::{ColumnId, TableDef, TableId};
 use vauban_storage::{Direction, IndexId};
@@ -477,6 +478,9 @@ pub struct PhysicalInsert {
     /// True when the rows must be read entirely before the first one is written: the
     /// Halloween protection the planner decides and the executor applies.
     pub spool: bool,
+    /// The `DEFAULT` of each column `columns` leaves out, the computed columns and the
+    /// `CHECK` constraints of the table, bound once for the statement.
+    pub target: TargetExpressions,
 }
 
 /// An `UPDATE`, planned. Not produced yet.
@@ -490,6 +494,9 @@ pub struct PhysicalUpdate {
     pub assignments: Vec<(ColumnBinding, BoundExpr)>,
     /// True when the rows must be read entirely before the first one is written.
     pub spool: bool,
+    /// The computed columns and the `CHECK` constraints of the table, bound once for the
+    /// statement.
+    pub target: TargetExpressions,
 }
 
 /// A `DELETE`, planned. Not produced yet.

@@ -8,10 +8,10 @@
 use std::collections::BTreeSet;
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_parser::{BinaryOp, Expr, InList, Literal};
+use vauban_parser::{Expr, InList};
 use vauban_storage::{IndexId, KeyColumn, Row, TableId};
 use vauban_txn::{CommitAction, RollbackAction, TxnHandle};
-use vauban_types::{Collation, LiteralKind, Value, compare, parse_literal};
+use vauban_types::Value;
 
 use crate::catalog::Catalog;
 use crate::def::{AlterTable, ColumnDef, ConstraintDef, IndexDef, SortedColumn, TableDef};
@@ -74,6 +74,53 @@ pub(crate) fn alter_table(
     table: ObjectId,
     change: &AlterTable,
 ) -> SqlResult<TableMeta> {
+    alter_table_filled(catalog, txn, table, change, &mut refuse_to_fill)
+}
+
+/// The value [`Catalog::alter_table`] gives a `NOT NULL` column with a `DEFAULT` added to a
+/// table that holds rows: the internal error. The catalogue does not evaluate an
+/// expression; [`Catalog::alter_table_filling`] takes the evaluation from its caller.
+fn refuse_to_fill(column: &ColumnMeta) -> SqlResult<Value> {
+    Err(InternalError::Bug(format!(
+        "Catalog::alter_table: the NOT NULL column {} needs a value for the existing rows; \
+         Catalog::alter_table_filling takes it",
+        column.name
+    ))
+    .into())
+}
+
+impl Catalog {
+    /// [`Catalog::alter_table`], with the value each existing row takes in a `NOT NULL`
+    /// column the change adds with a `DEFAULT`.
+    ///
+    /// `fill` is called once per existing row and per such column, with the column as the
+    /// new table holds it, and answers the value to write, already of the type of the
+    /// column (`tests/alter.rs`, `add_not_null_column_with_default_still_fills_existing_rows`).
+    /// A nullable column added with a `DEFAULT` leaves the existing rows `NULL` and does not
+    /// call `fill`.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Catalog::alter_table`], and what `fill` answers.
+    pub fn alter_table_filling(
+        &self,
+        txn: &TxnHandle,
+        table: ObjectId,
+        change: &AlterTable,
+        fill: &mut dyn FnMut(&ColumnMeta) -> SqlResult<Value>,
+    ) -> SqlResult<TableMeta> {
+        alter_table_filled(self, txn, table, change, fill)
+    }
+}
+
+/// The body of [`alter_table`] and of [`Catalog::alter_table_filling`].
+fn alter_table_filled(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    table: ObjectId,
+    change: &AlterTable,
+    fill: &mut dyn FnMut(&ColumnMeta) -> SqlResult<Value>,
+) -> SqlResult<TableMeta> {
     // Both roads take the `Sch-M` first: a `CHECK`, `FOREIGN KEY` or `DEFAULT` added in
     // place changes what a write of the table is checked against, so another transaction
     // waits for the end of this one before it binds a statement over the table
@@ -106,7 +153,7 @@ pub(crate) fn alter_table(
             .collect();
         (old, plan, old_storage, old_indexes)
     };
-    let (meta, index_defs) = copy_table(catalog, txn, &old, &plan)?;
+    let (meta, index_defs) = copy_table(catalog, txn, &old, &plan, fill)?;
     // Granted at once: no other transaction knows the new storage table yet.
     catalog.txn.schema_modify_lock(txn, meta.storage_id)?;
     catalog
@@ -350,16 +397,6 @@ fn alter_table_constraint(
     table: ObjectId,
     change: &AlterTable,
 ) -> SqlResult<TableMeta> {
-    if let AlterTable::AddConstraint { constraint } = change
-        && let ConstraintDef::Check { name, expr } = constraint.as_ref()
-    {
-        let meta = table_meta_for_alter(catalog, table)?;
-        // The rows are read against the tree the constraint will hold, the one read back from
-        // its stored text (`meta.rs`, `stored_expression`): `a BETWEEN 1 AND 5` is checked as
-        // `[a]>=(1) AND [a]<=(5)`.
-        let (_, stored) = stored_expression(expr, ExpressionKind::Predicate)?;
-        refuse_check_violated_by_existing_rows(catalog, txn, &meta, name, &stored)?;
-    }
     let mut store = table::store(catalog);
     table::refresh(catalog, &mut store)?;
     index::refresh(catalog, &mut store)?;
@@ -397,23 +434,6 @@ fn alter_table_constraint(
         .get(table)
         .cloned()
         .expect("alter_table stored the table"))
-}
-
-fn table_meta_for_alter(catalog: &Catalog, table: ObjectId) -> SqlResult<TableMeta> {
-    let mut store = table::store(catalog);
-    table::refresh(catalog, &mut store)?;
-    index::refresh(catalog, &mut store)?;
-    crate::constraints::refresh_sessions(catalog, &mut store)?;
-    crate::constraints::forget_dropped(&mut store);
-    let Some(entry) = store.entries.get(&table) else {
-        return Err(SqlError::cannot_drop("alter", "table", &table.to_string()));
-    };
-    if entry.dropped_by.is_some() {
-        return Err(SqlError::cannot_drop("alter", "table", &entry.meta.name));
-    }
-    store.get(table).cloned().ok_or_else(|| {
-        InternalError::Bug(format!("Catalog::alter_table: table {table} vanished")).into()
-    })
 }
 
 /// Appends one column of an `ADD` (single or listed) to `columns`, in place.
@@ -663,6 +683,7 @@ fn copy_table(
     txn: &TxnHandle,
     old: &TableMeta,
     plan: &AlterPlan,
+    fill: &mut dyn FnMut(&ColumnMeta) -> SqlResult<Value>,
 ) -> SqlResult<(TableMeta, Vec<IndexDef>)> {
     let def = build_table_def(old, &plan.columns, &plan.keys, &[]);
     let keys = index::table_keys(&crate::constraints::keys_only(&def), &plan.columns)?;
@@ -682,7 +703,7 @@ fn copy_table(
         catalog.storage.drop_table(new_storage)?;
         return Err(err);
     }
-    copy_visible_rows(catalog, txn, old, new_storage, &plan.columns)?;
+    copy_visible_rows(catalog, txn, old, new_storage, &plan.columns, fill)?;
     let mut meta = TableMeta {
         id: old.id,
         storage_id: new_storage,
@@ -748,6 +769,7 @@ fn copy_visible_rows(
     old: &TableMeta,
     new_storage: TableId,
     new_columns: &[ColumnMeta],
+    fill: &mut dyn FnMut(&ColumnMeta) -> SqlResult<Value>,
 ) -> SqlResult<()> {
     let snap = catalog.txn.statement_snapshot(txn);
     let map = column_copy_map(&old.columns, new_columns);
@@ -768,11 +790,8 @@ fn copy_visible_rows(
             // column has no such row to leave `NULL`, so it keeps filling from the default
             // (`crates/vauban-executor/tests/ddl_alter.rs`,
             // `add_column_with_default_fills_existing_rows`).
-            if !filled.contains(&position)
-                && !column.ty.nullable
-                && let Some(value) = default_for_new_column(column)?
-            {
-                copied[position] = value;
+            if !filled.contains(&position) && !column.ty.nullable && column.default.is_some() {
+                copied[position] = fill(column)?;
             }
         }
         catalog.storage.insert(txn.id, new_storage, &Row(copied))?;
@@ -997,42 +1016,6 @@ fn constraint_def_name(constraint: &ConstraintDef) -> Option<String> {
     }
 }
 
-/// The value written into existing rows for a newly added column that carries a literal
-/// `DEFAULT`.
-fn default_for_new_column(column: &ColumnMeta) -> SqlResult<Option<vauban_types::Value>> {
-    use vauban_parser::{Expr, Literal};
-    use vauban_types::{LiteralKind, parse_literal};
-    let Some(expr) = &column.default else {
-        return Ok(None);
-    };
-    let value = match expr {
-        Expr::Literal(Literal::Integer(text), _) => parse_literal(LiteralKind::Integer, text)?.0,
-        Expr::Literal(Literal::Null, _) => vauban_types::Value::Null,
-        Expr::Literal(Literal::Str { value, unicode }, _) => {
-            let kind = if *unicode {
-                LiteralKind::NStr
-            } else {
-                LiteralKind::Str
-            };
-            parse_literal(kind, value)?.0
-        }
-        Expr::Nested(inner, _) => {
-            return default_for_new_column(&ColumnMeta {
-                default: Some((**inner).clone()),
-                ..column.clone()
-            });
-        }
-        _ => {
-            return Err(InternalError::Bug(format!(
-                "Catalog::alter_table: default on column {} is not a literal",
-                column.name
-            ))
-            .into());
-        }
-    };
-    Ok(Some(value))
-}
-
 fn column_copy_map(old: &[ColumnMeta], new: &[ColumnMeta]) -> Vec<(usize, usize)> {
     let mut map = Vec::new();
     for (new_pos, new_column) in new.iter().enumerate() {
@@ -1174,194 +1157,4 @@ fn statement_index_defs(store: &TableStore, table: &TableMeta) -> Vec<IndexDef> 
                 })
         })
         .collect()
-}
-
-/// Refuses a `CHECK` constraint that existing rows already violate (547).
-fn refuse_check_violated_by_existing_rows(
-    catalog: &Catalog,
-    txn: &TxnHandle,
-    table: &TableMeta,
-    name: &Option<String>,
-    expr: &Expr,
-) -> SqlResult<()> {
-    let snap = catalog.txn.statement_snapshot(txn);
-    for result in catalog.storage.scan(&snap, table.storage_id)? {
-        let (_, row) = result?;
-        if check_expr_is_false(expr, &row.0, &table.columns)? {
-            let db = catalog
-                .snapshot(txn)
-                .database_by_id(table.database)
-                .map(|entry| entry.name.clone())
-                .unwrap_or_else(|| "master".to_owned());
-            let qualified = format!("{}.{}", table.schema, table.name);
-            let constraint = name.as_deref().unwrap_or("CHECK");
-            return Err(SqlError::fk_violation(
-                "ALTER TABLE",
-                "CHECK",
-                constraint,
-                &db,
-                &qualified,
-                check_violation_column(expr),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// The column a simple `CHECK` names in its 547, when there is one.
-fn check_violation_column(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::Column(column) => Some(column.name.value.as_str()),
-        Expr::Binary { left, .. } => check_violation_column(left),
-        Expr::Unary { expr, .. } | Expr::Nested(expr, _) => check_violation_column(expr),
-        Expr::IsNull { expr, .. } => check_violation_column(expr),
-        _ => None,
-    }
-}
-
-/// Whether `expr` evaluates to false on `row` (unknown is not false).
-fn check_expr_is_false(expr: &Expr, row: &[Value], columns: &[ColumnMeta]) -> SqlResult<bool> {
-    Ok(matches!(eval_check_expr(expr, row, columns)?, Some(false)))
-}
-
-fn eval_check_expr(expr: &Expr, row: &[Value], columns: &[ColumnMeta]) -> SqlResult<Option<bool>> {
-    match expr {
-        Expr::Literal(literal, _) => Ok(Some(check_literal_is_true(literal)?)),
-        Expr::Binary {
-            op, left, right, ..
-        } => eval_check_binary(*op, left, right, row, columns),
-        Expr::Unary {
-            op: vauban_parser::UnaryOp::Not,
-            expr,
-            ..
-        } => Ok(eval_check_expr(expr, row, columns)?.map(|value| !value)),
-        Expr::Nested(inner, _) => eval_check_expr(inner, row, columns),
-        Expr::IsNull { expr, negated, .. } => {
-            let value = eval_check_expr_value(expr, row, columns)?;
-            Ok(Some(matches!(value, Value::Null) != *negated))
-        }
-        _ => Err(InternalError::Bug(format!(
-            "Catalog::alter_table: CHECK expression {expr:?} is not evaluated here"
-        ))
-        .into()),
-    }
-}
-
-fn eval_check_expr_value(expr: &Expr, row: &[Value], columns: &[ColumnMeta]) -> SqlResult<Value> {
-    match expr {
-        Expr::Literal(literal, _) => literal_value(literal),
-        Expr::Column(column) => Ok(column_value(row, columns, &column.name.value)?
-            .cloned()
-            .unwrap_or(Value::Null)),
-        Expr::Nested(inner, _) => eval_check_expr_value(inner, row, columns),
-        _ => Err(InternalError::Bug(format!(
-            "Catalog::alter_table: CHECK operand {expr:?} is not evaluated here"
-        ))
-        .into()),
-    }
-}
-
-fn eval_check_binary(
-    op: BinaryOp,
-    left: &Expr,
-    right: &Expr,
-    row: &[Value],
-    columns: &[ColumnMeta],
-) -> SqlResult<Option<bool>> {
-    match op {
-        BinaryOp::And => {
-            let left = eval_check_expr(left, row, columns)?;
-            if left == Some(false) {
-                return Ok(Some(false));
-            }
-            let right = eval_check_expr(right, row, columns)?;
-            Ok(match (left, right) {
-                (Some(true), Some(true)) => Some(true),
-                (Some(false), _) | (_, Some(false)) => Some(false),
-                _ => None,
-            })
-        }
-        BinaryOp::Or => {
-            let left = eval_check_expr(left, row, columns)?;
-            if left == Some(true) {
-                return Ok(Some(true));
-            }
-            let right = eval_check_expr(right, row, columns)?;
-            Ok(match (left, right) {
-                (Some(false), Some(false)) => Some(false),
-                (Some(true), _) | (_, Some(true)) => Some(true),
-                _ => None,
-            })
-        }
-        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-            let left = eval_check_expr_value(left, row, columns)?;
-            let right = eval_check_expr_value(right, row, columns)?;
-            let ordering = compare(&left, &right, &Collation::DEFAULT)?;
-            Ok(ordering.map(|ordering| comparison_holds(op, ordering)))
-        }
-        _ => Err(InternalError::Bug(format!(
-            "Catalog::alter_table: CHECK binary operator {op:?} is not evaluated here"
-        ))
-        .into()),
-    }
-}
-
-fn comparison_holds(op: BinaryOp, ordering: std::cmp::Ordering) -> bool {
-    use std::cmp::Ordering::{Equal, Greater, Less};
-    match op {
-        BinaryOp::Eq => ordering == Equal,
-        BinaryOp::Ne => ordering != Equal,
-        BinaryOp::Lt => ordering == Less,
-        BinaryOp::Le => ordering != Equal && ordering != Greater,
-        BinaryOp::Gt => ordering == Greater,
-        BinaryOp::Ge => ordering != Less && ordering != Equal,
-        _ => false,
-    }
-}
-
-fn check_literal_is_true(literal: &Literal) -> SqlResult<bool> {
-    match literal {
-        Literal::Integer(text) => Ok(text != "0"),
-        Literal::Null => Ok(false),
-        _ => Err(InternalError::Bug(format!(
-            "Catalog::alter_table: CHECK literal {literal:?} is not evaluated here"
-        ))
-        .into()),
-    }
-}
-
-fn literal_value(literal: &Literal) -> SqlResult<Value> {
-    match literal {
-        Literal::Integer(text) => Ok(parse_literal(LiteralKind::Integer, text)?.0),
-        Literal::Null => Ok(Value::Null),
-        Literal::Str { value, unicode } => {
-            let kind = if *unicode {
-                LiteralKind::NStr
-            } else {
-                LiteralKind::Str
-            };
-            Ok(parse_literal(kind, value)?.0)
-        }
-        _ => Err(InternalError::Bug(format!(
-            "Catalog::alter_table: CHECK literal {literal:?} is not evaluated here"
-        ))
-        .into()),
-    }
-}
-
-fn column_value<'a>(
-    row: &'a [Value],
-    columns: &[ColumnMeta],
-    name: &str,
-) -> SqlResult<Option<&'a Value>> {
-    let Some(column) = columns
-        .iter()
-        .find(|column| column.name.eq_ignore_ascii_case(name))
-    else {
-        return Err(InternalError::Bug(format!(
-            "Catalog::alter_table: CHECK names the unknown column {name}"
-        ))
-        .into());
-    };
-    Ok(row.get(column.ordinal as usize))
 }

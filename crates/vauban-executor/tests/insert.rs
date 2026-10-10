@@ -5,8 +5,8 @@ use std::slice;
 use std::sync::Arc;
 
 use vauban_binder::{
-    BindContext, BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LockHints, NoVariables,
-    OutputColumn, OutputSchema, SessionOptions, bind,
+    BindContext, BoundExpr, BoundExprKind, BoundStatement, ColumnBinding, CompareOp, LockHints,
+    NoVariables, OutputColumn, OutputSchema, SessionOptions, TargetExpressions, bind,
 };
 use vauban_catalog::{Catalog, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, TableDef};
 use vauban_errors::SqlResult;
@@ -241,6 +241,7 @@ fn insert_one(table: TableId, bindings: &[ColumnBinding], row: Vec<Value>) -> Ph
         columns: bindings.to_vec(),
         source: values_plan(vec![row], &types),
         spool: false,
+        target: Default::default(),
     })
 }
 
@@ -311,6 +312,7 @@ fn insert_values_then_scan_returns_the_rows() {
             &[int(false), int(true)],
         ),
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -390,6 +392,11 @@ fn missing_column_takes_its_default() {
         columns: vec![col_binding(0, "a", int(false))],
         source: values_plan(vec![vec![Value::I32(7)]], &[int(false)]),
         spool: false,
+        target: bound_target(
+            &catalog,
+            &handle,
+            "INSERT INTO dbo.insert_test_default (a) VALUES (7);",
+        ),
     });
 
     let eval = StaticContext::default();
@@ -468,6 +475,11 @@ fn missing_column_takes_its_named_default() {
         columns: vec![col_binding(0, "a", int(false))],
         source: values_plan(vec![vec![Value::I32(7)]], &[int(false)]),
         spool: false,
+        target: bound_target(
+            &catalog,
+            &handle,
+            "INSERT INTO dbo.insert_test_named_default (a) VALUES (7);",
+        ),
     });
 
     let eval = StaticContext::default();
@@ -546,6 +558,7 @@ fn missing_not_null_column_is_515() {
         columns: vec![col_binding(0, "a", int(false))],
         source: values_plan(vec![vec![Value::I32(7)]], &[int(false)]),
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -621,6 +634,7 @@ fn identity_increments_per_row() {
             &[int(true)],
         ),
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -706,6 +720,7 @@ fn explicit_identity_value_bumps_the_counter_for_the_next_row() {
             &[int(true)],
         ),
         spool: false,
+        target: Default::default(),
     });
     let explicit = PhysicalStatement::Insert(PhysicalInsert {
         table: meta.storage_id,
@@ -715,12 +730,14 @@ fn explicit_identity_value_bumps_the_counter_for_the_next_row() {
             &[int(false), int(true)],
         ),
         spool: false,
+        target: Default::default(),
     });
     let automatic = PhysicalStatement::Insert(PhysicalInsert {
         table: meta.storage_id,
         columns: vec![v],
         source: values_plan(vec![vec![Value::I32(100)]], &[int(true)]),
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -875,7 +892,7 @@ fn trailing_zero_bytes_beyond_the_declared_length_do_not_raise_2628() {
 #[test]
 fn a_default_literal_too_long_for_the_column_is_2628() {
     let mut f = Fixture::new();
-    let table = f.create(
+    f.create(
         "insert_trunc_default",
         vec![
             column("k", int(false), None),
@@ -889,10 +906,8 @@ fn a_default_literal_too_long_for_the_column_is_2628() {
             ),
         ],
     );
-    let k = col_binding(0, "k", int(false));
-
     let err = f
-        .run(&insert_one(table, slice::from_ref(&k), vec![Value::I32(1)]))
+        .run_sql("INSERT INTO dbo.insert_trunc_default (k) VALUES (1);")
         .expect_err("the default is too long for the column");
     assert_eq!(err.number, 2628);
     assert_eq!(err.state, 1);
@@ -953,6 +968,7 @@ fn an_explicit_cast_still_truncates_without_error() {
             },
         },
         spool: false,
+        target: Default::default(),
     });
 
     f.run(&stmt).expect("CAST already cut the string");
@@ -1043,6 +1059,7 @@ fn insert_from_plan_counts_rows() {
         columns: vec![col_binding(0, "a", int(true))],
         source,
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -1096,6 +1113,7 @@ fn insert_reading_its_own_target_is_materialized() {
         columns: vec![col_binding(0, "a", int(true))],
         source: values_plan(vec![vec![Value::I32(1)], vec![Value::I32(2)]], &[int(true)]),
         spool: false,
+        target: Default::default(),
     });
 
     let eval = StaticContext::default();
@@ -1127,6 +1145,7 @@ fn insert_reading_its_own_target_is_materialized() {
         columns: vec![col_binding(0, "a", int(true))],
         source: src_scan,
         spool: true,
+        target: Default::default(),
     });
 
     let (outcome, _) = execute_collect(&copy_stmt, &mut ctx).expect("spooled INSERT succeeds");
@@ -1247,6 +1266,7 @@ fn a_null_from_a_select_source_is_515() {
         columns: vec![a.clone()],
         source: select,
         spool: false,
+        target: Default::default(),
     });
     let err = f.run(&stmt).expect_err("the source row carries a NULL");
     assert_eq!(err.number, 515);
@@ -1278,6 +1298,7 @@ fn a_null_from_a_variable_is_515() {
             },
         },
         spool: false,
+        target: Default::default(),
     });
     let err = f.run(&stmt).expect_err("@v is NULL");
     assert_eq!(err.number, 515);
@@ -1328,7 +1349,7 @@ fn a_written_null_does_not_fall_back_to_the_default() {
     assert_eq!(err.number, 515);
     assert!(err.message.contains("'d'"), "{}", err.message);
 
-    f.run(&insert_one(table, slice::from_ref(&k), vec![Value::I32(2)]))
+    f.run_sql("INSERT INTO dbo.insert_null_over_default (k) VALUES (2);")
         .expect("the omitted column takes its default");
     assert_eq!(
         f.read(table, &[k, d]),
@@ -1342,17 +1363,15 @@ fn a_written_null_does_not_fall_back_to_the_default() {
 #[test]
 fn a_null_default_on_a_not_null_column_is_refused() {
     let mut f = Fixture::new();
-    let table = f.create(
+    f.create(
         "insert_null_default",
         vec![
             column("k", int(true), None),
             column("d", int(false), Some(default_of(Literal::Null))),
         ],
     );
-    let k = col_binding(0, "k", int(true));
-
     let err = f
-        .run(&insert_one(table, &[k], vec![Value::I32(1)]))
+        .run_sql("INSERT INTO dbo.insert_null_default (k) VALUES (1);")
         .expect_err("the default is NULL and the column is NOT NULL");
     assert_eq!(err.number, 515);
     assert_eq!(err.state, 2);
@@ -1408,8 +1427,8 @@ fn signed_and_binary_defaults() {
     );
     let k = col_binding(0, "k", int(false));
 
-    f.run(&insert_one(table, slice::from_ref(&k), vec![Value::I32(1)]))
-        .expect("every default is a literal");
+    f.run_sql("INSERT INTO dbo.insert_defaults_signed (k) VALUES (1);")
+        .expect("each default evaluates");
     let row = &f.read(
         table,
         &[
@@ -1434,11 +1453,12 @@ fn signed_and_binary_defaults() {
     assert_eq!(row[4], Value::I32(8), "DEFAULT (8) on an int column");
 }
 
-/// An arithmetic default is an expression and not a literal: it keeps the internal error
-/// rather than being computed. The line that separates the two is the sign and the
-/// parentheses of `signed_and_binary_defaults`, which are part of the literal.
+/// A `DEFAULT` that is an expression is evaluated by the evaluator of the queries and
+/// converted to its column as an explicit value is: `1 + 1`, `SYSDATETIME()` and `NEWID()`, on
+/// `INSERT … DEFAULT VALUES` and on a column the list leaves out.
 #[test]
-fn an_arithmetic_default_is_not_a_literal() {
+fn a_non_literal_default_is_evaluated() {
+    vauban_sysfn::register_builtins();
     let mut f = Fixture::new();
     let table = f.create(
         "insert_defaults_arith",
@@ -1457,10 +1477,57 @@ fn an_arithmetic_default_is_not_a_literal() {
             ),
         ],
     );
-    let k = col_binding(0, "k", int(true));
+    f.run_sql("CREATE TABLE dbo.insert_defaults_calls (k int NULL, at datetime2 NOT NULL DEFAULT SYSDATETIME(), id uniqueidentifier NOT NULL DEFAULT NEWID());")
+        .expect("the table is created");
 
-    let err = f
-        .run(&insert_one(table, &[k], vec![Value::I32(1)]))
-        .expect_err("1 + 1 is not a literal");
-    assert_eq!(err.number, 50_000);
+    f.run_sql("INSERT INTO dbo.insert_defaults_arith (k) VALUES (1);")
+        .expect("1 + 1 is evaluated");
+    f.run_sql("INSERT INTO dbo.insert_defaults_arith DEFAULT VALUES;")
+        .expect("DEFAULT VALUES evaluates it as well");
+    let rows = f.read(
+        table,
+        &[
+            col_binding(0, "k", int(true)),
+            col_binding(1, "d", int(false)),
+        ],
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::I32(1), Value::I32(2)],
+            vec![Value::Null, Value::I32(2)]
+        ]
+    );
+
+    f.run_sql("INSERT INTO dbo.insert_defaults_calls DEFAULT VALUES;")
+        .expect("SYSDATETIME() and NEWID() are evaluated");
+    f.run_sql("INSERT INTO dbo.insert_defaults_calls (k) VALUES (2);")
+        .expect("and evaluated again for the next row");
+    let (_, set) = f
+        .run_sql("SELECT at, id FROM dbo.insert_defaults_calls;")
+        .expect("the rows read back");
+    assert_eq!(set.rows.len(), 2);
+    for row in &set.rows {
+        assert!(matches!(row[0], Value::DateTime2(_)), "{:?}", row[0]);
+        assert!(matches!(row[1], Value::Guid(_)), "{:?}", row[1]);
+    }
+    assert_ne!(set.rows[0][1], set.rows[1][1], "NEWID() differs per row");
+}
+
+/// The bound object expressions the binder puts in the plan of the `INSERT` of `text`.
+fn bound_target(catalog: &Catalog, handle: &TxnHandle, text: &str) -> TargetExpressions {
+    let batch = parse_batch(text, &ParseOptions::default()).expect("the statement parses");
+    let snap = catalog.snapshot(handle);
+    let bind_ctx = BindContext {
+        text,
+        catalog: Some(&snap),
+        database: "master",
+        default_schema: "dbo",
+        variables: &NoVariables,
+        options: SessionOptions::default(),
+    };
+    match bind(&batch.statements[0], &bind_ctx).expect("the INSERT binds") {
+        BoundStatement::Insert(insert) => insert.target,
+        _ => panic!("not an INSERT"),
+    }
 }

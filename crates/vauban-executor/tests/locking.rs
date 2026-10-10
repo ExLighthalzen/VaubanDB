@@ -238,6 +238,7 @@ impl Fixture {
             input,
             assignments: vec![(binding(1, "b"), lit(value))],
             spool: false,
+            target: Default::default(),
         });
         execute_collect(&stmt, &mut ctx).map(|_| ())
     }

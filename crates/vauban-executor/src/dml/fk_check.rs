@@ -1,14 +1,25 @@
 //! `FOREIGN KEY` and `CHECK` at write time: the 547 of a row that breaks one.
+//!
+//! # Resolved once, checked per row
+//!
+//! [`WriteChecks::resolve`] reads what a statement checks out of the catalogue snapshot the
+//! statement already holds and out of the `CHECK` predicates its plan carries, bound once
+//! by the binder: the name of each constraint, the ordinals of the key columns, the index a
+//! parent key is sought through, and the tables whose foreign keys point at the written
+//! table. Checking a row is then evaluating those predicates and seeking those keys, with no
+//! catalogue snapshot and no text to read again (`tests/fk_check.rs`,
+//! `an_insert_select_builds_one_catalogue_snapshot`).
+//!
+//! A `CHECK` the plan does not carry, because its stored text did not bind, is not skipped:
+//! a row written under it is refused with the internal error, which names the constraint
+//! (`tests/fk_check.rs`, `a_check_missing_from_the_plan_refuses_the_row`).
 
 use std::collections::HashMap;
 
-use vauban_binder::{
-    BindContext, BoundStatement, CatalogView, LogicalPlan, NoVariables, SessionOptions, bind,
-};
+use vauban_binder::{BoundExpr, BoundObjectExpression};
 use vauban_catalog::{Catalog, CatalogSnapshot, ColumnId, ConstraintMeta, ObjectId, TableMeta};
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_parser::{Expr, ParseOptions, parse_batch};
-use vauban_storage::{Direction, IndexId, KeyRange};
+use vauban_storage::{Direction, IndexId, KeyRange, TableId};
 use vauban_types::Value;
 
 use crate::context::ExecContext;
@@ -16,157 +27,299 @@ use crate::errors::at;
 use crate::expr::eval_expr;
 use crate::row::Row;
 
-/// Runs the `CHECK` and outgoing `FOREIGN KEY` constraints of `table` against `row`.
-pub(crate) fn check_row(
-    table: &TableMeta,
-    row: &Row,
-    statement: &str,
-    ctx: &mut ExecContext<'_>,
-) -> SqlResult<()> {
-    let catalog = ctx.catalog()?;
-    let handle = ctx.handle()?;
-    let snap = catalog.snapshot(handle);
-    let db = database_name(&snap, table.database);
-    let table_object = format!("{}.{}", table.schema, table.name);
-    let constraint_names = constraint_names(catalog, table.id)?;
-
-    for constraint in &table.constraints {
-        match constraint {
-            ConstraintMeta::Check {
-                constraint, expr, ..
-            } => {
-                let bound = bind_check_predicate(table, &db, expr, &snap, ctx.options)?;
-                let value = eval_expr(&bound, Some(row), ctx)?;
-                if matches!(value, Value::Bit(false)) {
-                    let name = constraint_names
-                        .get(constraint)
-                        .map(String::as_str)
-                        .unwrap_or("?");
-                    return Err(at(
-                        SqlError::fk_violation(statement, "CHECK", name, &db, &table_object, None),
-                        bound.line,
-                    ));
-                }
-            }
-            ConstraintMeta::ForeignKey {
-                constraint,
-                columns,
-                referenced_table,
-                referenced_columns,
-                referenced_index,
-                ..
-            } => {
-                let key = key_values(table, row, columns)?;
-                if key.iter().any(|value| matches!(value, Value::Null)) {
-                    continue;
-                }
-                let Some(referenced) = snap.table(*referenced_table) else {
-                    return Err(bug(
-                        "FOREIGN KEY: referenced table is missing from the snapshot",
-                    ));
-                };
-                if !parent_key_exists(ctx, *referenced_index, &key)? {
-                    let name = constraint_names
-                        .get(constraint)
-                        .map(String::as_str)
-                        .unwrap_or("?");
-                    let column = referenced_column_name(referenced, referenced_columns.first());
-                    return Err(at(
-                        SqlError::fk_violation(
-                            statement,
-                            "FOREIGN KEY",
-                            name,
-                            &db,
-                            &format!("{}.{}", referenced.schema, referenced.name),
-                            column.as_deref(),
-                        ),
-                        0,
-                    ));
-                }
-            }
-            ConstraintMeta::PrimaryKey(_)
-            | ConstraintMeta::Unique(_)
-            | ConstraintMeta::Default { .. } => {}
-        }
-    }
-    Ok(())
+/// What one statement checks on each row it writes into one table.
+pub(crate) struct WriteChecks {
+    /// `INSERT`, `UPDATE` or `DELETE`, for the 547 text.
+    statement: &'static str,
+    /// The database of the table, for the 547 text.
+    database: String,
+    /// `schema.table`, for the 547 of a `CHECK`.
+    object: String,
+    /// The `CHECK` and outgoing `FOREIGN KEY` constraints, in the order the table declares
+    /// them.
+    rules: Vec<Rule>,
+    /// The foreign keys of other tables that point at this one.
+    incoming: Vec<Incoming>,
 }
 
-/// Refuses when a row of another table still references `row` through a foreign key.
-pub(crate) fn check_no_referencing_rows(
-    table: &TableMeta,
-    row: &Row,
-    statement: &str,
-    ctx: &mut ExecContext<'_>,
-) -> SqlResult<()> {
-    let catalog = ctx.catalog()?;
-    let handle = ctx.handle()?;
-    let snap = catalog.snapshot(handle);
-    let db = database_name(&snap, table.database);
-    let refs = catalog.referencing_foreign_keys(table.id)?;
-    if refs.is_empty() {
-        return Ok(());
+/// One `CHECK` or outgoing `FOREIGN KEY` of the written table.
+enum Rule {
+    /// A `CHECK`; `predicate` is `None` when the plan carries no bound predicate for it.
+    Check {
+        name: String,
+        predicate: Option<BoundExpr>,
+    },
+    /// A `FOREIGN KEY` of the written table.
+    ForeignKey {
+        name: String,
+        /// The ordinals of the key columns in a row of the written table.
+        ordinals: Vec<usize>,
+        /// The index of the parent key the key is sought in.
+        index: IndexId,
+        /// `schema.table` of the parent.
+        parent: String,
+        /// The first referenced column, which the 547 text names.
+        column: Option<String>,
+    },
+}
+
+/// A foreign key of a child table that points at the written table.
+struct Incoming {
+    name: String,
+    /// The storage table of the child.
+    child: TableId,
+    /// The ordinals of the key columns in a row of the child.
+    child_ordinals: Vec<usize>,
+    /// An index of the child whose leading columns are the key, when there is one.
+    child_index: Option<IndexId>,
+    /// The ordinals of the referenced columns in a row of the written table.
+    referenced_ordinals: Vec<usize>,
+    /// `schema.table` of the child.
+    object: String,
+    /// The first key column of the child, which the 547 text names.
+    column: Option<String>,
+}
+
+impl WriteChecks {
+    /// Resolves what a statement writing into `table` checks.
+    ///
+    /// `checks` are the bound `CHECK` predicates of the plan; `incoming` asks for the
+    /// foreign keys that point at the table, which an `UPDATE` and a `DELETE` need and an
+    /// `INSERT` does not.
+    ///
+    /// # Errors
+    ///
+    /// The internal error when the snapshot no longer holds a table a constraint names, and
+    /// what reading the constraints of the catalogue raises.
+    pub(crate) fn resolve(
+        table: &TableMeta,
+        snap: &CatalogSnapshot,
+        checks: &[BoundObjectExpression],
+        statement: &'static str,
+        incoming: bool,
+        ctx: &ExecContext<'_>,
+    ) -> SqlResult<Self> {
+        let catalog = ctx.catalog()?;
+        let database = snap
+            .database_by_id(table.database)
+            .map_or_else(|| "?".to_owned(), |db| db.name.clone());
+        let names = constraint_names(catalog, table.id)?;
+        let name_of = |id: &ObjectId| names.get(id).cloned().unwrap_or_else(|| "?".to_owned());
+        let mut rules = Vec::new();
+        for constraint in &table.constraints {
+            match constraint {
+                ConstraintMeta::Check { constraint, .. } => {
+                    let name = name_of(constraint);
+                    let predicate = checks
+                        .iter()
+                        .find(|check| check.constraint.as_deref() == Some(name.as_str()))
+                        .map(|check| check.expr.clone());
+                    rules.push(Rule::Check { name, predicate });
+                }
+                ConstraintMeta::ForeignKey {
+                    constraint,
+                    columns,
+                    referenced_table,
+                    referenced_columns,
+                    referenced_index,
+                    ..
+                } => {
+                    let Some(parent) = snap.table(*referenced_table) else {
+                        return Err(bug(
+                            "FOREIGN KEY: referenced table is missing from the snapshot",
+                        ));
+                    };
+                    rules.push(Rule::ForeignKey {
+                        name: name_of(constraint),
+                        ordinals: ordinals(table, columns)?,
+                        index: *referenced_index,
+                        parent: format!("{}.{}", parent.schema, parent.name),
+                        column: column_name(parent, referenced_columns.first()),
+                    });
+                }
+                ConstraintMeta::PrimaryKey(_)
+                | ConstraintMeta::Unique(_)
+                | ConstraintMeta::Default { .. } => {}
+            }
+        }
+        let incoming = if incoming {
+            resolve_incoming(table, snap, catalog)?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            statement,
+            database,
+            object: format!("{}.{}", table.schema, table.name),
+            rules,
+            incoming,
+        })
     }
 
-    for reference in refs {
+    /// Runs the `CHECK` and outgoing `FOREIGN KEY` constraints against `row`, a row of the
+    /// written table.
+    ///
+    /// # Errors
+    ///
+    /// 547 for the first constraint `row` breaks; the internal error for a `CHECK` the plan
+    /// carries no predicate for; what evaluating a predicate or seeking a key raises.
+    pub(crate) fn check_row(&self, row: &Row, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+        for rule in &self.rules {
+            match rule {
+                Rule::Check { name, predicate } => {
+                    let Some(predicate) = predicate else {
+                        return Err(bug(&format!(
+                            "{}: the CHECK constraint '{name}' of table '{}' has no bound \
+                             predicate, so the row is not written",
+                            self.statement, self.object
+                        )));
+                    };
+                    let value = eval_expr(predicate, Some(row), ctx)?;
+                    if matches!(value, Value::Bit(false)) {
+                        return Err(at(
+                            SqlError::fk_violation(
+                                self.statement,
+                                "CHECK",
+                                name,
+                                &self.database,
+                                &self.object,
+                                None,
+                            ),
+                            predicate.line,
+                        ));
+                    }
+                }
+                Rule::ForeignKey {
+                    name,
+                    ordinals,
+                    index,
+                    parent,
+                    column,
+                } => {
+                    let key = key_values(row, ordinals)?;
+                    if key.iter().any(|value| matches!(value, Value::Null)) {
+                        continue;
+                    }
+                    if !key_exists(ctx, *index, &key)? {
+                        return Err(at(
+                            SqlError::fk_violation(
+                                self.statement,
+                                "FOREIGN KEY",
+                                name,
+                                &self.database,
+                                parent,
+                                column.as_deref(),
+                            ),
+                            0,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses when a row of another table still references `row` through a foreign key.
+    ///
+    /// # Errors
+    ///
+    /// 547 for the first foreign key that still finds a child row; what reading the child
+    /// raises.
+    pub(crate) fn check_no_referencing_rows(
+        &self,
+        row: &Row,
+        ctx: &mut ExecContext<'_>,
+    ) -> SqlResult<()> {
+        for reference in &self.incoming {
+            let key = key_values(row, &reference.referenced_ordinals)?;
+            if key.iter().any(|value| matches!(value, Value::Null)) {
+                continue;
+            }
+            if child_row_exists(ctx, reference, &key)? {
+                return Err(at(
+                    SqlError::fk_violation(
+                        self.statement,
+                        "REFERENCE",
+                        &reference.name,
+                        &self.database,
+                        &reference.object,
+                        reference.column.as_deref(),
+                    ),
+                    0,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `true` when an `UPDATE` changes a column an incoming foreign key references.
+    pub(crate) fn referenced_columns_changed(&self, old_row: &Row, new_row: &Row) -> bool {
+        self.incoming.iter().any(|reference| {
+            reference
+                .referenced_ordinals
+                .iter()
+                .any(|ordinal| old_row.get(*ordinal) != new_row.get(*ordinal))
+        })
+    }
+}
+
+/// The foreign keys of the other tables that point at `table`, resolved.
+fn resolve_incoming(
+    table: &TableMeta,
+    snap: &CatalogSnapshot,
+    catalog: &Catalog,
+) -> SqlResult<Vec<Incoming>> {
+    let mut resolved = Vec::new();
+    for reference in catalog.referencing_foreign_keys(table.id)? {
         let Some(child) = snap.table(reference.table) else {
             return Err(bug("REFERENCE: child table is missing from the snapshot"));
         };
-        let key = key_values(table, row, &reference.referenced_columns)?;
-        if key.iter().any(|value| matches!(value, Value::Null)) {
-            continue;
-        }
-        if child_row_exists(ctx, child, &reference.columns, &key)? {
-            let names = constraint_names(catalog, child.id)?;
-            let name = names
+        let names = constraint_names(catalog, child.id)?;
+        let child_ordinals = ordinals(child, &reference.columns)?;
+        resolved.push(Incoming {
+            name: names
                 .get(&reference.constraint)
-                .map(String::as_str)
-                .unwrap_or("?");
-            let column = referenced_column_name(child, reference.columns.first());
-            return Err(at(
-                SqlError::fk_violation(
-                    statement,
-                    "REFERENCE",
-                    name,
-                    &db,
-                    &format!("{}.{}", child.schema, child.name),
-                    column.as_deref(),
-                ),
-                0,
-            ));
-        }
+                .cloned()
+                .unwrap_or_else(|| "?".to_owned()),
+            child: child.storage_id,
+            child_index: index_for_key(snap, child, &child_ordinals)?,
+            child_ordinals,
+            referenced_ordinals: ordinals(table, &reference.referenced_columns)?,
+            object: format!("{}.{}", child.schema, child.name),
+            column: column_name(child, reference.columns.first()),
+        });
     }
-    Ok(())
+    Ok(resolved)
 }
 
-/// `true` when an `UPDATE` changes a column referenced by an incoming foreign key.
-pub(crate) fn referenced_columns_changed(
-    table: &TableMeta,
-    old_row: &Row,
-    new_row: &Row,
-    ctx: &mut ExecContext<'_>,
-) -> SqlResult<bool> {
-    let catalog = ctx.catalog()?;
-    let refs = catalog.referencing_foreign_keys(table.id)?;
-    if refs.is_empty() {
-        return Ok(false);
-    }
-    let mut referenced: HashMap<ColumnId, ()> = HashMap::new();
-    for reference in refs {
-        for column in &reference.referenced_columns {
-            referenced.insert(*column, ());
-        }
-    }
-    for column in referenced.keys() {
-        let ordinal = ordinal_of(table, *column)?;
-        if old_row[ordinal] != new_row[ordinal] {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+/// An index of `child` whose leading columns are `ordinals`, in that order.
+fn index_for_key(
+    snap: &CatalogSnapshot,
+    child: &TableMeta,
+    ordinals: &[usize],
+) -> SqlResult<Option<IndexId>> {
+    let ordinals: Vec<u16> = ordinals
+        .iter()
+        .map(|ordinal| {
+            u16::try_from(*ordinal)
+                .map_err(|_| bug("FOREIGN KEY: column ordinal does not fit an index key"))
+        })
+        .collect::<SqlResult<_>>()?;
+    Ok(snap
+        .indexes_of(child.id)
+        .iter()
+        .find(|index| {
+            index.columns.len() >= ordinals.len()
+                && index
+                    .columns
+                    .iter()
+                    .zip(ordinals.iter())
+                    .all(|(key, ordinal)| key.column == *ordinal)
+        })
+        .map(|index| index.id))
 }
 
-fn parent_key_exists(ctx: &mut ExecContext<'_>, index: IndexId, key: &[Value]) -> SqlResult<bool> {
+fn key_exists(ctx: &mut ExecContext<'_>, index: IndexId, key: &[Value]) -> SqlResult<bool> {
     let storage = ctx.storage()?;
     let snap = ctx.snapshot()?;
     let mut iter = storage.seek(
@@ -180,99 +333,21 @@ fn parent_key_exists(ctx: &mut ExecContext<'_>, index: IndexId, key: &[Value]) -
 
 fn child_row_exists(
     ctx: &mut ExecContext<'_>,
-    child: &TableMeta,
-    fk_columns: &[ColumnId],
+    reference: &Incoming,
     key: &[Value],
 ) -> SqlResult<bool> {
+    if let Some(index) = reference.child_index {
+        return key_exists(ctx, index, key);
+    }
     let storage = ctx.storage()?;
     let snap = ctx.snapshot()?;
-    if let Some(index) = index_for_fk_columns(ctx, child, fk_columns)? {
-        let mut iter = storage.seek(
-            snap,
-            index,
-            &KeyRange::Point(key.to_vec()),
-            Direction::Forward,
-        )?;
-        return Ok(iter.next().transpose()?.is_some());
-    }
-    for item in storage.scan(snap, child.storage_id)? {
+    for item in storage.scan(snap, reference.child)? {
         let (_, row) = item?;
-        let child_key = key_values(child, &row.0, fk_columns)?;
-        if child_key == key {
+        if key_values(&row.0, &reference.child_ordinals)? == key {
             return Ok(true);
         }
     }
     Ok(false)
-}
-
-fn index_for_fk_columns(
-    ctx: &mut ExecContext<'_>,
-    child: &TableMeta,
-    columns: &[ColumnId],
-) -> SqlResult<Option<IndexId>> {
-    let catalog = ctx.catalog()?;
-    let handle = ctx.handle()?;
-    let snap = catalog.snapshot(handle);
-    let ordinals: Vec<u16> = columns
-        .iter()
-        .map(|column| {
-            u16::try_from(ordinal_of(child, *column)?)
-                .map_err(|_| bug("FOREIGN KEY: column ordinal does not fit an index key"))
-        })
-        .collect::<SqlResult<_>>()?;
-    for index in snap.indexes_of(child.id) {
-        if index.columns.len() < ordinals.len() {
-            continue;
-        }
-        if index
-            .columns
-            .iter()
-            .zip(ordinals.iter())
-            .all(|(key, ordinal)| key.column == *ordinal)
-        {
-            return Ok(Some(index.id));
-        }
-    }
-    Ok(None)
-}
-
-fn bind_check_predicate(
-    table: &TableMeta,
-    db: &str,
-    expr: &Expr,
-    snap: &CatalogSnapshot,
-    options: SessionOptions,
-) -> SqlResult<vauban_binder::BoundExpr> {
-    let object = format!("{}.{}.{}", db, table.schema, table.name);
-    let sql = format!("SELECT 1 FROM {object} WHERE {expr};");
-    let batch = parse_batch(&sql, &ParseOptions::default()).map_err(|err| at(err, 0))?;
-    let Some(statement) = batch.statements.first() else {
-        return Err(bug("CHECK: synthetic predicate batch is empty"));
-    };
-    let bind_ctx = BindContext {
-        text: &sql,
-        catalog: Some(snap as &dyn CatalogView),
-        database: db,
-        default_schema: "dbo",
-        variables: &NoVariables,
-        options,
-    };
-    let bound = bind(statement, &bind_ctx).map_err(|err| at(err, 0))?;
-    let BoundStatement::Query(plan) = bound else {
-        return Err(bug("CHECK: synthetic predicate is not a query"));
-    };
-    extract_where_predicate(&plan).ok_or_else(|| bug("CHECK: synthetic query has no WHERE"))
-}
-
-fn extract_where_predicate(plan: &LogicalPlan) -> Option<vauban_binder::BoundExpr> {
-    match plan {
-        LogicalPlan::Filter { predicate, .. } => Some(predicate.clone()),
-        LogicalPlan::Project { input, .. }
-        | LogicalPlan::Limit { input, .. }
-        | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Distinct(input) => extract_where_predicate(input),
-        _ => None,
-    }
 }
 
 fn constraint_names(catalog: &Catalog, table: ObjectId) -> SqlResult<HashMap<ObjectId, String>> {
@@ -283,31 +358,32 @@ fn constraint_names(catalog: &Catalog, table: ObjectId) -> SqlResult<HashMap<Obj
         .collect())
 }
 
-fn database_name(snap: &CatalogSnapshot, database: vauban_storage::DbId) -> String {
-    snap.database_by_id(database)
-        .map_or_else(|| "?".to_owned(), |db| db.name.clone())
-}
-
-fn key_values(table: &TableMeta, row: &Row, columns: &[ColumnId]) -> SqlResult<Vec<Value>> {
-    columns
+fn key_values(row: &[Value], ordinals: &[usize]) -> SqlResult<Vec<Value>> {
+    ordinals
         .iter()
-        .map(|column| {
-            let ordinal = ordinal_of(table, *column)?;
-            Ok(row[ordinal].clone())
+        .map(|ordinal| {
+            row.get(*ordinal)
+                .cloned()
+                .ok_or_else(|| bug("constraint column is past the end of the row"))
         })
         .collect()
 }
 
-fn ordinal_of(table: &TableMeta, column: ColumnId) -> SqlResult<usize> {
-    table
-        .columns
+fn ordinals(table: &TableMeta, columns: &[ColumnId]) -> SqlResult<Vec<usize>> {
+    columns
         .iter()
-        .find(|col| col.id == column)
-        .map(|col| usize::from(col.ordinal))
-        .ok_or_else(|| bug("constraint column is missing from the table metadata"))
+        .map(|column| {
+            table
+                .columns
+                .iter()
+                .find(|col| col.id == *column)
+                .map(|col| usize::from(col.ordinal))
+                .ok_or_else(|| bug("constraint column is missing from the table metadata"))
+        })
+        .collect()
 }
 
-fn referenced_column_name(table: &TableMeta, column: Option<&ColumnId>) -> Option<String> {
+fn column_name(table: &TableMeta, column: Option<&ColumnId>) -> Option<String> {
     column.and_then(|column| {
         table
             .columns

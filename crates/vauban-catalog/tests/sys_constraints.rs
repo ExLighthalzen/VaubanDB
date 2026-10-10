@@ -1322,41 +1322,4 @@ fn a_table_rebuilt_from_its_stored_text_holds_the_same_expressions() {
             .expect("the check")
     };
     assert_eq!(check(&rebuilt), check(&original));
-
-    // The same result of the `CHECK` on a row: `a = 7` is refused by both predicates, read
-    // against the row by `ALTER TABLE … ADD CONSTRAINT`, and `a = 3` is accepted by both.
-    for (value, accepted) in [(7, false), (3, true)] {
-        for (meta, label) in [(&original, "original"), (&rebuilt, "rebuilt")] {
-            let handle = txn.begin(IsolationLevel::ReadCommitted);
-            storage
-                .insert(
-                    handle.id,
-                    meta.storage_id,
-                    &vauban_storage::Row(vec![
-                        vauban_types::Value::I32(value),
-                        vauban_types::Value::Null,
-                    ]),
-                )
-                .expect("insert");
-            let (predicate, _) = check(meta);
-            let outcome = catalog.alter_table(
-                &handle,
-                meta.id,
-                &AlterTable::AddConstraint {
-                    constraint: Box::new(ConstraintDef::Check {
-                        name: Some(format!("ck_again_{label}")),
-                        expr: predicate,
-                    }),
-                },
-            );
-            match outcome {
-                Ok(_) => assert!(accepted, "{label}: a = {value} passes"),
-                Err(error) => {
-                    assert!(!accepted, "{label}: a = {value} fails with {error:?}");
-                    assert_eq!(error.number, 547, "{label}");
-                }
-            }
-            txn.rollback(handle).expect("rollback");
-        }
-    }
 }
