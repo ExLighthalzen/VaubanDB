@@ -710,12 +710,13 @@ fn a_dropped_database_takes_the_resolution_of_its_tables_with_it() {
 
 #[test]
 fn a_name_outside_cp1252_is_not_case_folded() {
-    // `Collation::compare` of `vauban_types` indexes its weights by CP1252 byte, so the case
-    // of `š` is folded and the case of `ф` is not. Both pairs are one name in SQL Server:
-    // `CREATE TABLE dbo.[š] (a int);` then `CREATE TABLE dbo.[Š] (a int);` is 2714 state 6
-    // and `OBJECT_ID` of the two spellings is one number; the pair `ф` / `Ф` answers the
-    // same 2714 and one number. The state below is the one of this build; the fold lives in
-    // `vauban_types`.
+    // Names are compared under `Collation::DEFAULT`, whose order is the `varchar` order of
+    // code page 1252: there `Š` and `š` are two characters, as are `Œ`/`œ`, `Ž`/`ž` and
+    // `Ÿ`/`ÿ`, and the case of `ф` is not folded either. Both pairs are one name in SQL
+    // Server, where object names are `nvarchar`: `CREATE TABLE dbo.[š] (a int);` then
+    // `CREATE TABLE dbo.[Š] (a int);` is 2714 state 6 and `OBJECT_ID` of the two spellings
+    // is one number; the pair `ф` / `Ф` answers the same 2714 and one number. The state
+    // below is the one of this build; the comparison lives in `vauban_types`.
     let (catalog, manager) = instance();
     database(&catalog, &manager, "d");
     let inside = table(&catalog, &manager, &def("d", "dbo", "t_š"));
@@ -725,10 +726,14 @@ fn a_name_outside_cp1252_is_not_case_folded() {
     let snapshot = catalog.snapshot(&handle);
     assert_eq!(
         snapshot
-            .resolve_object("d", None, "T_Š", "dbo")
+            .resolve_object("d", None, "t_š", "dbo")
             .map(|object| object.id),
         Some(inside.id),
-        "`Š` is a character of CP1252: its case is folded"
+        "the spelling of the creation resolves"
+    );
+    assert!(
+        snapshot.resolve_object("d", None, "t_Š", "dbo").is_none(),
+        "current state: `Š` does not resolve `š`, where SQL Server answers one object"
     );
     assert_eq!(
         snapshot

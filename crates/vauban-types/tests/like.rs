@@ -472,3 +472,31 @@ fn collation_names() -> Vec<String> {
     names.push("Latin1_General_100_BIN2_UTF8".to_string());
     names
 }
+
+#[test]
+fn like_follows_the_sensitivity_flags() {
+    let parse = |name: &str| Collation::parse(name).expect("a collation the server has");
+    let cs = parse("Latin1_General_CS_AS");
+    let ci = parse("Latin1_General_CI_AS");
+    let ai = parse("Latin1_General_CI_AI");
+    let bin2 = parse("Latin1_General_BIN2");
+    let sql_cs = parse("SQL_Latin1_General_CP1_CS_AS");
+
+    assert!(!cs.like("ABC", "a%", None));
+    assert!(ci.like("ABC", "a%", None));
+    assert!(!bin2.like("ABC", "a%", None));
+
+    assert!(ai.like("élève", "ELEVE", None));
+    assert!(!ci.like("élève", "ELEVE", None));
+
+    // A range follows the order of the collation: lower case first under Windows, upper
+    // case first under the code page 1252 table, code units under `_BIN2`.
+    assert!(cs.like("B", "[a-c]", None));
+    assert!(!cs.like("a", "[A-C]", None));
+    assert!(sql_cs.like("B", "[a-c]", None));
+    assert!(sql_cs.like("a", "[A-C]", None));
+    assert!(!bin2.like("B", "[a-c]", None));
+
+    assert_eq!(cs.pattern_position("abcdef", "%CD%"), None);
+    assert_eq!(ai.pattern_position("abcdef", "%CD%"), Some(3));
+}

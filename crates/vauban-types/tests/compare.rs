@@ -62,8 +62,9 @@ fn compare_strings_ignore_trailing_spaces() {
     assert_eq!(cmp(&text("abc"), &text("abc  ")), Some(Equal));
     assert_eq!(cmp(&text("abc  "), &text("abc")), Some(Equal));
     assert_eq!(cmp(&text(""), &text("   ")), Some(Equal));
-    // Only U+0020 is a padding space: a trailing tab is significant.
-    assert_eq!(cmp(&text("abc"), &text("abc\t")), Some(Less));
+    // Only U+0020 is a padding space: a trailing tab is significant, and it sorts below
+    // the space the shorter side is padded with.
+    assert_eq!(cmp(&text("abc"), &text("abc\t")), Some(Greater));
 }
 
 #[test]
@@ -342,8 +343,8 @@ fn compare_via_value() {
         Ok(Some(Less))
     );
 
-    // Any other collation is *compared* like the default one: `Collation::parse` names
-    // more collations than `compare` implements, an assumed gap.
+    // The collation is the one given: `SQL_Latin1_General_CP1_CS_AS` tells the case
+    // apart, upper case first.
     let case_sensitive = Collation {
         lcid: 0x0409,
         flags: 0x0C,
@@ -353,7 +354,7 @@ fn compare_via_value() {
     assert_ne!(case_sensitive, Collation::DEFAULT);
     assert_eq!(
         compare(&text("a"), &text("A"), &case_sensitive),
-        Ok(Some(Equal))
+        Ok(Some(Greater))
     );
     // The collation is ignored for non-string values.
     assert_eq!(

@@ -1,6 +1,6 @@
 //! Integration tests of `Collation`: `parse` reads a collation name, `compare`,
 //! `compare_char` and `find` order and search strings under
-//! `SQL_Latin1_General_CP1_CI_AS`.
+//! `SQL_Latin1_General_CP1_CI_AS` and under the sensitivity flags of the other names.
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 
@@ -174,8 +174,8 @@ fn compare_is_case_insensitive_and_accent_sensitive() {
     assert_eq!(latin1.compare("á", "b"), Less);
     assert_eq!(latin1.compare("f", "é"), Greater);
 
-    // The accents of one letter are ordered among themselves, and the two characters no
-    // rule of the plan places: `æ` before `b`, `ß` before `t`.
+    // The accents of one letter are ordered among themselves; `æ` reads as `ae` and `ß`
+    // as `ss`.
     assert_eq!(latin1.compare("à", "á"), Less);
     assert_eq!(latin1.compare("â", "ä"), Less);
     assert_eq!(latin1.compare("æ", "b"), Less);
@@ -217,10 +217,12 @@ fn compare_ignores_trailing_spaces() {
     assert_eq!(latin1.compare("abc   ", "abc"), Equal);
     assert_eq!(latin1.compare("", "   "), Equal);
 
-    // Leading spaces are significant, and only U+0020 is padding.
+    // Leading spaces are significant, and only U+0020 is padding. Padding is not
+    // trimming: the shorter side is compared against spaces, and a tab sorts below the
+    // space under this collation.
     assert_eq!(latin1.compare(" a", "a"), Less);
     assert_eq!(latin1.compare("a", " a"), Greater);
-    assert_eq!(latin1.compare("abc", "abc\t"), Less);
+    assert_eq!(latin1.compare("abc", "abc\t"), Greater);
 
     // A string that is a prefix of the other one is the smaller one.
     assert_eq!(latin1.compare("ab", "abc"), Less);
@@ -231,9 +233,8 @@ fn compare_ignores_trailing_spaces() {
 fn compare_char_matches_compare() {
     let latin1 = Collation::DEFAULT;
 
-    // Space is left out on purpose: `compare` trims a trailing space away, `compare_char`
-    // weighs it, and the two disagree on `' '` against a control character. That is
-    // documented on `Collation::compare_char`.
+    // Space is left out on purpose: `compare` pads the empty side of a lone space and
+    // `compare_char` does not. That is documented on `Collation::compare_char`.
     let pairs = [
         ('a', 'A'),
         ('A', 'a'),
@@ -298,4 +299,137 @@ fn find_is_one_based_and_collated() {
     assert_eq!(latin1.find("abc", "", 1), None);
     assert_eq!(latin1.find("abc", "", 2), None);
     assert_eq!(latin1.find("", "", 1), None);
+}
+
+#[test]
+fn case_sensitivity_follows_the_flag() {
+    for name in [
+        "Latin1_General_CS_AS",
+        "Latin1_General_100_CS_AS",
+        "SQL_Latin1_General_CP1_CS_AS",
+        "Latin1_General_BIN",
+        "Latin1_General_BIN2",
+    ] {
+        let collation = parse(name);
+        assert_ne!(collation.compare("a", "A"), Equal, "{name}");
+        assert_ne!(collation.compare_char('a', 'A'), Equal, "{name}");
+        assert_eq!(collation.find("ABCDEF", "cd", 1), None, "{name}");
+        assert_eq!(collation.find("abcdef", "cd", 1), Some(3), "{name}");
+    }
+    for name in ["Latin1_General_CI_AS", "SQL_Latin1_General_CP1_CI_AS"] {
+        assert_eq!(parse(name).compare("a", "A"), Equal, "{name}");
+    }
+    // The Windows rules sort lower case first, the code page 1252 table upper case first.
+    assert_eq!(parse("Latin1_General_CS_AS").compare("a", "A"), Less);
+    assert_eq!(
+        parse("SQL_Latin1_General_CP1_CS_AS").compare("a", "A"),
+        Greater
+    );
+    // The case comes after the letters and the accents of the whole string.
+    assert_eq!(parse("Latin1_General_CS_AS").compare("Ab", "aC"), Less);
+    assert_eq!(parse("Latin1_General_CS_AS").compare("Ab", "ab"), Greater);
+}
+
+#[test]
+fn accent_sensitivity_follows_the_flag() {
+    for name in [
+        "Latin1_General_CI_AI",
+        "Latin1_General_100_CI_AI",
+        "Latin1_General_CS_AI",
+        "SQL_Latin1_General_CP1_CI_AI",
+    ] {
+        let collation = parse(name);
+        assert_eq!(collation.compare("e", "é"), Equal, "{name}");
+        assert_eq!(
+            collation.compare("élève", "ELEVE"),
+            parse(name).compare("eleve", "ELEVE"),
+            "{name}"
+        );
+        assert_eq!(collation.find("café", "e", 1), Some(4), "{name}");
+    }
+    for name in ["Latin1_General_CI_AS", "SQL_Latin1_General_CP1_CI_AS"] {
+        assert_eq!(parse(name).compare("e", "é"), Less, "{name}");
+    }
+    assert_eq!(
+        parse("Latin1_General_CI_AI").compare("élève", "ELEVE"),
+        Equal
+    );
+    // Under `_CS_AI` the case still counts.
+    assert_eq!(parse("Latin1_General_CS_AI").compare("é", "E"), Less);
+}
+
+#[test]
+fn binary_collations_order_by_code_unit() {
+    let bin2 = parse("Latin1_General_BIN2");
+    // Upper case letters, then lower case ones, then the Latin-1 letters, then the rest.
+    let mut words = vec!["b", "é", "a", "Z", "€", "B", "A", "z"];
+    words.sort_by(|x, y| bin2.compare(x, y));
+    assert_eq!(words, ["A", "B", "Z", "a", "b", "z", "é", "€"]);
+    // Trailing spaces still pad.
+    assert_eq!(bin2.compare("abc", "abc  "), Equal);
+    assert_eq!(bin2.compare("abc", "abc\t"), Greater);
+
+    // `_BIN` reads the first character as a code unit and the rest as little-endian
+    // bytes, so U+0100 sorts before U+00FF after the first position.
+    let bin = parse("Latin1_General_BIN");
+    assert_eq!(bin.compare("\u{100}", "\u{FF}"), Greater);
+    assert_eq!(bin.compare("a\u{100}", "a\u{FF}"), Less);
+    assert_eq!(bin2.compare("a\u{100}", "a\u{FF}"), Greater);
+    // ... and drops trailing spaces instead of padding.
+    assert_eq!(bin.compare("abc", "abc\t"), Less);
+}
+
+#[test]
+fn windows_rules_weigh_hyphens_last() {
+    let windows = parse("Latin1_General_CI_AS");
+    assert_eq!(windows.compare("a-b", "ab"), Greater);
+    assert_eq!(windows.compare("a-b", "ac"), Less);
+    assert_eq!(windows.compare("co-op", "coop"), Greater);
+    // The code page 1252 table weighs the hyphen as punctuation instead.
+    assert_eq!(Collation::DEFAULT.compare("a-b", "ab"), Less);
+    // Ligatures read as two letters under the Windows rules.
+    assert_eq!(windows.compare("æ", "ae"), Equal);
+    assert_eq!(windows.compare("straße", "strasse"), Equal);
+}
+
+#[test]
+fn kana_and_width_sensitivity_follow_the_flags() {
+    let full_width_a = "\u{FF41}";
+    let hiragana_a = "\u{3042}";
+    let katakana_a = "\u{30A2}";
+    assert_eq!(
+        parse("Latin1_General_CI_AS").compare(full_width_a, "a"),
+        Equal
+    );
+    assert_eq!(
+        parse("Latin1_General_CI_AS_WS").compare(full_width_a, "a"),
+        Greater
+    );
+    assert_eq!(
+        parse("Latin1_General_CI_AS").compare(hiragana_a, katakana_a),
+        Equal
+    );
+    assert_eq!(
+        parse("Latin1_General_CI_AS_KS").compare(hiragana_a, katakana_a),
+        Greater
+    );
+    // Case before width: `a < ａ < A < Ａ` once both count.
+    let all = parse("Latin1_General_CS_AS_KS_WS");
+    assert_eq!(all.compare(full_width_a, "A"), Less);
+    assert_eq!(all.compare("a", full_width_a), Less);
+}
+
+#[test]
+fn full_width_hyphen_and_apostrophe_are_weighed_last() {
+    let full_width_hyphen = "a\u{FF0D}b";
+    let full_width_apostrophe = "a\u{FF07}b";
+    let windows = parse("Latin1_General_CI_AS");
+    assert_eq!(windows.compare(full_width_hyphen, "ab"), Greater);
+    assert_eq!(windows.compare(full_width_hyphen, "ac"), Less);
+    assert_eq!(windows.compare(full_width_hyphen, "a-b"), Equal);
+    assert_eq!(windows.compare(full_width_apostrophe, "a'b"), Equal);
+    // Under `_WS` the width tells them from their ASCII forms.
+    let width = parse("Latin1_General_CI_AS_WS");
+    assert_eq!(width.compare(full_width_hyphen, "a-b"), Greater);
+    assert_eq!(width.compare(full_width_apostrophe, "a'b"), Greater);
 }

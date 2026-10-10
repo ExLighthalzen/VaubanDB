@@ -5,7 +5,15 @@
 //! ([`Collation::match_from`]): no recursion, no allocation per compared character, and a
 //! cost that stays linear in the size of the string times the size of the pattern. Every
 //! character comparison goes through [`Collation::compare_char`], so `LIKE` is case
-//! insensitive and accent sensitive under `SQL_Latin1_General_CP1_CI_AS` exactly like `=`.
+//! insensitive and accent sensitive under `SQL_Latin1_General_CP1_CI_AS` like `=`, case
+//! sensitive under `_CS_AS` and `_BIN2`, and accent insensitive under `_CI_AI`
+//! (`tests/like.rs`, `like_follows_the_sensitivity_flags`).
+//!
+//! Two differences with SQL Server remain on that path. A letter that expands to two under
+//! the Windows rules is placed in a range by its whole expansion here, so `'æ' LIKE
+//! '[à-é]'` is true under `Latin1_General_CS_AS`, where SQL Server answers false. And under
+//! `Latin1_General_100_CI_AI`, `LIKE` tells `¹`, `²`, `³`, `ª` and `º` from `1`, `2`, `3`,
+//! `a` and `o` although `=` does not; this module follows `=`.
 //!
 //! The four wildcards, `ESCAPE`, the collation of the expression and the trailing blanks
 //! of a pattern are the documented part; what the documentation leaves open is stated

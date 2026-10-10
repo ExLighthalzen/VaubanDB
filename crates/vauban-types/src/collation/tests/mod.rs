@@ -231,28 +231,45 @@ fn compare_outside_code_page_1252() {
 
 #[test]
 fn weights_are_case_insensitive_and_ordered_by_group() {
-    // A case pair of the code page shares its two weights (`_CI`).
-    for (upper, lower) in [('A', 'a'), ('Z', 'z'), ('É', 'é'), ('Æ', 'æ'), ('Ø', 'ø')] {
-        let (upper_byte, lower_byte) = (
-            super::cp1252_byte(upper).expect("in the code page"),
-            super::cp1252_byte(lower).expect("in the code page"),
-        );
-        assert_eq!(
-            super::WEIGHTS[upper_byte as usize],
-            super::WEIGHTS[lower_byte as usize],
-            "{upper} and {lower}"
-        );
-    }
-
-    // The four groups of primary weights, in order: control, punctuation, digit,
-    // letter.
-    let primary = |c: char| {
-        let byte = super::cp1252_byte(c).expect("in the code page");
-        super::WEIGHTS[byte as usize].0
+    let row = |table: &[super::Weights; 256], c: char| {
+        table[super::cp1252_byte(c).expect("in the code page") as usize]
     };
+    // A case pair of the code page shares its primary and accent weights, and is told
+    // apart by the case weights only.
+    for table in [
+        &super::SQL_CP1_WEIGHTS,
+        &super::WINDOWS_WEIGHTS,
+        &super::WINDOWS_100_WEIGHTS,
+    ] {
+        for (upper, lower) in [('A', 'a'), ('Z', 'z'), ('É', 'é'), ('Æ', 'æ'), ('Ø', 'ø')] {
+            let (upper, lower) = (row(table, upper), row(table, lower));
+            assert_eq!(upper.primary, lower.primary);
+            assert_eq!(upper.accent, lower.accent);
+            assert_ne!(upper.case_accent, lower.case_accent);
+        }
+    }
+    // Upper case first under the code page table, lower case first under Windows.
+    assert!(
+        row(&super::SQL_CP1_WEIGHTS, 'A').case_accent
+            < row(&super::SQL_CP1_WEIGHTS, 'a').case_accent
+    );
+    assert!(
+        row(&super::WINDOWS_WEIGHTS, 'a').case_accent
+            < row(&super::WINDOWS_WEIGHTS, 'A').case_accent
+    );
+
+    // The four groups of primary weights of the code page table, in order: control,
+    // punctuation, digit, letter.
+    let primary = |c: char| row(&super::SQL_CP1_WEIGHTS, c).primary;
     assert!(primary('\t') < primary(' '));
     assert!(primary(' ') < primary('-'));
     assert!(primary('-') < primary('0'));
     assert!(primary('9') < primary('A'));
     assert!(primary('A') < primary('B'));
+    // An accent shares the primary weight of its base letter and not its accent weight.
+    assert_eq!(primary('e'), primary('é'));
+    assert_ne!(
+        row(&super::SQL_CP1_WEIGHTS, 'e').accent,
+        row(&super::SQL_CP1_WEIGHTS, 'é').accent
+    );
 }

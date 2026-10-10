@@ -210,21 +210,18 @@ fn like_is_case_insensitive_by_default() {
 }
 
 /// The collation handed to `Collation::like` is the one of the tested value, and a
-/// `COLLATE` on it changes **nothing** — a known gap, pinned here so that it fails the day
-/// the gap closes.
+/// `COLLATE` on it changes the answer.
 ///
 /// `SELECT CASE WHEN ('ABC' COLLATE Latin1_General_CS_AS) LIKE 'a%' THEN 1 ELSE 0 END,
 ///  CASE WHEN (N'é' COLLATE Latin1_General_CI_AI) LIKE N'e' THEN 1 ELSE 0 END;` answers
-/// `0, 1` on SQL Server against the `1, 0` below: `Collation::compare_char` does not
-/// consult `self` and compares everything as `_CI_AS`. Nothing of that lives in the
-/// executor — the branch does pass the collation of the operand down — so the gap is
-/// `types`'s rather than worked around here.
+/// `0, 1`: the case-sensitive collation keeps the case apart, the accent-insensitive one
+/// drops the accent.
 #[test]
-fn like_collation_is_passed_down_but_ignored() {
+fn like_follows_the_collation_of_the_tested_value() {
     let cs_as = collate(s("ABC"), "Latin1_General_CS_AS");
-    assert_eq!(v(&when(like(cs_as, s("a%")))), Value::I32(1));
+    assert_eq!(v(&when(like(cs_as, s("a%")))), Value::I32(0));
     let ci_ai = collate(ns("é"), "Latin1_General_CI_AI");
-    assert_eq!(v(&when(like(ci_ai, ns("e")))), Value::I32(0));
+    assert_eq!(v(&when(like(ci_ai, ns("e")))), Value::I32(1));
 }
 
 /// The raw value of `'abc' LIKE NULL`, `NULL LIKE 'a%'` and `NULL LIKE NULL` is
