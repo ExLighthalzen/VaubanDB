@@ -571,3 +571,247 @@ fn a_read_does_not_wait_for_the_tables_a_write_would_check() {
     assert!(errors(&events).is_empty(), "{events:#?}");
     assert_eq!(ints(&run(&mut a, "SELECT id FROM dbo.x;")), vec![1]);
 }
+
+/// The names of the indexes of `dbo.t` in `sys.indexes`, by `index_id`, the heap left out.
+const INDEX_NAMES: &str = "SELECT name FROM sys.indexes \
+     WHERE object_id = OBJECT_ID('dbo.t') AND index_id > 0 ORDER BY index_id;";
+
+/// The indexes of `dbo.t` a plan may seek through, as a transaction of its own sees them,
+/// next to the ones `storage` holds.
+fn plan_indexes(engine: &Arc<Engine>) -> (usize, usize) {
+    use vauban_planner::{PlanCatalog, SnapshotIndexes, StorageIndexes};
+
+    let handle = engine.txn.begin(vauban_txn::IsolationLevel::ReadCommitted);
+    let snapshot = engine.catalog.snapshot(&handle);
+    let table = snapshot
+        .resolve_object("master", Some("dbo"), "t", "dbo")
+        .map(|object| object.id)
+        .and_then(|id| snapshot.table(id))
+        .map(|meta| meta.storage_id)
+        .expect("dbo.t");
+    let seen = SnapshotIndexes {
+        storage: engine.storage.as_ref(),
+        snapshot: &snapshot,
+    }
+    .indexes_of(table)
+    .len();
+    let held = StorageIndexes(engine.storage.as_ref())
+        .indexes_of(table)
+        .len();
+    engine.txn.commit(handle).expect("commit");
+    (seen, held)
+}
+
+/// A `CREATE INDEX` another session has not committed: `sys.indexes` does not list it, a plan
+/// does not seek through it although `storage` holds it, and a read of the table waits for
+/// the end of that session; a `ROLLBACK` leaves the index out, a `COMMIT` puts it in.
+#[test]
+fn an_uncommitted_create_index_is_waited_for_then_left_out() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let mut b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.t (a int, b int); INSERT INTO dbo.t VALUES (1, 2);",
+    );
+
+    run(&mut a, "BEGIN TRANSACTION; CREATE INDEX ix ON dbo.t (a);");
+    assert_eq!(names(&run(&mut a, INDEX_NAMES)), vec!["ix"]);
+    assert!(names(&run(&mut b, INDEX_NAMES)).is_empty());
+    assert_eq!(plan_indexes(&engine), (0, 1));
+    let waiting = Waiting::start(b, "SELECT b FROM dbo.t WHERE a = 1;");
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (mut b, events) = waiting.finish();
+    assert_eq!(ints(&events), vec![2], "{events:#?}");
+    assert!(names(&run(&mut b, INDEX_NAMES)).is_empty());
+    assert_eq!(plan_indexes(&engine), (0, 0));
+
+    run(&mut a, "BEGIN TRANSACTION; CREATE INDEX ix ON dbo.t (a);");
+    let waiting = Waiting::start(b, "SELECT b FROM dbo.t WHERE a = 1;");
+    run(&mut a, "COMMIT TRANSACTION;");
+    let (mut b, events) = waiting.finish();
+    assert_eq!(ints(&events), vec![2], "{events:#?}");
+    assert_eq!(names(&run(&mut b, INDEX_NAMES)), vec!["ix"]);
+    assert_eq!(plan_indexes(&engine), (1, 1));
+}
+
+/// The name of an index the transaction dropped is free for that transaction; after a
+/// `ROLLBACK TRANSACTION` to a savepoint taken before the `DROP INDEX`, the index is back and
+/// a second `CREATE INDEX` of its name is refused, naming 1913.
+#[test]
+fn a_dropped_index_name_is_free_for_its_transaction_until_a_savepoint_gives_it_back() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let mut b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.t (a int, b int); CREATE INDEX ix ON dbo.t (a);",
+    );
+    let key_column = "SELECT c.name FROM sys.index_columns AS ic \
+         JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+         WHERE ic.object_id = OBJECT_ID('dbo.t');";
+
+    run(
+        &mut a,
+        "BEGIN TRANSACTION; DROP INDEX ix ON dbo.t; CREATE INDEX ix ON dbo.t (b); \
+         COMMIT TRANSACTION;",
+    );
+    assert_eq!(names(&run(&mut b, INDEX_NAMES)), vec!["ix"]);
+    assert_eq!(names(&run(&mut b, key_column)), vec!["b"]);
+
+    let events = run_on(
+        &mut a,
+        "BEGIN TRANSACTION; SAVE TRANSACTION s; DROP INDEX ix ON dbo.t; \
+         ROLLBACK TRANSACTION s; CREATE INDEX ix ON dbo.t (a);",
+    );
+    let refused: Vec<&SqlError> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Error(err) => Some(err),
+            Event::Row(_) => None,
+        })
+        .collect();
+    assert_eq!(refused.len(), 1, "{events:#?}");
+    assert!(
+        refused[0].message.contains("1913"),
+        "{}",
+        refused[0].message
+    );
+    assert_eq!(names(&run(&mut a, INDEX_NAMES)), vec!["ix"]);
+    run(&mut a, "ROLLBACK TRANSACTION;");
+
+    run(
+        &mut a,
+        "BEGIN TRANSACTION; SAVE TRANSACTION s; DROP INDEX ix ON dbo.t; \
+         ROLLBACK TRANSACTION s; DROP INDEX ix ON dbo.t; CREATE INDEX ix ON dbo.t (a); \
+         COMMIT TRANSACTION;",
+    );
+    assert_eq!(names(&run(&mut b, INDEX_NAMES)), vec!["ix"]);
+    assert_eq!(names(&run(&mut b, key_column)), vec!["a"]);
+}
+
+/// A `CHECK` another session has added and not committed: `sys.check_constraints` does not
+/// list it, and an `INSERT` that breaks it waits for that session, then writes its row after
+/// a `ROLLBACK` and answers 547 after a `COMMIT`.
+#[test]
+fn an_uncommitted_check_is_not_enforced_on_another_session() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let mut b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.t (a int, b int); INSERT INTO dbo.t VALUES (1, 2);",
+    );
+    let checks = "SELECT name FROM sys.check_constraints;";
+
+    run(
+        &mut a,
+        "BEGIN TRANSACTION; ALTER TABLE dbo.t ADD CONSTRAINT ck CHECK (a > 0);",
+    );
+    assert!(names(&run(&mut b, checks)).is_empty());
+    let waiting = Waiting::start(b, "INSERT INTO dbo.t VALUES (-1, 2);");
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (mut b, events) = waiting.finish();
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(
+        ints(&run(&mut b, "SELECT a FROM dbo.t ORDER BY a;")),
+        vec![-1, 1]
+    );
+
+    run(&mut a, "DELETE FROM dbo.t WHERE a < 0;");
+    run(
+        &mut a,
+        "BEGIN TRANSACTION; ALTER TABLE dbo.t ADD CONSTRAINT ck CHECK (a > 0);",
+    );
+    let waiting = Waiting::start(b, "INSERT INTO dbo.t VALUES (-1, 2);");
+    run(&mut a, "COMMIT TRANSACTION;");
+    let (mut b, events) = waiting.finish();
+    assert_eq!(errors(&events), vec![547], "{events:#?}");
+    assert_eq!(names(&run(&mut b, checks)), vec!["ck"]);
+}
+
+/// The same for a `UNIQUE` constraint: `sys.key_constraints` does not list it, and an
+/// `INSERT` of a duplicate waits, then writes after a `ROLLBACK` and answers 2627 after a
+/// `COMMIT`.
+#[test]
+fn an_uncommitted_unique_is_not_enforced_on_another_session() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let mut b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.t (a int, b int); INSERT INTO dbo.t VALUES (1, 2);",
+    );
+    let keys = "SELECT name FROM sys.key_constraints;";
+
+    run(
+        &mut a,
+        "BEGIN TRANSACTION; ALTER TABLE dbo.t ADD CONSTRAINT uq UNIQUE (b);",
+    );
+    assert!(names(&run(&mut b, keys)).is_empty());
+    let waiting = Waiting::start(b, "INSERT INTO dbo.t VALUES (5, 2);");
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (mut b, events) = waiting.finish();
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(
+        ints(&run(&mut b, "SELECT a FROM dbo.t ORDER BY a;")),
+        vec![1, 5]
+    );
+
+    run(&mut a, "DELETE FROM dbo.t WHERE a = 5;");
+    run(
+        &mut a,
+        "BEGIN TRANSACTION; ALTER TABLE dbo.t ADD CONSTRAINT uq UNIQUE (b);",
+    );
+    let waiting = Waiting::start(b, "INSERT INTO dbo.t VALUES (5, 2);");
+    run(&mut a, "COMMIT TRANSACTION;");
+    let (mut b, events) = waiting.finish();
+    assert_eq!(errors(&events), vec![2627], "{events:#?}");
+    assert_eq!(names(&run(&mut b, keys)), vec!["uq"]);
+}
+
+/// A `FOREIGN KEY` another session has declared and not committed — with the table it
+/// created, or added to a table that exists — makes a `DELETE` of the referenced table wait
+/// for that session, then delete once it has rolled back.
+#[test]
+fn a_delete_waits_for_a_foreign_key_another_session_has_not_committed() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.p (a int PRIMARY KEY); INSERT INTO dbo.p VALUES (1), (2), (3);",
+    );
+
+    run(
+        &mut a,
+        "BEGIN TRANSACTION; CREATE TABLE dbo.c (a int REFERENCES dbo.p (a)); \
+         INSERT INTO dbo.c VALUES (2);",
+    );
+    let waiting = Waiting::start(b, "DELETE FROM dbo.p WHERE a = 2;");
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (b, events) = waiting.finish();
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(
+        ints(&run(&mut a, "SELECT a FROM dbo.p ORDER BY a;")),
+        vec![1, 3]
+    );
+
+    run(
+        &mut a,
+        "CREATE TABLE dbo.c (a int); INSERT INTO dbo.c VALUES (1);",
+    );
+    run(
+        &mut a,
+        "BEGIN TRANSACTION; \
+         ALTER TABLE dbo.c ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES dbo.p (a);",
+    );
+    let waiting = Waiting::start(b, "DELETE FROM dbo.p WHERE a = 1;");
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (_b, events) = waiting.finish();
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(
+        ints(&run(&mut a, "SELECT a FROM dbo.p ORDER BY a;")),
+        vec![3]
+    );
+}

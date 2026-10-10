@@ -217,7 +217,7 @@ use vauban_executor::{
     Site, StatementSink, eval_expr,
 };
 use vauban_parser::{SetOptionStatement, Statement, parse_batch};
-use vauban_planner::{PhysicalStatement, PlanContext, StorageIndexes};
+use vauban_planner::{PhysicalStatement, PlanContext, SnapshotIndexes};
 use vauban_storage::TableId;
 use vauban_tds::{ColumnFlags, ColumnMeta, EnvChange};
 use vauban_txn::{IsolationLevel, TxnHandle};
@@ -818,7 +818,10 @@ impl Session {
             });
         }
 
-        let indexes = StorageIndexes(self.engine.storage.as_ref());
+        let indexes = SnapshotIndexes {
+            storage: self.engine.storage.as_ref(),
+            snapshot,
+        };
         let physical = vauban_planner::plan(bound, &PlanContext { catalog: &indexes })
             .map_err(|error| at_statement(error, line))?;
 

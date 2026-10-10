@@ -13,10 +13,12 @@
 //!
 //! [`PlanCatalog`] is therefore keyed on the [`TableId`](vauban_storage::TableId) the bound
 //! `Scan` holds and has the shape of
-//! [`Storage::indexes`](vauban_storage::Storage::indexes): [`StorageIndexes`] is the
-//! production road, [`NoIndexes`] the empty answer, and
+//! [`Storage::indexes`](vauban_storage::Storage::indexes): [`SnapshotIndexes`] is the
+//! production road of a statement bound against a snapshot, [`StorageIndexes`] the one of a
+//! caller that holds none, [`NoIndexes`] the empty answer, and
 //! [`FakeCatalog`](crate::testing::FakeCatalog) the test double.
 
+use vauban_catalog::CatalogSnapshot;
 use vauban_storage::{IndexId, IndexShape, Storage, TableId};
 
 /// What a planning rule may read about the database.
@@ -61,6 +63,38 @@ impl PlanCatalog for StorageIndexes<'_> {
     /// (`tests/trivial.rs`, `storage_indexes_falls_back_to_a_scan_on_error`).
     fn indexes_of(&self, table: TableId) -> Vec<(IndexId, IndexShape)> {
         self.0.indexes(table).unwrap_or_default()
+    }
+}
+
+/// The [`PlanCatalog`] of a statement bound against a [`CatalogSnapshot`]: the indexes
+/// `storage` holds for a table, kept to those the snapshot sees.
+///
+/// `storage` holds an index from its `CREATE INDEX` on, committed or not, while the snapshot
+/// sees it under the rules of the transaction it was built for: another transaction's
+/// `CREATE INDEX` it has not committed is left out of the plan, and so is an index the
+/// transaction of the snapshot has dropped and not committed yet
+/// (`crates/vauban-session/tests/ddl_visibility.rs`,
+/// `an_uncommitted_create_index_is_waited_for_then_left_out`). A table the snapshot does not
+/// hold keeps the answer of `storage`.
+pub struct SnapshotIndexes<'a> {
+    /// The storage the shapes of the indexes are read from.
+    pub storage: &'a dyn Storage,
+    /// The snapshot the statement was bound against.
+    pub snapshot: &'a CatalogSnapshot,
+}
+
+impl PlanCatalog for SnapshotIndexes<'_> {
+    /// The answer of [`StorageIndexes`], less the indexes the snapshot does not list for
+    /// the table built on `table`.
+    fn indexes_of(&self, table: TableId) -> Vec<(IndexId, IndexShape)> {
+        let held = StorageIndexes(self.storage).indexes_of(table);
+        let Some(meta) = self.snapshot.table_by_storage(table) else {
+            return held;
+        };
+        let seen = self.snapshot.indexes_of(meta.id);
+        held.into_iter()
+            .filter(|(id, _)| seen.iter().any(|index| index.id == *id))
+            .collect()
     }
 }
 

@@ -572,13 +572,6 @@ fn indexes_of_after_create_index_has_two() {
     let created = catalog
         .create_index(&handle, &index_on_b(meta.id, "ix_b"))
         .expect("create_index");
-    // The store does not follow the transaction (`src/snapshot.rs`, section "Bound"): the
-    // index is in the snapshot of another transaction before the commit of this one.
-    let other = begin(&manager);
-    assert_eq!(
-        ids(catalog.snapshot(&other).indexes_of(meta.id)),
-        vec![clustered, created.id]
-    );
     manager.commit(handle).expect("commit of the create");
 
     let handle = begin(&manager);
@@ -623,8 +616,8 @@ fn indexes_of_an_unknown_table_is_empty() {
     assert_eq!(snapshot.indexes_of(meta.id).len(), 1);
 }
 
-/// A deferred `DROP INDEX` takes the index out of the snapshot before its `COMMIT` — the
-/// rule of `index.rs`, written in the rustdoc of `indexes_of` — and the commit leaves it out.
+/// A deferred `DROP INDEX` takes the index out of the snapshot of its own transaction before
+/// its `COMMIT`, not out of the snapshot of another one, and the commit leaves it out.
 #[test]
 fn a_dropped_index_leaves_the_snapshot_after_commit() {
     let (catalog, manager, meta, clustered) = instance_with_a_keyed_table();
@@ -647,9 +640,10 @@ fn a_dropped_index_leaves_the_snapshot_after_commit() {
     let other = begin(&manager);
     assert_eq!(
         ids(catalog.snapshot(&other).indexes_of(meta.id)),
-        vec![clustered],
-        "and from another transaction"
+        vec![clustered, created.id],
+        "and not from another transaction"
     );
+    manager.commit(other).expect("commit of the reader");
     manager.commit(dropper).expect("commit of the drop");
 
     let after = begin(&manager);
@@ -657,6 +651,131 @@ fn a_dropped_index_leaves_the_snapshot_after_commit() {
         ids(catalog.snapshot(&after).indexes_of(meta.id)),
         vec![clustered],
         "the index is gone from storage, the key is still there"
+    );
+}
+
+/// A `CREATE INDEX` not committed yet is in the snapshot of its own transaction and not in
+/// the snapshot of another one, which sees it once it is committed and never after a
+/// `ROLLBACK`.
+#[test]
+fn an_uncommitted_create_index_is_seen_by_its_transaction_alone() {
+    let (catalog, manager, meta, clustered) = instance_with_a_keyed_table();
+
+    let creator = begin(&manager);
+    let created = catalog
+        .create_index(&creator, &index_on_b(meta.id, "ix_b"))
+        .expect("create_index");
+    let other = begin(&manager);
+    assert_eq!(
+        ids(catalog.snapshot(&creator).indexes_of(meta.id)),
+        vec![clustered, created.id]
+    );
+    assert_eq!(
+        ids(catalog.snapshot(&other).indexes_of(meta.id)),
+        vec![clustered]
+    );
+    manager.rollback(creator).expect("rollback of the create");
+    assert_eq!(
+        ids(catalog.snapshot(&other).indexes_of(meta.id)),
+        vec![clustered]
+    );
+    manager.commit(other).expect("commit of the reader");
+
+    let creator = begin(&manager);
+    let created = catalog
+        .create_index(&creator, &index_on_b(meta.id, "ix_b"))
+        .expect("create_index after the rollback");
+    manager.commit(creator).expect("commit of the create");
+    let after = begin(&manager);
+    assert_eq!(
+        ids(catalog.snapshot(&after).indexes_of(meta.id)),
+        vec![clustered, created.id]
+    );
+}
+
+/// A `DROP INDEX` not committed yet hides the index from its own transaction alone.
+#[test]
+fn an_uncommitted_drop_index_hides_the_index_from_its_transaction_alone() {
+    let (catalog, manager, meta, clustered) = instance_with_a_keyed_table();
+    let created = create_index(&catalog, &manager, &index_on_b(meta.id, "ix_b"));
+
+    let dropper = begin(&manager);
+    catalog
+        .drop_index(&dropper, created.id)
+        .expect("drop_index");
+    let other = begin(&manager);
+    assert_eq!(
+        ids(catalog.snapshot(&dropper).indexes_of(meta.id)),
+        vec![clustered]
+    );
+    assert_eq!(
+        ids(catalog.snapshot(&other).indexes_of(meta.id)),
+        vec![clustered, created.id]
+    );
+    manager.commit(other).expect("commit of the reader");
+    manager.rollback(dropper).expect("rollback of the drop");
+}
+
+/// `ALTER TABLE … ADD CONSTRAINT ck CHECK (1)` not committed yet: the constraint is on the
+/// table and named in the snapshot of its own transaction, in neither of another one, and in
+/// both once it is committed.
+#[test]
+fn an_uncommitted_check_is_seen_by_its_transaction_alone() {
+    let (catalog, manager, meta, _) = instance_with_a_keyed_table();
+    let check = |snapshot: &vauban_catalog::CatalogSnapshot| -> Option<ObjectId> {
+        snapshot
+            .table(meta.id)
+            .expect("the table")
+            .constraints
+            .iter()
+            .find_map(|constraint| match constraint {
+                ConstraintMeta::Check { constraint, .. } => Some(*constraint),
+                _ => None,
+            })
+    };
+    let add = |handle: &TxnHandle| {
+        catalog
+            .alter_table(
+                handle,
+                meta.id,
+                &vauban_catalog::AlterTable::AddConstraint {
+                    constraint: Box::new(ConstraintDef::Check {
+                        name: Some("ck".to_owned()),
+                        expr: vauban_parser::Expr::Literal(
+                            vauban_parser::Literal::Integer("1".to_owned()),
+                            vauban_parser::Span::EMPTY,
+                        ),
+                    }),
+                },
+            )
+            .expect("alter_table")
+    };
+
+    let altering = begin(&manager);
+    add(&altering);
+    let other = begin(&manager);
+    let own = catalog.snapshot(&altering);
+    let id = check(&own).expect("the transaction sees its CHECK");
+    assert_eq!(
+        own.constraint_name(id).map(|name| name.name),
+        Some("ck".to_owned())
+    );
+    let seen = catalog.snapshot(&other);
+    assert_eq!(check(&seen), None, "another transaction does not");
+    assert_eq!(seen.constraint_name(id), None);
+    manager.rollback(altering).expect("rollback of the alter");
+    assert_eq!(check(&catalog.snapshot(&other)), None);
+    manager.commit(other).expect("commit of the reader");
+
+    let altering = begin(&manager);
+    add(&altering);
+    manager.commit(altering).expect("commit of the alter");
+    let after = begin(&manager);
+    let seen = catalog.snapshot(&after);
+    let id = check(&seen).expect("committed");
+    assert_eq!(
+        seen.constraint_name(id).map(|name| name.name),
+        Some("ck".to_owned())
     );
 }
 

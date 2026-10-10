@@ -74,10 +74,15 @@ pub(crate) fn alter_table(
     table: ObjectId,
     change: &AlterTable,
 ) -> SqlResult<TableMeta> {
+    // Both roads take the `Sch-M` first: a `CHECK`, `FOREIGN KEY` or `DEFAULT` added in
+    // place changes what a write of the table is checked against, so another transaction
+    // waits for the end of this one before it binds a statement over the table
+    // (`crates/vauban-session/tests/ddl_visibility.rs`,
+    // `an_uncommitted_check_is_not_enforced_on_another_session`).
+    lock_current_storage(catalog, txn, table)?;
     if uses_constraint_session(catalog, txn, table, change)? {
         return alter_table_constraint(catalog, txn, table, change);
     }
-    lock_current_storage(catalog, txn, table)?;
     let (old, plan, old_storage, old_indexes) = {
         let mut store = table::store(catalog);
         table::refresh(catalog, &mut store)?;
@@ -203,7 +208,11 @@ fn repoint_foreign_keys(
 /// # Errors
 ///
 /// The error of the `storage` calls of the refresh, and the error of the lock manager.
-fn lock_current_storage(catalog: &Catalog, txn: &TxnHandle, table: ObjectId) -> SqlResult<()> {
+pub(crate) fn lock_current_storage(
+    catalog: &Catalog,
+    txn: &TxnHandle,
+    table: ObjectId,
+) -> SqlResult<()> {
     let mut locked = BTreeSet::new();
     loop {
         let storage = {

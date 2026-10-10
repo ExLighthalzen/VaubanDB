@@ -155,6 +155,59 @@ impl ConstraintStore {
                 && object.name.name.eq_ignore_ascii_case(name)
         })
     }
+
+    /// The version of `table` over the storage table `storage` as it stood before another
+    /// open transaction than `me` changed its `FOREIGN KEY`, `CHECK` or `DEFAULT`
+    /// constraints in place, `None` when no such transaction has.
+    ///
+    /// `snapshot.rs` reads this in place of the version the store holds, which carries the
+    /// constraints that transaction has not committed (`tests/snapshot.rs`,
+    /// `an_uncommitted_check_is_seen_by_its_transaction_alone`). The caller runs
+    /// [`refresh_sessions`] first, so a session left is one of an open transaction.
+    pub(crate) fn before_change_of_another(
+        &self,
+        table: ObjectId,
+        storage: TableId,
+        me: TxnId,
+    ) -> Option<&TableMeta> {
+        self.alter_sessions
+            .iter()
+            .filter(|(owner, _)| **owner != me)
+            .filter_map(|(_, session)| session.tables.get(&table))
+            .map(|state| &state.original_meta)
+            .find(|meta| meta.storage_id == storage)
+    }
+
+    /// The constraint objects the transaction `me` sees: the entries of the store, less the
+    /// ones another open transaction has added in place, plus the ones it has dropped in
+    /// place, by increasing [`ObjectId`].
+    ///
+    /// The same rule as [`ConstraintStore::before_change_of_another`], for the names
+    /// `snapshot.rs` hands out (`tests/snapshot.rs`,
+    /// `an_uncommitted_check_is_seen_by_its_transaction_alone`).
+    pub(crate) fn seen_by(&self, me: TxnId) -> Vec<&ObjectMeta> {
+        let others = || {
+            self.alter_sessions
+                .iter()
+                .filter(move |(owner, _)| **owner != me)
+                .flat_map(|(_, session)| session.tables.values())
+        };
+        let added: BTreeSet<ObjectId> = others()
+            .flat_map(|state| state.added_ids.iter().copied())
+            .collect();
+        let mut seen: BTreeMap<ObjectId, &ObjectMeta> = self
+            .entries
+            .iter()
+            .filter(|(id, _)| !added.contains(id))
+            .map(|(id, object)| (*id, object))
+            .collect();
+        for state in others() {
+            for (object, _) in &state.removed {
+                seen.insert(object.id, object);
+            }
+        }
+        seen.into_values().collect()
+    }
 }
 
 /// One foreign key that points at a table: what
@@ -529,8 +582,7 @@ pub(crate) fn add_table_constraint(
 ///
 /// # Errors
 ///
-/// 3728 when `name` is not a constraint of the table (`tests/alter.rs`,
-/// `drop_unknown_constraint_is_3728`).
+/// 3728 when `name` is not a constraint of the table (`tests/alter.rs`).
 pub(crate) fn drop_table_constraint(
     catalog: &Catalog,
     txn: &TxnHandle,

@@ -66,17 +66,41 @@
 //! In [`IndexStore`], the `indexes` field of the [`TableStore`] of `table.rs`, for the
 //! reason written there. `storage` stays the reference on existence, so a reader calls
 //! [`refresh`] before [`IndexStore::of_table`].
+//!
+//! # What a transaction sees of the indexes
+//!
+//! The store is a cache shared by the transactions. Which of its entries a transaction sees
+//! is decided by the rows of `vauban_sys_object_storage` that name an index, read under the
+//! snapshot of that transaction ([`visible_indexes`]): those rows are versioned and written in
+//! the transaction of the `CREATE INDEX` or of the `DROP INDEX`, so
+//!
+//! - an index whose `CREATE INDEX` is not committed is seen by its own transaction alone, and
+//!   one whose `DROP INDEX` is not committed is hidden from that transaction alone
+//!   (`tests/snapshot.rs`, `an_uncommitted_create_index_is_seen_by_its_transaction_alone`,
+//!   `an_uncommitted_drop_index_hides_the_index_from_its_transaction_alone`);
+//! - a `ROLLBACK TRANSACTION <savepoint>` that undoes a `DROP INDEX` puts its rows back, and the
+//!   index with them; the mark the `DROP` left on the entry is then cleared the next time that
+//!   transaction reads the store ([`forget_undone_drops`]; `tests/index.rs`,
+//!   `a_savepoint_rollback_gives_the_dropped_index_back`).
+//!
+//! `CREATE INDEX` and `DROP INDEX` take the `Sch-M` of the storage table of their table, held
+//! until the end of the transaction, as `ALTER TABLE` does: another transaction that names the
+//! table waits for that end before it binds a statement over it
+//! (`crates/vauban-session/tests/ddl_visibility.rs`,
+//! `an_uncommitted_create_index_is_waited_for_then_left_out`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::{IndexId, IndexShape, KeyColumn, TableId, TxnId};
 use vauban_txn::{CommitAction, RollbackAction, TxnHandle};
+use vauban_types::Value;
 
 use crate::catalog::{Catalog, not_implemented};
 use crate::def::{ConstraintDef, IndexDef, SortedColumn, TableDef};
 use crate::ids::ObjectId;
 use crate::meta::{ColumnMeta, ConstraintMeta, IndexMeta, TableMeta};
+use crate::table::reload::{STORAGE_TABLE, storage_columns};
 use crate::table::{self, TableStore};
 
 /// The state error 3701 sends when the `DROP INDEX` names an index of a table the caller
@@ -181,14 +205,89 @@ impl IndexStore {
         self.entries.get(&id).map(|entry| &entry.meta)
     }
 
-    /// The entry of the index of `table` called `name`, or `None`.
+    /// The indexes of `table` built over `storage_table` whose identifier is in `visible`,
+    /// by increasing [`IndexId`]: a `DROP` mark on the entry does not leave it out
+    /// (`tests/snapshot.rs`, `an_uncommitted_drop_index_hides_the_index_from_its_transaction_alone`).
     ///
-    /// A pending `DROP` does not free the name: the index is in `storage` until the
-    /// `COMMIT` (`tests/index.rs`, `a_duplicate_index_name_on_a_table_is_refused`).
-    fn named(&self, table: ObjectId, name: &str) -> Option<&IndexEntry> {
+    /// The read side `snapshot.rs` uses, with the identifiers [`visible_indexes`] gives for
+    /// the reading transaction (module documentation, "What a transaction sees of the
+    /// indexes").
+    pub(crate) fn seen_on(
+        &self,
+        table: ObjectId,
+        storage_table: TableId,
+        visible: &BTreeSet<IndexId>,
+    ) -> Vec<&IndexMeta> {
+        self.entries
+            .iter()
+            .filter(|(id, entry)| {
+                entry.table == table && entry.storage_table == storage_table && visible.contains(id)
+            })
+            .map(|(_, entry)| &entry.meta)
+            .collect()
+    }
+
+    /// The entry of the index of `table` called `name` that holds the name for the
+    /// transaction `me`, or `None`.
+    ///
+    /// A `DROP` that another transaction has not committed does not free the name: the
+    /// index is in `storage` until that `COMMIT` (`tests/index.rs`,
+    /// `a_duplicate_index_name_on_a_table_is_refused`). The transaction that dropped the
+    /// index may give its name to a new one (`tests/index.rs`,
+    /// `an_index_dropped_by_the_transaction_frees_its_name_for_it`), once
+    /// [`forget_undone_drops`] has cleared the mark of a `DROP` a savepoint undid.
+    fn named(&self, table: ObjectId, name: &str, me: TxnId) -> Option<&IndexEntry> {
         self.entries.values().find(|entry| {
-            entry.table == table && !entry.superseded && entry.meta.name.eq_ignore_ascii_case(name)
+            entry.table == table
+                && !entry.superseded
+                && entry.dropped_by != Some(me)
+                && entry.meta.name.eq_ignore_ascii_case(name)
         })
+    }
+}
+
+/// The identifiers of the indexes `txn` sees: the rows of `vauban_sys_object_storage` that
+/// name an index, read under the snapshot of the statement (module documentation).
+///
+/// # Errors
+///
+/// The error of the scan; an empty set when the registry does not name the table, as for a
+/// catalogue that was not bootstrapped.
+pub(crate) fn visible_indexes(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<BTreeSet<IndexId>> {
+    let Some(table) = crate::bootstrap::internal_table_id(catalog, STORAGE_TABLE)? else {
+        return Ok(BTreeSet::new());
+    };
+    let snapshot = catalog.txn.statement_snapshot(txn);
+    let mut visible = BTreeSet::new();
+    for row in catalog.storage.scan(&snapshot, table)? {
+        let (_, row) = row?;
+        if matches!(
+            row.0.get(storage_columns::INDEX_NAME),
+            None | Some(Value::Null)
+        ) {
+            continue;
+        }
+        if let Some(&Value::I64(id)) = row.0.get(storage_columns::STORAGE_ID)
+            && let Ok(id) = u32::try_from(id)
+        {
+            visible.insert(IndexId(id));
+        }
+    }
+    Ok(visible)
+}
+
+/// Clears the `DROP` mark `me` left on an entry whose index `me` sees again, which is what a
+/// `DROP INDEX` undone by `ROLLBACK TRANSACTION <savepoint>` looks like from here: the
+/// transaction manager forgets the deferred drop and `storage` puts the rows back
+/// (`tests/index.rs`, `a_savepoint_rollback_gives_the_dropped_index_back`).
+///
+/// `visible` is what [`visible_indexes`] answers for `me`. The mark of another transaction is
+/// left to [`refresh`], which clears it once that transaction has closed.
+pub(crate) fn forget_undone_drops(store: &mut IndexStore, me: TxnId, visible: &BTreeSet<IndexId>) {
+    for (id, entry) in &mut store.entries {
+        if entry.dropped_by == Some(me) && visible.contains(id) {
+            entry.dropped_by = None;
+        }
     }
 }
 
@@ -414,9 +513,12 @@ pub(crate) fn create_index(
     txn: &TxnHandle,
     def: &IndexDef,
 ) -> SqlResult<IndexMeta> {
+    crate::alter::lock_current_storage(catalog, txn, def.table)?;
+    let visible = visible_indexes(catalog, txn)?;
     let mut store = table::store(catalog);
     table::refresh(catalog, &mut store)?;
     refresh(catalog, &mut store)?;
+    forget_undone_drops(&mut store.indexes, txn.id, &visible);
     let Some(meta) = store.get(def.table).cloned() else {
         return Err(InternalError::Bug(format!(
             "Catalog::create_index: index {} names the unknown table {}; resolving a name is \
@@ -463,22 +565,16 @@ pub(crate) fn create_index(
 /// `ROLLBACK` leaves it where it was (`tests/index.rs`, `drop_index_deferred`,
 /// `a_rolled_back_drop_index_leaves_the_index`).
 ///
-/// The bound `table.rs` writes on `drop_table` holds here for the same reason: a `DROP`
-/// undone by `ROLLBACK TRANSACTION <savepoint>` keeps the mark this function leaves on the
-/// entry, the public API of `vauban_txn` not saying whether a registered action is still in
-/// the log (`table.rs`, section "Bound"; `tests/index.rs`,
-/// `a_savepoint_rollback_leaves_the_drop_mark_in_place`).
+/// A `DROP` undone by `ROLLBACK TRANSACTION <savepoint>` gives the index back: the
+/// transaction manager forgets the deferred drop, `storage` puts back the rows that name the
+/// index, and [`forget_undone_drops`] clears the mark this function leaves on the entry the
+/// next time that transaction reads the store (`tests/index.rs`,
+/// `a_savepoint_rollback_gives_the_dropped_index_back`).
 ///
-/// # Bound: the name of a dropped index before the `COMMIT`
-///
-/// The deferral keeps the index in `storage` until the `COMMIT`, so its name stays taken for
-/// the rest of the transaction and a `CREATE INDEX` that reuses it answers the duplicate-name
-/// bug of [`Origin::Statement`]. SQL Server frees the name at once:
-/// `DROP INDEX ix ON t; CREATE INDEX ix ON t (b);` in one transaction is accepted there. The
-/// state this gives is frozen by `tests/index.rs`,
-/// `a_name_dropped_in_the_transaction_is_not_free_before_the_commit`; freeing it asks for
-/// versioned rows, the name of an index being a row of the catalogue then, rather than for
-/// a second mark on this entry.
+/// The name of the dropped index is free for the transaction that dropped it, before the
+/// `COMMIT`: `DROP INDEX ix ON t; CREATE INDEX ix ON t (b);` in one transaction is accepted
+/// (`tests/index.rs`, `an_index_dropped_by_the_transaction_frees_its_name_for_it`), and stays
+/// taken for another transaction ([`IndexStore::named`]).
 ///
 /// # Errors
 ///
@@ -534,9 +630,20 @@ fn drop_index_with(
     index: IndexId,
     constraints: Constraints,
 ) -> SqlResult<()> {
+    let owner = {
+        let mut store = table::store(catalog);
+        table::refresh(catalog, &mut store)?;
+        refresh(catalog, &mut store)?;
+        store.indexes.entries.get(&index).map(|entry| entry.table)
+    };
+    if let Some(owner) = owner {
+        crate::alter::lock_current_storage(catalog, txn, owner)?;
+    }
+    let visible = visible_indexes(catalog, txn)?;
     let mut store = table::store(catalog);
     table::refresh(catalog, &mut store)?;
     refresh(catalog, &mut store)?;
+    forget_undone_drops(&mut store.indexes, txn.id, &visible);
     let Some(entry) = store.indexes.entries.get(&index) else {
         return Err(SqlError::cannot_drop("drop", "index", &index.to_string()));
     };
@@ -726,7 +833,7 @@ fn create_one_index(
     origin: Origin,
     meta: IndexMeta,
 ) -> SqlResult<IndexId> {
-    if store.indexes.named(table.id, &meta.name).is_some() {
+    if store.indexes.named(table.id, &meta.name, txn.id).is_some() {
         return Err(origin.duplicate_name(&table.name, &meta.name).into());
     }
     let shape = IndexShape {

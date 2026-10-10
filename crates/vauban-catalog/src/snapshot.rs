@@ -17,10 +17,11 @@
 //!   whose storage table its row carries, the [`TableMeta`] of that version being read from
 //!   the cache of `table.rs` (`TableStore::visible`, refreshed against `storage` first by
 //!   `table::refresh`). Their **indexes** come from the same cache, the `IndexStore` that
-//!   `table.rs` holds beside the tables: read through `IndexStore::of_table` once
-//!   `index::refresh` has brought it back in line with `storage`, which is the reference on
-//!   existence, and kept to those of the storage table of the version read
-//!   (`tests/snapshot.rs`, `indexes_of_a_table_with_a_primary_key_has_its_index`);
+//!   `table.rs` holds beside the tables, once `index::refresh` has brought it back in line
+//!   with `storage`, which is the reference on existence: kept to those of the storage table
+//!   of the version read whose row of `vauban_sys_object_storage` the snapshot of the
+//!   transaction sees (`index::visible_indexes`; `tests/snapshot.rs`,
+//!   `indexes_of_a_table_with_a_primary_key_has_its_index`);
 //! - the **internal tables of `master`** are the `InternalTableDef` the bootstrap created a
 //!   table of `storage` for, read from code ([`internal_table_objects`]) and paired with the
 //!   `TableId` the registry of `bootstrap.rs` gives for their name. They are entries of `tables` as well as of
@@ -32,8 +33,9 @@
 //!   describes the same ones, so there is no row to scan for them (section below);
 //! - the **constraint names** are the `FOREIGN KEY`, `CHECK` and `DEFAULT` entries of
 //!   `constraints.rs`'s `ConstraintStore`, read from the same store as the tables and the
-//!   indexes, under the same lock and after the same refresh
-//!   ([`CatalogSnapshot::constraint_name`]).
+//!   indexes, under the same lock and after the same refresh, less those another open
+//!   transaction has added in place and plus those it has dropped in place
+//!   (`ConstraintStore::seen_by`; [`CatalogSnapshot::constraint_name`]).
 //!
 //! # The system views of `views/`
 //!
@@ -175,12 +177,21 @@
 //!   others the old one (`tests/alter.rs`,
 //!   `another_transaction_reads_the_old_shape_until_the_commit`).
 //!
-//! What does not follow it yet: the indexes and the `FOREIGN KEY`, `CHECK` and `DEFAULT`
-//! constraints of a table are read from the cache as they stand, so a `create_index` its
-//! transaction has not committed is in the snapshot of another transaction
-//! (`tests/snapshot.rs`, `indexes_of_after_create_index_has_two`). A table whose database
-//! is invisible to the snapshot is invisible too, its three-part name having no first part to
-//! be written with.
+//! Their indexes and constraints follow it the same way:
+//!
+//! - a `create_index` not committed yet is in the snapshot of its own transaction and not in
+//!   the snapshot of another one, and a `drop_index` not committed yet hides the index from
+//!   its own transaction alone (`tests/snapshot.rs`,
+//!   `an_uncommitted_create_index_is_seen_by_its_transaction_alone`,
+//!   `an_uncommitted_drop_index_hides_the_index_from_its_transaction_alone`);
+//! - a `FOREIGN KEY`, `CHECK` or `DEFAULT` an `alter_table` adds or drops in place, not
+//!   committed yet, is seen that way by its own transaction alone: another one reads the
+//!   version of the table from before that transaction changed it
+//!   (`ConstraintStore::before_change_of_another`; `tests/snapshot.rs`,
+//!   `an_uncommitted_check_is_seen_by_its_transaction_alone`).
+//!
+//! A table whose database is invisible to the snapshot is invisible too, its three-part name
+//! having no first part to be written with.
 //!
 //! # What a binding waits for
 //!
@@ -434,6 +445,12 @@ struct BindingWaits {
     /// under the same lock as the tables of the snapshot: a name
     /// [`CatalogSnapshot::resolve_object`] does not find may be one of them.
     pending: Vec<table::PendingName>,
+    /// For each table, the storage tables a write of its rows checks through a `FOREIGN
+    /// KEY`, in both directions, read from the store as it stands and not as the transaction
+    /// sees it: a key another open transaction has declared, in place or with a table it
+    /// created, makes a write wait for that transaction rather than run against a check it
+    /// does not see ([`foreign_key_neighbours`]).
+    foreign_keys: BTreeMap<ObjectId, Vec<TableId>>,
     /// What the name resolutions made through the snapshot reached, in order, until
     /// [`CatalogSnapshot::take_resolved_tables`] drains it.
     resolved: Mutex<Vec<Resolved>>,
@@ -611,6 +628,9 @@ impl CatalogSnapshot {
                             push(other.storage_id);
                         }
                     }
+                    for storage in self.waits.foreign_keys.get(&id).into_iter().flatten() {
+                        push(*storage);
+                    }
                 }
             }
         }
@@ -687,13 +707,13 @@ impl CatalogSnapshot {
     /// `indexes_of_after_create_index_has_two`).
     ///
     /// The [`IndexMeta`] are copied in when the snapshot is built, from the `IndexStore` of
-    /// `index.rs` refreshed against `storage` (module documentation), so a snapshot keeps the
-    /// answer it was built with. Two shapes that rule decides:
+    /// `index.rs` refreshed against `storage` and kept to the indexes the transaction sees
+    /// (module documentation), so a snapshot keeps the answer it was built with. Two shapes
+    /// that rule decides:
     ///
-    /// - an index whose `DROP INDEX` is deferred to the `COMMIT` is out of a snapshot built
-    ///   before that commit — `index.rs` marks the entry and `IndexStore::of_table` skips a
-    ///   marked one — for the transaction that asked for the drop as for another one, while
-    ///   `storage` still holds the index. A `ROLLBACK` clears the mark, and a snapshot built
+    /// - an index whose `DROP INDEX` is deferred to the `COMMIT` is out of a snapshot of the
+    ///   transaction that asked for the drop, and in the snapshot of another one, while
+    ///   `storage` still holds the index. A `ROLLBACK` puts it back, and a snapshot built
     ///   afterwards carries the index again (`tests/snapshot.rs`,
     ///   `a_dropped_index_leaves_the_snapshot_after_commit`,
     ///   `a_rolled_back_drop_index_is_in_the_snapshot_again`);
@@ -781,33 +801,39 @@ pub(crate) fn build(catalog: &Catalog, txn: &TxnHandle) -> CatalogSnapshot {
 fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
     let databases = databases_of(catalog, txn)?;
     let visible = table::reload::visible_tables(catalog, txn)?;
-    let (live, mut indexes, constraint_names, pending) = {
+    let visible_indexes = index::visible_indexes(catalog, txn)?;
+    let (live, mut indexes, constraint_names, pending, foreign_keys) = {
         let mut store = table::store(catalog);
         table::refresh(catalog, &mut store)?;
         index::refresh(catalog, &mut store)?;
+        index::forget_undone_drops(&mut store.indexes, txn.id, &visible_indexes);
         // Same refresh `Catalog::constraints_of` runs before reading `store.constraints`
         // (`constraints.rs`), under the same lock as the tables and the indexes above: a
         // `FOREIGN KEY` or a `CHECK` this snapshot names comes from one state of the store.
         constraints::refresh_sessions(catalog, &mut store)?;
         constraints::forget_dropped(&mut store);
-        let live: Vec<TableMeta> = store.visible(&visible).cloned().collect();
+        // The version the transaction sees, without the constraints another open
+        // transaction has added or dropped in place (module documentation).
+        let live: Vec<TableMeta> = store
+            .visible(&visible)
+            .map(|meta| {
+                store
+                    .constraints
+                    .before_change_of_another(meta.id, meta.storage_id, txn.id)
+                    .unwrap_or(meta)
+                    .clone()
+            })
+            .collect();
+        // The indexes of the version this transaction sees, among those its rows name: an
+        // uncommitted `ALTER TABLE` of another transaction has put those of its new storage
+        // table in the store, which this version does not carry.
         let indexes: BTreeMap<ObjectId, Vec<IndexMeta>> = live
             .iter()
             .filter_map(|meta| {
-                // The indexes of the version this transaction sees: an uncommitted
-                // `ALTER TABLE` of another transaction has put those of its new storage
-                // table in the store, which this version does not carry.
                 let metas: Vec<IndexMeta> = store
                     .indexes
-                    .of_table(meta.id)
+                    .seen_on(meta.id, meta.storage_id, &visible_indexes)
                     .into_iter()
-                    .filter(|index| {
-                        store
-                            .indexes
-                            .entries
-                            .get(&index.id)
-                            .is_some_and(|entry| entry.storage_table == meta.storage_id)
-                    })
                     .cloned()
                     .collect();
                 (!metas.is_empty()).then_some((meta.id, metas))
@@ -817,13 +843,19 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
         // (module documentation).
         let constraint_names: BTreeMap<ObjectId, QualifiedName> = store
             .constraints
-            .entries
-            .values()
+            .seen_by(txn.id)
+            .into_iter()
             .filter(|object| databases.iter().any(|db| db.id == object.database))
             .map(|object| (object.id, object.name.clone()))
             .collect();
         let pending = table::pending_names(catalog, &store, txn.id);
-        (live, indexes, constraint_names, pending)
+        (
+            live,
+            indexes,
+            constraint_names,
+            pending,
+            foreign_key_neighbours(&store),
+        )
     };
     let mut objects = BTreeMap::new();
     let mut system_views = Vec::new();
@@ -874,9 +906,41 @@ fn read(catalog: &Catalog, txn: &TxnHandle) -> SqlResult<CatalogSnapshot> {
         constraint_names,
         waits: Box::new(BindingWaits {
             pending,
+            foreign_keys,
             resolved: Mutex::default(),
         }),
     })
+}
+
+/// For each table of `store`, the storage tables of the tables its `FOREIGN KEY`
+/// constraints reference and of the tables whose `FOREIGN KEY` references it, from the
+/// versions the store holds, uncommitted ones included (`BindingWaits::foreign_keys`;
+/// `crates/vauban-session/tests/ddl_visibility.rs`,
+/// `a_delete_waits_for_a_foreign_key_another_session_has_not_committed`).
+fn foreign_key_neighbours(store: &table::TableStore) -> BTreeMap<ObjectId, Vec<TableId>> {
+    let mut neighbours: BTreeMap<ObjectId, Vec<TableId>> = BTreeMap::new();
+    let mut add = |table: ObjectId, storage: TableId| {
+        let list = neighbours.entry(table).or_default();
+        if !list.contains(&storage) {
+            list.push(storage);
+        }
+    };
+    for (id, entry) in &store.entries {
+        for constraint in &entry.meta.constraints {
+            let crate::meta::ConstraintMeta::ForeignKey {
+                referenced_table, ..
+            } = constraint
+            else {
+                continue;
+            };
+            let Some(referenced) = store.entries.get(referenced_table) else {
+                continue;
+            };
+            add(*id, referenced.meta.storage_id);
+            add(*referenced_table, entry.meta.storage_id);
+        }
+    }
+    neighbours
 }
 
 /// The system views the files of `views/` describe.

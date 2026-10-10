@@ -67,8 +67,9 @@
 //! # Where the context comes from
 //!
 //! [`PlanContext`] carries one thing, [`PlanCatalog`], keyed on the
-//! [`TableId`](vauban_storage::TableId) a bound `Scan` holds. [`StorageIndexes`] is the
-//! production implementation, [`NoIndexes`] the one that reports no index, and
+//! [`TableId`](vauban_storage::TableId) a bound `Scan` holds. [`SnapshotIndexes`] is the
+//! production implementation, which keeps the indexes of [`StorageIndexes`] to those the
+//! snapshot of the binding sees, [`NoIndexes`] the one that reports no index, and
 //! [`testing::FakeCatalog`] the double the rule tests declare their indexes with. The
 //! reasons for this shape are in `context.rs`.
 
@@ -85,7 +86,7 @@ mod sort;
 mod subquery;
 pub mod testing;
 
-pub use context::{NoIndexes, PlanCatalog, PlanContext, StorageIndexes};
+pub use context::{NoIndexes, PlanCatalog, PlanContext, SnapshotIndexes, StorageIndexes};
 pub use explain::explain;
 pub use physical::{
     KeyRangeExpr, PhysicalDeclaration, PhysicalDelete, PhysicalInsert, PhysicalJoinKind,

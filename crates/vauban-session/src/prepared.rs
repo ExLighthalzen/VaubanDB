@@ -9,7 +9,7 @@ use vauban_binder::{
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{DataType, ParameterDeclaration, Statement, parse_batch};
-use vauban_planner::{PhysicalPlan, PhysicalStatement, PlanContext, StorageIndexes};
+use vauban_planner::{PhysicalPlan, PhysicalStatement, PlanContext, SnapshotIndexes};
 use vauban_tds::RpcParam;
 use vauban_txn::IsolationLevel;
 use vauban_types::{
@@ -405,7 +405,10 @@ fn bind_prepared_statements(
                 batch_variables.declare(&declaration.name, declaration.ty.clone())?;
             }
         }
-        let indexes = StorageIndexes(session.engine().storage.as_ref());
+        let indexes = SnapshotIndexes {
+            storage: session.engine().storage.as_ref(),
+            snapshot,
+        };
         let physical = vauban_planner::plan(bound, &PlanContext { catalog: &indexes })?;
         let eval = SessionEvalContext::new(state, Some(snapshot));
         let mut exec = vauban_executor::ExecContext::scalar(&eval, state.options.to_binder());

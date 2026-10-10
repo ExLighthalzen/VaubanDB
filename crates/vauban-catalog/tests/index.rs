@@ -643,11 +643,11 @@ fn the_unique_flag_of_a_primary_key_reaches_storage() {
     txn.rollback(handle).expect("rollback");
 }
 
-/// The bound `table.rs` writes on `drop_table` holds for `drop_index`: a `DROP` undone by
-/// `ROLLBACK TRANSACTION <savepoint>` keeps its mark, so the next `DROP` answers 3701 while
-/// the index survives the `COMMIT`. Current state, not the aim.
+/// A `DROP INDEX` undone by `ROLLBACK TRANSACTION <savepoint>` gives the index back: a
+/// second `CREATE INDEX` of its name is refused (1913), a second `DROP INDEX` is accepted,
+/// and the `COMMIT` of that second `DROP` takes the index away.
 #[test]
-fn a_savepoint_rollback_leaves_the_drop_mark_in_place() {
+fn a_savepoint_rollback_gives_the_dropped_index_back() {
     let (catalog, storage, txn) = instance();
     let (meta, ordinary) = table_with_an_ordinary_index(&catalog, &txn, "t");
 
@@ -656,17 +656,57 @@ fn a_savepoint_rollback_leaves_the_drop_mark_in_place() {
     catalog.drop_index(&dropper, ordinary).expect("drop_index");
     txn.rollback_to(&dropper, mark)
         .expect("rollback to the savepoint");
+    let seen: Vec<IndexId> = catalog
+        .snapshot(&dropper)
+        .indexes_of(meta.id)
+        .iter()
+        .map(|index| index.id)
+        .collect();
+    assert!(seen.contains(&ordinary), "{seen:?}");
     let err = catalog
+        .create_index(&dropper, &index(meta.id, "ix_b", &[("b", false)]))
+        .expect_err("the index is back under its name");
+    assert!(err.message.contains("1913"), "{}", err.message);
+    catalog
         .drop_index(&dropper, ordinary)
-        .expect_err("the mark is still there");
-    assert_eq!(err.number, 3701);
+        .expect("the index can be dropped again");
+    txn.commit(dropper).expect("commit");
+    assert!(
+        !indexes_of(&storage, meta.storage_id)
+            .iter()
+            .any(|(id, _)| *id == ordinary),
+        "the second drop took effect at the commit"
+    );
+}
+
+/// A `DROP INDEX` undone by `ROLLBACK TRANSACTION <savepoint>` then committed leaves the
+/// index in `storage` and in the snapshot of another transaction.
+#[test]
+fn a_drop_undone_to_a_savepoint_leaves_the_index_after_the_commit() {
+    let (catalog, storage, txn) = instance();
+    let (meta, ordinary) = table_with_an_ordinary_index(&catalog, &txn, "t");
+
+    let dropper = begin(&txn);
+    let mark = txn.savepoint(&dropper).expect("savepoint");
+    catalog.drop_index(&dropper, ordinary).expect("drop_index");
+    txn.rollback_to(&dropper, mark)
+        .expect("rollback to the savepoint");
     txn.commit(dropper).expect("commit");
     assert!(
         indexes_of(&storage, meta.storage_id)
             .iter()
             .any(|(id, _)| *id == ordinary),
-        "the deferred drop was forgotten by rollback_to: the index is still in storage"
+        "the deferred drop was forgotten by rollback_to"
     );
+    let reader = begin(&txn);
+    let seen: Vec<IndexId> = catalog
+        .snapshot(&reader)
+        .indexes_of(meta.id)
+        .iter()
+        .map(|index| index.id)
+        .collect();
+    assert!(seen.contains(&ordinary), "{seen:?}");
+    txn.commit(reader).expect("commit");
 }
 
 /// A `DROP INDEX` over the index of a `PRIMARY KEY` is refused: dropping it would leave the
@@ -931,25 +971,57 @@ fn a_failed_key_leaves_a_table_the_catalogue_does_not_name() {
     );
 }
 
-/// The name of an index dropped in the transaction stays taken until the `COMMIT`, the index
-/// being still in `storage`, where SQL Server frees it at once. Current state of the bound
-/// written on `drop_index`, not the aim.
+/// The transaction that dropped an index may give its name to a new one before its
+/// `COMMIT`, and the `COMMIT` leaves the new index alone; a `ROLLBACK` brings the old one
+/// back and takes the new one away.
 #[test]
-fn a_name_dropped_in_the_transaction_is_not_free_before_the_commit() {
-    let (catalog, _storage, txn) = instance();
+fn an_index_dropped_by_the_transaction_frees_its_name_for_it() {
+    let (catalog, storage, txn) = instance();
     let (meta, ordinary) = table_with_an_ordinary_index(&catalog, &txn, "t");
+
     let handle = begin(&txn);
     catalog.drop_index(&handle, ordinary).expect("drop_index");
-    let err = catalog
-        .create_index(&handle, &index(meta.id, "ix_b", &[("a", false)]))
-        .expect_err("the name is held by the deferred drop");
-    assert!(err.message.contains("1913"), "{}", err.message);
+    let created = catalog
+        .create_index(&handle, &index(meta.id, "IX_B", &[("a", false)]))
+        .expect("the name the transaction freed");
     txn.commit(handle).expect("commit");
-    let second = begin(&txn);
-    catalog
-        .create_index(&second, &index(meta.id, "ix_b", &[("a", false)]))
-        .expect("after the commit the name is free");
-    txn.commit(second).expect("commit");
+    let ids: Vec<IndexId> = indexes_of(&storage, meta.storage_id)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(ids.contains(&created.id), "{ids:?}");
+    assert!(!ids.contains(&ordinary), "{ids:?}");
+
+    let undone = begin(&txn);
+    catalog.drop_index(&undone, created.id).expect("drop_index");
+    let again = catalog
+        .create_index(&undone, &index(meta.id, "ix_b", &[("b", false)]))
+        .expect("the name the transaction freed");
+    txn.rollback(undone).expect("rollback");
+    let ids: Vec<IndexId> = indexes_of(&storage, meta.storage_id)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(ids.contains(&created.id), "{ids:?}");
+    assert!(!ids.contains(&again.id), "{ids:?}");
+}
+
+/// A `DROP INDEX` another transaction rolled back leaves the name taken: the mark that
+/// transaction left on the entry does not free it for a second one.
+#[test]
+fn an_index_dropped_by_another_transaction_keeps_its_name() {
+    let (catalog, _storage, txn) = instance();
+    let (meta, ordinary) = table_with_an_ordinary_index(&catalog, &txn, "t");
+
+    let dropper = begin(&txn);
+    catalog.drop_index(&dropper, ordinary).expect("drop_index");
+    txn.rollback(dropper).expect("rollback");
+    let other = begin(&txn);
+    let err = catalog
+        .create_index(&other, &index(meta.id, "ix_b", &[("a", false)]))
+        .expect_err("the drop was rolled back");
+    assert!(err.message.contains("1913"), "{}", err.message);
+    txn.rollback(other).expect("rollback");
 }
 
 /// The refusal of the point above is not a refusal of the pair: `DROP INDEX` then
