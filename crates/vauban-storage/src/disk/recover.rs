@@ -108,13 +108,17 @@
 //! commit of the first clears the `in_progress` flag of that page
 //! (`a_page_shared_by_two_txns_loses_its_flag_at_the_first_commit` in
 //! [`super::version`]), after which a flush may write the version of the second one to `data`.
-//! That leftover is hidden by the register rather than taken away:
-//! [`super::version::HeapTable::resume_after_recovery`] marks the losers `Aborted`, which
-//! [`crate::Snapshot::is_visible`] reads (`a_loser_whose_page_reached_data_is_invisible`).
 //! A loser that rolled back before the crash journalled its undo, and the redo takes its
 //! versions out (above). The writes of a loser that neither a `ROLLBACK TO` nor a rollback the
-//! crash cut short had undone carry no compensation in the journal; their bytes stay until a
-//! vacuum takes them.
+//! crash cut short had undone are taken back after the redo, when the table is first reached:
+//! [`super::version::HeapTable::resume_after_recovery`] marks the losers `Aborted`, which
+//! [`crate::Snapshot::is_visible`] reads (`a_loser_whose_page_reached_data_is_invisible`), then
+//! takes out each version a loser created and unsets each `xmax` a loser set, each by a
+//! [`WalRecordKind::Compensation`] it appends and syncs before the slot changes. A later write
+//! of the row, and its rollback, find the chain the winners left
+//! (`a_row_a_loser_updated_then_deleted_takes_an_update_and_its_rollback`), and the next
+//! recovery replays those compensations as it replays the ones of a rollback
+//! (`a_loser_taken_back_by_a_recovery_cut_short_is_taken_back_by_the_next`).
 //!
 //! The `in_progress` flag itself is a field of a frame of the pool
 //! ([`super::buffer::BufferPool::set_in_progress`] writes it on the frame of a pinned page),

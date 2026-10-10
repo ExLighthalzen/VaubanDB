@@ -1711,3 +1711,126 @@ fn a_vacuum_then_a_crash_recovers_the_committed_rows_without_the_purged_versions
         assert_eq!(recovery.released, 6, "reopen {pass}");
     }
 }
+
+/// A crash after transaction 5 updated the row transaction 4 committed, then deleted it when
+/// `delete` says so: the page reaches `data` through the commit of transaction 6, which
+/// shares it.
+fn a_loser_updated_the_row(dir: &TempDir, delete: bool) -> (RowId, RowId) {
+    let storage = open(dir);
+    let head = install(&storage);
+    let mut table = HeapTable::open(&storage, TABLE, head, int_shape());
+    let id = table.insert(TxnId(4), &row(11)).expect("insert");
+    table.commit(TxnId(4)).expect("commit 4");
+    table
+        .update(TxnId(5), id, &row(12))
+        .expect("update by the loser");
+    if delete {
+        table.delete(TxnId(5), id).expect("delete by the loser");
+    }
+    let other = table.insert(TxnId(6), &row(21)).expect("insert");
+    table.commit(TxnId(6)).expect("commit 6");
+    storage.checkpoint().expect("checkpoint");
+    (id, other)
+}
+
+#[test]
+fn a_row_a_loser_updated_then_deleted_takes_an_update_and_its_rollback() {
+    for delete in [true, false] {
+        let dir = TempDir::created("recover-loser-row");
+        let (id, other) = a_loser_updated_the_row(&dir, delete);
+        let committed = vec![(id, row(11)), (other, row(21))];
+        {
+            let storage = open(&dir);
+            assert_eq!(storage.recovery().losers, vec![TxnId(5)]);
+            let mut table = resumed(&storage);
+            assert_eq!(table.scan(&snap(99, 100)).expect("scan"), committed);
+            table.update(TxnId(7), id, &row(13)).expect("update");
+            table.rollback(TxnId(7)).expect("rollback of the update");
+            assert_eq!(table.scan(&snap(99, 100)).expect("scan"), committed);
+            table.delete(TxnId(8), id).expect("delete");
+            table.rollback(TxnId(8)).expect("rollback of the delete");
+            assert_eq!(table.scan(&snap(99, 100)).expect("scan"), committed);
+            table.update(TxnId(9), id, &row(14)).expect("update");
+            table.commit(TxnId(9)).expect("commit 9");
+        }
+        for pass in 0..2 {
+            let storage = open(&dir);
+            let mut table = resumed(&storage);
+            assert_eq!(
+                table.scan(&snap(99, 100)).expect("scan"),
+                vec![(id, row(14)), (other, row(21))],
+                "delete {delete}, reopen {pass}"
+            );
+            assert!(
+                placed(&storage)
+                    .iter()
+                    .all(|(_, header)| header.xmin != TxnId(5) && header.xmax != Some(TxnId(5))),
+                "delete {delete}, reopen {pass}: no byte of the loser is left"
+            );
+            table
+                .update(TxnId(20 + pass), id, &row(15))
+                .expect("update");
+            table.rollback(TxnId(20 + pass)).expect("rollback");
+        }
+    }
+}
+
+#[test]
+fn a_loser_taken_back_by_a_recovery_cut_short_is_taken_back_by_the_next() {
+    let dir = TempDir::created("recover-loser-cut-short");
+    let (id, other) = a_loser_updated_the_row(&dir, true);
+    let committed = vec![(id, row(11)), (other, row(21))];
+    let journal_len =
+        |storage: &DiskStorage| storage.wal.records().expect("read the journal").len();
+    {
+        // A recovery that stopped after its first compensation: the record is durable, the
+        // page it names is not.
+        let storage = open(&dir);
+        let (at, header) = placed(&storage)
+            .into_iter()
+            .find(|(_, header)| header.xmin == TxnId(5))
+            .expect("the version of the loser reached data");
+        let payload = SlotRelease {
+            table: TABLE,
+            header,
+            at,
+            release: Release::Removed,
+        }
+        .encode();
+        storage
+            .wal
+            .append(WalRecordKind::Compensation, TxnId(5), &payload)
+            .expect("append");
+        storage.wal.flush().expect("flush");
+    }
+    {
+        let storage = open(&dir);
+        assert_eq!(storage.recovery().released, 1);
+        let before = journal_len(&storage);
+        let table = resumed(&storage);
+        assert_eq!(
+            journal_len(&storage),
+            before + 1,
+            "the xmax of the loser is what is left to take back"
+        );
+        assert_eq!(table.scan(&snap(99, 100)).expect("scan"), committed);
+    }
+    for pass in 0..2 {
+        let storage = open(&dir);
+        assert_eq!(storage.recovery().released, 2, "reopen {pass}");
+        let before = journal_len(&storage);
+        let mut table = resumed(&storage);
+        assert_eq!(journal_len(&storage), before, "reopen {pass}: nothing left");
+        assert!(
+            placed(&storage)
+                .iter()
+                .all(|(_, header)| header.xmin != TxnId(5) && header.xmax.is_none()),
+            "reopen {pass}"
+        );
+        assert_eq!(table.scan(&snap(99, 100)).expect("scan"), committed);
+        table
+            .update(TxnId(20 + pass), id, &row(15))
+            .expect("update");
+        table.rollback(TxnId(20 + pass)).expect("rollback");
+    }
+}

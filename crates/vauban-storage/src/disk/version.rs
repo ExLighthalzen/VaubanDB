@@ -443,17 +443,16 @@ impl<'storage> HeapTable<'storage> {
     /// lists are the ones of the journal of the instance, held per instance rather than per
     /// table in [`super::TxnRegistry`].
     ///
-    /// The directory is rebuilt from the heap rather than from the records of the redo: the
-    /// versions of the losers are left out of it, and each row takes the address of its
-    /// largest `seq`, [`HeapTable::stored_versions`] answering in that order. A row whose
-    /// current version was left there by a loser therefore keeps a version the register hides
-    /// but the undo of this build does not take away, and an [`HeapTable::update`] on that row
-    /// answers [`InternalError::Bug`]; taking those bytes back belongs to a vacuum, which is
-    /// not implemented.
+    /// Before the directory is rebuilt, the bytes the losers left on the heap are taken back,
+    /// each by a journalled compensation ([`HeapTable::take_back_losers`]). The directory is
+    /// then rebuilt from the heap rather than from the records of the redo, each row taking
+    /// the address of its largest `seq`, [`HeapTable::stored_versions`] answering in that
+    /// order.
     ///
     /// # Errors
     ///
-    /// Those of [`Heap::get`] and of [`VersionHeader::read_from`] while the heap is walked.
+    /// Those of [`Heap::get`] and of [`VersionHeader::read_from`] while the heap is walked,
+    /// and those of the journal and of the heap while the losers are taken back.
     pub(crate) fn resume_after_recovery(
         &mut self,
         next_row_id: u64,
@@ -465,7 +464,7 @@ impl<'storage> HeapTable<'storage> {
         self.state.next_seq = self.state.next_seq.max(next_seq);
         self.state.resumed();
         self.storage.register_recovered(winners, losers)?;
-        self.clear_losers_xmax(losers)?;
+        self.take_back_losers(losers)?;
         self.state.directory.clear();
         self.state.versions.clear();
         for version in self.stored_versions(None)? {
@@ -479,30 +478,65 @@ impl<'storage> HeapTable<'storage> {
         Ok(())
     }
 
-    /// Takes back the `xmax` a losing transaction wrote on a page that reached `data`.
+    /// Takes back what the losers left on the heap: the versions they created leave their
+    /// slot, and the `xmax` they set on a version of another writer is unset in place.
     ///
-    /// A version whose `xmax` names a loser reads back as hidden by [`Snapshot::is_visible`]
-    /// — the write did not commit — but [`HeapTable::check_current`] refuses an `update` on
-    /// it as stale, because the field is set by the reader regardless of its writer's status.
-    /// The recovery
-    /// unsets the `xmax` of each such version in place, so the row is writable again as
-    /// soon as the instance opens (`a_loser_xmax_on_data_is_cleared`).
-    fn clear_losers_xmax(&mut self, losers: &[TxnId]) -> Result<(), InternalError> {
-        let losers: std::collections::BTreeSet<TxnId> = losers.iter().copied().collect();
+    /// Such bytes are on the heap when the page reached `data` through a page shared with a
+    /// committing transaction (`super::recover`, "Losers"). Left there, a version of a loser
+    /// is hidden by the register, but it stays the last of the chain of its row, and the undo
+    /// of a later update of that row would find it where it looks for the version the update
+    /// replaced (`recover::tests::a_row_a_loser_updated_then_deleted_takes_an_update_and_its_rollback`);
+    /// an `xmax` of a loser makes [`HeapTable::check_current`] refuse an update of the row
+    /// (`a_loser_xmax_on_data_is_cleared`).
+    ///
+    /// Each change is journalled first, as the undo of a rollback journals it: one
+    /// [`WalRecordKind::Compensation`] under the loser that wrote the bytes,
+    /// [`Release::Removed`] for a version it created and [`Release::XmaxCleared`] for an
+    /// `xmax` it set. The journal is `sync_all`ed before the first slot changes, and each page
+    /// takes the number of its record in the change, so a page that reaches `data` with the
+    /// change is a page whose record is durable, and a recovery cut short replays the records
+    /// that were appended and takes back the rest
+    /// (`recover::tests::a_loser_taken_back_by_a_recovery_cut_short_is_taken_back_by_the_next`).
+    fn take_back_losers(&mut self, losers: &[TxnId]) -> Result<(), InternalError> {
+        let losers: BTreeSet<TxnId> = losers.iter().copied().collect();
+        let mut doomed = Vec::new();
         for version in self.stored_versions(None)? {
-            let Some(x) = version.header.xmax else {
-                continue;
-            };
-            if !losers.contains(&x) {
-                continue;
+            if losers.contains(&version.header.xmin) {
+                doomed.push((version.header.xmin, version, Release::Removed));
+            } else if let Some(x) = version.header.xmax
+                && losers.contains(&x)
+            {
+                doomed.push((x, version, Release::XmaxCleared));
             }
-            let patched = with_xmax(&version.bytes, None)?;
-            self.heap.overwrite(
-                version.rid,
-                OFF_XMAX,
-                &patched[OFF_XMAX..OFF_XMAX + 8],
-                Lsn(0),
-            )?;
+        }
+        if doomed.is_empty() {
+            return Ok(());
+        }
+        let mut records = Vec::with_capacity(doomed.len());
+        for (writer, version, release) in &doomed {
+            records.push(self.log_release(
+                WalRecordKind::Compensation,
+                *writer,
+                version,
+                *release,
+            )?);
+        }
+        self.storage.wal.flush()?;
+        for ((_, version, release), lsn) in doomed.into_iter().zip(records) {
+            match release {
+                Release::Removed => {
+                    self.heap.free_slot(version.rid, lsn)?;
+                }
+                Release::XmaxCleared => {
+                    let patched = with_xmax(&version.bytes, None)?;
+                    self.heap.overwrite(
+                        version.rid,
+                        OFF_XMAX,
+                        &patched[OFF_XMAX..OFF_XMAX + 8],
+                        lsn,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
