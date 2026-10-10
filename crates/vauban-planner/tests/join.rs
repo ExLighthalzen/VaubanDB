@@ -11,8 +11,8 @@ use vauban_planner::{
 };
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundStatement, ColumnBinding, CompareOp, JoinKind, LockHints,
-    LogicalOp, LogicalPlan, OutputColumn, OutputSchema,
+    BoundExpr, BoundExprKind, BoundStatement, BoundSubquery, ColumnBinding, CompareOp, JoinKind,
+    LockHints, LogicalOp, LogicalPlan, OutputColumn, OutputSchema,
 };
 use vauban_catalog::ColumnId;
 use vauban_storage::{Direction, IndexId, KeyColumn, TableId};
@@ -815,4 +815,197 @@ fn the_seek_follows_the_storage_position_of_the_inner_column() {
         join_on(compare(CompareOp::Eq, column_a("k", 0), joined_b("c", 0))),
     );
     assert!(!holds_a_seek(&on_c), "no seek on b.c: {on_c:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Subqueries in the ON
+// ---------------------------------------------------------------------------
+
+/// `EXISTS (SELECT … FROM dbo.b WHERE b.k = <column of the joined row at index 0>)`: the
+/// reference reads the row of the join, one query up.
+fn exists_correlated_to_the_join() -> BoundExpr {
+    let joined_a_k = BoundExpr {
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            depth: 1,
+            ..binding_a("k", 0)
+        }),
+        ty: int_type(),
+        line: 1,
+    };
+    let inner_b_k = BoundExpr {
+        kind: BoundExprKind::ColumnRef(stored_b("k", 0)),
+        ty: int_type(),
+        line: 1,
+    };
+    let inner = LogicalPlan::Filter {
+        input: Box::new(scan_b()),
+        predicate: compare(CompareOp::Eq, inner_b_k, joined_a_k),
+    };
+    BoundExpr {
+        kind: BoundExprKind::Exists(BoundSubquery::new(inner)),
+        ty: bit_type(),
+        line: 1,
+    }
+}
+
+/// `(SELECT … FROM dbo.b)`, reading nothing of the join.
+fn scalar_uncorrelated() -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::ScalarSubquery(BoundSubquery::new(scan_b())),
+        ty: int_type(),
+        line: 1,
+    }
+}
+
+/// The identity of the subquery node `expr` is or holds at its root.
+fn subquery_id(expr: &BoundExpr) -> vauban_binder::SubqueryId {
+    match &expr.kind {
+        BoundExprKind::Exists(subquery) | BoundExprKind::ScalarSubquery(subquery) => subquery.id,
+        other => panic!("not a subquery: {other:?}"),
+    }
+}
+
+/// Splits a `SubqueryEval` into its input and its plans, or fails the test.
+fn under_subquery_eval(planned: &PhysicalPlan) -> (&PhysicalPlan, &[vauban_planner::SubPlan]) {
+    let PhysicalPlan::SubqueryEval {
+        input, subplans, ..
+    } = planned
+    else {
+        panic!("expected a SubqueryEval over the join, got {planned:?}")
+    };
+    (input, subplans)
+}
+
+#[test]
+fn a_subquery_in_the_on_puts_the_loop_under_a_subquery_eval() {
+    let subquery = exists_correlated_to_the_join();
+    let id = subquery_id(&subquery);
+    let on = and(
+        compare(CompareOp::Gt, column_a("c", 1), column_b("c", 1)),
+        subquery,
+    );
+    let planned = plan_with(&FakeCatalog::new(), join(JoinKind::Left, Some(on)));
+
+    let (input, subplans) = under_subquery_eval(&planned);
+    let PhysicalPlan::NestedLoopJoin { kind, on, .. } = input else {
+        panic!("expected a NestedLoopJoin, got {input:?}")
+    };
+    assert_eq!(*kind, PhysicalJoinKind::Left);
+    assert!(
+        debug(on).contains("Exists"),
+        "the EXISTS stays on the join: {on:?}"
+    );
+    assert_eq!(subplans.len(), 1);
+    assert_eq!(subplans[0].id, id);
+    assert!(subplans[0].correlated, "the subquery reads the joined row");
+}
+
+#[test]
+fn a_subquery_in_the_on_stays_in_the_residual_of_the_hash_join() {
+    let on = and(
+        compare(CompareOp::Eq, column_a("k", 0), column_b("k", 0)),
+        compare(CompareOp::Gt, column_b("c", 1), scalar_uncorrelated()),
+    );
+    let planned = plan_with(&FakeCatalog::new(), join(JoinKind::Inner, Some(on)));
+
+    let (input, subplans) = under_subquery_eval(&planned);
+    let PhysicalPlan::HashJoin { keys, residual, .. } = input else {
+        panic!("expected a HashJoin, got {input:?}")
+    };
+    assert_eq!(keys.len(), 1, "a.k = b.k is the key: {keys:?}");
+    assert!(
+        debug(residual).contains("ScalarSubquery"),
+        "the comparison with the subquery is residual: {residual:?}"
+    );
+    assert_eq!(subplans.len(), 1);
+    assert!(!subplans[0].correlated);
+}
+
+#[test]
+fn a_subquery_equal_to_an_inner_column_is_no_hash_key() {
+    let on = compare(CompareOp::Eq, column_b("k", 0), scalar_uncorrelated());
+    let planned = plan_with(&FakeCatalog::new(), join(JoinKind::Inner, Some(on)));
+
+    let (input, _) = under_subquery_eval(&planned);
+    let PhysicalPlan::HashJoin { keys, residual, .. } = input else {
+        panic!("expected a HashJoin, got {input:?}")
+    };
+    assert!(keys.is_empty(), "no key pairs the two rows: {keys:?}");
+    assert!(debug(residual).contains("ScalarSubquery"));
+}
+
+#[test]
+fn a_subquery_in_the_on_leaves_the_seek_to_the_equality() {
+    let catalog = FakeCatalog::new().with_index(
+        TABLE_B,
+        &[KeyColumn {
+            column: 0,
+            descending: false,
+        }],
+        true,
+    );
+    let on = and(
+        exists_correlated_to_the_join(),
+        compare(CompareOp::Eq, column_a("k", 0), column_b("k", 0)),
+    );
+    let planned = plan_with(&catalog, join(JoinKind::Inner, Some(on)));
+
+    let (input, subplans) = under_subquery_eval(&planned);
+    let PhysicalPlan::NestedLoopJoin { inner, on, .. } = input else {
+        panic!("expected a NestedLoopJoin, got {input:?}")
+    };
+    assert!(matches!(inner.as_ref(), PhysicalPlan::IndexSeek { .. }));
+    assert!(
+        matches!(
+            on.as_ref().map(|on| &on.kind),
+            Some(BoundExprKind::Exists(_))
+        ),
+        "the EXISTS alone stays on the loop: {on:?}"
+    );
+    assert_eq!(subplans.len(), 1);
+}
+
+#[test]
+fn a_subquery_in_the_on_of_a_right_or_full_join_is_evaluated_on_the_loop() {
+    for kind in [JoinKind::Right, JoinKind::Full] {
+        let on = and(
+            compare(CompareOp::Eq, column_a("k", 0), column_b("k", 0)),
+            exists_correlated_to_the_join(),
+        );
+        let planned = plan_with(&FakeCatalog::new(), join(kind, Some(on)));
+        let (input, subplans) = under_subquery_eval(&planned);
+        assert!(
+            matches!(input, PhysicalPlan::NestedLoopJoin { on: Some(_), .. }),
+            "{kind:?}: {input:?}"
+        );
+        assert_eq!(subplans.len(), 1, "{kind:?}");
+    }
+}
+
+#[test]
+fn a_subquery_in_the_on_keeps_the_schema_of_the_join() {
+    let on = and(
+        compare(CompareOp::Eq, column_a("k", 0), column_b("k", 0)),
+        exists_correlated_to_the_join(),
+    );
+    let planned = plan_with(&FakeCatalog::new(), join(JoinKind::Left, Some(on)));
+
+    assert!(matches!(planned, PhysicalPlan::SubqueryEval { .. }));
+    assert_eq!(debug(planned.schema()), debug(&join_schema()));
+}
+
+#[test]
+fn a_join_whose_on_holds_no_subquery_is_not_wrapped() {
+    let on = compare(CompareOp::Eq, column_a("k", 0), column_b("k", 0));
+    let planned = plan_with(&FakeCatalog::new(), join(JoinKind::Left, Some(on)));
+    assert!(
+        matches!(planned, PhysicalPlan::HashJoin { .. }),
+        "{planned:?}"
+    );
+
+    let cross = plan_with(&FakeCatalog::new(), join(JoinKind::Cross, None));
+    assert!(
+        matches!(cross, PhysicalPlan::NestedLoopJoin { .. }),
+        "{cross:?}"
+    );
 }

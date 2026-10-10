@@ -28,6 +28,15 @@
 //!
 //! The conjunctions consumed by the range are removed from the `on` field of the
 //! [`NestedLoopJoin`]; the remaining ones stay on it.
+//!
+//! # Subqueries in the `ON`
+//!
+//! A conjunction that holds a subquery is neither a seek bound nor a hash key: it stays in
+//! the `on` of the loop or the `residual` of the hash join, and the join is laid under a
+//! [`SubqueryEval`](PhysicalPlan::SubqueryEval) that carries the plans of those subqueries
+//! ([`plan_on_subqueries`](crate::subquery::plan_on_subqueries); `tests/join.rs`,
+//! `a_subquery_in_the_on_puts_the_loop_under_a_subquery_eval`,
+//! `a_subquery_in_the_on_stays_in_the_residual_of_the_hash_join`).
 
 use vauban_binder::{BoundExpr, BoundExprKind, CompareOp, LogicalOp, LogicalPlan};
 use vauban_errors::SqlResult;
@@ -35,6 +44,7 @@ use vauban_errors::SqlResult;
 use crate::context::PlanContext;
 use crate::physical::{KeyRangeExpr, PhysicalJoinKind, PhysicalPlan};
 use crate::plan::plan_node;
+use crate::subquery::plan_on_subqueries;
 
 /// Plans a [`LogicalPlan::Join`] into the join operator that runs it.
 ///
@@ -42,6 +52,16 @@ use crate::plan::plan_node;
 /// choosing the operator; it plans its children through
 /// [`plan_node`](crate::plan::plan_node).
 pub(crate) fn plan_join(plan: &LogicalPlan, ctx: &PlanContext<'_>) -> SqlResult<PhysicalPlan> {
+    let joined = plan_join_operator(plan, ctx)?;
+    match plan {
+        LogicalPlan::Join { on: Some(on), .. } => plan_on_subqueries(on, joined, ctx),
+        _ => Ok(joined),
+    }
+}
+
+/// Chooses the operator of a [`LogicalPlan::Join`], the subqueries of its `ON` left to
+/// [`plan_join`].
+fn plan_join_operator(plan: &LogicalPlan, ctx: &PlanContext<'_>) -> SqlResult<PhysicalPlan> {
     let LogicalPlan::Join {
         left,
         right,

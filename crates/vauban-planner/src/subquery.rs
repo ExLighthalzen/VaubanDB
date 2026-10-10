@@ -101,6 +101,35 @@ pub(crate) fn plan_expr_subqueries(
     })
 }
 
+/// Lays `join` under the [`SubqueryEval`](PhysicalPlan::SubqueryEval) that computes the
+/// subqueries of its `ON` predicate `on`; a predicate that holds no subquery answers `join`
+/// unchanged.
+///
+/// The `ON` is read over the joined row, left columns then right ones, so a reference of
+/// the subquery to a column of the join reads that row. Nothing is decorrelated here: an
+/// `ON` decides which pairs exist, and an outer join keeps the rows it rejects.
+///
+/// The node passes the rows of the join through as they are, so its schema is the schema of
+/// the join, without a column per subquery: a join above it, or an outer join that pads
+/// the missing side with `NULL`, reads the width of its operands from their schema
+/// (`tests/join.rs`, `a_subquery_in_the_on_keeps_the_schema_of_the_join`).
+pub(crate) fn plan_on_subqueries(
+    on: &BoundExpr,
+    join: PhysicalPlan,
+    ctx: &PlanContext<'_>,
+) -> SqlResult<PhysicalPlan> {
+    if !holds_subquery(on) {
+        return Ok(join);
+    }
+    let subplans = collect_subplans(on, ctx)?;
+    let schema = join.schema().clone();
+    Ok(PhysicalPlan::SubqueryEval {
+        input: Box::new(join),
+        subplans,
+        schema,
+    })
+}
+
 /// Plans the subqueries of an expression evaluated outside any plan: the value of a
 /// `SET`, the initial value of a `DECLARE`.
 ///
