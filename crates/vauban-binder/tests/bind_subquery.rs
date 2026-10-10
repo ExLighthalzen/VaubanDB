@@ -6,14 +6,14 @@
 //! current database. No row is necessary: the binder reads nothing from storage.
 
 use vauban_binder::{
-    BindContext, BoundExprKind, BoundStatement, CatalogView, LogicalPlan, NoVariables,
+    BindContext, BoundExprKind, BoundStatement, CatalogView, CompareOp, LogicalPlan, NoVariables,
     ResolvedTable, ResolvedTableKind, SessionOptions, bind,
 };
 use vauban_catalog::{ColumnId, ObjectId, TableId};
 use vauban_errors::SqlError;
 use vauban_parser::{ObjectName, ParseOptions, parse_batch};
 use vauban_sysfn::register_builtins;
-use vauban_types::{SqlType, TypeInfo};
+use vauban_types::{SqlType, TypeInfo, Value};
 
 /// Two tables, `dbo.a (k int not null, c int)` and `dbo.b (k int, c int)`.
 struct TwoTables;
@@ -415,6 +415,272 @@ fn in_a_subquery_converts_to_the_common_type() {
     };
     assert!(predicate.is_predicate());
     assert!(matches!(predicate.kind, BoundExprKind::InSubquery { .. }));
+}
+
+// ---------------------------------------------------------------------------------------
+// v <op> ANY | SOME | ALL (SELECT ...)
+// ---------------------------------------------------------------------------------------
+
+/// The predicate of the `Filter` under the root `Project` of `plan`.
+fn where_predicate(plan: &LogicalPlan) -> &vauban_binder::BoundExpr {
+    let LogicalPlan::Project { input, .. } = plan else {
+        panic!("root is not a Project: {plan:?}");
+    };
+    let LogicalPlan::Filter { predicate, .. } = input.as_ref() else {
+        panic!("input is not a Filter: {input:?}");
+    };
+    predicate
+}
+
+/// Strips the conversions the binder inserted around `expr`.
+fn unconverted(expr: &vauban_binder::BoundExpr) -> &vauban_binder::BoundExpr {
+    match &expr.kind {
+        BoundExprKind::Convert { expr, .. } => unconverted(expr),
+        _ => expr,
+    }
+}
+
+/// `= ANY`, `= SOME` and `<> ALL` are the `IN` and `NOT IN` of a subquery: the tested
+/// value stays in the enclosing query and the plan of the subquery is the one written.
+#[test]
+fn eq_any_and_ne_all_bind_as_in_and_not_in() {
+    for (text, negated) in [
+        ("SELECT k FROM a WHERE c = ANY (SELECT k FROM b)", false),
+        ("SELECT k FROM a WHERE c = SOME (SELECT k FROM b)", false),
+        ("SELECT k FROM a WHERE c <> ALL (SELECT k FROM b)", true),
+        ("SELECT k FROM a WHERE c != ALL (SELECT k FROM b)", true),
+    ] {
+        let plan = bind_with(text).expect("binds");
+        let predicate = where_predicate(&plan);
+        let BoundExprKind::InSubquery {
+            expr,
+            plan: inner,
+            negated: bound_negated,
+        } = &predicate.kind
+        else {
+            panic!("{text}: not an InSubquery: {predicate:?}");
+        };
+        assert_eq!(*bound_negated, negated, "{text}");
+        let BoundExprKind::ColumnRef(tested) = &unconverted(expr).kind else {
+            panic!("{text}: the tested value is not the column: {expr:?}");
+        };
+        assert_eq!((tested.name.as_str(), tested.depth), ("c", 0), "{text}");
+        let LogicalPlan::Project { exprs, .. } = inner.plan.as_ref() else {
+            panic!("{text}: inner root is not a Project: {inner:?}");
+        };
+        assert!(
+            matches!(exprs[0].expr.kind, BoundExprKind::ColumnRef(_)),
+            "{text}: the subquery was rewritten: {inner:?}"
+        );
+    }
+}
+
+/// The other forms test a constant against the outcomes of the comparisons, one per row
+/// of the subquery: `1 IN (outcomes)` for `ANY` and `SOME`, `0 NOT IN (outcomes)` for
+/// `ALL`. The tested value is read inside the rewritten subquery, so the column `x.c` of
+/// the enclosing query carries `depth` 1 there, and the column of the subquery `depth` 0.
+#[test]
+fn a_quantified_comparison_reads_the_tested_value_one_query_deeper() {
+    for (text, op, probe, negated) in [
+        (
+            "SELECT k FROM a x WHERE x.c > ALL (SELECT k FROM b)",
+            CompareOp::Gt,
+            0,
+            true,
+        ),
+        (
+            "SELECT k FROM a x WHERE x.c < ANY (SELECT k FROM b)",
+            CompareOp::Lt,
+            1,
+            false,
+        ),
+        (
+            "SELECT k FROM a x WHERE x.c >= SOME (SELECT k FROM b)",
+            CompareOp::Ge,
+            1,
+            false,
+        ),
+        (
+            "SELECT k FROM a x WHERE x.c = ALL (SELECT k FROM b)",
+            CompareOp::Eq,
+            0,
+            true,
+        ),
+        (
+            "SELECT k FROM a x WHERE x.c <> ANY (SELECT k FROM b)",
+            CompareOp::Ne,
+            1,
+            false,
+        ),
+        (
+            "SELECT k FROM a x WHERE x.c !< ALL (SELECT k FROM b)",
+            CompareOp::Ge,
+            0,
+            true,
+        ),
+        (
+            "SELECT k FROM a x WHERE x.c !> ANY (SELECT k FROM b)",
+            CompareOp::Le,
+            1,
+            false,
+        ),
+    ] {
+        let plan = bind_with(text).expect("binds");
+        let predicate = where_predicate(&plan);
+        let BoundExprKind::InSubquery {
+            expr,
+            plan: inner,
+            negated: bound_negated,
+        } = &predicate.kind
+        else {
+            panic!("{text}: not an InSubquery: {predicate:?}");
+        };
+        assert_eq!(*bound_negated, negated, "{text}");
+        assert!(
+            matches!(expr.kind, BoundExprKind::Literal(Value::I32(v)) if v == probe),
+            "{text}: probe {expr:?}"
+        );
+        let LogicalPlan::Project { exprs, input, .. } = inner.plan.as_ref() else {
+            panic!("{text}: inner root is not a Project: {inner:?}");
+        };
+        assert!(
+            matches!(input.as_ref(), LogicalPlan::Project { .. }),
+            "{text}"
+        );
+        let BoundExprKind::Case { arms, else_, .. } = &exprs[0].expr.kind else {
+            panic!("{text}: the outcome is not a CASE: {:?}", exprs[0]);
+        };
+        assert!(else_.is_none(), "{text}");
+        assert!(matches!(
+            arms[0].then.kind,
+            BoundExprKind::Literal(Value::I32(1))
+        ));
+        assert!(matches!(
+            arms[1].then.kind,
+            BoundExprKind::Literal(Value::I32(0))
+        ));
+        assert!(
+            matches!(&arms[1].when.kind, BoundExprKind::Not(inner) if matches!(inner.kind, BoundExprKind::Compare { .. })),
+            "{text}"
+        );
+        let BoundExprKind::Compare {
+            op: bound_op,
+            left,
+            right,
+        } = &arms[0].when.kind
+        else {
+            panic!("{text}: the first arm is not a comparison: {:?}", arms[0]);
+        };
+        assert_eq!(*bound_op, op, "{text}");
+        let (BoundExprKind::ColumnRef(tested), BoundExprKind::ColumnRef(candidate)) =
+            (&unconverted(left).kind, &unconverted(right).kind)
+        else {
+            panic!("{text}: the comparison is not between two columns: {left:?} {right:?}");
+        };
+        assert_eq!((tested.name.as_str(), tested.depth), ("c", 1), "{text}");
+        assert_eq!((candidate.index, candidate.depth), (0, 0), "{text}");
+    }
+}
+
+/// A quantified comparison is a predicate, nullable when one operand is: `a.k` is NOT
+/// NULL and `b.k` nullable.
+#[test]
+fn a_quantified_comparison_is_a_nullable_predicate() {
+    let plan = bind_with("SELECT k FROM a WHERE k > ALL (SELECT k FROM b)").expect("binds");
+    let predicate = where_predicate(&plan);
+    assert!(predicate.is_predicate());
+    assert_eq!(predicate.ty, TypeInfo::new(SqlType::Bit, true));
+    // Counter-proof: over the NOT NULL `a.k` on both sides, the predicate is not nullable.
+    let plan = bind_with("SELECT k FROM a WHERE k > ALL (SELECT k FROM a)").expect("binds");
+    assert_eq!(
+        where_predicate(&plan).ty,
+        TypeInfo::new(SqlType::Bit, false)
+    );
+}
+
+/// A quantified subquery of two columns is 116, rewritten form or `IN` form.
+#[test]
+fn two_columns_under_a_quantifier_is_116() {
+    for text in [
+        "SELECT c FROM a WHERE c > ALL (SELECT k, c FROM b)",
+        "SELECT c FROM a WHERE c = ANY (SELECT k, c FROM b)",
+        "SELECT c FROM a WHERE c <= SOME (SELECT k, c FROM b)",
+    ] {
+        let error = error_of(text);
+        assert_eq!(error.number, 116, "{text}: {}", error.message);
+    }
+}
+
+/// An unknown column on the left of the quantifier is 207 (the left operand is bound
+/// one query deeper, where the subquery's own columns are not in scope).
+#[test]
+fn an_unknown_tested_column_is_207() {
+    let error = error_of("SELECT c FROM a WHERE nosuch > ALL (SELECT k FROM b)");
+    assert_eq!(error.number, 207, "{}", error.message);
+}
+
+/// An aggregate on the left of a quantifier is extracted into the `Aggregate` like any
+/// other aggregate of a `HAVING`: the tested value read inside the rewritten subquery is
+/// the slot of that aggregate, one query up.
+#[test]
+fn an_aggregate_tested_by_a_quantifier_is_extracted() {
+    for text in [
+        "SELECT k FROM a GROUP BY k HAVING MAX(c) > ALL (SELECT k FROM b)",
+        "SELECT k FROM a GROUP BY k HAVING COUNT(*) = ANY (SELECT k FROM b)",
+        "SELECT k FROM a GROUP BY k HAVING k < SOME (SELECT k FROM b)",
+    ] {
+        let plan = bind_with(text).expect("binds");
+        let LogicalPlan::Project { input, .. } = &plan else {
+            panic!("{text}: root is not a Project: {plan:?}");
+        };
+        let LogicalPlan::Filter { input, predicate } = input.as_ref() else {
+            panic!("{text}: no HAVING Filter: {input:?}");
+        };
+        assert!(
+            matches!(input.as_ref(), LogicalPlan::Aggregate { .. }),
+            "{text}: the HAVING does not read the Aggregate: {input:?}"
+        );
+        assert!(
+            matches!(predicate.kind, BoundExprKind::InSubquery { .. }),
+            "{text}: {predicate:?}"
+        );
+    }
+    // The select list of a grouped query takes the same path.
+    assert!(
+        bind_with(
+            "SELECT k, CASE WHEN SUM(c) >= ALL (SELECT k FROM b) THEN 1 ELSE 0 END \
+             FROM a GROUP BY k"
+        )
+        .is_ok()
+    );
+}
+
+/// An aggregate tested by a quantifier in the select list of a query without `GROUP BY`
+/// makes the query one group, as the same aggregate tested by `IN` does.
+#[test]
+fn an_aggregate_under_a_quantifier_groups_a_query_without_group_by() {
+    let plan =
+        bind_with("SELECT CASE WHEN MAX(c) > ALL (SELECT k FROM b) THEN 1 ELSE 0 END FROM a")
+            .expect("binds");
+    let LogicalPlan::Project { input, .. } = &plan else {
+        panic!("root is not a Project: {plan:?}");
+    };
+    let LogicalPlan::Aggregate { group_by, .. } = input.as_ref() else {
+        panic!("the select list does not read an Aggregate: {input:?}");
+    };
+    assert!(group_by.is_empty());
+}
+
+/// A quantified comparison does not hide an aggregate from the checks of the grouping:
+/// 147 in a `WHERE`, 8121 for a column of the `HAVING` that is no key.
+#[test]
+fn an_aggregate_under_a_quantifier_keeps_the_grouping_errors() {
+    let error = error_of("SELECT k FROM a WHERE MAX(c) > ALL (SELECT k FROM b)");
+    assert_eq!(error.number, 147, "{}", error.message);
+    let error = error_of("SELECT k FROM a WHERE COUNT(*) = ANY (SELECT k FROM b)");
+    assert_eq!(error.number, 147, "{}", error.message);
+    let error = error_of("SELECT k FROM a GROUP BY k HAVING c > ALL (SELECT k FROM b)");
+    assert_eq!(error.number, 8121, "{}", error.message);
 }
 
 // ---------------------------------------------------------------------------------------

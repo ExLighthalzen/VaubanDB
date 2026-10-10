@@ -9,9 +9,9 @@ use vauban_planner::{
 };
 
 use vauban_binder::{
-    AggregateCall, BoundDeclaration, BoundExpr, BoundExprKind, BoundProjection, BoundStatement,
-    BoundSubquery, BoundTop, ColumnBinding, CompareOp, DeletePlan, JoinKind, LockHints, LogicalOp,
-    LogicalPlan, OutputColumn, OutputSchema, SetOpKind, SortKey,
+    AggregateCall, BoundCaseArm, BoundDeclaration, BoundExpr, BoundExprKind, BoundProjection,
+    BoundStatement, BoundSubquery, BoundTop, ColumnBinding, CompareOp, DeletePlan, JoinKind,
+    LockHints, LogicalOp, LogicalPlan, OutputColumn, OutputSchema, SetOpKind, SortKey,
 };
 use vauban_catalog::ColumnId;
 use vauban_storage::{KeyColumn, TableId};
@@ -584,6 +584,60 @@ fn not_in_stays_a_subquery_eval() {
         ),
         "NOT IN must not become AntiSemi"
     );
+}
+
+/// `a.c > ALL (SELECT k FROM b)` as the binder rewrites it: `0 NOT IN` the outcomes
+/// `CASE WHEN a.c > b.k THEN 1 WHEN NOT (a.c > b.k) THEN 0 END`, one per row of `b`. The
+/// outcome reads `a.c` one query up, so the subquery is correlated and evaluated per row,
+/// not turned into a join.
+#[test]
+fn a_quantified_rewrite_reads_the_outer_value_per_row() {
+    let comparison = compare(
+        CompareOp::Gt,
+        column(outer_a("c", 2, 1)),
+        column(binding_b("k", 11, 0)),
+    );
+    let outcome = BoundExpr {
+        kind: BoundExprKind::Case {
+            operand: None,
+            arms: vec![
+                BoundCaseArm {
+                    when: comparison.clone(),
+                    then: literal(1),
+                },
+                BoundCaseArm {
+                    when: not(comparison),
+                    then: literal(0),
+                },
+            ],
+            else_: None,
+        },
+        ty: TypeInfo::new(SqlType::Int, true),
+        line: 1,
+    };
+    let outcomes = LogicalPlan::Project {
+        input: Box::new(project_one(scan_b(), binding_b("k", 11, 0), "k")),
+        exprs: vec![BoundProjection {
+            expr: outcome,
+            name: String::new(),
+        }],
+        schema: schema(&[""]),
+    };
+    for negated in [true, false] {
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(scan_a()),
+            predicate: in_subquery(literal(i32::from(!negated)), outcomes.clone(), negated),
+        };
+        let planned = plan_with(&FakeCatalog::new(), filtered);
+        let PhysicalPlan::Filter { input, .. } = &planned else {
+            panic!("expected Filter over SubqueryEval, got {planned:?}");
+        };
+        let PhysicalPlan::SubqueryEval { subplans, .. } = input.as_ref() else {
+            panic!("expected SubqueryEval, got {input:?}");
+        };
+        assert_eq!(subplans.len(), 1);
+        assert!(subplans[0].correlated, "{planned:?}");
+    }
 }
 
 #[test]

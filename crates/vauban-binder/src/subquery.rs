@@ -1,5 +1,6 @@
-//! Subqueries in the positions T-SQL allows one: `EXISTS (…)`, `IN (SELECT …)`, the scalar
-//! `(SELECT …)` of a value position, and the derived table of a `FROM`.
+//! Subqueries in the positions T-SQL allows one: `EXISTS (…)`, `IN (SELECT …)`, the
+//! quantified comparison `v > ALL (SELECT …)`, the scalar `(SELECT …)` of a value position,
+//! and the derived table of a `FROM`.
 //!
 //! Each entry point receives the query and the scope of the enclosing query, builds a
 //! child scope whose parent link leads to that enclosing scope for correlated references,
@@ -25,16 +26,20 @@
 //! - the errors of the inner query: 207, 209, 4104, 208 and everything
 //!   `bind_select` raises.
 
+use vauban_catalog::ColumnId;
 use vauban_errors::{SqlError, SqlResult};
-use vauban_parser::{Expr, Ident, SelectStatement, Span, TableRef};
-use vauban_types::{SqlType, TypeInfo};
+use vauban_parser::{
+    BinaryOp as AstBinaryOp, Expr, Ident, Quantifier, SelectStatement, Span, TableRef,
+};
+use vauban_types::{SqlType, TypeInfo, Value};
 
 use crate::bound::{
-    BoundExpr, BoundExprKind, BoundSubquery, LogicalPlan, OutputColumn, OutputSchema,
+    BoundCaseArm, BoundExpr, BoundExprKind, BoundProjection, BoundSubquery, ColumnBinding,
+    CompareOp, LogicalPlan, OutputColumn, OutputSchema,
 };
 use crate::context::BindContext;
 use crate::errors::line_of;
-use crate::expr::{Scope, bind_expr, convert_to};
+use crate::expr::{Scope, bind_expr, compare_node, convert_to};
 use crate::insert::{common_value_type, is_untyped_null};
 use crate::query::bind_select_with_parent;
 
@@ -316,6 +321,133 @@ pub(crate) fn bind_in_subquery(
             negated,
         },
         ty: vauban_types::TypeInfo::new(vauban_types::SqlType::Bit, nullable),
+        line,
+    })
+}
+
+/// Binds `v <op> ANY | SOME | ALL (SELECT …)`.
+///
+/// `= ANY` (and `= SOME`) is `v IN (SELECT …)` and `<> ALL` is `v NOT IN (SELECT …)`,
+/// three-valued logic included: both are bound by [`bind_in_subquery`], so that the
+/// planner decorrelates them where it decorrelates an `IN`.
+///
+/// The other forms keep the shape of an `IN` over a rewritten subquery. Each row
+/// `s` of the subquery is mapped to the outcome of `v <op> s`, `CASE WHEN v <op> s THEN 1
+/// WHEN NOT (v <op> s) THEN 0 END`, `NULL` for unknown; then
+///
+/// - `v <op> ANY (S)` is `1 IN (outcomes)`: true when one comparison holds; otherwise
+///   unknown when one comparison is unknown; otherwise false, an empty `S` included;
+/// - `v <op> ALL (S)` is `0 NOT IN (outcomes)`: false when one comparison fails; otherwise
+///   unknown when one comparison is unknown; otherwise true, an empty `S` included, with
+///   `v` `NULL` or not.
+///
+/// `v` is bound one query deeper than where it is written, since it is read inside the
+/// rewritten subquery: its columns carry one more level of
+/// [`ColumnBinding::depth`], which makes the subquery correlated
+/// (`tests/bind_subquery.rs`, `a_quantified_comparison_reads_the_tested_value_one_query_deeper`).
+///
+/// # Errors
+///
+/// - 116 when the select list has more than one column;
+/// - 206 when the tested value and the subquery column have no common type;
+/// - the errors of the inner query and of `v`.
+pub(crate) fn bind_quantified(
+    expr: &Expr,
+    op: AstBinaryOp,
+    quantifier: Quantifier,
+    query: &SelectStatement,
+    ctx: &BindContext<'_>,
+    scope: &Scope,
+) -> SqlResult<BoundExpr> {
+    let op = match op {
+        AstBinaryOp::Eq => CompareOp::Eq,
+        AstBinaryOp::Ne => CompareOp::Ne,
+        AstBinaryOp::Lt => CompareOp::Lt,
+        AstBinaryOp::Le | AstBinaryOp::NotGt => CompareOp::Le,
+        AstBinaryOp::Gt => CompareOp::Gt,
+        AstBinaryOp::Ge | AstBinaryOp::NotLt => CompareOp::Ge,
+        _ => {
+            return Err(crate::query::bug(
+                "bind_quantified: the operator of a quantified predicate is a comparison",
+            ));
+        }
+    };
+    let all = quantifier == Quantifier::All;
+    match (op, all) {
+        (CompareOp::Eq, false) => return bind_in_subquery(expr, query, false, ctx, scope),
+        (CompareOp::Ne, true) => return bind_in_subquery(expr, query, true, ctx, scope),
+        _ => {}
+    }
+    let line = line_of(&query.span);
+    let child_scope = Scope::empty().inside(scope.clone());
+    let plan = bind_select_with_parent(query, ctx, &child_scope)?;
+    let [produced] = plan.schema().columns.as_slice() else {
+        return Err(SqlError::only_one_expression_in_subquery().with_line(line));
+    };
+    let produced = produced.clone();
+    let tested = bind_expr(expr, ctx, &child_scope)?;
+    let candidate = BoundExpr {
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            column: ColumnId(1),
+            index: 0,
+            name: produced.name.clone(),
+            ty: produced.ty.clone(),
+            depth: 0,
+        }),
+        ty: produced.ty.clone(),
+        line,
+    };
+    let comparison = compare_node(op, tested, candidate, line)?;
+    let nullable = comparison.ty.nullable;
+    let int = |value: i32| BoundExpr {
+        kind: BoundExprKind::Literal(Value::I32(value)),
+        ty: TypeInfo::new(SqlType::Int, false),
+        line,
+    };
+    let fails = BoundExpr {
+        kind: BoundExprKind::Not(Box::new(comparison.clone())),
+        ty: comparison.ty.clone(),
+        line,
+    };
+    let outcome_ty = TypeInfo::new(SqlType::Int, true);
+    let outcome = BoundExpr {
+        kind: BoundExprKind::Case {
+            operand: None,
+            arms: vec![
+                BoundCaseArm {
+                    when: comparison,
+                    then: int(1),
+                },
+                BoundCaseArm {
+                    when: fails,
+                    then: int(0),
+                },
+            ],
+            else_: None,
+        },
+        ty: outcome_ty.clone(),
+        line,
+    };
+    let outcomes = LogicalPlan::Project {
+        input: Box::new(plan),
+        exprs: vec![BoundProjection {
+            expr: outcome,
+            name: String::new(),
+        }],
+        schema: OutputSchema {
+            columns: vec![OutputColumn {
+                name: String::new(),
+                ty: outcome_ty,
+            }],
+        },
+    };
+    Ok(BoundExpr {
+        kind: BoundExprKind::InSubquery {
+            expr: Box::new(int(if all { 0 } else { 1 })),
+            plan: BoundSubquery::new(outcomes),
+            negated: all,
+        },
+        ty: TypeInfo::new(SqlType::Bit, nullable),
         line,
     })
 }

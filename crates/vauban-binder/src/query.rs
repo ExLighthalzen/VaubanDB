@@ -443,6 +443,7 @@ fn holds_an_aggregate(expr: &Expr) -> bool {
                     pending.extend(items);
                 }
             }
+            Expr::Quantified { expr, .. } => pending.push(expr),
             _ => {}
         }
     }

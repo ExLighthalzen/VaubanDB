@@ -185,8 +185,8 @@ impl Scope {
 /// an operand type an operator refuses, 447 for a `COLLATE` on a non-string, 448 for an
 /// unknown collation, 4145 for a value where a condition was expected, and whatever
 /// `call.rs` raises for a conversion or a call (195, 243, 529, 4121…). What is not bound
-/// yet — subqueries, `EXISTS`, quantified comparisons, `NEXT VALUE FOR` — is an internal
-/// error 50000, not a user-facing message.
+/// yet — `NEXT VALUE FOR`, the ODBC placeholder — is an internal error 50000, not a
+/// user-facing message.
 pub(crate) fn bind_expr(e: &Expr, ctx: &BindContext<'_>, scope: &Scope) -> SqlResult<BoundExpr> {
     // The descents of the binder into a child node pass here, so counting the levels
     // here counts the depth of the tree, flat text or not.
@@ -272,11 +272,13 @@ pub(crate) fn bind_expr(e: &Expr, ctx: &BindContext<'_>, scope: &Scope) -> SqlRe
         // `subquery.rs`. This file routes, and binds none of them.
         Expr::Exists(query, _) => subquery::bind_exists(query, ctx, scope),
         Expr::Subquery(query, _) => subquery::bind_scalar(query, ctx, scope),
-        // `ALL`, `ANY` and `SOME` are not routed to `subquery.rs`: the refusal names the
-        // form.
-        Expr::Quantified { .. } => Err(not_yet(
-            "bind_expr: ALL/ANY/SOME over a subquery is not implemented yet",
-        )),
+        Expr::Quantified {
+            expr,
+            op,
+            quantifier,
+            subquery,
+            ..
+        } => subquery::bind_quantified(expr, *op, *quantifier, subquery, ctx, scope),
         Expr::NextValueFor { .. } => {
             Err(not_yet("bind_expr: NEXT VALUE FOR is not implemented yet"))
         }
@@ -1008,9 +1010,9 @@ fn bind_comparison(
     compare_node(op, left, right, line)
 }
 
-/// One comparison, with the conversions inserted: the shape `BETWEEN` and the simple
-/// `CASE` are desugared into.
-fn compare_node(
+/// One comparison, with the conversions inserted: the shape `BETWEEN`, the simple `CASE`
+/// and a quantified comparison (`subquery.rs`) are desugared into.
+pub(crate) fn compare_node(
     op: CompareOp,
     left: BoundExpr,
     right: BoundExpr,

@@ -565,12 +565,25 @@ impl Grouping {
                 span: *span,
             },
             Expr::Nested(inner, span) => Expr::Nested(Box::new(child(inner)?), *span),
+            // The tested value belongs to the grouped query, the subquery does not.
+            Expr::Quantified {
+                expr,
+                op,
+                quantifier,
+                subquery,
+                span,
+            } => Expr::Quantified {
+                expr: Box::new(child(expr)?),
+                op: *op,
+                quantifier: *quantifier,
+                subquery: subquery.clone(),
+                span: *span,
+            },
             Expr::Literal(..)
             | Expr::Column(_)
             | Expr::Variable { .. }
             | Expr::Exists(..)
             | Expr::Subquery(..)
-            | Expr::Quantified { .. }
             | Expr::Assign { .. }
             | Expr::NextValueFor { .. }
             | Expr::InvalidNiladic { .. }
@@ -1065,12 +1078,12 @@ fn find_aggregate(e: &Expr) -> Option<&Expr> {
                     children.extend(items);
                 }
             }
+            Expr::Quantified { expr, .. } => children.push(expr),
             Expr::Literal(..)
             | Expr::Column(_)
             | Expr::Variable { .. }
             | Expr::Exists(..)
             | Expr::Subquery(..)
-            | Expr::Quantified { .. }
             | Expr::NextValueFor { .. }
             | Expr::InvalidNiladic { .. }
             | Expr::Placeholder(_) => {}
