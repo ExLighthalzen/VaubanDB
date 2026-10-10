@@ -10,13 +10,13 @@ use vauban_planner::{
 
 use vauban_binder::{
     AggregateCall, BoundDeclaration, BoundExpr, BoundExprKind, BoundProjection, BoundStatement,
-    BoundSubquery, BoundTop, ColumnBinding, CompareOp, JoinKind, LockHints, LogicalOp, LogicalPlan,
-    OutputColumn, OutputSchema, SortKey,
+    BoundSubquery, BoundTop, ColumnBinding, CompareOp, DeletePlan, JoinKind, LockHints, LogicalOp,
+    LogicalPlan, OutputColumn, OutputSchema, SetOpKind, SortKey,
 };
 use vauban_catalog::ColumnId;
 use vauban_storage::{KeyColumn, TableId};
 use vauban_sysfn::{Arity, EvalArgs, EvalContext, FunctionDef, FunctionKind};
-use vauban_types::{SqlType, TypeInfo, Value};
+use vauban_types::{BinaryOp, SqlType, TypeInfo, Value};
 
 const TABLE_A: TableId = TableId(1);
 const TABLE_B: TableId = TableId(2);
@@ -398,6 +398,165 @@ fn in_subquery_compares_the_column_the_inner_plan_produces() {
     };
     assert_eq!((tested.index, tested.depth), (0, 0));
     assert_eq!((produced.index, produced.depth), (2, 0));
+}
+
+/// `b.c / 10`, computed by the inner plan over the row of `b`.
+fn c_over_ten() -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Arith {
+            op: BinaryOp::Div,
+            left: Box::new(column(binding_b("c", 12, 1))),
+            right: Box::new(literal(10)),
+        },
+        ty: int_type(),
+        line: 1,
+    }
+}
+
+/// The position of the column the equality of a decorrelated `IN` reads on the inner side,
+/// with the inner plan it reads it from.
+fn produced_position(planned: &PhysicalPlan) -> (usize, &PhysicalPlan) {
+    let PhysicalPlan::NestedLoopJoin {
+        kind: PhysicalJoinKind::Semi,
+        on: Some(on),
+        inner,
+        ..
+    } = planned
+    else {
+        panic!("expected a semi-join with an ON, got {planned:?}");
+    };
+    let BoundExprKind::Compare { right, .. } = &on.kind else {
+        panic!("expected equality ON, got {on:?}");
+    };
+    let BoundExprKind::ColumnRef(produced) = &right.kind else {
+        panic!("expected a column reference, got {right:?}");
+    };
+    assert_eq!(produced.depth, 0);
+    (produced.index, inner)
+}
+
+/// `a.k IN (SELECT DISTINCT b.c / 10 AS q FROM b)`: the computed, renamed column under
+/// `DISTINCT` is the one column of the inner plan, read right after the two columns of `a`.
+#[test]
+fn in_subquery_reads_a_computed_column_under_distinct_after_the_outer_columns() {
+    let inner = LogicalPlan::Distinct(Box::new(LogicalPlan::Project {
+        input: Box::new(scan_b()),
+        exprs: vec![BoundProjection {
+            expr: c_over_ten(),
+            name: "q".to_owned(),
+        }],
+        schema: schema(&["q"]),
+    }));
+    let filtered = LogicalPlan::Filter {
+        input: Box::new(scan_a()),
+        predicate: in_subquery(column(binding_a("k", 1, 0)), inner, false),
+    };
+    let planned = plan_with(&FakeCatalog::new(), filtered);
+    let (index, inner) = produced_position(&planned);
+    assert_eq!(index, 2);
+    assert_eq!(inner.schema().columns.len(), 1);
+    assert_eq!(inner.schema().columns[0].name, "q");
+}
+
+/// `DELETE FROM a WHERE a.k IN (SELECT b.c / 10 FROM b)`: the rows of `a` carry their row
+/// identifier after their visible values, and the joined row keeps it after the inner
+/// column, so the equality still reads the inner column at index 2.
+#[test]
+fn in_subquery_under_a_delete_reads_past_the_visible_columns_alone() {
+    let inner = LogicalPlan::Project {
+        input: Box::new(scan_b()),
+        exprs: vec![BoundProjection {
+            expr: c_over_ten(),
+            name: String::new(),
+        }],
+        schema: schema(&[""]),
+    };
+    let stmt = BoundStatement::Delete(DeletePlan {
+        table: TABLE_A,
+        input: Box::new(LogicalPlan::Filter {
+            input: Box::new(scan_a()),
+            predicate: in_subquery(column(binding_a("k", 1, 0)), inner, false),
+        }),
+    });
+    let catalog = FakeCatalog::new();
+    let ctx = PlanContext { catalog: &catalog };
+    let Ok(PhysicalStatement::Delete(delete)) = plan(stmt, &ctx) else {
+        panic!("a DELETE plans to a Delete");
+    };
+    let (index, _) = produced_position(&delete.input);
+    let PhysicalPlan::NestedLoopJoin { outer, .. } = &delete.input else {
+        panic!("expected the semi-join at the root of the input");
+    };
+    assert_eq!(outer.row_id_count(), 1);
+    assert_eq!(outer.schema().columns.len(), 2);
+    assert_eq!(index, 2);
+}
+
+/// `a.k IN (SELECT b.c / 10 FROM b UNION SELECT b.k FROM b)`: the root of the subquery is
+/// the set operation, and the equality reads its one output column after the outer columns.
+#[test]
+fn in_subquery_over_a_union_compares_its_output_column() {
+    let left = LogicalPlan::Project {
+        input: Box::new(scan_b()),
+        exprs: vec![BoundProjection {
+            expr: c_over_ten(),
+            name: "q".to_owned(),
+        }],
+        schema: schema(&["q"]),
+    };
+    let union = LogicalPlan::SetOp {
+        op: SetOpKind::Union,
+        all: false,
+        left: Box::new(left),
+        right: Box::new(project_one(scan_b(), binding_b("k", 11, 0), "k")),
+        schema: schema(&["q"]),
+    };
+    let filtered = LogicalPlan::Filter {
+        input: Box::new(scan_a()),
+        predicate: in_subquery(column(binding_a("k", 1, 0)), union, false),
+    };
+    let planned = plan_with(&FakeCatalog::new(), filtered);
+    let (index, inner) = produced_position(&planned);
+    assert_eq!(index, 2);
+    assert_eq!(inner.schema().columns.len(), 1);
+}
+
+/// `a.k IN (SELECT b.k FROM b) AND a.c NOT IN (SELECT b.c FROM b)`: the `IN` becomes the
+/// semi-join, and the residual `NOT IN` is filtered over a `SubqueryEval` that carries its
+/// plan, laid over the semi-join.
+#[test]
+fn a_residual_not_in_is_evaluated_over_the_semi_join() {
+    let predicate = and(
+        in_subquery(
+            column(binding_a("k", 1, 0)),
+            project_one(scan_b(), binding_b("k", 11, 0), "k"),
+            false,
+        ),
+        in_subquery(
+            column(binding_a("c", 2, 1)),
+            project_one(scan_b(), binding_b("c", 12, 1), "c"),
+            true,
+        ),
+    );
+    let filtered = LogicalPlan::Filter {
+        input: Box::new(scan_a()),
+        predicate,
+    };
+    let planned = plan_with(&FakeCatalog::new(), filtered);
+    let PhysicalPlan::Filter { input, .. } = &planned else {
+        panic!("expected a Filter for the residual, got {planned:?}");
+    };
+    let PhysicalPlan::SubqueryEval {
+        input: join,
+        subplans,
+        ..
+    } = input.as_ref()
+    else {
+        panic!("expected a SubqueryEval under the Filter, got {input:?}");
+    };
+    assert_eq!(subplans.len(), 1);
+    let (index, _) = produced_position(join);
+    assert_eq!(index, 2);
 }
 
 #[test]

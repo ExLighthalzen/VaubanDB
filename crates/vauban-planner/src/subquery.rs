@@ -29,8 +29,8 @@
 //! (`tests/subquery.rs`, `subplans_follow_the_expression_order`).
 
 use vauban_binder::{
-    BoundExpr, BoundExprKind, BoundProjection, BoundSubquery, ColumnBinding, CompareOp, LogicalOp,
-    LogicalPlan, OutputColumn, OutputSchema,
+    BoundExpr, BoundExprKind, BoundSubquery, ColumnBinding, CompareOp, LogicalOp, LogicalPlan,
+    OutputColumn, OutputSchema,
 };
 use vauban_catalog::ColumnId;
 use vauban_errors::SqlResult;
@@ -124,7 +124,10 @@ pub(crate) fn plan_statement_subplans(
 ///
 /// When the predicate is `EXISTS (…) AND c = 1`, the semi-join replaces the `EXISTS`
 /// conjunct and a [`Filter`](PhysicalPlan::Filter) keeps the residual `c = 1`
-/// (`tests/subquery.rs`, `exists_and_a_residual_predicate_keeps_the_filter`).
+/// (`tests/subquery.rs`, `exists_and_a_residual_predicate_keeps_the_filter`). A residual
+/// that holds a subquery reads it from a [`SubqueryEval`](PhysicalPlan::SubqueryEval) laid
+/// over the semi-join (`tests/subquery.rs`,
+/// `a_residual_not_in_is_evaluated_over_the_semi_join`).
 fn try_decorrelate_predicate(
     predicate: &BoundExpr,
     outer: &PhysicalPlan,
@@ -162,8 +165,9 @@ fn try_decorrelate_predicate(
     else {
         return Ok(Some(join));
     };
+    let input = plan_expr_subqueries(&predicate, join, ctx)?;
     Ok(Some(PhysicalPlan::Filter {
-        input: Box::new(join),
+        input: Box::new(input),
         predicate,
     }))
 }
@@ -278,31 +282,33 @@ fn semi_join(
 
 /// The equality `on` for `e IN (SELECT x …)`: `e`, read on the outer side of the
 /// concatenated row, against the single column the inner plan produces, which sits right
-/// after the outer columns. `x` itself is computed by the inner plan, over the rows of
-/// the subquery, and is not read again here (`tests/subquery.rs`,
-/// `in_subquery_compares_the_column_the_inner_plan_produces`).
+/// after the outer columns. The column is typed and named by the output schema of the
+/// subquery, whatever its root (a projection, a `UNION`, an `INTERSECT`): `x` itself is
+/// computed by the inner plan and is not read again here (`tests/subquery.rs`,
+/// `in_subquery_compares_the_column_the_inner_plan_produces`,
+/// `in_subquery_over_a_union_compares_its_output_column`).
 fn in_subquery_equality(
     tested: &BoundExpr,
     plan: &LogicalPlan,
     outer: &PhysicalPlan,
 ) -> SqlResult<BoundExpr> {
     let outer_width = outer.schema().columns.len();
-    let selected = subquery_select_expr(plan)?;
-    let name = plan
-        .schema()
-        .columns
-        .first()
-        .map_or_else(String::new, |column| column.name.clone());
+    let [produced] = plan.schema().columns.as_slice() else {
+        return Err(crate::plan::not_implemented(
+            "subquery::in_subquery_equality",
+            "a subquery whose select list is not one column wide",
+        ));
+    };
     let inner_column = BoundExpr {
         kind: BoundExprKind::ColumnRef(ColumnBinding {
             column: ColumnId(1),
             index: outer_width,
-            name,
-            ty: selected.ty.clone(),
+            name: produced.name.clone(),
+            ty: produced.ty.clone(),
             depth: 0,
         }),
-        ty: selected.ty,
-        line: selected.line,
+        ty: produced.ty.clone(),
+        line: tested.line,
     };
     let ty = tested.ty.clone();
     Ok(BoundExpr {
@@ -314,40 +320,6 @@ fn in_subquery_equality(
         ty,
         line: tested.line,
     })
-}
-
-/// The single expression of a one-column subquery select list.
-fn subquery_select_expr(plan: &LogicalPlan) -> SqlResult<BoundExpr> {
-    let Some(LogicalPlan::Project { exprs, .. }) = project_node(plan) else {
-        return Err(crate::plan::not_implemented(
-            "subquery::subquery_select_expr",
-            "a subquery whose root is not a Project",
-        ));
-    };
-    let [BoundProjection { expr, .. }] = exprs.as_slice() else {
-        return Err(crate::plan::not_implemented(
-            "subquery::subquery_select_expr",
-            "a subquery whose select list is not one column wide",
-        ));
-    };
-    Ok(expr.clone())
-}
-
-fn project_node(plan: &LogicalPlan) -> Option<&LogicalPlan> {
-    match plan {
-        LogicalPlan::Project { .. } => Some(plan),
-        LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Limit { input, .. }
-        | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Subquery { input, .. } => project_node(input),
-        LogicalPlan::Distinct(input) => project_node(input),
-        LogicalPlan::OneRow
-        | LogicalPlan::Scan { .. }
-        | LogicalPlan::Values { .. }
-        | LogicalPlan::Join { .. }
-        | LogicalPlan::SetOp { .. } => None,
-    }
 }
 
 /// True when `plan` reads a column of a query that encloses it: a `ColumnRef` whose
