@@ -22,7 +22,8 @@
 //! nothing; `Sch-S` and `Sch-M`, which `tests/schema_lock.rs` covers; the database options
 //! and the `SNAPSHOT` level, not served yet; range locks, which this engine does not model
 //! (`serializable_locks_the_rows_it_read_not_the_range`); the numbers 1222 and 1205 beyond
-//! the one refusal `nowait_yields_1222` asserts, which `tests/deadlock.rs` covers.
+//! the refusals `nowait_yields_1222` and `the_timeout_of_the_intent_bounds_a_write` assert,
+//! which `tests/deadlock.rs` covers.
 //!
 //! A thread that must be waiting before a scenario goes on is attested through
 //! [`LockManager::waiters`], as `tests/lock.rs` does, so that no assertion rests on a thread
@@ -35,8 +36,8 @@ use std::time::{Duration, Instant};
 
 use vauban_storage::{MemoryStorage, RowId, TableId, TxnId};
 use vauban_txn::{
-    IsolationLevel, LockIntent, LockManager, LockMode, LockResource, LockWait, ReadAccess,
-    TransactionManager, TxnHandle,
+    IsolationLevel, LockIntent, LockManager, LockMode, LockResource, LockTimeout, LockWait,
+    ReadAccess, TransactionManager, TxnHandle,
 };
 
 /// How long a test waits for something it expects to happen.
@@ -689,6 +690,52 @@ fn nowait_yields_1222() {
         "a refused row wait under NOWAIT is 1222/51; message was {:?}",
         refused.message
     );
+}
+
+/// The [`LockIntent::timeout`] a caller passes bounds the wait of a write and of an
+/// `UPDLOCK` read on a row another transaction holds: 1222, state 51, once it has run out.
+/// `NOWAIT` stands in front of an infinite timeout.
+#[test]
+fn the_timeout_of_the_intent_bounds_a_write() {
+    let mgr = manager();
+    let a = mgr.begin(IsolationLevel::ReadCommitted);
+    mgr.write_lock(&a, T, R, &plain(), &LockWait::none())
+        .expect("A takes the row");
+
+    let b = mgr.begin(IsolationLevel::ReadCommitted);
+    let bounded = LockIntent {
+        timeout: LockTimeout::Millis(100),
+        ..LockIntent::default()
+    };
+    let started = Instant::now();
+    let refused = mgr
+        .write_lock(&b, T, R, &bounded, &LockWait::none())
+        .expect_err("the row is taken");
+    assert_eq!((refused.number, refused.state), (1222, 51));
+    assert!(
+        started.elapsed() >= Duration::from_millis(90) && started.elapsed() < SOON,
+        "the write gave up after {:?}",
+        started.elapsed()
+    );
+
+    let updlock = LockIntent {
+        updlock: true,
+        ..bounded
+    };
+    let refused = mgr
+        .read_lock(&b, T, R, &updlock, &LockWait::none())
+        .expect_err("the row is taken");
+    assert_eq!((refused.number, refused.state), (1222, 51));
+
+    let nowait_first = LockIntent {
+        nowait: true,
+        timeout: LockTimeout::Infinite,
+        ..LockIntent::default()
+    };
+    let refused = mgr
+        .write_lock(&b, T, R, &nowait_first, &LockWait::none())
+        .expect_err("NOWAIT does not wait");
+    assert_eq!(refused.number, 1222);
 }
 
 // ------------------------------------------------------------------ Intent and release

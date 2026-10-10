@@ -43,9 +43,13 @@ pub enum IsolationLevel {
 /// `Millis(0)` and [`LockTimeout::NoWait`] are kept apart because they come from two
 /// different places: the session setting `SET LOCK_TIMEOUT` and the `NOWAIT` table hint.
 /// What each of them reports is decided by the lock manager.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The default value is [`LockTimeout::Infinite`], the `SET LOCK_TIMEOUT -1` a session starts
+/// with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum LockTimeout {
     /// Wait forever, the default of a session (`SET LOCK_TIMEOUT -1`).
+    #[default]
     Infinite,
     /// Wait at most this many milliseconds, then fail.
     Millis(u32),

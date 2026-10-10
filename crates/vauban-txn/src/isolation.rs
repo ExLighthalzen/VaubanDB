@@ -112,7 +112,8 @@ use crate::{IsolationLevel, LockTimeout, TransactionManager, TxnHandle, Versioni
 /// table reference into this structure. Nothing here parses a hint or names one in SQL.
 ///
 /// [`LockIntent::default`] carries no hint: `level` is `None`, so the level of the
-/// transaction decides, and the seven flags are `false`. The fields are public and the
+/// transaction decides, the seven flags are `false` and `timeout` is
+/// [`LockTimeout::Infinite`]. The fields are public and the
 /// structure is built by its literal, so a caller that sets one field writes
 /// `LockIntent { updlock: true, ..LockIntent::default() }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -136,6 +137,9 @@ pub struct LockIntent {
     pub tablock: bool,
     /// `TABLOCKX`: carried here without effect.
     pub tablockx: bool,
+    /// How long a lock of this statement waits when `NOWAIT` is not asked for: the
+    /// `SET LOCK_TIMEOUT` of the session, [`LockTimeout::Infinite`] in the default value.
+    pub timeout: LockTimeout,
 }
 
 /// What the caller may do with the row it asked to read.
@@ -236,15 +240,15 @@ fn intent_of(mode: LockMode) -> LockMode {
     }
 }
 
-/// The wait a lock of this transaction is given when the hints carry no `NOWAIT`.
-///
-/// `SET LOCK_TIMEOUT -1`, [`LockTimeout::Infinite`], is the default of a SQL Server
-/// session. [`TxnHandle`] carries an identifier and a level and no timeout (`handle.rs`), so
-/// that default is what the locks of this file wait for until the session value is put on
-/// the handle; this function is the line that changes then.
-fn session_timeout(txn: &TxnHandle) -> LockTimeout {
-    let _ = txn;
-    LockTimeout::Infinite
+/// The wait a lock taken under `hints` is given: [`LockTimeout::NoWait`] under `NOWAIT`,
+/// the [`LockIntent::timeout`] of the statement otherwise (`tests/isolation.rs`,
+/// `the_timeout_of_the_intent_bounds_a_write`).
+fn lock_wait_of(hints: &LockIntent) -> LockTimeout {
+    if hints.nowait {
+        LockTimeout::NoWait
+    } else {
+        hints.timeout
+    }
 }
 
 impl TransactionManager {
@@ -321,11 +325,7 @@ impl TransactionManager {
         if mode == LockMode::S && self.read_versioning(txn, level) != VersioningMode::Locking {
             return Ok(ReadAccess::Versioned);
         }
-        let lock_wait = if hints.nowait {
-            LockTimeout::NoWait
-        } else {
-            session_timeout(txn)
-        };
+        let lock_wait = lock_wait_of(hints);
         self.take(
             txn.id,
             LockResource::Table(table),
@@ -408,11 +408,7 @@ impl TransactionManager {
         hints: &LockIntent,
         wait: &LockWait,
     ) -> SqlResult<()> {
-        let lock_wait = if hints.nowait {
-            LockTimeout::NoWait
-        } else {
-            session_timeout(txn)
-        };
+        let lock_wait = lock_wait_of(hints);
         self.take(
             txn.id,
             LockResource::Table(table),

@@ -70,7 +70,7 @@
 use vauban_binder::LockHints;
 use vauban_errors::SqlResult;
 use vauban_storage::{RowId, Snapshot, TableId};
-use vauban_txn::{IsolationLevel, LockIntent, ReadAccess};
+use vauban_txn::{IsolationLevel, LockIntent, LockTimeout, ReadAccess};
 
 use crate::context::ExecContext;
 
@@ -88,8 +88,16 @@ pub(crate) enum RowVisibility {
     Skip,
 }
 
-/// The [`LockIntent`] of `hints`, the shape `txn` takes.
-fn intent_of(hints: &LockHints) -> LockIntent {
+/// The lock timeout of the statement `ctx` runs: the `SET LOCK_TIMEOUT` of its session, or
+/// [`LockTimeout::Infinite`] for a context built without session state.
+fn timeout_of(ctx: &ExecContext<'_>) -> LockTimeout {
+    ctx.session
+        .as_deref()
+        .map_or(LockTimeout::Infinite, |session| session.lock_timeout)
+}
+
+/// The [`LockIntent`] of `hints` under the lock timeout `timeout`, the shape `txn` takes.
+fn intent_of(hints: &LockHints, timeout: LockTimeout) -> LockIntent {
     let level = if hints.nolock {
         Some(IsolationLevel::ReadUncommitted)
     } else if hints.readcommitted {
@@ -112,6 +120,7 @@ fn intent_of(hints: &LockHints) -> LockIntent {
         nowait: hints.nowait,
         tablock: hints.tablock,
         tablockx: hints.tablockx,
+        timeout,
     }
 }
 
@@ -128,7 +137,8 @@ fn intent_of(hints: &LockHints) -> LockIntent {
 /// # Errors
 ///
 /// What `txn` raises for a lock it refused: 1222 for a `NOWAIT` on a row another
-/// transaction holds (`tests/locking.rs`, `nowait_is_1222`), 1205 for a deadlock. The
+/// transaction holds (`tests/locking.rs`, `nowait_is_1222`) or once the `SET LOCK_TIMEOUT`
+/// of the session has run out (`vauban-session/tests/lock_timeout.rs`), 1205 for a deadlock. The
 /// internal error 50000 of a context with no transaction manager.
 pub(crate) fn read_lock(
     ctx: &mut ExecContext<'_>,
@@ -140,8 +150,9 @@ pub(crate) fn read_lock(
         return Ok(RowVisibility::Visible);
     };
     let wait = ctx.cancel.lock_wait();
+    let intent = intent_of(hints, timeout_of(ctx));
     Ok(
-        match manager.read_lock(handle, table, id, &intent_of(hints), &wait)? {
+        match manager.read_lock(handle, table, id, &intent, &wait)? {
             ReadAccess::Locked | ReadAccess::Dirty => RowVisibility::Latest,
             ReadAccess::Versioned => RowVisibility::Visible,
             ReadAccess::Skip => RowVisibility::Skip,
@@ -181,7 +192,11 @@ pub(crate) fn write_lock(ctx: &mut ExecContext<'_>, table: TableId, id: RowId) -
         return Ok(());
     };
     let wait = ctx.cancel.lock_wait();
-    manager.write_lock(handle, table, id, &LockIntent::default(), &wait)
+    let intent = LockIntent {
+        timeout: timeout_of(ctx),
+        ..LockIntent::default()
+    };
+    manager.write_lock(handle, table, id, &intent, &wait)
 }
 
 /// The snapshot a scan or a seek iterates under `hints`.
@@ -223,9 +238,12 @@ mod tests {
         let with = |set: fn(&mut LockHints)| {
             let mut hints = LockHints::default();
             set(&mut hints);
-            intent_of(&hints)
+            intent_of(&hints, LockTimeout::Infinite)
         };
-        assert_eq!(intent_of(&LockHints::default()).level, None);
+        assert_eq!(
+            intent_of(&LockHints::default(), LockTimeout::Infinite).level,
+            None
+        );
         assert_eq!(
             with(|h| h.nolock = true).level,
             Some(IsolationLevel::ReadUncommitted)
@@ -264,7 +282,7 @@ mod tests {
             paglock: true,
             ..LockHints::default()
         };
-        let intent = intent_of(&hints);
+        let intent = intent_of(&hints, LockTimeout::Infinite);
         assert!(intent.updlock);
         assert!(intent.xlock);
         assert!(intent.readpast);
@@ -272,7 +290,7 @@ mod tests {
         assert!(intent.tablock);
         assert!(intent.tablockx);
         // Counter-proof in `translate_the_mode_words`: a default `LockHints` matches `LockIntent::default()`.
-        let plain = intent_of(&LockHints::default());
+        let plain = intent_of(&LockHints::default(), LockTimeout::Infinite);
         assert_eq!(plain, LockIntent::default());
     }
 
