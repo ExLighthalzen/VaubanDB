@@ -18,9 +18,9 @@ use vauban_binder::{
     AggregateCall, BoundExecute, BoundExpr, BoundProjection, BoundTop, ColumnBinding, DdlStatement,
     DeferredStatement, JoinKind, LockHints, OutputSchema, SortKey, SubqueryId, TxnStatement,
 };
-use vauban_catalog::{TableDef, TableId};
+use vauban_catalog::{ColumnId, TableDef, TableId};
 use vauban_storage::{Direction, IndexId};
-use vauban_types::TypeInfo;
+use vauban_types::{SqlType, TypeInfo};
 
 /// A statement, planned: what the `executor` runs.
 ///
@@ -157,11 +157,13 @@ pub enum PhysicalPlan {
         /// The table in `storage`.
         table: TableId,
         /// The columns read, each carrying the 0-based `index` of its value in the row
-        /// `storage` produces.
+        /// `storage` produces, then the row-identifier bindings ([`row_id_binding`]) the
+        /// plan asked for, which have no entry in `schema`.
         columns: Vec<ColumnBinding>,
         /// The name the rest of the query refers to this source by.
         alias: String,
-        /// The columns this node produces, in the same order as `columns`.
+        /// The columns this node produces, in the same order as `columns`, row identifiers
+        /// left out.
         schema: OutputSchema,
         /// The lock hints written on the reference this scan comes from,
         /// [`LockHints::default`] for a reference written without a hint.
@@ -176,11 +178,13 @@ pub enum PhysicalPlan {
         index: IndexId,
         /// The keys served, with bounds still to evaluate.
         range: KeyRangeExpr,
-        /// The columns read, as for a [`PhysicalPlan::TableScan`].
+        /// The columns read, then the row-identifier bindings, as for a
+        /// [`PhysicalPlan::TableScan`].
         columns: Vec<ColumnBinding>,
         /// Forward or backward relative to the index order.
         direction: Direction,
-        /// The columns this node produces, in the same order as `columns`.
+        /// The columns this node produces, in the same order as `columns`, row identifiers
+        /// left out.
         schema: OutputSchema,
         /// The lock hints of the scan this seek replaces, copied unchanged.
         hints: LockHints,
@@ -499,6 +503,121 @@ impl PhysicalPlan {
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::TopN { input, .. } => input.schema(),
             PhysicalPlan::Distinct(input) => input.schema(),
+        }
+    }
+}
+
+/// Name of a row-identifier binding. No scope of the binder holds it, so a query cannot
+/// name the column.
+pub const ROW_ID_NAME: &str = "%rowid";
+
+/// The binding that asks a [`PhysicalPlan::TableScan`] or a [`PhysicalPlan::IndexSeek`] of
+/// `table` to emit, after the columns of its `schema`, the
+/// [`RowId`](vauban_storage::RowId) of each row it reads.
+///
+/// # The row identifier in the row stream
+///
+/// A plan asks for row identifiers so that a write statement can reach, from a row of its
+/// input, the row of its target table that produced it. The identifier is an invisible
+/// column: it has no entry in any `schema`, and no expression of the plan reads it, so the
+/// positions the binder resolved are left as they were. Each row carries the identifiers
+/// after its visible values, as a tail:
+///
+/// - a scan or a seek appends one value per row-identifier binding of its `columns`;
+/// - `Filter`, `Top`, `Sort`, `TopN` and `SubqueryEval` hand the row over, tail included;
+/// - `Project` appends the tail of its input after the values it computes;
+/// - a join puts the visible values of both sides first, then the tail of the left side,
+///   then that of the right; a side padded with `NULL` has a `NULL` per identifier;
+/// - `Distinct`, the aggregates and the set operators build rows of their own, without
+///   a tail.
+///
+/// [`PhysicalPlan::row_id_tables`] lists the table each value of the tail belongs to, in
+/// that order (`tests/row_id.rs`, `the_tail_follows_the_join_order`).
+///
+/// The binding is recognised by its `column`, which holds the table, negated and moved one
+/// down so that it stays below 0, the identifier the binder gives a computed column, and
+/// below the identifiers of the columns of a table, which start at 1 (`tests/row_id.rs`,
+/// `the_binding_names_its_table`). Its `index` is 0, a position inside each row of a table
+/// with a column: a reader that picks the values of `columns` by `index` without telling
+/// this binding apart still reads inside the row.
+///
+/// `None` for a table whose identifier does not fit in a column identifier.
+#[must_use]
+pub fn row_id_binding(table: TableId) -> Option<ColumnBinding> {
+    let table = i32::try_from(table.0).ok()?;
+    Some(ColumnBinding {
+        column: ColumnId(-table - 1),
+        index: 0,
+        name: ROW_ID_NAME.to_owned(),
+        ty: TypeInfo::new(SqlType::BigInt, false),
+        depth: 0,
+    })
+}
+
+/// The table a row-identifier binding names, `None` for the binding of a column
+/// (`tests/row_id.rs`, `the_binding_names_its_table`).
+#[must_use]
+pub fn row_id_table(binding: &ColumnBinding) -> Option<TableId> {
+    if binding.column.0 >= 0 {
+        return None;
+    }
+    u32::try_from(-(i64::from(binding.column.0) + 1))
+        .ok()
+        .map(TableId)
+}
+
+impl PhysicalPlan {
+    /// The table of each row identifier the rows of this node carry after their visible
+    /// values, in the order of the tail ([`row_id_binding`]). Empty for a plan nothing
+    /// asked a row identifier of.
+    #[must_use]
+    pub fn row_id_tables(&self) -> Vec<TableId> {
+        let mut tables = Vec::new();
+        self.visit_row_ids(&mut |table| tables.push(table));
+        tables
+    }
+
+    /// How many row identifiers the rows of this node carry after their visible values:
+    /// the length of [`PhysicalPlan::row_id_tables`], without building it.
+    #[must_use]
+    pub fn row_id_count(&self) -> usize {
+        let mut count = 0;
+        self.visit_row_ids(&mut |_| count += 1);
+        count
+    }
+
+    /// Calls `f` with the table of each value of the tail, in the order of the tail.
+    fn visit_row_ids(&self, f: &mut impl FnMut(TableId)) {
+        match self {
+            PhysicalPlan::TableScan { columns, .. } | PhysicalPlan::IndexSeek { columns, .. } => {
+                columns.iter().filter_map(row_id_table).for_each(f);
+            }
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Top { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::TopN { input, .. }
+            | PhysicalPlan::SubqueryEval { input, .. } => input.visit_row_ids(f),
+            PhysicalPlan::NestedLoopJoin {
+                outer, inner, kind, ..
+            } => {
+                outer.visit_row_ids(f);
+                if !matches!(kind, PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi) {
+                    inner.visit_row_ids(f);
+                }
+            }
+            PhysicalPlan::HashJoin { build, probe, .. } => {
+                probe.visit_row_ids(f);
+                build.visit_row_ids(f);
+            }
+            PhysicalPlan::OneRow
+            | PhysicalPlan::Values { .. }
+            | PhysicalPlan::HashAggregate { .. }
+            | PhysicalPlan::StreamAggregate { .. }
+            | PhysicalPlan::Distinct(_)
+            | PhysicalPlan::Union { .. }
+            | PhysicalPlan::Except { .. }
+            | PhysicalPlan::Intersect { .. } => {}
         }
     }
 }

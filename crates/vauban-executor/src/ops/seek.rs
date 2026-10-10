@@ -38,7 +38,8 @@
 //!
 //! As for a `TableScan`, the `index` of each [`ColumnBinding`] is the position of the
 //! value in the row the storage hands out, and the answer keeps the columns of the node
-//! in the order of the node (`tests/seek.rs`, `seek_projects_the_plan_columns`).
+//! in the order of the node (`tests/seek.rs`, `seek_projects_the_plan_columns`). The
+//! row-identifier bindings that follow them are served as a scan serves them.
 //!
 //! # One lock per row handed over
 //!
@@ -60,14 +61,18 @@ use crate::errors::at;
 use crate::expr::eval_expr;
 use crate::locking::{self, RowVisibility};
 use crate::operator::Operator;
-use crate::row::Row;
+use crate::ops::scan::split_row_ids;
+use crate::row::{Row, row_id_value};
 
 /// The rows `index` serves for `range`, in `direction`, keeping the columns `columns`
 /// names, in that order.
 struct IndexSeek<'a> {
     index: IndexId,
     range: KeyRangeExpr,
+    /// The columns read, row-identifier bindings left out.
     columns: Vec<ColumnBinding>,
+    /// How many times the row identifier follows the columns of each row, as for a scan.
+    row_ids: usize,
     direction: Direction,
     schema: OutputSchema,
     /// The locking words written on the table reference, read once per row.
@@ -90,7 +95,9 @@ struct KeyColumnType {
 /// # Errors
 ///
 /// The internal error 50000 for a `schema` and a `columns` of different widths, which
-/// takes a bug of the planner, and for a node that is not an `IndexSeek`.
+/// takes a bug of the planner, for a `columns` [`split_row_ids`] refuses, and for a node
+/// that is not an `IndexSeek`. The row identifiers follow the columns as for a scan
+/// (`tests/row_id.rs`, `a_seek_asked_for_its_row_id_appends_it`).
 pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> + 'a>> {
     let PhysicalPlan::IndexSeek {
         index,
@@ -103,17 +110,12 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
     else {
         return Err(bug("IndexSeek: the node is not an IndexSeek"));
     };
-    if schema.columns.len() != columns.len() {
-        return Err(bug(&format!(
-            "IndexSeek: the node publishes {} column(s) and reads {}",
-            schema.columns.len(),
-            columns.len()
-        )));
-    }
+    let (columns, row_ids) = split_row_ids("IndexSeek", columns, schema)?;
     Ok(Box::new(IndexSeek {
         index: *index,
         range: range.clone(),
-        columns: columns.clone(),
+        columns,
+        row_ids,
         direction: *direction,
         schema: schema.clone(),
         hints: *hints,
@@ -191,7 +193,7 @@ impl<'a> Operator<'a> for IndexSeek<'a> {
                 }
                 RowVisibility::Visible => {}
             }
-            let mut row = Vec::with_capacity(self.columns.len());
+            let mut row = Vec::with_capacity(self.columns.len() + self.row_ids);
             for binding in &self.columns {
                 let value = source.0.get(binding.index).ok_or_else(|| {
                     bug(&format!(
@@ -203,6 +205,7 @@ impl<'a> Operator<'a> for IndexSeek<'a> {
                 })?;
                 row.push(value.clone());
             }
+            row.extend(std::iter::repeat_n(row_id_value(id), self.row_ids));
             locking::end_row_read(ctx, table, id)?;
             return Ok(Some(row));
         }

@@ -27,6 +27,15 @@
 //! here: it identifies the column for the catalogue and survives the drop of a column
 //! before it, which makes it useless as a position.
 //!
+//! # The row identifier
+//!
+//! A binding the planner made with [`vauban_planner::row_id_binding`] is not a column: it
+//! asks for the [`RowId`](vauban_storage::RowId) of the row, which the scan appends after
+//! the columns of its `schema`, once per such binding (`tests/row_id.rs`,
+//! `a_scan_asked_for_its_row_id_appends_it`). Those bindings follow the columns in
+//! `columns`; a column after one of them is refused (`tests/row_id.rs`,
+//! `a_column_after_a_row_id_binding_is_a_bug`).
+//!
 //! # One lock per row handed over
 //!
 //! The [`LockHints`] written on the table reference travel with the node, and each row the
@@ -41,18 +50,23 @@
 
 use vauban_binder::{ColumnBinding, LockHints, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
+use vauban_planner::row_id_table;
 use vauban_storage::{RowIter, TableId};
 
 use crate::context::ExecContext;
 use crate::locking::{self, RowVisibility};
 use crate::operator::Operator;
-use crate::row::Row;
+use crate::row::{Row, row_id_value};
 
 /// The rows of `table` visible to the snapshot of the context, keeping the columns
 /// `columns` names, in that order.
 struct TableScan<'a> {
     table: TableId,
+    /// The columns read, row-identifier bindings left out.
     columns: Vec<ColumnBinding>,
+    /// How many times the row identifier follows the columns of each row: once per
+    /// row-identifier binding the plan put in `columns`; zero when the plan did not ask for it.
+    row_ids: usize,
     schema: OutputSchema,
     /// The locking words written on the table reference, read once per row.
     hints: LockHints,
@@ -69,27 +83,61 @@ struct TableScan<'a> {
 /// # Errors
 ///
 /// The internal error 50000 for a `schema` and a `columns` of different widths, which
-/// takes a bug of the binder.
+/// takes a bug of the binder, and for a `columns` [`split_row_ids`] refuses.
+///
+/// After its columns, each row carries the row identifier once per row-identifier binding
+/// of `columns` (`tests/row_id.rs`, `a_scan_asked_for_its_row_id_appends_it`), and nothing
+/// for a node that holds none (`tests/row_id.rs`, `a_scan_asked_nothing_keeps_its_width`).
 pub(crate) fn build<'a>(
     table: TableId,
     columns: &[ColumnBinding],
     schema: &OutputSchema,
     hints: LockHints,
 ) -> SqlResult<Box<dyn Operator<'a> + 'a>> {
-    if schema.columns.len() != columns.len() {
-        return Err(bug(&format!(
-            "TableScan: the node publishes {} column(s) and reads {}",
-            schema.columns.len(),
-            columns.len()
-        )));
-    }
+    let (columns, row_ids) = split_row_ids("TableScan", columns, schema)?;
     Ok(Box::new(TableScan {
         table,
-        columns: columns.to_vec(),
+        columns,
+        row_ids,
         schema: schema.clone(),
         hints,
         iter: None,
     }))
+}
+
+/// Separates the columns a scan or a seek reads from the row-identifier bindings that
+/// follow them ([`vauban_planner::row_id_binding`]), and answers how many of those there
+/// are.
+///
+/// # Errors
+///
+/// The internal error 50000 for a `schema` whose width is not the number of columns read,
+/// and for a row-identifier binding followed by a column, which would move the column out
+/// of the position the plan gave it.
+pub(crate) fn split_row_ids(
+    node: &str,
+    columns: &[ColumnBinding],
+    schema: &OutputSchema,
+) -> SqlResult<(Vec<ColumnBinding>, usize)> {
+    let width = columns
+        .iter()
+        .position(|binding| row_id_table(binding).is_some())
+        .unwrap_or(columns.len());
+    let (read, row_ids) = columns.split_at(width);
+    if row_ids
+        .iter()
+        .any(|binding| row_id_table(binding).is_none())
+    {
+        return Err(bug(&format!("{node}: a column follows a row identifier")));
+    }
+    if schema.columns.len() != read.len() {
+        return Err(bug(&format!(
+            "{node}: the node publishes {} column(s) and reads {}",
+            schema.columns.len(),
+            read.len()
+        )));
+    }
+    Ok((read.to_vec(), row_ids.len()))
 }
 
 impl<'a> Operator<'a> for TableScan<'a> {
@@ -140,7 +188,7 @@ impl<'a> Operator<'a> for TableScan<'a> {
                 }
                 RowVisibility::Visible => {}
             }
-            let mut row = Vec::with_capacity(self.columns.len());
+            let mut row = Vec::with_capacity(self.columns.len() + self.row_ids);
             for binding in &self.columns {
                 let value = source.0.get(binding.index).ok_or_else(|| {
                     bug(&format!(
@@ -152,6 +200,7 @@ impl<'a> Operator<'a> for TableScan<'a> {
                 })?;
                 row.push(value.clone());
             }
+            row.extend(std::iter::repeat_n(row_id_value(id), self.row_ids));
             locking::end_row_read(ctx, self.table, id)?;
             return Ok(Some(row));
         }

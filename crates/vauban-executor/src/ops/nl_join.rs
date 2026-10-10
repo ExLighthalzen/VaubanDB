@@ -18,16 +18,23 @@
 //! `self_cross_join_projects_both_aliases`). An expression of the inner tree reads the
 //! inner row by its own index, and an index-seek bound the outer row pushed on the
 //! context.
+//!
+//! # Row identifiers
+//!
+//! The row identifiers each side carries after its visible values go to the end of the
+//! joined row, the outer ones first, so that the `on` and the operators above read the
+//! visible values at the positions the plan gave them (`tests/row_id.rs`,
+//! `the_row_id_of_a_joined_table_crosses_the_joins_the_filter_and_the_sort`). A semi-join
+//! and an anti-semi-join hand over the outer row as it came, tail included.
 
 use vauban_binder::{BoundExpr, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{PhysicalJoinKind, PhysicalPlan};
-use vauban_types::Value;
 
 use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
 use crate::expr::{as_condition, eval_expr};
 use crate::operator::{Operator, build_operator};
-use crate::row::Row;
+use crate::row::{JoinSide, Row, join_rows};
 
 /// Where the join stands between two `next()` calls.
 pub enum Phase<'a> {
@@ -66,6 +73,34 @@ pub enum Phase<'a> {
     },
 }
 
+/// The visible width and the number of row identifiers of each side of the join.
+#[derive(Clone, Copy)]
+struct Widths {
+    outer_width: usize,
+    inner_width: usize,
+    outer_tail: usize,
+    inner_tail: usize,
+}
+
+impl Widths {
+    /// The joined row of `outer` and `inner`, a missing side padded with `Value::Null`,
+    /// row identifiers included ([`join_rows`]).
+    fn join(self, outer: Option<&Row>, inner: Option<&Row>) -> Row {
+        join_rows(
+            &JoinSide {
+                row: outer.map(Vec::as_slice),
+                width: self.outer_width,
+                tail: self.outer_tail,
+            },
+            &JoinSide {
+                row: inner.map(Vec::as_slice),
+                width: self.inner_width,
+                tail: self.inner_tail,
+            },
+        )
+    }
+}
+
 /// Runs a nested-loop join of any supported kind.
 pub struct NestedLoopJoin<'a> {
     /// The outer (left) operator.
@@ -83,6 +118,10 @@ pub struct NestedLoopJoin<'a> {
     pub outer_width: usize,
     /// The number of columns of the inner side.
     pub inner_width: usize,
+    /// How many row identifiers the outer rows carry after their visible values.
+    pub outer_tail: usize,
+    /// How many row identifiers the inner rows carry after their visible values.
+    pub inner_tail: usize,
     /// Where the join stands between two `next()` calls.
     pub phase: Phase<'a>,
     /// Materialised inner rows for RIGHT / FULL.
@@ -115,6 +154,8 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
     };
     let outer_width = outer.schema().columns.len();
     let inner_width = inner.schema().columns.len();
+    let outer_tail = outer.row_id_count();
+    let inner_tail = inner.row_id_count();
     Ok(Box::new(NestedLoopJoin {
         outer: build_operator(outer)?,
         inner_plan: (**inner).clone(),
@@ -123,6 +164,8 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         schema: schema.clone(),
         outer_width,
         inner_width,
+        outer_tail,
+        inner_tail,
         phase: Phase::Done,
         inner_rows: Vec::new(),
         matched: Vec::new(),
@@ -150,36 +193,26 @@ impl<'a> NestedLoopJoin<'a> {
     /// Builds the concatenated row and returns it if `on` holds.
     fn pair(
         on: &Option<BoundExpr>,
+        widths: Widths,
         outer: &Row,
         inner: &Row,
         ctx: &mut ExecContext<'a>,
     ) -> SqlResult<Option<Row>> {
-        let mut combined = Row::with_capacity(outer.len() + inner.len());
-        combined.extend_from_slice(outer);
-        combined.extend_from_slice(inner);
+        let combined = widths.join(Some(outer), Some(inner));
         match Self::check_on(on, &combined, ctx)? {
             None | Some(false) => Ok(None),
             Some(true) => Ok(Some(combined)),
         }
     }
 
-    /// Pads the missing side with `Value::Null`.
-    fn padded(
-        outer: Option<&Row>,
-        inner: Option<&Row>,
-        outer_width: usize,
-        inner_width: usize,
-    ) -> Row {
-        let mut row = Row::with_capacity(outer_width + inner_width);
-        match outer {
-            Some(r) => row.extend_from_slice(r),
-            None => row.resize(outer_width, Value::Null),
+    /// The widths and tails of the two sides, copied out of the operator.
+    fn widths(&self) -> Widths {
+        Widths {
+            outer_width: self.outer_width,
+            inner_width: self.inner_width,
+            outer_tail: self.outer_tail,
+            inner_tail: self.inner_tail,
         }
-        match inner {
-            Some(r) => row.extend_from_slice(r),
-            None => row.resize(outer_width + inner_width, Value::Null),
-        }
-        row
     }
 
     /// Pulls and returns the next outer row, updating the cancellation counter.
@@ -249,6 +282,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
     }
 
     fn next(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<Option<Row>> {
+        let widths = self.widths();
         loop {
             match &mut self.phase {
                 Phase::Done => return Ok(None),
@@ -257,12 +291,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                         let p = *pos;
                         *pos += 1;
                         if !self.matched[p] {
-                            return Ok(Some(Self::padded(
-                                None,
-                                Some(&self.inner_rows[p]),
-                                self.outer_width,
-                                self.inner_width,
-                            )));
+                            return Ok(Some(widths.join(None, Some(&self.inner_rows[p]))));
                         }
                     }
                     self.phase = Phase::Done;
@@ -270,12 +299,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                 }
                 Phase::EmitUnmatchedOuter { pos } => {
                     if *pos < self.unmatched_outer.len() {
-                        let row = Self::padded(
-                            Some(&self.unmatched_outer[*pos]),
-                            None,
-                            self.outer_width,
-                            self.inner_width,
-                        );
+                        let row = widths.join(Some(&self.unmatched_outer[*pos]), None);
                         *pos += 1;
                         return Ok(Some(row));
                     }
@@ -296,7 +320,8 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                         Some(inner_row) => {
                             let holds = match self.kind {
                                 PhysicalJoinKind::Cross => true,
-                                _ => Self::pair(&self.on, outer_row, &inner_row, ctx)?.is_some(),
+                                _ => Self::pair(&self.on, widths, outer_row, &inner_row, ctx)?
+                                    .is_some(),
                             };
                             if holds {
                                 *had_match = true;
@@ -314,7 +339,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                     continue;
                                 }
                                 if let Some(combined) =
-                                    Self::pair(&self.on, outer_row, &inner_row, ctx)?
+                                    Self::pair(&self.on, widths, outer_row, &inner_row, ctx)?
                                 {
                                     return Ok(Some(combined));
                                 }
@@ -339,12 +364,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                             }
                             // LEFT: emit padded row if no match.
                             if self.kind == PhysicalJoinKind::Left && !matched {
-                                let padded = Self::padded(
-                                    Some(outer_row),
-                                    None,
-                                    self.outer_width,
-                                    self.inner_width,
-                                );
+                                let padded = widths.join(Some(outer_row), None);
                                 self.phase = Phase::NeedOuter;
                                 return Ok(Some(padded));
                             }
@@ -362,7 +382,7 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                         let p = *pos;
                         *pos += 1;
                         if let Some(combined) =
-                            Self::pair(&self.on, outer_row, &self.inner_rows[p], ctx)?
+                            Self::pair(&self.on, widths, outer_row, &self.inner_rows[p], ctx)?
                         {
                             self.matched[p] = true;
                             *had_match = true;

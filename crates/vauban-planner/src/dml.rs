@@ -4,13 +4,13 @@
 //! Halloween problem.
 
 use vauban_binder::{BoundExpr, ColumnBinding, DeletePlan, InsertPlan, SelectIntoPlan, UpdatePlan};
-use vauban_errors::SqlResult;
+use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::TableId;
 
 use crate::context::PlanContext;
 use crate::physical::{
-    PhysicalDelete, PhysicalInsert, PhysicalPlan, PhysicalSelectInto, PhysicalStatement,
-    PhysicalUpdate,
+    PhysicalDelete, PhysicalInsert, PhysicalJoinKind, PhysicalPlan, PhysicalSelectInto,
+    PhysicalStatement, PhysicalUpdate, row_id_binding, row_id_table,
 };
 use crate::plan::plan_node;
 
@@ -47,7 +47,8 @@ pub(crate) fn plan_update(
     stmt: &UpdatePlan,
     ctx: &PlanContext<'_>,
 ) -> SqlResult<PhysicalStatement> {
-    let input = plan_node(&stmt.input, ctx)?;
+    let mut input = plan_node(&stmt.input, ctx)?;
+    request_row_ids(&mut input, stmt.table, ctx)?;
     let spool = spool_for_update(&input, &stmt.assignments, stmt.table, ctx);
     Ok(PhysicalStatement::Update(PhysicalUpdate {
         table: stmt.table,
@@ -62,13 +63,102 @@ pub(crate) fn plan_delete(
     stmt: &DeletePlan,
     ctx: &PlanContext<'_>,
 ) -> SqlResult<PhysicalStatement> {
-    let input = plan_node(&stmt.input, ctx)?;
+    let mut input = plan_node(&stmt.input, ctx)?;
+    request_row_ids(&mut input, stmt.table, ctx)?;
     let spool = count_table_references(&input, stmt.table, ctx) > 1;
     Ok(PhysicalStatement::Delete(PhysicalDelete {
         table: stmt.table,
         input,
         spool,
     }))
+}
+
+/// Asks each scan and each seek of `table` in `plan` for the row identifier of the rows it
+/// reads ([`row_id_binding`]), so that the rows of the input of a write statement carry the
+/// identifier of the target row they come from (`tests/row_id.rs`,
+/// `an_update_over_a_join_asks_the_target_side_alone`).
+///
+/// The walk goes down the nodes that keep the tail of their input
+/// ([`PhysicalPlan::row_id_tables`]) and stops at the others, and at the inner side of a
+/// semi-join or an anti-semi-join, whose rows are not handed over. A node that already
+/// carries the binding is left as it is.
+///
+/// # Errors
+///
+/// The internal error 50000 for a table whose identifier does not fit in a column
+/// identifier.
+fn request_row_ids(
+    plan: &mut PhysicalPlan,
+    table: TableId,
+    ctx: &PlanContext<'_>,
+) -> SqlResult<()> {
+    match plan {
+        PhysicalPlan::TableScan {
+            table: read,
+            columns,
+            ..
+        } => {
+            if *read == table {
+                push_row_id(columns, table)?;
+            }
+        }
+        PhysicalPlan::IndexSeek { index, columns, .. } => {
+            let index = *index;
+            if ctx
+                .catalog
+                .indexes_of(table)
+                .iter()
+                .any(|(id, _)| *id == index)
+            {
+                push_row_id(columns, table)?;
+            }
+        }
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Top { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::TopN { input, .. }
+        | PhysicalPlan::SubqueryEval { input, .. } => request_row_ids(input, table, ctx)?,
+        PhysicalPlan::NestedLoopJoin {
+            outer, inner, kind, ..
+        } => {
+            request_row_ids(outer, table, ctx)?;
+            if !matches!(kind, PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi) {
+                request_row_ids(inner, table, ctx)?;
+            }
+        }
+        PhysicalPlan::HashJoin { build, probe, .. } => {
+            request_row_ids(probe, table, ctx)?;
+            request_row_ids(build, table, ctx)?;
+        }
+        PhysicalPlan::OneRow
+        | PhysicalPlan::Values { .. }
+        | PhysicalPlan::HashAggregate { .. }
+        | PhysicalPlan::StreamAggregate { .. }
+        | PhysicalPlan::Distinct(_)
+        | PhysicalPlan::Union { .. }
+        | PhysicalPlan::Except { .. }
+        | PhysicalPlan::Intersect { .. } => {}
+    }
+    Ok(())
+}
+
+/// Appends the row-identifier binding of `table` to the `columns` of a scan or a seek,
+/// unless they already carry it.
+fn push_row_id(columns: &mut Vec<ColumnBinding>, table: TableId) -> SqlResult<()> {
+    if columns
+        .iter()
+        .any(|binding| row_id_table(binding) == Some(table))
+    {
+        return Ok(());
+    }
+    let binding = row_id_binding(table).ok_or_else(|| {
+        SqlError::from(InternalError::Bug(format!(
+            "row identifier: table {table} does not fit in a column identifier"
+        )))
+    })?;
+    columns.push(binding);
+    Ok(())
 }
 
 /// Halloween protection for an `UPDATE`:

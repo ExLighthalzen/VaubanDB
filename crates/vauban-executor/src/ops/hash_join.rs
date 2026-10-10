@@ -2,6 +2,11 @@
 //! other. `NULL` keys do not match. `Full` answers the internal error 50000.
 //!
 //! The hash table lives entirely in memory; spilling to disk is not implemented for V1.
+//!
+//! The joined row is the probe row then the build row, visible values first; the row
+//! identifiers each side carries follow them, those of the probe side first, as in a
+//! nested-loop join (`tests/row_id.rs`,
+//! `the_row_id_of_a_joined_table_crosses_the_joins_the_filter_and_the_sort`).
 
 use std::collections::HashMap;
 
@@ -14,7 +19,7 @@ use crate::context::ExecContext;
 use crate::expr::eval_expr;
 use crate::operator::{Operator, bucket_hash, build_operator, keys_equal};
 use crate::ops::not_implemented;
-use crate::row::Row;
+use crate::row::{JoinSide, Row, join_rows};
 
 /// The hash join operator, built from a [`PhysicalPlan::HashJoin`].
 pub(crate) struct HashJoin<'a> {
@@ -26,6 +31,10 @@ pub(crate) struct HashJoin<'a> {
     schema: OutputSchema,
     left_width: usize,
     right_width: usize,
+    /// How many row identifiers the probe rows carry after their visible values.
+    probe_tail: usize,
+    /// How many row identifiers the build rows carry after their visible values.
+    build_tail: usize,
 
     // Built during open
     build_buckets: HashMap<u64, Vec<usize>>,
@@ -103,20 +112,21 @@ impl<'a> HashJoin<'a> {
         Ok(())
     }
 
-    /// Concatenates a probe row and a build row into the output row.
-    fn concat(&self, probe_row: &Row, build_row: &Row) -> Row {
-        let mut out = Vec::with_capacity(self.left_width + build_row.len());
-        out.extend_from_slice(probe_row);
-        out.extend_from_slice(build_row);
-        out
-    }
-
-    /// Extends a probe row with `count` NULLs for the build side.
-    fn extend_null(&self, probe_row: &Row, count: usize) -> Row {
-        let mut out = Vec::with_capacity(self.left_width + count);
-        out.extend_from_slice(probe_row);
-        out.extend(std::iter::repeat_n(Value::Null, count));
-        out
+    /// Concatenates a probe row and a build row into the output row, or pads the build
+    /// side with `NULL` when `build_row` is `None` ([`join_rows`]).
+    fn concat(&self, probe_row: &Row, build_row: Option<&Row>) -> Row {
+        join_rows(
+            &JoinSide {
+                row: Some(probe_row),
+                width: self.left_width,
+                tail: self.probe_tail,
+            },
+            &JoinSide {
+                row: build_row.map(Vec::as_slice),
+                width: self.right_width,
+                tail: self.build_tail,
+            },
+        )
     }
 }
 
@@ -160,7 +170,7 @@ impl<'a> Operator<'a> for HashJoin<'a> {
                     // NULL key does not match. For LEFT, emit probe with NULL padding.
                     let row = self.probe_row.as_ref().unwrap();
                     if self.kind == PhysicalJoinKind::Left {
-                        let nulled = self.extend_null(row, self.right_width);
+                        let nulled = self.concat(row, None);
                         self.probe_row = None;
                         return Ok(Some(nulled));
                     }
@@ -201,7 +211,7 @@ impl<'a> Operator<'a> for HashJoin<'a> {
 
                 // Keys match. Apply the residual if present.
                 if let Some(residual) = &self.residual {
-                    let concat = self.concat(row, build_row);
+                    let concat = self.concat(row, Some(build_row));
                     let ok = eval_expr(residual, Some(&concat), ctx)?;
                     if !matches!(ok, Value::Bit(true)) {
                         continue;
@@ -209,12 +219,12 @@ impl<'a> Operator<'a> for HashJoin<'a> {
                 }
 
                 self.probe_matched = true;
-                return Ok(Some(self.concat(row, build_row)));
+                return Ok(Some(self.concat(row, Some(build_row))));
             }
 
             // Bucket exhausted for this probe row.
             if self.kind == PhysicalJoinKind::Left && !self.probe_matched {
-                let nulled = self.extend_null(row, self.right_width);
+                let nulled = self.concat(row, None);
                 self.probe_row = None;
                 return Ok(Some(nulled));
             }
@@ -582,6 +592,8 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         schema: schema.clone(),
         left_width,
         right_width,
+        probe_tail: probe.row_id_count(),
+        build_tail: build.row_id_count(),
         build_buckets: HashMap::new(),
         build_rows: Vec::new(),
         probe_row: None,

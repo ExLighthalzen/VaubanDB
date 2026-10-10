@@ -2,6 +2,7 @@
 
 use vauban_binder::OutputSchema;
 use vauban_errors::SqlError;
+use vauban_storage::RowId;
 use vauban_types::{TypeInfo, Value};
 
 /// One argument of an `EXECUTE`, evaluated and ready for the session.
@@ -21,7 +22,72 @@ pub struct EvaluatedExecArg {
 ///
 /// An alias and not a structure: a row is passed around by slice, and
 /// [`crate::eval_expr`] receives one for each column reference it evaluates.
+///
+/// A row of a plan that asked for row identifiers carries them after those values, as a
+/// tail no expression reads ([`vauban_planner::row_id_binding`]): the tail of a node is
+/// `PhysicalPlan::row_id_count` values long, and empty for a plan that did not ask for it
+/// (`tests/row_id.rs`, `a_scan_asked_nothing_keeps_its_width`).
 pub type Row = Vec<Value>;
+
+/// The value a [`RowId`] takes in the tail of a row: a `bigint` holding the same 64 bits,
+/// so that reading them back gives the identifier unchanged (`row/tests/mod.rs`,
+/// `a_row_id_round_trips_through_its_value`). The `NULL` of a side a join padded names no
+/// row.
+pub(crate) fn row_id_value(id: RowId) -> Value {
+    Value::I64(i64::from_ne_bytes(id.0.to_ne_bytes()))
+}
+
+/// Splits `row` into its visible values and its tail of `tail` row identifiers. A row
+/// shorter than its tail is taken as a tail and nothing else, which takes a bug of the node
+/// that built it.
+fn split_tail(row: &[Value], tail: usize) -> (&[Value], &[Value]) {
+    row.split_at(row.len().saturating_sub(tail))
+}
+
+/// One side of a join, as [`join_rows`] takes it: the row, or `None` for a side padded
+/// with `NULL`, then the visible width and the tail length of that side.
+pub(crate) struct JoinSide<'r> {
+    /// The row of the side, `None` when the join pads it.
+    pub(crate) row: Option<&'r [Value]>,
+    /// How many visible values a padded row of the side has.
+    pub(crate) width: usize,
+    /// How many row identifiers the rows of the side carry.
+    pub(crate) tail: usize,
+}
+
+/// The row a join hands over for a pair of sides: the visible values of the left side,
+/// those of the right, then the tail of the left and the tail of the right. A padded side
+/// gives `NULL` for each of its visible values and for each of its row identifiers
+/// (`tests/row_id.rs`, `a_left_join_pads_the_row_id_of_the_missing_side`).
+pub(crate) fn join_rows(left: &JoinSide<'_>, right: &JoinSide<'_>) -> Row {
+    let (left_values, left_tail) = left.row.map_or((None, None), |row| {
+        let (values, tail) = split_tail(row, left.tail);
+        (Some(values), Some(tail))
+    });
+    let (right_values, right_tail) = right.row.map_or((None, None), |row| {
+        let (values, tail) = split_tail(row, right.tail);
+        (Some(values), Some(tail))
+    });
+    let mut out = Row::with_capacity(left.width + right.width + left.tail + right.tail);
+    extend_or_null(&mut out, left_values, left.width);
+    extend_or_null(&mut out, right_values, right.width);
+    extend_or_null(&mut out, left_tail, left.tail);
+    extend_or_null(&mut out, right_tail, right.tail);
+    out
+}
+
+/// Appends `values`, or `count` `NULL`s for a side without a row.
+fn extend_or_null(out: &mut Row, values: Option<&[Value]>, count: usize) {
+    match values {
+        Some(values) => out.extend_from_slice(values),
+        None => out.extend(std::iter::repeat_n(Value::Null, count)),
+    }
+}
+
+/// The tail of `row`: its last `tail` values.
+pub(crate) fn tail_of(row: &[Value], tail: usize) -> &[Value] {
+    split_tail(row, tail).1
+}
 
 /// A materialised result set: the schema the client is sent, then the rows.
 ///
@@ -88,3 +154,6 @@ pub enum ExecOutcome {
         line: u32,
     },
 }
+
+#[cfg(test)]
+mod tests;
