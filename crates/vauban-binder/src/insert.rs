@@ -141,6 +141,7 @@ use crate::errors::{line_of, on_the_statement};
 use crate::expr::{Scope, bind_condition, bind_expr};
 use crate::names::{check_object_exists, from_needs_the_catalogue};
 use crate::query::{bind_select, bug, dotted, not_implemented, not_yet, reread_table_arguments};
+use crate::setop::literal_entry_type;
 use crate::star::Source as RowSource;
 
 /// Binds an `INSERT` into [`BoundStatement::Insert`].
@@ -954,6 +955,11 @@ fn keeps_its_own_length(source: &TypeInfo, target: &TypeInfo) -> bool {
 /// columns. A row shorter than `position` is skipped, so that a caller which has yet to
 /// refuse rows of differing widths does not index out of bounds.
 ///
+/// An integer literal beside an exact numeric value of the position counts its own
+/// digits, as in a set operation: `VALUES (1), (2.5)` is a `numeric(2,1)`
+/// (`tests/bind_subquery.rs`,
+/// `a_values_column_takes_the_type_its_pair_takes_under_a_set_operation`).
+///
 /// # Errors
 ///
 /// 206 on `line` when two values of the position have no type in common.
@@ -962,19 +968,20 @@ pub(crate) fn common_value_type(
     position: usize,
     line: u32,
 ) -> SqlResult<Option<TypeInfo>> {
+    let values: Vec<&BoundExpr> = rows
+        .iter()
+        .filter_map(|row| row.get(position))
+        .filter(|value| !is_untyped_null(value))
+        .collect();
+    let exact = values.iter().any(|value| value.ty.ty.is_exact_numeric());
     let mut common: Option<TypeInfo> = None;
-    for row in rows {
-        let Some(value) = row.get(position) else {
-            continue;
-        };
-        if is_untyped_null(value) {
-            continue;
-        }
+    for value in values {
+        let entry = literal_entry_type(value, exact);
         common = Some(match common {
-            None => value.ty.clone(),
+            None => entry,
             Some(so_far) => {
                 check_pair(&so_far, &value.ty, line)?;
-                implicit_result_type(&so_far, &value.ty).unwrap_or(so_far)
+                implicit_result_type(&so_far, &entry).unwrap_or(so_far)
             }
         });
     }

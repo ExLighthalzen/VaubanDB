@@ -10,7 +10,7 @@ use vauban_binder::{
 use vauban_errors::SqlError;
 use vauban_parser::{ParseOptions, parse_batch};
 use vauban_sysfn::register_builtins;
-use vauban_types::SqlType;
+use vauban_types::{Len, SqlType};
 
 /// Binds the first statement of `text` and returns its plan.
 fn plan(text: &str) -> LogicalPlan {
@@ -305,4 +305,316 @@ fn except_and_intersect_produce_a_set_op() {
 fn string_and_int_use_the_precedence() {
     let t = types("SELECT 'hello' UNION SELECT 1");
     assert_eq!(t, vec![(SqlType::Int, false)]);
+}
+
+// ---------------------------------------------------------------------------
+// The type of a run, over its operands
+// ---------------------------------------------------------------------------
+
+/// The column types of every `SELECT` under the set operation, left to right, read on the
+/// schema of each operand that is not itself a set operation.
+fn leaf_types(plan: &LogicalPlan) -> Vec<SqlType> {
+    let mut out = Vec::new();
+    collect_leaf_types(plan, &mut out);
+    out
+}
+
+fn collect_leaf_types(plan: &LogicalPlan, out: &mut Vec<SqlType>) {
+    match plan {
+        LogicalPlan::SetOp { left, right, .. } => {
+            collect_leaf_types(left, out);
+            collect_leaf_types(right, out);
+        }
+        LogicalPlan::Sort { input, .. } => collect_leaf_types(input, out),
+        other => out.push(other.schema().columns[0].ty.ty),
+    }
+}
+
+/// The type of a `UNION ALL` run is decided over all of its operands: integer literals
+/// count their digits against a decimal, and bare `NULL`s bring no type, however the tree
+/// is shaped.
+#[test]
+fn a_union_all_run_is_typed_over_its_operands() {
+    let numeric_2_1 = SqlType::Numeric {
+        precision: 2,
+        scale: 1,
+    };
+    assert_eq!(
+        types("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 2.5"),
+        vec![(numeric_2_1, false)]
+    );
+    assert_eq!(
+        leaf_types(&plan("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 2.5")),
+        vec![numeric_2_1; 3]
+    );
+    let varchar_1 = SqlType::VarChar(Len::Fixed(1));
+    for text in [
+        "SELECT NULL UNION ALL SELECT 'a'",
+        "SELECT NULL UNION ALL SELECT NULL UNION ALL SELECT 'a'",
+        "(SELECT NULL UNION ALL SELECT NULL) UNION ALL SELECT 'a'",
+        "SELECT NULL INTERSECT SELECT NULL UNION ALL SELECT 'a'",
+        "SELECT NULL UNION SELECT NULL UNION ALL SELECT 'a'",
+    ] {
+        assert_eq!(types(text), vec![(varchar_1, true)], "{text}");
+    }
+    // Bare NULLs alone stay int.
+    assert_eq!(
+        types("SELECT NULL UNION ALL SELECT NULL"),
+        vec![(SqlType::Int, true)]
+    );
+    // The lengths are those of the widest operand of the run.
+    assert_eq!(
+        types(
+            "SELECT CAST('ab' AS varchar(5)) UNION ALL SELECT N'abc' \
+             UNION ALL SELECT CAST('x' AS varchar(20))"
+        ),
+        vec![(SqlType::NVarChar(Len::Fixed(20)), true)]
+    );
+}
+
+/// Fifty branches are balanced by the parser; the type is still decided over the fifty,
+/// and each of them is converted to it.
+#[test]
+fn a_balanced_run_of_fifty_branches_is_typed_over_its_fifty_operands() {
+    let mut text = String::from("SELECT 1");
+    for i in 2..50 {
+        text.push_str(&format!(" UNION ALL SELECT {i}"));
+    }
+    text.push_str(" UNION ALL SELECT 2.5");
+    let numeric_3_1 = SqlType::Numeric {
+        precision: 3,
+        scale: 1,
+    };
+    let p = plan(&text);
+    assert_eq!(p.schema().columns[0].ty.ty, numeric_3_1);
+    assert_eq!(leaf_types(&p), vec![numeric_3_1; 50]);
+}
+
+/// A `UNION` run under a `UNION ALL` keeps its own type, which the outer run converts
+/// above the nested node: the deduplication happens on the strings.
+#[test]
+fn a_nested_run_is_converted_above_its_own_node() {
+    let p = plan("SELECT '1' UNION SELECT '01' UNION ALL SELECT 5");
+    let LogicalPlan::SetOp {
+        all: true,
+        left,
+        schema,
+        ..
+    } = p
+    else {
+        panic!("expected the UNION ALL at the root, got {p:?}");
+    };
+    assert_eq!(schema.columns[0].ty.ty, SqlType::Int);
+    let LogicalPlan::Project { input, exprs, .. } = *left else {
+        panic!("expected a projection above the nested UNION, got {left:?}");
+    };
+    assert!(matches!(exprs[0].expr.kind, BoundExprKind::Convert { .. }));
+    assert_eq!(exprs[0].expr.ty.ty, SqlType::Int);
+    let LogicalPlan::SetOp {
+        all: false, schema, ..
+    } = *input
+    else {
+        panic!("expected the nested UNION, got {input:?}");
+    };
+    assert_eq!(schema.columns[0].ty.ty, SqlType::VarChar(Len::Fixed(2)));
+
+    // A UNION run under a UNION ALL is typed on its own: its integers are no longer
+    // literals for the outer run.
+    assert_eq!(
+        types("SELECT 1 UNION SELECT 2 UNION ALL SELECT 2.5"),
+        vec![(
+            SqlType::Numeric {
+                precision: 11,
+                scale: 1
+            },
+            false
+        )]
+    );
+}
+
+/// `INTERSECT` and `EXCEPT` hand the digits of their left literal to the run above them.
+#[test]
+fn intersect_hands_its_left_literal_to_the_run_above() {
+    for (text, precision) in [
+        ("SELECT 12345 INTERSECT SELECT 1 UNION ALL SELECT 2.5", 6),
+        ("SELECT 1 INTERSECT SELECT 12345 UNION ALL SELECT 2.5", 2),
+        (
+            "SELECT CAST(1 AS int) INTERSECT SELECT 1 UNION ALL SELECT 2.5",
+            11,
+        ),
+        ("SELECT 1 EXCEPT SELECT 2 UNION ALL SELECT 2.5", 2),
+    ] {
+        assert_eq!(
+            plan(text).schema().columns[0].ty.ty,
+            SqlType::Numeric {
+                precision,
+                scale: 1
+            },
+            "{text}"
+        );
+    }
+}
+
+/// An exact numeric past 38 digits keeps its integral digits and gives up scale.
+#[test]
+fn a_wide_decimal_gives_up_scale() {
+    for (text, scale) in [
+        (
+            "SELECT CAST(1 AS decimal(35,0)) UNION ALL SELECT CAST(1 AS decimal(20,19))",
+            3,
+        ),
+        (
+            "SELECT CAST(1 AS decimal(38,0)) UNION ALL SELECT CAST(1 AS decimal(10,9)) \
+             UNION ALL SELECT CAST(1 AS decimal(5,2))",
+            0,
+        ),
+        (
+            "SELECT CAST(1 AS decimal(30,0)) UNION ALL SELECT CAST(1 AS decimal(10,9))",
+            8,
+        ),
+    ] {
+        assert_eq!(
+            plan(text).schema().columns[0].ty.ty,
+            SqlType::Decimal {
+                precision: 38,
+                scale
+            },
+            "{text}"
+        );
+    }
+}
+
+/// A clash between a date and an integer literal names the literal `int`, even beside a
+/// decimal where the literal counts its digits.
+#[test]
+fn a_clash_names_the_literal_as_an_int() {
+    let error = err("SELECT CAST('2020-01-01' AS date) UNION ALL SELECT 1 UNION ALL SELECT 2.5");
+    assert_eq!(error.number, 206);
+    assert!(error.message.contains("int"), "{}", error.message);
+    assert!(!error.message.contains("numeric"), "{}", error.message);
+}
+
+/// A signed integer literal counts its digits as the unsigned one does.
+#[test]
+fn a_negative_literal_counts_its_digits() {
+    for (text, precision) in [
+        ("SELECT 2.5 UNION ALL SELECT -7", 2),
+        ("SELECT -(7) UNION ALL SELECT 2.5", 2),
+        ("SELECT -(-7) UNION ALL SELECT 2.5", 2),
+        ("SELECT -9999 UNION ALL SELECT 2.5", 5),
+        ("SELECT -10000 UNION ALL SELECT 2.5", 7),
+        ("SELECT -12345 UNION ALL SELECT 2.5", 7),
+        ("SELECT -99999 UNION ALL SELECT 2.5", 7),
+        ("SELECT -123456 UNION ALL SELECT 2.5", 7),
+        ("SELECT -1234567 UNION ALL SELECT 2.5", 8),
+        ("SELECT -2147483647 UNION ALL SELECT 2.5", 11),
+        ("SELECT 12345 UNION ALL SELECT 2.5", 6),
+        ("SELECT -100 INTERSECT SELECT 1 UNION ALL SELECT 2.5", 4),
+    ] {
+        assert_eq!(
+            plan(text).schema().columns[0].ty.ty,
+            SqlType::Numeric {
+                precision,
+                scale: 1
+            },
+            "{text}"
+        );
+    }
+}
+
+/// A catalogue without tables, for a `FROM` over a table value constructor.
+struct NoTables;
+
+impl vauban_binder::CatalogView for NoTables {
+    fn resolve_table(
+        &self,
+        _name: &vauban_parser::ObjectName,
+        _database: &str,
+        _default_schema: &str,
+    ) -> Option<vauban_binder::ResolvedTable> {
+        None
+    }
+
+    fn view_definition(&self, _object: vauban_catalog::ObjectId) -> Option<&str> {
+        None
+    }
+
+    fn identity_column(
+        &self,
+        _object: vauban_catalog::ObjectId,
+    ) -> Option<vauban_catalog::ColumnId> {
+        None
+    }
+
+    fn computed_columns(&self, _object: vauban_catalog::ObjectId) -> Vec<vauban_catalog::ColumnId> {
+        Vec::new()
+    }
+
+    fn constraint_names_on_table(&self, _table: vauban_catalog::ObjectId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn primary_key_columns(&self, _table: vauban_catalog::ObjectId) -> Option<Vec<String>> {
+        None
+    }
+
+    fn unique_key_on(&self, _table: vauban_catalog::ObjectId, _columns: &[String]) -> bool {
+        false
+    }
+
+    fn classify_table_reference(
+        &self,
+        _name: &vauban_parser::ObjectName,
+        _database: &str,
+        _default_schema: &str,
+    ) -> vauban_binder::TableReferenceKind {
+        vauban_binder::TableReferenceKind::Unknown
+    }
+}
+
+/// Binds the first statement of `text` with a catalogue, so that a `FROM` binds.
+fn plan_with_from(text: &str) -> LogicalPlan {
+    register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default()).expect("the text parses");
+    let ctx = BindContext {
+        text,
+        catalog: Some(&NoTables),
+        database: "master",
+        default_schema: "dbo",
+        variables: &vauban_binder::NoVariables,
+        options: SessionOptions::default(),
+    };
+    match bind(&batch.statements[0], &ctx).expect("the statement binds") {
+        BoundStatement::Query(plan) => *plan,
+        other => panic!("expected a bound query, got {other:?}"),
+    }
+}
+
+/// A `SELECT DISTINCT` branch deduplicates in its own type: the conversion goes above its
+/// `Distinct`, on the left and on the right.
+#[test]
+fn a_distinct_branch_is_converted_above_its_distinct() {
+    let distinct = "SELECT DISTINCT v FROM (VALUES ('1'), ('01')) t(v)";
+    for text in [
+        format!("{distinct} UNION ALL SELECT 5"),
+        format!("SELECT 5 UNION ALL {distinct}"),
+    ] {
+        let LogicalPlan::SetOp { left, right, .. } = plan_with_from(&text) else {
+            panic!("expected a set operation for {text}");
+        };
+        let branch = if text.starts_with("SELECT DISTINCT") {
+            left
+        } else {
+            right
+        };
+        let LogicalPlan::Project { input, exprs, .. } = *branch else {
+            panic!("expected a projection above the DISTINCT branch of {text}");
+        };
+        assert!(matches!(exprs[0].expr.kind, BoundExprKind::Convert { .. }));
+        assert_eq!(exprs[0].expr.ty.ty, SqlType::Int);
+        assert!(
+            matches!(*input, LogicalPlan::Distinct(_)),
+            "{text}: {input:?}"
+        );
+    }
 }
