@@ -27,10 +27,20 @@ use std::time::{Duration, Instant};
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
-/// How long the port has to accept a connection after the start.
-const START_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long one client exchange may take.
-const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap, in seconds, on every wait for the server when `VAUBAN_TEST_TIMEOUT_SECS` is unset.
+/// Each wait ends on the event it observes, so a large cap costs nothing on an idle machine.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Raises (or lowers) that cap for a loaded machine.
+const TIMEOUT_ENV: &str = "VAUBAN_TEST_TIMEOUT_SECS";
+
+/// The cap on the waits of one test.
+fn wait_cap() -> Duration {
+    let secs = std::env::var(TIMEOUT_ENV)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 /// PRELOGIN packet type ([MS-TDS] 2.2.3.1.1).
 const PACKET_PRELOGIN: u8 = 0x12;
@@ -137,7 +147,8 @@ impl Running {
             .spawn()
             .expect("spawn the server");
 
-        let deadline = Instant::now() + START_TIMEOUT;
+        let cap = wait_cap();
+        let deadline = Instant::now() + cap;
         loop {
             if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
                 drop(stream);
@@ -153,7 +164,7 @@ impl Running {
             }
             assert!(
                 Instant::now() < deadline,
-                "port {port} did not accept a connection within {START_TIMEOUT:?}"
+                "port {port} did not accept a connection within {cap:?}"
             );
             sleep(Duration::from_millis(50));
         }
@@ -222,7 +233,7 @@ fn prelogin_packet(encryption: u8) -> Vec<u8> {
 /// server's response.
 fn negotiate_encryption(port: u16, client_encryption: u8) -> u8 {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-    stream.set_read_timeout(Some(IO_TIMEOUT)).expect("timeout");
+    stream.set_read_timeout(Some(wait_cap())).expect("timeout");
     stream
         .write_all(&prelogin_packet(client_encryption))
         .expect("send PRELOGIN");
@@ -396,7 +407,7 @@ async fn tiberius_login(port: u16, level: EncryptionLevel) -> Result<(), tiberiu
 
     let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
     tcp.set_nodelay(true)?;
-    let client = tokio::time::timeout(IO_TIMEOUT, Client::connect(config, tcp.compat_write()))
+    let client = tokio::time::timeout(wait_cap(), Client::connect(config, tcp.compat_write()))
         .await
         .expect("login within the timeout")?;
     client.close().await?;

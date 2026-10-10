@@ -26,10 +26,20 @@ use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use vauban_session::VERSION_BANNER;
 
-/// How long the port has to accept a connection after the start.
-const START_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long one client exchange may take.
-const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap, in seconds, on every wait for the server when `VAUBAN_TEST_TIMEOUT_SECS` is unset.
+/// Each wait ends on the event it observes, so a large cap costs nothing on an idle machine.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Raises (or lowers) that cap for a loaded machine.
+const TIMEOUT_ENV: &str = "VAUBAN_TEST_TIMEOUT_SECS";
+
+/// The cap on the waits of one test.
+fn wait_cap() -> Duration {
+    let secs = std::env::var(TIMEOUT_ENV)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 /// The port of the server of one test: `VAUBAN_TEST_PORT` when set, else `1433`, plus
 /// `offset`. Offsets `30..=39` belong to this file (see the module documentation).
@@ -60,7 +70,8 @@ impl Running {
         let port = port(offset);
         let mut child = spawn_serve(port, extra_env);
 
-        let deadline = Instant::now() + START_TIMEOUT;
+        let cap = wait_cap();
+        let deadline = Instant::now() + cap;
         loop {
             if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
                 drop(stream);
@@ -76,7 +87,7 @@ impl Running {
             }
             assert!(
                 Instant::now() < deadline,
-                "port {port} did not accept a connection within {START_TIMEOUT:?}"
+                "port {port} did not accept a connection within {cap:?}"
             );
             sleep(Duration::from_millis(50));
         }
@@ -139,14 +150,15 @@ struct Refused {
     stderr: String,
 }
 
-/// Spawns `serve` with `extra_env` and waits for it to exit, at most [`START_TIMEOUT`].
+/// Spawns `serve` with `extra_env` and waits for it to exit, at most [`wait_cap`].
 ///
 /// The port is passed but not bound when the configuration is refused: the check runs before
 /// the listener. A server still alive at the deadline is killed and the test fails — that is
 /// exactly the bug this covers, a faulty identity accepted at startup.
 fn refused_startup(offset: u16, extra_env: &[(&str, &str)]) -> Refused {
     let mut child = spawn_serve(port(offset), extra_env);
-    let deadline = Instant::now() + START_TIMEOUT;
+    let cap = wait_cap();
+    let deadline = Instant::now() + cap;
     loop {
         match child.try_wait().expect("try_wait") {
             Some(status) => {
@@ -161,7 +173,7 @@ fn refused_startup(offset: u16, extra_env: &[(&str, &str)]) -> Refused {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!("the server was still running {START_TIMEOUT:?} after the start");
+                    panic!("the server was still running {cap:?} after the start");
                 }
                 sleep(Duration::from_millis(50));
             }
@@ -182,7 +194,7 @@ async fn query_first_string(port: u16, query: &str) -> Result<String, tiberius::
 
     let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
     tcp.set_nodelay(true)?;
-    let mut client = tokio::time::timeout(IO_TIMEOUT, Client::connect(config, tcp.compat_write()))
+    let mut client = tokio::time::timeout(wait_cap(), Client::connect(config, tcp.compat_write()))
         .await
         .expect("login within the timeout")?;
     let row = client

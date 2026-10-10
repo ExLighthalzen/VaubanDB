@@ -27,9 +27,20 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use vauban_storage::{DiskOptions, DiskStorage, Row, Snapshot, Storage, TxnId};
 use vauban_types::{SqlString, Value};
 
-/// How long the port has to accept a connection after the start, and the process to exit
-/// after a SIGINT.
-const WAIT: Duration = Duration::from_secs(30);
+/// Cap, in seconds, on every wait for the server when `VAUBAN_TEST_TIMEOUT_SECS` is unset.
+/// Each wait ends on the event it observes, so a large cap costs nothing on an idle machine.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Raises (or lowers) that cap for a loaded machine.
+const TIMEOUT_ENV: &str = "VAUBAN_TEST_TIMEOUT_SECS";
+
+/// The cap on the waits of one test.
+fn wait_cap() -> Duration {
+    let secs = std::env::var(TIMEOUT_ENV)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 /// The port of the server of one test: `VAUBAN_TEST_PORT` when set, else `1433`, plus
 /// `offset`.
@@ -107,6 +118,7 @@ impl Running {
             .spawn()
             .expect("spawn the server");
         let started = Instant::now();
+        let cap = wait_cap();
         loop {
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {
                 break;
@@ -118,8 +130,8 @@ impl Running {
                 );
             }
             assert!(
-                started.elapsed() < WAIT,
-                "port {port} did not accept a connection within {WAIT:?}\n{}",
+                started.elapsed() < cap,
+                "port {port} did not accept a connection within {cap:?}\n{}",
                 fs::read_to_string(log).unwrap_or_default()
             );
             sleep(Duration::from_millis(50));
@@ -140,14 +152,12 @@ impl Running {
             .expect("run kill");
         assert!(sent.success(), "kill -INT failed: {sent}");
         let started = Instant::now();
+        let cap = wait_cap();
         loop {
             if child.try_wait().expect("try_wait").is_some() {
                 return;
             }
-            assert!(
-                started.elapsed() < WAIT,
-                "no exit within {WAIT:?} of SIGINT"
-            );
+            assert!(started.elapsed() < cap, "no exit within {cap:?} of SIGINT");
             sleep(Duration::from_millis(50));
         }
     }
@@ -542,15 +552,16 @@ fn a_directory_of_another_catalogue_shape_is_refused_before_listening() {
         .spawn()
         .expect("spawn the server");
     let started = Instant::now();
+    let cap = wait_cap();
     let status = loop {
         if let Some(status) = child.try_wait().expect("try_wait") {
             break status;
         }
-        if started.elapsed() > WAIT {
+        if started.elapsed() > cap {
             let _ = child.kill();
             let _ = child.wait();
             panic!(
-                "the server did not exit within {WAIT:?}\n{}",
+                "the server did not exit within {cap:?}\n{}",
                 fs::read_to_string(&log).unwrap_or_default()
             );
         }
