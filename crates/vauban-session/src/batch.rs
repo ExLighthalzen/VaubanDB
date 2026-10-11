@@ -828,11 +828,7 @@ impl Session {
             }
             Err(error) => return Err(error),
         };
-        if let BoundStatement::Declare(declarations) = &bound {
-            for declaration in declarations {
-                batch_variables.declare(&declaration.name, declaration.ty.clone())?;
-            }
-        }
+        batch_variables.declare_held_by(&bound)?;
         if let BoundStatement::Execute(execute) = bound {
             return Ok(PreparedStatement::Execute {
                 stmt: execute,

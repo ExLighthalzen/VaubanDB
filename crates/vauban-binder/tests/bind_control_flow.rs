@@ -4,8 +4,8 @@
 //! The bound nodes derive no `PartialEq`: a shape is checked by pattern matching.
 
 use vauban_binder::{
-    BindContext, BoundExprKind, BoundStatement, CatalogView, ColumnBinding, NoVariables,
-    ResolvedTable, ResolvedTableKind, SessionOptions, bind,
+    BatchVariables, BindContext, BoundExprKind, BoundStatement, CatalogView, ColumnBinding,
+    NoVariables, ResolvedTable, ResolvedTableKind, SessionOptions, VariableScope, bind,
 };
 use vauban_catalog::{ColumnId, ObjectId, TableId};
 use vauban_errors::SqlError;
@@ -700,4 +700,104 @@ fn a_goto_in_a_branch_binds_with_the_branch() {
         matches!(then_.as_ref(), BoundStatement::Goto { label } if label == "again"),
         "then_ is the Goto, got {then_:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A DECLARE held by IF, WHILE or BEGIN … END
+// ---------------------------------------------------------------------------
+
+/// Binds every statement of `text` in order against one [`BatchVariables`], entering
+/// after each statement the declarations it carries at any depth, as the session does.
+/// Answers the bound statements and the scope at the end, or the first error.
+fn bind_batch(text: &str) -> Result<(Vec<BoundStatement>, BatchVariables), SqlError> {
+    register_builtins();
+    let batch = parse_batch(text, &ParseOptions::default())
+        .unwrap_or_else(|e| unreachable!("{text} parses, got {e:?}"));
+    let mut variables = BatchVariables::new();
+    let mut bound = Vec::new();
+    for statement in &batch.statements {
+        let ctx = BindContext {
+            variables: &variables,
+            ..BindContext::scalar(text, SessionOptions::default())
+        };
+        let one = bind(statement, &ctx)?;
+        variables.declare_held_by(&one)?;
+        bound.push(one);
+    }
+    Ok((bound, variables))
+}
+
+/// The shapes where a `DECLARE` written in an `IF`, an `ELSE`, a `WHILE` body or a
+/// `BEGIN … END` is read after it, in its block or after the block, the branch taken or
+/// not. Each binds without 137.
+const DECLARED_IN_A_BLOCK: [&str; 13] = [
+    "if 1=0 begin declare @x int; select @x end else select 0",
+    "IF 1 = 1 BEGIN DECLARE @x int = 5; SELECT @x END ELSE SELECT 0",
+    "IF 1 = 0 DECLARE @x int; SELECT @x",
+    "BEGIN DECLARE @x int = 1; END SELECT @x",
+    "IF 1 = 0 BEGIN DECLARE @x int = 7; END SELECT @x",
+    "WHILE 1 = 0 BEGIN DECLARE @y int; END SELECT @y",
+    "IF 1 = 0 DECLARE @a int ELSE SET @a = 1; SELECT @a",
+    "IF 1 = 1 SELECT 1 ELSE BEGIN DECLARE @w int = 3; END SELECT @w",
+    "IF 1 = 0 BEGIN IF 1 = 1 BEGIN DECLARE @n nvarchar(10) = N'x'; END END SELECT @n, @n + N'!'",
+    "IF 1 = 0 BEGIN DECLARE @q int; END SET @q = 4; SELECT @q",
+    "IF 1 = 0 BEGIN DECLARE @d decimal(5,2); END SET @d = 1.239; SELECT @d",
+    "DECLARE @c int = 0; WHILE @c < 2 BEGIN SET @c += 1; IF @c = 1 CONTINUE; \
+     DECLARE @late int = 9; END SELECT @late",
+    "DECLARE @i int = 0; WHILE @i < 3 BEGIN DECLARE @k int = 0; SET @k = @k + 1; \
+     SET @i += 1; END SELECT @k",
+];
+
+/// Each shape of [`DECLARED_IN_A_BLOCK`] binds, where reading the variable answered 137
+/// while a `DECLARE` held by a control-of-flow statement entered no scope.
+#[test]
+fn a_declare_inside_a_control_of_flow_statement_is_seen_after_it() {
+    for text in DECLARED_IN_A_BLOCK {
+        if let Err(error) = bind_batch(text) {
+            panic!("{text} should bind, got {error:?}");
+        }
+    }
+}
+
+/// `@d`, declared `decimal(5,2)` in a branch not taken, keeps that type after the block:
+/// the scope holds it, and the `SELECT @d` after the block returns a `decimal(5,2)`.
+#[test]
+fn a_variable_declared_in_a_block_keeps_its_declared_type() {
+    let text = "IF 1 = 0 BEGIN DECLARE @d decimal(5,2); END SET @d = 1.239; SELECT @d";
+    let (bound, variables) = bind_batch(text).unwrap_or_else(|e| panic!("binds, got {e:?}"));
+    let decimal_5_2 = SqlType::Decimal {
+        precision: 5,
+        scale: 2,
+    };
+    assert_eq!(variables.type_of("@d").map(|ty| ty.ty), Some(decimal_5_2));
+    let BoundStatement::Query(plan) = &bound[2] else {
+        panic!("SELECT @d binds to a query, got {:?}", bound[2]);
+    };
+    assert_eq!(plan.schema().columns[0].ty.ty, decimal_5_2);
+}
+
+/// A second `DECLARE` of a name the batch already declared is 134, whether the two are
+/// in the same block or the first one is in a block written before the second.
+#[test]
+fn a_second_declare_inside_or_after_a_block_is_134() {
+    for text in [
+        "IF 1 = 1 BEGIN DECLARE @d int; DECLARE @d int; END",
+        "IF 1 = 0 BEGIN DECLARE @e int; END DECLARE @e int; SELECT 1",
+        "DECLARE @x int; IF 1 = 1 BEGIN DECLARE @x int; END",
+    ] {
+        let error = bind_batch(text)
+            .err()
+            .unwrap_or_else(|| panic!("{text} should answer 134"));
+        assert_eq!(error.number, 134, "{text}: {error:?}");
+    }
+}
+
+/// A variable read before its `DECLARE` is still 137: the scope runs from the declaration
+/// on, not over the whole batch.
+#[test]
+fn a_variable_read_before_its_declare_is_still_137() {
+    let error = bind_batch("SELECT @z; DECLARE @z int;")
+        .err()
+        .unwrap_or_else(|| panic!("should answer 137"));
+    assert_eq!(error.number, 137);
 }

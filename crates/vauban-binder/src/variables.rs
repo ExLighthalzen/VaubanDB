@@ -5,10 +5,24 @@
 //!
 //! The binder binds **one statement at a time** against a [`VariableScope`] it reads and
 //! does not write. [`bind_declare`] answers a [`BoundStatement::Declare`] and enters
-//! nothing into the scope: it is the caller (the session, or a test) that, on that answer,
-//! calls [`BatchVariables::declare`] for each declaration before it binds the next
-//! statement. There is no interior mutability in [`BatchVariables`], so a
-//! `&dyn VariableScope` handed to a [`BindContext`] does not change under the binder.
+//! nothing into the scope: it is the caller (the session, or a test) that, on the bound
+//! statement, calls [`BatchVariables::declare_held_by`] before it binds the next
+//! statement. That call enters the declarations of a `DECLARE` written at the head of the
+//! batch and those an `IF`, a `WHILE` or a `BEGIN … END` hold at any depth among the
+//! statements bound with the batch: such a variable is in scope from its `DECLARE` to the
+//! end of the batch, inside its block and after it, the branch taken or not. A `DECLARE`
+//! held by a statement bound only when it runs (a `BoundStatement::Deferred`, such as an
+//! `IF` whose condition reads a table created earlier in the block) enters nothing
+//! (`tests/bind_control_flow.rs`,
+//! `a_declare_inside_a_control_of_flow_statement_is_seen_after_it`). There is no interior
+//! mutability in [`BatchVariables`], so a `&dyn VariableScope` handed to a
+//! [`BindContext`] does not change under the binder.
+//!
+//! Inside one control-of-flow statement, the statements it holds are bound in written
+//! order (`THEN` before `ELSE`) against a scope that reads first the declarations written
+//! earlier in that statement, then the caller's (`control.rs`). A second `DECLARE` of a
+//! name among the statements bound with the batch is therefore 134, inside or after the
+//! block (`tests/bind_control_flow.rs`, `a_second_declare_inside_or_after_a_block_is_134`).
 //!
 //! A consequence the caller relies on: within one `DECLARE`, a later initial value does not
 //! see an earlier item of the same statement. `DECLARE @a int = 1, @b int = @a;` answers
@@ -141,6 +155,45 @@ impl BatchVariables {
         }
         self.positions.insert(key, self.declared.len());
         self.declared.push((name.to_owned(), ty));
+        Ok(())
+    }
+
+    /// Enters the declarations `stmt` carries: those of a [`BoundStatement::Declare`], and
+    /// those of the `DECLARE` statements an `IF`, its `ELSE`, a `WHILE` body or a
+    /// `BEGIN … END` hold, at any depth, in written order.
+    ///
+    /// The scope of a variable is the batch from the point it is declared, whether the
+    /// `DECLARE` is written at the head of the batch or inside a block, and whether its
+    /// branch is taken or not: `IF 1 = 0 BEGIN DECLARE @x int = 7; END SELECT @x;` reads
+    /// `@x` at `NULL` (`tests/bind_control_flow.rs`,
+    /// `a_declare_inside_a_control_of_flow_statement_is_seen_after_it`). A
+    /// [`BoundStatement::Deferred`] is not read: what it would declare is not known before it
+    /// is bound.
+    ///
+    /// # Errors
+    ///
+    /// Error 134 when a name is already in the scope, as [`BatchVariables::declare`].
+    pub fn declare_held_by(&mut self, stmt: &BoundStatement) -> SqlResult<()> {
+        match stmt {
+            BoundStatement::Declare(declarations) => {
+                for declaration in declarations {
+                    self.declare(&declaration.name, declaration.ty.clone())?;
+                }
+            }
+            BoundStatement::If { then_, else_, .. } => {
+                self.declare_held_by(then_)?;
+                if let Some(else_) = else_ {
+                    self.declare_held_by(else_)?;
+                }
+            }
+            BoundStatement::While { body, .. } => self.declare_held_by(body)?,
+            BoundStatement::Block(statements) => {
+                for statement in statements {
+                    self.declare_held_by(statement)?;
+                }
+            }
+            _ => {}
+        }
         Ok(())
     }
 

@@ -29,6 +29,19 @@
 //! (`a_condition_over_a_missing_table_is_still_208`). Written one level down, that same
 //! condition travels with its own `IF`, which this file defers as one statement
 //! (`a_condition_of_a_nested_if_is_deferred_with_it`).
+//!
+//! # A `DECLARE` a block holds
+//!
+//! The statements an `IF … ELSE`, a `WHILE` or a `BEGIN … END` hold are bound in written
+//! order, `THEN` before `ELSE`, against a [`DeclaredEarlier`] scope: the declarations the
+//! statements before them in the same control-of-flow statement carry, at any depth among
+//! the statements bound with it (a `BoundStatement::Deferred` carries none), then the scope
+//! of the caller. A variable declared in a block is thus seen by the statements
+//! after it in that block, by the `ELSE` after a `THEN` that declares it, and, once the
+//! caller enters the bound statement with [`BatchVariables::declare_held_by`], by the rest
+//! of the batch (`tests/bind_control_flow.rs`,
+//! `a_declare_inside_a_control_of_flow_statement_is_seen_after_it`). A name declared twice
+//! is 134 (`a_second_declare_inside_or_after_a_block_is_134`).
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -38,9 +51,10 @@ use vauban_parser::{Expr, Ident, Statement};
 use vauban_types::{Len, SqlType, TypeInfo};
 
 use crate::bound::{BoundExpr, BoundExprKind, BoundStatement, DeferredStatement};
-use crate::context::BindContext;
+use crate::context::{BindContext, VariableScope};
 use crate::expr::{Scope, bind_condition, bind_expr};
 use crate::statement;
+use crate::variables::BatchVariables;
 
 /// State of the 2714 a `CREATE TABLE` or a `SELECT … INTO` answers for a name the
 /// catalogue resolves ([`SqlError::object_already_exists`]).
@@ -117,6 +131,48 @@ thread_local! {
     static WHILE_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
+/// The scope the statements of one control-of-flow statement are bound against: what the
+/// statements before them in it declared, then the scope of the caller (module header).
+struct DeclaredEarlier<'a> {
+    /// The scope of the caller.
+    outer: &'a dyn VariableScope,
+    /// The declarations of the statements already bound, in written order.
+    earlier: BatchVariables,
+}
+
+impl<'a> DeclaredEarlier<'a> {
+    /// No declaration yet, over the scope of `ctx`.
+    fn over(ctx: &BindContext<'a>) -> Self {
+        Self {
+            outer: ctx.variables,
+            earlier: BatchVariables::new(),
+        }
+    }
+
+    /// Binds `stmt` against this scope, then enters what it declares.
+    fn bind(&mut self, stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement> {
+        let inner = BindContext {
+            text: ctx.text,
+            catalog: ctx.catalog,
+            database: ctx.database,
+            default_schema: ctx.default_schema,
+            variables: &*self,
+            options: ctx.options,
+        };
+        let bound = bind_nested(stmt, &inner)?;
+        self.earlier.declare_held_by(&bound)?;
+        Ok(bound)
+    }
+}
+
+impl VariableScope for DeclaredEarlier<'_> {
+    fn type_of(&self, name: &str) -> Option<TypeInfo> {
+        self.earlier
+            .type_of(name)
+            .or_else(|| self.outer.type_of(name))
+    }
+}
+
 /// Binds one statement written inside a control-of-flow statement, keeping it unbound when
 /// its binding answers one of [`BOUND_WHEN_REACHED`] (module header).
 fn bind_nested(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement> {
@@ -142,8 +198,9 @@ pub(crate) fn bind_if(
     ctx: &BindContext<'_>,
 ) -> SqlResult<BoundStatement> {
     let condition = bind_condition(condition, ctx, &Scope::empty())?;
-    let then_ = bind_nested(then_branch, ctx)?;
-    let else_ = else_branch.map(|s| bind_nested(s, ctx)).transpose()?;
+    let mut scope = DeclaredEarlier::over(ctx);
+    let then_ = scope.bind(then_branch, ctx)?;
+    let else_ = else_branch.map(|s| scope.bind(s, ctx)).transpose()?;
     Ok(BoundStatement::If {
         condition,
         then_: Box::new(then_),
@@ -176,8 +233,9 @@ pub(crate) fn bind_block(
     statements: &[Statement],
     ctx: &BindContext<'_>,
 ) -> SqlResult<BoundStatement> {
+    let mut scope = DeclaredEarlier::over(ctx);
     let bound: SqlResult<Vec<BoundStatement>> =
-        statements.iter().map(|s| bind_nested(s, ctx)).collect();
+        statements.iter().map(|s| scope.bind(s, ctx)).collect();
     Ok(BoundStatement::Block(bound?))
 }
 

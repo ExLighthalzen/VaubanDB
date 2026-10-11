@@ -3,9 +3,7 @@
 
 use std::collections::HashMap;
 
-use vauban_binder::{
-    BatchVariables, BindContext, BoundExprKind, BoundStatement, resolve_declared_type,
-};
+use vauban_binder::{BatchVariables, BindContext, BoundExprKind, resolve_declared_type};
 use vauban_catalog::CatalogSnapshot;
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{DataType, ParameterDeclaration, Statement, parse_batch};
@@ -448,11 +446,7 @@ fn bind_prepared_one(
         options,
     };
     let bound = vauban_binder::bind(statement, &ctx)?;
-    if let BoundStatement::Declare(declarations) = &bound {
-        for declaration in declarations {
-            batch_variables.declare(&declaration.name, declaration.ty.clone())?;
-        }
-    }
+    batch_variables.declare_held_by(&bound)?;
     let indexes = SnapshotIndexes {
         storage: session.engine().storage.as_ref(),
         snapshot,

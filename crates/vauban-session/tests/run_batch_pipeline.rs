@@ -2216,3 +2216,43 @@ fn a_dynamic_text_runs_its_calls_and_its_jumps_in_place() {
         assert_eq!(rows(&events), values, "{text}");
     }
 }
+
+/// A `DECLARE` an `IF`, a `WHILE` or a `BEGIN … END` holds puts its variable in scope for
+/// the rest of the batch, the branch taken or not, with the value its run left: `NULL` and
+/// the `ELSE` for a branch not taken, the initial value for one taken, the value of a
+/// `DECLARE` run on a later turn of a loop, and a later `SET` after a block not run.
+#[test]
+fn a_declare_held_by_a_block_is_in_scope_for_the_rest_of_the_batch() {
+    for (batch, expected) in [
+        (
+            "if 1=0 begin declare @x int; select @x end else select 0",
+            Value::I32(0),
+        ),
+        (
+            "IF OBJECT_ID(N'sys.sp_MSIsContainedAGSession', N'P') IS NOT NULL BEGIN DECLARE @x int; \
+             EXECUTE @x = sys.sp_MSIsContainedAGSession; SELECT @x END ELSE SELECT 0",
+            Value::I32(0),
+        ),
+        (
+            "IF 1 = 1 BEGIN DECLARE @x int = 5; SELECT @x END ELSE SELECT 0",
+            Value::I32(5),
+        ),
+        (
+            "DECLARE @c int = 0; WHILE @c < 2 BEGIN SET @c += 1; IF @c = 1 CONTINUE; \
+             DECLARE @late int = 9; END SELECT @late",
+            Value::I32(9),
+        ),
+        (
+            "IF 1 = 0 BEGIN DECLARE @q int; END SET @q = 4; SELECT @q",
+            Value::I32(4),
+        ),
+    ] {
+        let events = run(batch);
+        assert!(
+            !events.iter().any(|event| matches!(event, Event::Error(_))),
+            "{batch}: {events:#?}"
+        );
+        assert_eq!(rows(&events), vec![vec![expected]], "{batch}");
+        assert_eq!(columns(&events, 0)[0].ty.ty, SqlType::Int, "{batch}");
+    }
+}

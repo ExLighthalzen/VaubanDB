@@ -960,3 +960,34 @@ fn a_prepare_waits_for_an_uncommitted_alter_of_its_table() {
         vec![Event::Columns, Event::Row(int(1)), Event::Row(int(2))]
     );
 }
+
+/// A prepared text that declares a variable inside a `BEGIN … END` and reads it after the
+/// block is accepted by `sp_prepare`, and `sp_execute` answers the value the block left.
+#[test]
+fn a_variable_declared_in_a_block_of_a_prepared_text_is_read_after_it() {
+    let mut session = session();
+    let mut sink = Recording::default();
+    let mut prepare = prepare_rpc_of("@P1 int");
+    prepare.params[2].value = nvarchar("BEGIN DECLARE @y int = @P1; END SELECT @y AS n");
+    session.run_rpc(&prepare, &mut sink).expect("prepare");
+    assert!(
+        !sink.0.iter().any(|event| matches!(event, Event::Error(_))),
+        "{:?}",
+        sink.0
+    );
+    sink.0.clear();
+    session
+        .run_rpc(&execute_rpc(1, 7), &mut sink)
+        .expect("execute");
+    assert!(
+        !sink.0.iter().any(|event| matches!(event, Event::Error(_))),
+        "{:?}",
+        sink.0
+    );
+    let rows: Vec<&Event> = sink
+        .0
+        .iter()
+        .filter(|event| matches!(event, Event::Row(_)))
+        .collect();
+    assert_eq!(rows, vec![&Event::Row(int(7))]);
+}
