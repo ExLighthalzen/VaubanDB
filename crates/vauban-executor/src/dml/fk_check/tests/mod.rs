@@ -132,8 +132,8 @@ fn a_foreign_key_another_transaction_has_not_committed_is_not_checked() {
                     columns: vec!["a".to_owned()],
                     referenced: name("p"),
                     referenced_columns: vec!["a".to_owned()],
-                    on_delete: vauban_parser::RefAction::NoAction,
-                    on_update: vauban_parser::RefAction::NoAction,
+                    on_delete: vauban_catalog::RefAction::NoAction,
+                    on_update: vauban_catalog::RefAction::NoAction,
                 }),
             },
         )

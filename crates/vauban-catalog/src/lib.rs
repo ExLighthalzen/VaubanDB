@@ -50,7 +50,7 @@ mod table;
 mod views;
 
 pub use catalog::Catalog;
-pub use def::{AlterTable, ColumnDef, ConstraintDef, IndexDef, SortedColumn, TableDef};
+pub use def::{AlterTable, ColumnDef, ConstraintDef, IndexDef, RefAction, SortedColumn, TableDef};
 pub use ids::{ColumnId, ObjectId};
 pub use meta::{
     ColumnMeta, ConstraintMeta, DatabaseMeta, DatabaseOption, IdentitySpec, IndexMeta, ObjectKind,

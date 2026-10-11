@@ -546,8 +546,8 @@ fn keyed(name: &str, references: Option<&str>) -> TableDef {
             columns: vec!["parent".to_owned()],
             referenced: tbl_name(referenced),
             referenced_columns: vec!["id".to_owned()],
-            on_delete: vauban_parser::RefAction::NoAction,
-            on_update: vauban_parser::RefAction::NoAction,
+            on_delete: vauban_catalog::RefAction::NoAction,
+            on_update: vauban_catalog::RefAction::NoAction,
         });
     }
     TableDef {

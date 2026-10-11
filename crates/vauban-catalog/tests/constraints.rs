@@ -12,11 +12,11 @@
 
 use std::sync::Arc;
 
+use vauban_catalog::RefAction;
 use vauban_catalog::{
     AlterTable, Catalog, ColumnDef, ConstraintDef, ConstraintMeta, ObjectId, ObjectKind,
     QualifiedName, SortedColumn, TableDef, TableMeta,
 };
-use vauban_parser::{Expr, Literal, RefAction, Span};
 use vauban_storage::{DbId, MemoryStorage, Storage};
 use vauban_txn::{IsolationLevel, TransactionManager, TxnHandle};
 use vauban_types::{SqlType, TypeInfo};
@@ -106,9 +106,10 @@ fn foreign_key(
     }
 }
 
-/// The integer literal `value`, the simplest expression a `CHECK` or a `DEFAULT` carries.
-fn integer(value: &str) -> Expr {
-    Expr::Literal(Literal::Integer(value.to_owned()), Span::EMPTY)
+/// The stored text of the integer literal `value`, the simplest expression a `CHECK` or a
+/// `DEFAULT` carries.
+fn integer(value: &str) -> String {
+    format!("(({value}))")
 }
 
 /// The parent table `<name>` with a clustered `PRIMARY KEY` on `id`, created and committed.
@@ -622,7 +623,7 @@ fn default_constraint_carries_the_column_ordinal() {
 }
 
 #[test]
-fn a_check_keeps_its_expression_and_its_text() {
+fn a_check_keeps_its_text() {
     let (catalog, storage, txn) = instance();
     let _ = master(&storage);
     let handle = begin(&txn);
@@ -639,16 +640,13 @@ fn a_check_keeps_its_expression_and_its_text() {
             ),
         )
         .expect("the check");
-    let ConstraintMeta::Check {
-        expr, definition, ..
-    } = meta.constraints.first().expect("the constraint is stored")
+    let ConstraintMeta::Check { definition, .. } =
+        meta.constraints.first().expect("the constraint is stored")
     else {
         panic!("the constraint is a check");
     };
-    // The text is the normalised one, a number between parentheses inside the outer pair,
-    // and the tree is the one read back from it.
+    // The text the caller wrote is the text the constraint holds.
     assert_eq!(definition, "((1))");
-    assert_eq!(expr.to_string(), "((1))");
 }
 
 #[test]

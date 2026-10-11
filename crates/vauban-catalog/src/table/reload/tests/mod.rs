@@ -106,8 +106,10 @@ fn sorted(name: &str, descending: bool) -> SortedColumn {
     }
 }
 
-fn value(text: &str) -> vauban_parser::Expr {
-    parse_stored_expression(text, ExpressionKind::Value).expect("a value")
+/// The stored text `text`, as the binder writes it for a `DEFAULT`, a `CHECK` or a computed
+/// column.
+fn value(text: &str) -> String {
+    text.to_owned()
 }
 
 /// `parent (id int PRIMARY KEY, code varchar(10) UNIQUE)`.
@@ -142,9 +144,9 @@ fn child() -> TableDef {
         increment: 5,
     });
     let mut status = column("status", SqlType::TinyInt, false);
-    status.default = Some(value("7"));
+    status.default = Some(value("((7))"));
     let mut doubled = column("doubled", SqlType::Int, true);
-    doubled.computed = Some(value("qty * 2"));
+    doubled.computed = Some(value("([qty]*(2))"));
     let mut label = column("label", SqlType::NVarChar(Len::Fixed(20)), true);
     label.ty.collation = Some(Collation::parse("Latin1_General_BIN").expect("a collation"));
     TableDef {
@@ -182,13 +184,12 @@ fn child() -> TableDef {
             },
             ConstraintDef::Check {
                 name: Some("ck_child_qty".to_owned()),
-                expr: parse_stored_expression("qty > 0", ExpressionKind::Predicate)
-                    .expect("a predicate"),
+                expr: value("([qty]>(0))"),
             },
             ConstraintDef::Default {
                 name: Some("df_child_created".to_owned()),
                 column: "created".to_owned(),
-                expr: value("getdate()"),
+                expr: value("(getdate())"),
             },
         ],
     }
@@ -329,8 +330,7 @@ fn the_counter_starts_past_every_stored_identifier() {
         constraints: (0..10)
             .map(|bound| ConstraintDef::Check {
                 name: None,
-                expr: parse_stored_expression(&format!("a > {bound}"), ExpressionKind::Predicate)
-                    .expect("a predicate"),
+                expr: format!("([a]>({bound}))"),
             })
             .collect(),
     };
@@ -650,8 +650,7 @@ fn a_foreign_key_whose_index_has_gone_is_left_out() {
                     },
                     ConstraintDef::Check {
                         name: Some("ck_f".to_owned()),
-                        expr: parse_stored_expression("x > 0", ExpressionKind::Predicate)
-                            .expect("a predicate"),
+                        expr: value("([x]>(0))"),
                     },
                 ],
             },

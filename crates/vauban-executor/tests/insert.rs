@@ -11,7 +11,7 @@ use vauban_binder::{
 use vauban_catalog::{Catalog, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, TableDef};
 use vauban_errors::SqlResult;
 use vauban_executor::{ExecContext, ExecOutcome, ExecSession, RowSet, execute_collect};
-use vauban_parser::{BinaryOp, Expr, Literal, ParseOptions, Span, UnaryOp, parse_batch};
+use vauban_parser::{ParseOptions, parse_batch};
 use vauban_planner::{
     NoIndexes, PhysicalInsert, PhysicalPlan, PhysicalStatement, PlanContext, plan,
 };
@@ -223,7 +223,7 @@ impl Fixture {
 }
 
 /// One column, with the `DEFAULT` expression it carries and nothing else.
-fn column(name: &str, ty: TypeInfo, default: Option<Expr>) -> ColumnDef {
+fn column(name: &str, ty: TypeInfo, default: Option<String>) -> ColumnDef {
     ColumnDef {
         name: name.to_owned(),
         ty,
@@ -245,18 +245,9 @@ fn insert_one(table: TableId, bindings: &[ColumnBinding], row: Vec<Value>) -> Ph
     })
 }
 
-/// A literal `Expr` of the AST, as a `DEFAULT` constraint holds it.
-fn default_of(literal: Literal) -> Expr {
-    Expr::Literal(literal, Span::EMPTY)
-}
-
-/// `- expr`, the shape the parser gives `DEFAULT -5`.
-fn negated(expr: Expr) -> Expr {
-    Expr::Unary {
-        op: UnaryOp::Minus,
-        expr: Box::new(expr),
-        span: Span::EMPTY,
-    }
+/// The stored text of a `DEFAULT`, as the catalogue holds it: `((7))` for `DEFAULT 7`.
+fn stored(text: &str) -> String {
+    text.to_owned()
 }
 
 // ---------------------------------------------------------------
@@ -374,10 +365,7 @@ fn missing_column_takes_its_default() {
                     ColumnDef {
                         name: "b".to_owned(),
                         ty: int(false),
-                        default: Some(Expr::Literal(
-                            Literal::Integer("42".to_owned()),
-                            Span::EMPTY,
-                        )),
+                        default: Some("((42))".to_owned()),
                         identity: None,
                         computed: None,
                     },
@@ -464,7 +452,7 @@ fn missing_column_takes_its_named_default() {
                 constraints: vec![ConstraintDef::Default {
                     name: Some("df_b".to_owned()),
                     column: "b".to_owned(),
-                    expr: Expr::Literal(Literal::Integer("42".to_owned()), Span::EMPTY),
+                    expr: "((42))".to_owned(),
                 }],
             },
         )
@@ -896,14 +884,7 @@ fn a_default_literal_too_long_for_the_column_is_2628() {
         "insert_trunc_default",
         vec![
             column("k", int(false), None),
-            column(
-                "d",
-                varchar(2, false),
-                Some(default_of(Literal::Str {
-                    value: "abcd".to_owned(),
-                    unicode: false,
-                })),
-            ),
+            column("d", varchar(2, false), Some(stored("('abcd')"))),
         ],
     );
     let err = f
@@ -1329,11 +1310,7 @@ fn a_written_null_does_not_fall_back_to_the_default() {
         "insert_null_over_default",
         vec![
             column("k", int(false), None),
-            column(
-                "d",
-                int(false),
-                Some(default_of(Literal::Integer("7".to_owned()))),
-            ),
+            column("d", int(false), Some(stored("((7))"))),
         ],
     );
     let k = col_binding(0, "k", int(false));
@@ -1367,7 +1344,7 @@ fn a_null_default_on_a_not_null_column_is_refused() {
         "insert_null_default",
         vec![
             column("k", int(true), None),
-            column("d", int(false), Some(default_of(Literal::Null))),
+            column("d", int(false), Some(stored("(NULL)"))),
         ],
     );
     let err = f
@@ -1400,29 +1377,10 @@ fn signed_and_binary_defaults() {
         "insert_defaults_signed",
         vec![
             column("k", int(false), None),
-            column(
-                "neg",
-                int(false),
-                Some(negated(default_of(Literal::Integer("5".to_owned())))),
-            ),
-            column(
-                "bin",
-                one_byte.clone(),
-                Some(default_of(Literal::Binary("01".to_owned()))),
-            ),
-            column(
-                "dec",
-                money.clone(),
-                Some(negated(default_of(Literal::Decimal("1.25".to_owned())))),
-            ),
-            column(
-                "par",
-                int(false),
-                Some(Expr::Nested(
-                    Box::new(default_of(Literal::Integer("8".to_owned()))),
-                    Span::EMPTY,
-                )),
-            ),
+            column("neg", int(false), Some(stored("((-5))"))),
+            column("bin", one_byte.clone(), Some(stored("(0x01)"))),
+            column("dec", money.clone(), Some(stored("((-1.25))"))),
+            column("par", int(false), Some(stored("((8))"))),
         ],
     );
     let k = col_binding(0, "k", int(false));
@@ -1464,17 +1422,7 @@ fn a_non_literal_default_is_evaluated() {
         "insert_defaults_arith",
         vec![
             column("k", int(true), None),
-            column(
-                "d",
-                int(false),
-                Some(Expr::Binary {
-                    op: BinaryOp::Add,
-                    op_span: Span::EMPTY,
-                    left: Box::new(default_of(Literal::Integer("1".to_owned()))),
-                    right: Box::new(default_of(Literal::Integer("1".to_owned()))),
-                    span: Span::EMPTY,
-                }),
-            ),
+            column("d", int(false), Some(stored("((1)+(1))"))),
         ],
     );
     f.run_sql("CREATE TABLE dbo.insert_defaults_calls (k int NULL, at datetime2 NOT NULL DEFAULT SYSDATETIME(), id uniqueidentifier NOT NULL DEFAULT NEWID());")

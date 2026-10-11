@@ -38,7 +38,8 @@
 use std::collections::HashMap;
 
 use vauban_binder::{
-    BindContext, BoundExpr, BoundStatement, CatalogView, DdlStatement, LogicalPlan, bind,
+    BindContext, BoundExpr, BoundStatement, CatalogView, DdlStatement, ExpressionKind, LogicalPlan,
+    bind, parse_stored_expression,
 };
 use vauban_catalog::{
     AlterTable, Catalog, CatalogSnapshot, ColumnDef, ColumnMeta, ConstraintDef, ObjectId,
@@ -83,7 +84,8 @@ pub(crate) fn execute_alter_table(
             if let AlterTable::AddConstraint { constraint } = action
                 && let ConstraintDef::Check { name, expr } = constraint.as_ref()
             {
-                refuse_check_violated_by_existing_rows(meta, &snap, database, name, expr, ctx)?;
+                let expr = parse_stored_expression(expr, ExpressionKind::Predicate)?;
+                refuse_check_violated_by_existing_rows(meta, &snap, database, name, &expr, ctx)?;
             }
             let added = added_columns(action);
             let outcome = if added.is_empty() {
@@ -269,6 +271,7 @@ impl<'a> NewDefaults<'a> {
         let mut bound = HashMap::new();
         for column in columns {
             if let Some(default) = &column.default {
+                let default = parse_stored_expression(default, ExpressionKind::Value)?;
                 let text = format!("SELECT {default};");
                 let plan = bind_query(&text, None, "master", ctx)?;
                 let LogicalPlan::Project { exprs, .. } = plan else {

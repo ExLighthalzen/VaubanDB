@@ -741,10 +741,7 @@ fn an_uncommitted_check_is_seen_by_its_transaction_alone() {
                 &vauban_catalog::AlterTable::AddConstraint {
                     constraint: Box::new(ConstraintDef::Check {
                         name: Some("ck".to_owned()),
-                        expr: vauban_parser::Expr::Literal(
-                            vauban_parser::Literal::Integer("1".to_owned()),
-                            vauban_parser::Span::EMPTY,
-                        ),
+                        expr: "((1))".to_owned(),
                     }),
                 },
             )
@@ -1676,8 +1673,8 @@ fn the_resolved_tables_are_the_user_tables_a_name_reached() {
             name: "parent".to_owned(),
         },
         referenced_columns: vec!["a".to_owned()],
-        on_delete: vauban_parser::RefAction::NoAction,
-        on_update: vauban_parser::RefAction::NoAction,
+        on_delete: vauban_catalog::RefAction::NoAction,
+        on_update: vauban_catalog::RefAction::NoAction,
     }];
     let child = table(&catalog, &manager, &child_def);
 

@@ -87,7 +87,8 @@
 //! `SELECT 'a' COLLATE …`.
 
 use vauban_catalog::{
-    ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, SortedColumn, TableDef,
+    ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, RefAction as CatalogAction,
+    SortedColumn, TableDef,
 };
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{
@@ -110,6 +111,7 @@ use crate::insert::unbracket_type_names;
 use crate::names::from_needs_the_catalogue;
 use crate::query::not_yet;
 use crate::star::Source;
+use crate::stored_text::{ExpressionKind, stored_text};
 
 /// Binds `CREATE DATABASE d [options]`.
 ///
@@ -482,6 +484,7 @@ pub(crate) fn bind_create_table(
     let pk_clustered = primary_key_clustered_by_default(stmt);
     let mut columns = Vec::with_capacity(stmt.definition.columns.len());
     let mut constraints = Vec::new();
+    let mut deferred = None;
     for (index, column) in stmt.definition.columns.iter().enumerate() {
         // `#<n>` of message 2715 is 1-based and counts the columns of the statement, whatever
         // their type (`ddl::tests::unknown_type_2715_numbers_the_column_and_names_the_statement`).
@@ -494,12 +497,25 @@ pub(crate) fn bind_create_table(
                     .with_line(stmt.span.line),
             );
         }
-        let (def, column_constraints) = column_of(column, position, &stmt.span, pk_clustered, ctx)?;
+        let (def, column_constraints) = column_of(
+            column,
+            position,
+            &stmt.span,
+            pk_clustered,
+            ctx,
+            &mut deferred,
+        )?;
         columns.push(def);
         constraints.extend(column_constraints);
     }
     for constraint in &stmt.definition.constraints {
-        constraints.push(table_constraint(constraint, pk_clustered, ctx, &stmt.span)?);
+        constraints.push(table_constraint(
+            constraint,
+            pk_clustered,
+            ctx,
+            &stmt.span,
+            &mut deferred,
+        )?);
     }
     // After the column list and before the nullability of the key (`ddl_index.rs`).
     refuse_duplicate_key_column(&constraints, stmt.span.line)?;
@@ -531,6 +547,9 @@ pub(crate) fn bind_create_table(
         return Err(
             SqlError::object_already_exists(&stmt.name.name.value).with_line(stmt.span.line)
         );
+    }
+    if let Some(err) = deferred {
+        return Err(err);
     }
 
     Ok(BoundStatement::Ddl(DdlStatement::CreateTable {
@@ -762,7 +781,7 @@ pub(crate) fn written(name: &ObjectName) -> String {
 /// [`ConstraintDef::Default`] so that the name the client chose survives to
 /// `sys.default_constraints`. Neither is evaluated here: [`bind_create_table`] binds each
 /// expression and refuses the shapes [`check_default_expression`] lists, and the catalogue
-/// holds the `parser::Expr`.
+/// holds the text [`stored_text_or_defer`] writes for it.
 ///
 /// # Errors
 ///
@@ -778,6 +797,7 @@ fn column_of(
     statement: &Span,
     pk_clustered: bool,
     ctx: &BindContext<'_>,
+    deferred: &mut Option<SqlError>,
 ) -> SqlResult<(ColumnDef, Vec<ConstraintDef>)> {
     if column.computed.is_some() {
         // Before the type is resolved: `AS a + 1` writes no type, and `parse_column_def` fills
@@ -801,13 +821,14 @@ fn column_of(
             ColumnConstraintKind::Null => nullable = true,
             ColumnConstraintKind::NotNull => nullable = false,
             ColumnConstraintKind::Default(expr) => {
+                let text = stored_text_or_defer(expr, ExpressionKind::Value, deferred);
                 if name.is_none() && default.is_none() {
-                    default = Some(expr.clone());
+                    default = Some(text);
                 } else {
                     constraints.push(ConstraintDef::Default {
                         name,
                         column: column.name.value.clone(),
-                        expr: expr.clone(),
+                        expr: text,
                     });
                 }
             }
@@ -836,7 +857,7 @@ fn column_of(
             }
             ColumnConstraintKind::Check { expr, .. } => constraints.push(ConstraintDef::Check {
                 name,
-                expr: expr.clone(),
+                expr: stored_text_or_defer(expr, ExpressionKind::Predicate, deferred),
             }),
             ColumnConstraintKind::RowGuidCol => {
                 return Err(SqlError::from(InternalError::Bug(format!(
@@ -862,7 +883,7 @@ fn column_of(
                     .increment
                     .unwrap_or(IdentitySpec::default().increment),
             }),
-            computed: column.computed.clone(),
+            computed: None,
         },
         constraints,
     ))
@@ -880,6 +901,7 @@ fn table_constraint(
     pk_clustered: bool,
     ctx: &BindContext<'_>,
     span: &Span,
+    deferred: &mut Option<SqlError>,
 ) -> SqlResult<ConstraintDef> {
     let name = constraint.name.as_ref().map(|ident| ident.value.clone());
     Ok(match &constraint.kind {
@@ -908,9 +930,37 @@ fn table_constraint(
         )?,
         TableConstraintKind::Check { expr, .. } => ConstraintDef::Check {
             name,
-            expr: expr.clone(),
+            expr: stored_text_or_defer(expr, ExpressionKind::Predicate, deferred),
         },
     })
+}
+
+/// The text the catalogue stores for `expr` ([`stored_text`]). When it cannot be written,
+/// the error is kept in `deferred` for the end of the statement, so that the refusals the
+/// binding of the expression raises come first, and the text is empty.
+pub(crate) fn stored_text_or_defer(
+    expr: &Expr,
+    kind: ExpressionKind,
+    deferred: &mut Option<SqlError>,
+) -> String {
+    match stored_text(expr, kind) {
+        Ok(text) => text,
+        Err(err) => {
+            deferred.get_or_insert(err);
+            String::new()
+        }
+    }
+}
+
+/// The action of the catalogue for the `ON DELETE` or `ON UPDATE` a statement wrote,
+/// `NO ACTION` for a clause left out.
+pub(crate) fn catalog_action(action: Option<RefAction>) -> CatalogAction {
+    match action {
+        None | Some(RefAction::NoAction) => CatalogAction::NoAction,
+        Some(RefAction::Cascade) => CatalogAction::Cascade,
+        Some(RefAction::SetNull) => CatalogAction::SetNull,
+        Some(RefAction::SetDefault) => CatalogAction::SetDefault,
+    }
 }
 
 /// A `FOREIGN KEY` / `REFERENCES`, with the actions the statement left out filled with the
@@ -956,8 +1006,8 @@ fn foreign_key(
             .iter()
             .map(|ident| ident.value.clone())
             .collect(),
-        on_delete: reference.on_delete.unwrap_or(RefAction::NoAction),
-        on_update: reference.on_update.unwrap_or(RefAction::NoAction),
+        on_delete: catalog_action(reference.on_delete),
+        on_update: catalog_action(reference.on_update),
     })
 }
 

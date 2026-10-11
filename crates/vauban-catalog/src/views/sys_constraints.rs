@@ -42,10 +42,8 @@
 //!
 //! `constraints.rs` stores them: the object of a constraint carries its identifier and its
 //! name, and the [`ConstraintMeta`] carries the identifier, the flag `is_system_named`
-//! publishes and, for a `CHECK`, the text of its definition. The `definition` of a `DEFAULT`
-//! is `definition_text` (`meta.rs`) of the tree the constraint holds, which gives back the
-//! text that tree was read from (`meta.rs`, unit test
-//! `the_text_of_a_stored_tree_is_the_stored_text`). The four builders read those
+//! publishes and, for a `CHECK` and a `DEFAULT`, the stored text of its definition, published
+//! as it is. The four builders read those
 //! fields, and take the objects beside the tables to write the name a statement wrote (unit
 //! tests `foreign_key_row_when_tabledef_has_one`, `check_constraint_row_stores_the_expression`,
 //! `a_row_falls_back_on_the_generated_name_without_its_object`).
@@ -75,16 +73,15 @@
 use std::collections::BTreeMap;
 
 use vauban_errors::{InternalError, SqlResult};
-use vauban_parser::{Expr, InList, RefAction};
 use vauban_storage::{DbId, IndexId, Row};
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
 use crate::bootstrap::{SYSTEM_DATABASES, SYSTEM_SCHEMAS};
-use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
+use crate::def::{InternalColumnDef, InternalTableDef, RefAction, SystemViewDef};
 use crate::ids::ColumnId;
 use crate::ids::ObjectId;
 use crate::index::IndexStore;
-use crate::meta::{ColumnMeta, ConstraintMeta, QualifiedName, TableMeta, definition_text};
+use crate::meta::{ColumnMeta, ConstraintMeta, QualifiedName, TableMeta, column_names};
 
 /// Internal table of the foreign keys, read by `sys.foreign_keys`.
 ///
@@ -488,7 +485,6 @@ pub(crate) fn check_constraint_rows(
             let ConstraintMeta::Check {
                 constraint: object,
                 system_named,
-                expr,
                 definition,
             } = constraint
             else {
@@ -500,7 +496,7 @@ pub(crate) fn check_constraint_rows(
                 table,
                 *object,
                 names.get(object).map(String::as_str).unwrap_or(&generated),
-                check_parent_column_id(table, expr),
+                check_parent_column_id(table, definition),
                 definition,
                 *system_named,
             ));
@@ -509,16 +505,15 @@ pub(crate) fn check_constraint_rows(
     Ok(rows)
 }
 
-/// The `parent_column_id` SQL Server publishes for the `CHECK` predicate `expr` of `table`:
-/// the identifier of the one column it names, [`TABLE_LEVEL_COLUMN`] when it names zero or
-/// several distinct columns of `table` (module documentation; unit tests
+/// The `parent_column_id` SQL Server publishes for the `CHECK` whose stored text is
+/// `definition`: the identifier of the one column it names, [`TABLE_LEVEL_COLUMN`] when it
+/// names zero or several distinct columns of `table` (module documentation; unit tests
 /// `check_constraint_row_stores_the_expression`,
-/// `a_table_level_check_names_zero_or_two_columns`).
-fn check_parent_column_id(table: &TableMeta, expr: &Expr) -> i32 {
-    let mut names = Vec::new();
-    collect_column_names(expr, &mut names);
-    let mut ids: Vec<i32> = names
-        .into_iter()
+/// `a_table_level_check_names_zero_or_two_columns`). The names are those
+/// [`column_names`] reads in the text.
+fn check_parent_column_id(table: &TableMeta, definition: &str) -> i32 {
+    let mut ids: Vec<i32> = column_names(definition)
+        .iter()
         .filter_map(|name| column_id_by_name(table, name))
         .collect();
     ids.sort_unstable();
@@ -526,92 +521,6 @@ fn check_parent_column_id(table: &TableMeta, expr: &Expr) -> i32 {
     match ids.as_slice() {
         [only] => *only,
         _ => TABLE_LEVEL_COLUMN,
-    }
-}
-
-/// The column names `expr` mentions, in no particular order, duplicates included:
-/// [`check_parent_column_id`] is the one reader, and reduces the list to how many distinct
-/// columns of the table they resolve to.
-///
-/// [`Expr::Exists`], [`Expr::Subquery`] and the subquery arm of [`Expr::In`] carry a
-/// [`vauban_parser::SelectStatement`] rather than columns of `table`, so they contribute
-/// nothing rather than being walked.
-fn collect_column_names<'e>(expr: &'e Expr, into: &mut Vec<&'e str>) {
-    match expr {
-        Expr::Literal(..)
-        | Expr::Variable { .. }
-        | Expr::NextValueFor { .. }
-        | Expr::InvalidNiladic { .. }
-        | Expr::Placeholder(_)
-        | Expr::Exists(..)
-        | Expr::Subquery(..) => {}
-        Expr::Column(column) => into.push(column.name.value.as_str()),
-        Expr::Binary { left, right, .. } => {
-            collect_column_names(left, into);
-            collect_column_names(right, into);
-        }
-        Expr::Unary { expr, .. }
-        | Expr::Nested(expr, _)
-        | Expr::Cast { expr, .. }
-        | Expr::IsNull { expr, .. }
-        | Expr::Collate { expr, .. }
-        | Expr::Quantified { expr, .. }
-        | Expr::Assign { value: expr, .. } => collect_column_names(expr, into),
-        Expr::Convert { expr, style, .. } => {
-            collect_column_names(expr, into);
-            if let Some(style) = style {
-                collect_column_names(style, into);
-            }
-        }
-        Expr::Function { args, .. } => {
-            for arg in args {
-                collect_column_names(arg, into);
-            }
-        }
-        Expr::Case {
-            operand,
-            arms,
-            else_,
-            ..
-        } => {
-            if let Some(operand) = operand {
-                collect_column_names(operand, into);
-            }
-            for arm in arms {
-                collect_column_names(&arm.when, into);
-                collect_column_names(&arm.then, into);
-            }
-            if let Some(else_) = else_ {
-                collect_column_names(else_, into);
-            }
-        }
-        Expr::In { expr, list, .. } => {
-            collect_column_names(expr, into);
-            if let InList::Exprs(exprs) = list {
-                for item in exprs {
-                    collect_column_names(item, into);
-                }
-            }
-        }
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            collect_column_names(expr, into);
-            collect_column_names(pattern, into);
-            if let Some(escape) = escape {
-                collect_column_names(escape, into);
-            }
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            collect_column_names(expr, into);
-            collect_column_names(low, into);
-            collect_column_names(high, into);
-        }
     }
 }
 
@@ -652,7 +561,7 @@ pub(crate) fn default_constraint_rows(
                 constraint: object,
                 system_named,
                 column,
-                expr,
+                definition,
             } = constraint
             else {
                 continue;
@@ -666,12 +575,12 @@ pub(crate) fn default_constraint_rows(
                 *object,
                 names.get(object).map(String::as_str).unwrap_or(&generated),
                 column.0,
-                &definition_text(expr),
+                definition,
                 *system_named,
             ));
         }
         for (position, column) in table.columns.iter().enumerate() {
-            let Some(expr) = &column.default else {
+            let Some(definition) = &column.default else {
                 continue;
             };
             if published.contains(&column.id) {
@@ -689,7 +598,7 @@ pub(crate) fn default_constraint_rows(
                     table.constraints.len() + position,
                 ),
                 column.id.0,
-                &definition_text(expr),
+                definition,
                 true,
             ));
         }
@@ -1010,8 +919,8 @@ fn views_of(name: &str, definition: &str) -> Vec<SystemViewDef> {
 /// item whose expression is its own name written bare, the others as
 /// `<expression> AS <name>`. The three files each hold their own copy of this helper. The 62
 /// column names of the four views are written bare, where `sys.columns`
-/// has to bracket its `precision` (unit test `each_definition_parses_as_one_select`, which
-/// sends the four texts through `vauban_parser::parse_batch`).
+/// has to bracket its `precision` (`crates/vauban-binder/tests/system_view_definitions.rs`,
+/// `each_definition_parses_as_one_select`, which sends the four texts through the parser).
 fn definition(items: &[(&str, &str)], table: &str) -> String {
     let mut text = String::from("SELECT ");
     for (index, (name, expression)) in items.iter().enumerate() {
@@ -1048,9 +957,6 @@ fn text(value: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use vauban_parser::{
-        BinaryOp, ColumnRef, Ident, Literal, ParseOptions, Span, Statement, parse_batch,
-    };
     use vauban_storage::{DbId, TableId};
 
     use crate::ids::ObjectId;
@@ -1272,7 +1178,7 @@ mod tests {
     }
 
     /// A column of a [`TableMeta`], at `position` from `0`, with the default given.
-    fn meta_column(position: usize, name: &str, default: Option<Expr>) -> ColumnMeta {
+    fn meta_column(position: usize, name: &str, default: Option<String>) -> ColumnMeta {
         let ordinal = u16::try_from(position).expect("a test table is narrow");
         ColumnMeta {
             id: ColumnId(i32::from(ordinal) + 1),
@@ -1285,9 +1191,9 @@ mod tests {
         }
     }
 
-    /// The integer literal `value` as an [`Expr`].
-    fn integer(value: &str) -> Expr {
-        Expr::Literal(Literal::Integer(value.to_owned()), Span::EMPTY)
+    /// The stored text of the integer literal `value`, `((0))` for `0`.
+    fn integer(value: &str) -> String {
+        format!("(({value}))")
     }
 
     /// The definitions of the four views, by the name a client writes after `sys.`.
@@ -1643,22 +1549,6 @@ mod tests {
     }
 
     #[test]
-    fn each_definition_parses_as_one_select() {
-        // The four texts go through the parser: a column name that had to be bracketed, as
-        // the `precision` of `sys.columns` is in `views/sys_tables.rs`, would be refused
-        // here: a select list holding a bare `precision` is a syntax error of that parser.
-        for (name, definition) in definitions() {
-            let batch = parse_batch(&definition, &ParseOptions::default())
-                .unwrap_or_else(|err| panic!("sys.{name}: {}", err.message));
-            assert_eq!(batch.statements.len(), 1, "sys.{name}");
-            assert!(
-                matches!(batch.statements[0], Statement::Select(_)),
-                "sys.{name} is a SELECT"
-            );
-        }
-    }
-
-    #[test]
     fn each_view_reads_its_own_internal_table() {
         // The two constraint tables share their shape, so this test is what ties a view to
         // the table that carries it: `sys.default_constraints` reading the table of the
@@ -1832,38 +1722,13 @@ mod tests {
         );
     }
 
-    /// A reference to the column `name`, unqualified.
-    fn column_ref(name: &str) -> Expr {
-        Expr::Column(ColumnRef {
-            qualifier: None,
-            name: Ident {
-                value: name.to_owned(),
-                quoted: false,
-            },
-            span: Span::EMPTY,
-        })
-    }
-
-    /// `left op right`, both boxed.
-    fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
-        Expr::Binary {
-            op,
-            op_span: Span::EMPTY,
-            left: Box::new(left),
-            right: Box::new(right),
-            span: Span::EMPTY,
-        }
-    }
-
     #[test]
     fn check_constraint_row_stores_the_expression() {
         let mut target = table("tbl011_check", &["id", "amount"]);
-        let expr = binary(BinaryOp::Ge, column_ref("amount"), integer("0"));
         target.constraints.push(ConstraintMeta::Check {
             constraint: ObjectId(1_000_501),
             system_named: false,
-            expr: expr.clone(),
-            definition: definition_text(&expr),
+            definition: "([amount]>=(0))".to_owned(),
         });
         let rows =
             check_constraint_rows(&[target], &named(1_000_501, "ck_tbl011_check")).expect("rows");
@@ -1875,10 +1740,8 @@ mod tests {
             row[constraint_columns::PARENT_OBJECT_ID],
             Value::I32(1_000_000)
         );
-        // The text stored is the normalised form of the expression, `([amount]>=(0))` for
-        // `CHECK (amount >= 0)`.
+        // The text stored is published as it is.
         assert_eq!(row[constraint_columns::DEFINITION], text("([amount]>=(0))"));
-        assert_eq!(definition_text(&expr), "([amount]>=(0))");
         // The predicate names one column of `target`, `amount`, at position 2 (`id` is 1):
         // SQL Server resolves a single-column `CHECK` to that column (module documentation).
         assert_eq!(row[constraint_columns::PARENT_COLUMN_ID], Value::I32(2));
@@ -1895,12 +1758,10 @@ mod tests {
         // zero: `parent_column_id` answers 0 on both, the value a table-level constraint
         // carries (module documentation).
         let mut two_columns = table("tbl011_pair", &["a", "b"]);
-        let expr = binary(BinaryOp::Lt, column_ref("a"), column_ref("b"));
         two_columns.constraints.push(ConstraintMeta::Check {
             constraint: ObjectId(1_000_506),
             system_named: true,
-            expr: expr.clone(),
-            definition: definition_text(&expr),
+            definition: "([a]<[b])".to_owned(),
         });
         let rows = check_constraint_rows(&[two_columns], &BTreeMap::new()).expect("rows");
         assert_eq!(
@@ -1909,12 +1770,10 @@ mod tests {
         );
 
         let mut no_column = table("tbl011_none", &["a"]);
-        let expr = binary(BinaryOp::Eq, integer("1"), integer("1"));
         no_column.constraints.push(ConstraintMeta::Check {
             constraint: ObjectId(1_000_507),
             system_named: true,
-            expr: expr.clone(),
-            definition: definition_text(&expr),
+            definition: "((1)=(1))".to_owned(),
         });
         let rows = check_constraint_rows(&[no_column], &BTreeMap::new()).expect("rows");
         assert_eq!(
@@ -1953,13 +1812,13 @@ mod tests {
             constraint: ObjectId(1_000_502),
             system_named: true,
             column: ColumnId(2),
-            expr: integer("0"),
+            definition: integer("0"),
         });
         target.constraints.push(ConstraintMeta::Default {
             constraint: ObjectId(1_000_503),
             system_named: true,
             column: ColumnId(1),
-            expr: integer("7"),
+            definition: integer("7"),
         });
         let rows = default_constraint_rows(&[target], &BTreeMap::new()).expect("rows");
 
@@ -2061,7 +1920,6 @@ mod tests {
         target.constraints.push(ConstraintMeta::Check {
             constraint: ObjectId(1_000_504),
             system_named: false,
-            expr: integer("1"),
             definition: "(1)".to_owned(),
         });
         let with = check_constraint_rows(
@@ -2084,7 +1942,6 @@ mod tests {
         target.constraints.push(ConstraintMeta::Check {
             constraint: ObjectId(1_000_505),
             system_named: true,
-            expr: integer("1"),
             definition: "(1)".to_owned(),
         });
         let rows = check_constraint_rows(&[target], &BTreeMap::new()).expect("rows");

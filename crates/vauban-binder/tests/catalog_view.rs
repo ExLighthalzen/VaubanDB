@@ -16,7 +16,7 @@ use vauban_catalog::{
     AlterTable, Catalog, CatalogSnapshot, ColumnDef, ObjectId, QualifiedName, TableDef,
 };
 use vauban_errors::{SqlError, SqlResult};
-use vauban_parser::{Expr, Ident, Literal, ObjectName, ParseOptions, Span, parse_batch};
+use vauban_parser::{Ident, ObjectName, ParseOptions, Span, parse_batch};
 use vauban_storage::{MemoryStorage, Storage};
 use vauban_sysfn::register_builtins;
 use vauban_txn::{IsolationLevel, TransactionManager};
@@ -228,7 +228,7 @@ fn identity_column_is_the_column_declared_identity() {
 #[test]
 fn computed_columns_lists_the_computed_column() {
     let fixture = Fixture::new();
-    let column = |name: &str, computed: Option<Expr>| ColumnDef {
+    let column = |name: &str, computed: Option<String>| ColumnDef {
         name: name.to_owned(),
         ty: TypeInfo::new(SqlType::Int, true),
         default: None,
@@ -241,13 +241,7 @@ fn computed_columns_lists_the_computed_column() {
             schema: "dbo".to_owned(),
             name: "c".to_owned(),
         },
-        columns: vec![
-            column("a", None),
-            column(
-                "b",
-                Some(Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY)),
-            ),
-        ],
+        columns: vec![column("a", None), column("b", Some("((1))".to_owned()))],
         constraints: Vec::new(),
     };
     let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);
@@ -482,44 +476,17 @@ fn object_expressions_reads_the_texts_and_the_names() {
     );
 }
 
-/// The tree of the value `text` as a statement writes it.
-fn value(text: &str) -> Expr {
-    let sql = format!("SELECT {text}");
-    let batch = parse_batch(&sql, &ParseOptions::default()).expect("parse");
-    let vauban_parser::Statement::Select(select) = &batch.statements[0] else {
-        panic!("{sql} is a SELECT");
-    };
-    let vauban_parser::QueryBody::Select(spec) = &select.body else {
-        panic!("{sql} is a query specification");
-    };
-    let vauban_parser::SelectItem::Expr { expr, .. } = &spec.items[0] else {
-        panic!("{sql} selects one expression");
-    };
-    expr.clone()
-}
-
 /// `c (a int, b AS a * 2, d int DEFAULT 7, CONSTRAINT ck_c CHECK (c.a >= 0 AND d < 100))`,
 /// created through [`Catalog::create_table`]: the binder does not bind a computed column
 /// yet.
 fn table_with_object_expressions() -> Fixture {
     let fixture = Fixture::new();
-    let column = |name: &str, default: Option<Expr>, computed: Option<Expr>| ColumnDef {
+    let column = |name: &str, default: Option<&str>, computed: Option<&str>| ColumnDef {
         name: name.to_owned(),
         ty: TypeInfo::new(SqlType::Int, true),
-        default,
+        default: default.map(str::to_owned),
         identity: None,
-        computed,
-    };
-    let check = parse_batch(
-        "SELECT 1 WHERE c.a >= 0 AND d < 100",
-        &ParseOptions::default(),
-    )
-    .expect("parse");
-    let vauban_parser::Statement::Select(select) = &check.statements[0] else {
-        panic!("a SELECT");
-    };
-    let vauban_parser::QueryBody::Select(spec) = &select.body else {
-        panic!("a query specification");
+        computed: computed.map(str::to_owned),
     };
     let def = TableDef {
         name: QualifiedName {
@@ -529,12 +496,12 @@ fn table_with_object_expressions() -> Fixture {
         },
         columns: vec![
             column("a", None, None),
-            column("b", None, Some(value("a * 2"))),
-            column("d", Some(value("7")), None),
+            column("b", None, Some("([a]*(2))")),
+            column("d", Some("((7))"), None),
         ],
         constraints: vec![vauban_catalog::ConstraintDef::Check {
             name: Some("ck_c".to_owned()),
-            expr: spec.where_.clone().expect("a WHERE"),
+            expr: "([c].[a]>=(0) AND [d]<(100))".to_owned(),
         }],
     };
     let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);

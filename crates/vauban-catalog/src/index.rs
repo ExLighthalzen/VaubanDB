@@ -1171,10 +1171,7 @@ mod tests {
         let err = table_keys(
             &def(vec![ConstraintDef::Check {
                 name: None,
-                expr: vauban_parser::Expr::Literal(
-                    vauban_parser::Literal::Integer("1".to_owned()),
-                    vauban_parser::Span::EMPTY,
-                ),
+                expr: "((1))".to_owned(),
             }]),
             &columns(),
         )

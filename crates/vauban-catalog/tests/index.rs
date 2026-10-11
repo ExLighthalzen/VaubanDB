@@ -563,8 +563,8 @@ fn a_foreign_key_to_an_unknown_table_names_1767() {
                         name: "other".to_owned(),
                     },
                     referenced_columns: vec!["a".to_owned()],
-                    on_delete: vauban_parser::RefAction::NoAction,
-                    on_update: vauban_parser::RefAction::NoAction,
+                    on_delete: vauban_catalog::RefAction::NoAction,
+                    on_update: vauban_catalog::RefAction::NoAction,
                 }],
             ),
         )
@@ -791,8 +791,8 @@ fn dropping_a_unique_index_a_foreign_key_points_at_is_3723_state_6() {
                         name: "r".to_owned(),
                     },
                     referenced_columns: vec!["b".to_owned()],
-                    on_delete: vauban_parser::RefAction::NoAction,
-                    on_update: vauban_parser::RefAction::NoAction,
+                    on_delete: vauban_catalog::RefAction::NoAction,
+                    on_update: vauban_catalog::RefAction::NoAction,
                 }],
             ),
         )

@@ -508,8 +508,8 @@ fn drop_constraint_binds_a_create_table_foreign_key() {
             name: "t1".to_owned(),
         },
         referenced_columns: vec!["id".to_owned()],
-        on_delete: vauban_parser::RefAction::NoAction,
-        on_update: vauban_parser::RefAction::NoAction,
+        on_delete: vauban_catalog::RefAction::NoAction,
+        on_update: vauban_catalog::RefAction::NoAction,
     });
     catalog.create_table(&handle, &t2).expect("create t2");
     txn.commit(handle).expect("commit create");
@@ -555,10 +555,7 @@ fn drop_constraint_binds_an_added_check() {
             &vauban_catalog::AlterTable::AddConstraint {
                 constraint: Box::new(ConstraintDef::Check {
                     name: Some("ck_t3".to_owned()),
-                    expr: vauban_parser::Expr::Literal(
-                        vauban_parser::Literal::Integer("1".to_owned()),
-                        vauban_parser::Span::EMPTY,
-                    ),
+                    expr: "((1))".to_owned(),
                 }),
             },
         )

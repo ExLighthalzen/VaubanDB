@@ -8,7 +8,6 @@
 use std::collections::BTreeSet;
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_parser::{Expr, InList};
 use vauban_storage::{IndexId, KeyColumn, Row, TableId};
 use vauban_txn::{CommitAction, RollbackAction, TxnHandle};
 use vauban_types::Value;
@@ -17,9 +16,7 @@ use crate::catalog::Catalog;
 use crate::def::{AlterTable, ColumnDef, ConstraintDef, IndexDef, SortedColumn, TableDef};
 use crate::ids::{ColumnId, ObjectId};
 use crate::index;
-use crate::meta::{
-    ColumnMeta, ConstraintMeta, ExpressionKind, QualifiedName, TableMeta, stored_expression,
-};
+use crate::meta::{ColumnMeta, ConstraintMeta, QualifiedName, TableMeta, column_names};
 use crate::table::{self, TableStore};
 
 /// The highest `column_id` already used on the table, live or dropped.
@@ -470,14 +467,11 @@ fn plan_add_column(
             old.name
         ))
     })?;
-    // The tree read back from the stored text, the one the column and its `DEFAULT` hold
-    // once `apply_table_constraints` has run (`meta.rs`, `stored_expression`); a `DEFAULT`
-    // that is not a literal, `GETDATE()`, is stored the same way (`tests/alter.rs`,
+    // The stored text, the one the column and its `DEFAULT` hold once
+    // `apply_table_constraints` has run; a `DEFAULT` that is not a literal, `GETDATE()`, is
+    // stored the same way (`tests/alter.rs`,
     // `add_nullable_column_with_a_getdate_default_is_accepted`).
-    let default = match &column.default {
-        Some(expr) => Some(stored_expression(expr, ExpressionKind::Value)?.1),
-        None => None,
-    };
+    let default = column.default.clone();
     *watermark += 1;
     columns.push(ColumnMeta {
         id: ColumnId(*watermark),
@@ -860,8 +854,13 @@ fn refuse_drop_column_used(
                 ));
             }
             ConstraintMeta::Check {
-                constraint, expr, ..
-            } if expr_mentions_column(expr, &target.name) => {
+                constraint,
+                definition,
+                ..
+            } if column_names(definition)
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&target.name)) =>
+            {
                 let name = constraint_object_name(store, *constraint)?;
                 return Err(SqlError::object_depends_on_column(
                     "object",
@@ -897,80 +896,6 @@ fn constraint_object_name(store: &TableStore, object: ObjectId) -> SqlResult<Str
             ))
             .into()
         })
-}
-
-fn expr_mentions_column(expr: &Expr, name: &str) -> bool {
-    match expr {
-        Expr::Column(column) => column.name.value.eq_ignore_ascii_case(name),
-        Expr::Binary { left, right, .. } => {
-            expr_mentions_column(left, name) || expr_mentions_column(right, name)
-        }
-        Expr::Unary { expr, .. } => expr_mentions_column(expr, name),
-        Expr::Nested(inner, _) => expr_mentions_column(inner, name),
-        Expr::Function { args, .. } => args.iter().any(|arg| expr_mentions_column(arg, name)),
-        Expr::Case {
-            operand,
-            arms,
-            else_,
-            ..
-        } => {
-            operand
-                .as_ref()
-                .is_some_and(|value| expr_mentions_column(value, name))
-                || arms.iter().any(|arm| {
-                    expr_mentions_column(&arm.when, name) || expr_mentions_column(&arm.then, name)
-                })
-                || else_
-                    .as_ref()
-                    .is_some_and(|value| expr_mentions_column(value, name))
-        }
-        Expr::Cast { expr, .. } | Expr::Collate { expr, .. } | Expr::IsNull { expr, .. } => {
-            expr_mentions_column(expr, name)
-        }
-        Expr::Convert { expr, style, .. } => {
-            expr_mentions_column(expr, name)
-                || style
-                    .as_ref()
-                    .is_some_and(|value| expr_mentions_column(value, name))
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            expr_mentions_column(expr, name)
-                || expr_mentions_column(low, name)
-                || expr_mentions_column(high, name)
-        }
-        Expr::In { expr, list, .. } => {
-            expr_mentions_column(expr, name)
-                || match list {
-                    InList::Exprs(values) => {
-                        values.iter().any(|value| expr_mentions_column(value, name))
-                    }
-                    InList::Subquery(_) => false,
-                }
-        }
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            expr_mentions_column(expr, name)
-                || expr_mentions_column(pattern, name)
-                || escape
-                    .as_ref()
-                    .is_some_and(|value| expr_mentions_column(value, name))
-        }
-        Expr::Quantified { expr, .. } => expr_mentions_column(expr, name),
-        Expr::Assign { value, .. } => expr_mentions_column(value, name),
-        Expr::Exists(..)
-        | Expr::Literal(..)
-        | Expr::Variable { .. }
-        | Expr::InvalidNiladic { .. }
-        | Expr::Subquery(..)
-        | Expr::NextValueFor { .. }
-        | Expr::Placeholder(..) => false,
-    }
 }
 
 fn key_constraint_uses_column(key: &ConstraintDef, column: ColumnId, table: &TableMeta) -> bool {

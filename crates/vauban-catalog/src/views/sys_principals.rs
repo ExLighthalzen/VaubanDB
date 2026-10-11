@@ -670,22 +670,6 @@ mod tests {
     }
 
     #[test]
-    fn the_four_definitions_parse() {
-        use vauban_parser::{ParseOptions, parse_batch};
-
-        for (name, definition) in [
-            ("database_principals", database_principals_definition()),
-            ("server_principals", server_principals_definition()),
-            ("database_role_members", database_role_members_definition()),
-            ("server_role_members", server_role_members_definition()),
-        ] {
-            let batch = parse_batch(&definition, &ParseOptions::default())
-                .unwrap_or_else(|err| panic!("sys.{name}: {}", err.message));
-            assert_eq!(batch.statements.len(), 1, "sys.{name}");
-        }
-    }
-
-    #[test]
     fn each_view_is_installed_in_the_four_system_databases() {
         for table in internal_tables() {
             let names: Vec<&str> = table

@@ -5,7 +5,6 @@ use std::sync::Arc;
 use vauban_catalog::{
     AlterTable, Catalog, ColumnDef, ConstraintDef, IdentitySpec, ObjectId, QualifiedName, TableDef,
 };
-use vauban_parser::{Expr, Literal, Span};
 use vauban_storage::{DbId, MemoryStorage, Row, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager, TxnHandle};
 use vauban_types::{Len, SqlType, TypeInfo, Value};
@@ -431,7 +430,7 @@ fn add_nullable_column_with_default_leaves_existing_rows_null() {
         .expect("create_table");
     insert_rows(&storage, &handle, meta.storage_id, &[(1, 2)]);
     let mut with_default = column("c", SqlType::Int, true);
-    with_default.default = Some(Expr::Literal(Literal::Integer("7".to_owned()), Span::EMPTY));
+    with_default.default = Some("((7))".to_owned());
     let altered = catalog
         .alter_table(
             &handle,
@@ -455,7 +454,7 @@ fn add_nullable_column_with_default_leaves_existing_rows_null() {
 fn add_nullable_column_with_a_getdate_default_is_accepted() {
     // `ALTER TABLE t ADD d datetime DEFAULT GETDATE()`: a default that is not a literal is
     // stored as the text `(getdate())`, the existing row keeps `NULL`, and the column holds
-    // the tree read back from that text.
+    // that text.
     let (catalog, storage, txn) = instance();
     let handle = begin(&txn);
     let meta = catalog
@@ -463,23 +462,7 @@ fn add_nullable_column_with_a_getdate_default_is_accepted() {
         .expect("create_table");
     insert_rows(&storage, &handle, meta.storage_id, &[(1, 2)]);
     let mut with_default = column("d", SqlType::DateTime, true);
-    with_default.default = Some(Expr::Function {
-        name: vauban_parser::ObjectName {
-            server: None,
-            database: None,
-            schema: None,
-            name: vauban_parser::Ident {
-                value: "GETDATE".to_owned(),
-                quoted: false,
-            },
-            span: Span::EMPTY,
-        },
-        args: Vec::new(),
-        star: false,
-        distinct: false,
-        over: None,
-        span: Span::EMPTY,
-    });
+    with_default.default = Some("(getdate())".to_owned());
     let altered = catalog
         .alter_table(
             &handle,
@@ -508,7 +491,7 @@ fn add_not_null_column_with_default_still_fills_existing_rows() {
         .expect("create_table");
     insert_rows(&storage, &handle, meta.storage_id, &[(1, 2)]);
     let mut with_default = column("c", SqlType::Int, false);
-    with_default.default = Some(Expr::Literal(Literal::Integer("7".to_owned()), Span::EMPTY));
+    with_default.default = Some("((7))".to_owned());
     let mut filled = Vec::new();
     let altered = catalog
         .alter_table_filling(
@@ -545,7 +528,7 @@ fn add_not_null_column_with_default_without_a_fill_is_an_internal_error() {
         .expect("create_table");
     insert_rows(&storage, &handle, meta.storage_id, &[(1, 2)]);
     let mut with_default = column("c", SqlType::Int, false);
-    with_default.default = Some(Expr::Literal(Literal::Integer("7".to_owned()), Span::EMPTY));
+    with_default.default = Some("((7))".to_owned());
     let err = catalog
         .alter_table(
             &handle,
@@ -794,23 +777,7 @@ fn drop_column_used_by_a_check_is_refused() {
             &AlterTable::AddConstraint {
                 constraint: Box::new(ConstraintDef::Check {
                     name: Some("ck".to_owned()),
-                    expr: Expr::Binary {
-                        op: vauban_parser::BinaryOp::Gt,
-                        op_span: Span::EMPTY,
-                        left: Box::new(Expr::Column(vauban_parser::ColumnRef {
-                            qualifier: None,
-                            name: vauban_parser::Ident {
-                                value: "a".to_owned(),
-                                quoted: false,
-                            },
-                            span: Span::EMPTY,
-                        })),
-                        right: Box::new(Expr::Literal(
-                            Literal::Integer("0".to_owned()),
-                            Span::EMPTY,
-                        )),
-                        span: Span::EMPTY,
-                    },
+                    expr: "([a]>(0))".to_owned(),
                 }),
             },
         )
@@ -864,23 +831,7 @@ fn add_check_constraint_becomes_an_object() {
             &AlterTable::AddConstraint {
                 constraint: Box::new(ConstraintDef::Check {
                     name: Some("ck".to_owned()),
-                    expr: Expr::Binary {
-                        op: vauban_parser::BinaryOp::Gt,
-                        op_span: Span::EMPTY,
-                        left: Box::new(Expr::Column(vauban_parser::ColumnRef {
-                            qualifier: None,
-                            name: vauban_parser::Ident {
-                                value: "a".to_owned(),
-                                quoted: false,
-                            },
-                            span: Span::EMPTY,
-                        })),
-                        right: Box::new(Expr::Literal(
-                            Literal::Integer("0".to_owned()),
-                            Span::EMPTY,
-                        )),
-                        span: Span::EMPTY,
-                    },
+                    expr: "([a]>(0))".to_owned(),
                 }),
             },
         )
@@ -898,7 +849,7 @@ fn add_check_does_not_duplicate_existing_default() {
     let (catalog, _storage, txn) = instance();
     let handle = begin(&txn);
     let mut bare = table("t_bare", vec![column("a", SqlType::Int, true)]);
-    bare.columns[0].default = Some(Expr::Literal(Literal::Integer("0".to_owned()), Span::EMPTY));
+    bare.columns[0].default = Some("((0))".to_owned());
     let bare_table = catalog.create_table(&handle, &bare).expect("create_table");
     assert_eq!(
         catalog
@@ -915,23 +866,7 @@ fn add_check_does_not_duplicate_existing_default() {
             &AlterTable::AddConstraint {
                 constraint: Box::new(ConstraintDef::Check {
                     name: Some("ck_bare".to_owned()),
-                    expr: Expr::Binary {
-                        op: vauban_parser::BinaryOp::Gt,
-                        op_span: Span::EMPTY,
-                        left: Box::new(Expr::Column(vauban_parser::ColumnRef {
-                            qualifier: None,
-                            name: vauban_parser::Ident {
-                                value: "a".to_owned(),
-                                quoted: false,
-                            },
-                            span: Span::EMPTY,
-                        })),
-                        right: Box::new(Expr::Literal(
-                            Literal::Integer("0".to_owned()),
-                            Span::EMPTY,
-                        )),
-                        span: Span::EMPTY,
-                    },
+                    expr: "([a]>(0))".to_owned(),
                 }),
             },
         )
@@ -949,7 +884,7 @@ fn add_check_does_not_duplicate_existing_default() {
     named.constraints.push(ConstraintDef::Default {
         name: Some("df_a".to_owned()),
         column: "a".to_owned(),
-        expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+        expr: "((1))".to_owned(),
     });
     let named_table = catalog.create_table(&handle, &named).expect("create_table");
     assert_eq!(
@@ -967,7 +902,7 @@ fn add_check_does_not_duplicate_existing_default() {
             &AlterTable::AddConstraint {
                 constraint: Box::new(ConstraintDef::Check {
                     name: Some("ck_named".to_owned()),
-                    expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+                    expr: "((1))".to_owned(),
                 }),
             },
         )
@@ -998,7 +933,7 @@ fn drop_constraint_removes_the_object() {
             &AlterTable::AddConstraint {
                 constraint: Box::new(ConstraintDef::Check {
                     name: Some("ck".to_owned()),
-                    expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+                    expr: "((1))".to_owned(),
                 }),
             },
         )
@@ -1067,8 +1002,8 @@ fn drop_foreign_key_unlists_it_from_the_target() {
                         name: "parent_t".to_owned(),
                     },
                     referenced_columns: vec!["id".to_owned()],
-                    on_delete: vauban_parser::RefAction::NoAction,
-                    on_update: vauban_parser::RefAction::NoAction,
+                    on_delete: vauban_catalog::RefAction::NoAction,
+                    on_update: vauban_catalog::RefAction::NoAction,
                 }),
             },
         )
@@ -1115,7 +1050,7 @@ fn constraint_changes_roll_back() {
             &AlterTable::AddConstraint {
                 constraint: Box::new(ConstraintDef::Check {
                     name: Some("ck".to_owned()),
-                    expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+                    expr: "((1))".to_owned(),
                 }),
             },
         )
@@ -1136,7 +1071,7 @@ fn constraint_changes_roll_back() {
             &AlterTable::AddConstraint {
                 constraint: Box::new(ConstraintDef::Check {
                     name: Some("ck".to_owned()),
-                    expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+                    expr: "((1))".to_owned(),
                 }),
             },
         )
@@ -1169,7 +1104,7 @@ fn add_column_default_then_drop_is_5074() {
         .create_table(&handle, &table("t", vec![column("a", SqlType::Int, false)]))
         .expect("create_table");
     let mut with_default = column("b", SqlType::Int, true);
-    with_default.default = Some(Expr::Literal(Literal::Integer("0".to_owned()), Span::EMPTY));
+    with_default.default = Some("((0))".to_owned());
     let with_b = catalog
         .alter_table(
             &handle,
@@ -1296,25 +1231,12 @@ fn drop_constraint_declared_in_create_table_removes_it() {
             name: "t1".to_owned(),
         },
         referenced_columns: vec!["a".to_owned()],
-        on_delete: vauban_parser::RefAction::NoAction,
-        on_update: vauban_parser::RefAction::NoAction,
+        on_delete: vauban_catalog::RefAction::NoAction,
+        on_update: vauban_catalog::RefAction::NoAction,
     });
     t2.constraints.push(ConstraintDef::Check {
         name: Some("ck_t2".to_owned()),
-        expr: Expr::Binary {
-            op: vauban_parser::BinaryOp::Gt,
-            op_span: Span::EMPTY,
-            left: Box::new(Expr::Column(vauban_parser::ColumnRef {
-                qualifier: None,
-                name: vauban_parser::Ident {
-                    value: "b".to_owned(),
-                    quoted: false,
-                },
-                span: Span::EMPTY,
-            })),
-            right: Box::new(Expr::Literal(Literal::Integer("0".to_owned()), Span::EMPTY)),
-            span: Span::EMPTY,
-        },
+        expr: "([b]>(0))".to_owned(),
     });
     let t2_meta = catalog.create_table(&handle, &t2).expect("create t2");
     txn.commit(handle).expect("commit create");
@@ -1377,8 +1299,8 @@ fn drop_constraint_rollback_restores_a_create_table_foreign_key() {
             name: "t1".to_owned(),
         },
         referenced_columns: vec!["a".to_owned()],
-        on_delete: vauban_parser::RefAction::NoAction,
-        on_update: vauban_parser::RefAction::NoAction,
+        on_delete: vauban_catalog::RefAction::NoAction,
+        on_update: vauban_catalog::RefAction::NoAction,
     });
     let t2_meta = catalog.create_table(&setup, &t2).expect("create t2");
     txn.commit(setup).expect("commit create");
@@ -1595,7 +1517,7 @@ fn adding_a_check_under_the_name_of_a_key_is_2714_state_5() {
     let check = |name: &str| AlterTable::AddConstraint {
         constraint: Box::new(ConstraintDef::Check {
             name: Some(name.to_owned()),
-            expr: Expr::Literal(Literal::Integer("1".to_owned()), Span::EMPTY),
+            expr: "((1))".to_owned(),
         }),
     };
     for (table, name) in [(c1.id, "pk_c1"), (c1.id, "UQ_C1"), (other.id, "pk_c1")] {
@@ -1659,8 +1581,8 @@ fn referenced_table(catalog: &Catalog, txn: &Arc<TransactionManager>) -> (Object
                 name: "r".to_owned(),
             },
             referenced_columns: vec![to.to_owned()],
-            on_delete: vauban_parser::RefAction::NoAction,
-            on_update: vauban_parser::RefAction::NoAction,
+            on_delete: vauban_catalog::RefAction::NoAction,
+            on_update: vauban_catalog::RefAction::NoAction,
         });
     }
     let f_meta = catalog.create_table(&handle, &f).expect("create f");
@@ -1738,8 +1660,8 @@ fn dropping_a_unique_constraint_a_foreign_key_reads_is_3725() {
             name: "r2".to_owned(),
         },
         referenced_columns: vec!["b".to_owned()],
-        on_delete: vauban_parser::RefAction::NoAction,
-        on_update: vauban_parser::RefAction::NoAction,
+        on_delete: vauban_catalog::RefAction::NoAction,
+        on_update: vauban_catalog::RefAction::NoAction,
     });
     catalog.create_table(&handle, &f2).expect("create f2");
     txn.commit(handle).expect("commit create");
@@ -1824,8 +1746,8 @@ fn table_with_every_index(
                 name: "x".to_owned(),
             },
             referenced_columns: vec![to.to_owned()],
-            on_delete: vauban_parser::RefAction::NoAction,
-            on_update: vauban_parser::RefAction::NoAction,
+            on_delete: vauban_catalog::RefAction::NoAction,
+            on_update: vauban_catalog::RefAction::NoAction,
         });
     }
     let y_meta = catalog.create_table(&handle, &y).expect("create y");

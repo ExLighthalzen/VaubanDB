@@ -9,7 +9,6 @@ homepage.workspace = true
 
 [dependencies]
 vauban-errors.workspace = true
-vauban-parser.workspace = true
 vauban-storage.workspace = true
 vauban-txn.workspace = true
 vauban-types.workspace = true

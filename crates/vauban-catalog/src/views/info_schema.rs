@@ -98,8 +98,8 @@
 //!
 //! `COLUMN_DEFAULT` is the text of the `DEFAULT` of the column, `NULL` when it has none, and
 //! `NULL` on an `IDENTITY` column and on a computed column. The text is the one
-//! `sys.default_constraints.definition` publishes, `definition_text` of `meta.rs`: `DEFAULT 0`
-//! is `((0))`, `DEFAULT (1 + 2)` is `((1)+(2))` and `DEFAULT 'x'` is `('x')` (unit test
+//! `sys.default_constraints.definition` publishes, the stored text the column holds:
+//! `DEFAULT 0` is `((0))` (unit test
 //! `the_column_default_is_the_parenthesised_text_of_the_expression`).
 //!
 //! # Execution
@@ -913,7 +913,7 @@ fn column_row(database: i32, table: &TableMeta, column: &ColumnMeta) -> Row {
 /// `DEFAULT` clause (unit test `the_column_default_is_the_parenthesised_text_of_the_expression`).
 fn column_default(column: &ColumnMeta) -> Value {
     match &column.default {
-        Some(expr) => text(&crate::meta::definition_text(expr)),
+        Some(definition) => text(definition),
         None => Value::Null,
     }
 }
@@ -1157,7 +1157,6 @@ fn number(value: Option<Value>) -> Value {
 mod tests {
     use std::sync::Arc;
 
-    use vauban_parser::{Expr, Literal, Span};
     use vauban_storage::{MemoryStorage, Storage};
     use vauban_txn::{IsolationLevel, TransactionManager};
 
@@ -1781,7 +1780,7 @@ mod tests {
         name: &str,
         ty: SqlType,
         nullable: bool,
-        default: Option<Expr>,
+        default: Option<String>,
         identity: bool,
     ) -> ColumnDef {
         ColumnDef {
@@ -2459,7 +2458,7 @@ mod tests {
     fn the_column_default_is_the_parenthesised_text_of_the_expression() {
         // `DEFAULT 0` is stored `((0))` and an `IDENTITY` column publishes `NULL`.
         let catalog = bootstrapped();
-        let zero = Expr::Literal(Literal::Integer("0".to_owned()), Span::EMPTY);
+        let zero = "((0))".to_owned();
         let tables = created(
             &catalog,
             "t",

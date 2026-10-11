@@ -23,10 +23,9 @@
 //! `column_row`), `sys.tables.max_column_id_used` counts the columns the table still holds,
 //! and the views do not publish the identifiers `storage` gives a table and an index.
 //!
-//! A `DEFAULT`, a `CHECK` and a computed column come back as the tree
-//! [`parse_stored_expression`] reads from their stored text, the tree `create_table` holds
-//! as well (`meta.rs`, `stored_expression`), so a reopened catalogue holds the table it wrote
-//! (unit test `a_reopened_catalogue_holds_the_tables_it_wrote`).
+//! A `DEFAULT`, a `CHECK` and a computed column come back as their stored text, the text
+//! `create_table` holds as well, so a reopened catalogue holds the table it wrote (unit test
+//! `a_reopened_catalogue_holds_the_tables_it_wrote`).
 //!
 //! # What is left out
 //!
@@ -53,7 +52,6 @@
 use std::collections::BTreeMap;
 
 use vauban_errors::{InternalError, SqlResult};
-use vauban_parser::RefAction;
 use vauban_storage::{DbId, IndexId, KeyColumn, Row, Snapshot, TableId, TxnId};
 use vauban_txn::TxnHandle;
 use vauban_types::{Collation, Len, SqlString, SqlType, TypeInfo, Value};
@@ -64,13 +62,13 @@ use crate::bootstrap::{
     registered_internal_tables, registry_snapshot,
 };
 use crate::catalog::Catalog;
-use crate::def::{InternalColumnDef, InternalTableDef};
+use crate::def::{InternalColumnDef, InternalTableDef, RefAction};
 use crate::identity::COUNTERS_TABLE;
 use crate::ids::{ColumnId, ObjectId};
 use crate::index::{IndexEntry, IndexStore};
 use crate::meta::{
-    ColumnMeta, ConstraintMeta, ExpressionKind, IdentitySpec, IndexMeta, ObjectKind, ObjectMeta,
-    QualifiedName, TableMeta, definition_text, parse_stored_expression,
+    ColumnMeta, ConstraintMeta, IdentitySpec, IndexMeta, ObjectKind, ObjectMeta, QualifiedName,
+    TableMeta,
 };
 use crate::views::{sys_constraints, sys_indexes, sys_tables};
 
@@ -233,7 +231,7 @@ pub(crate) fn column_rows(table: &TableMeta) -> SqlResult<Vec<Row>> {
                 row[at::COLLATION_SORT_ID] = Value::I8(collation.sort_id);
             }
             if let Some(computed) = &column.computed {
-                row[at::COMPUTED_DEFINITION] = text(&definition_text(computed));
+                row[at::COMPUTED_DEFINITION] = text(computed);
             }
             Row(row)
         })
@@ -608,14 +606,9 @@ impl Stored {
                 .and_then(|ordinal| u16::try_from(ordinal).ok())
                 .or_else(|| u16::try_from(rank).ok())
                 .ok_or_else(|| missing(object, "a column position"))?;
-            let computed = match detail
+            let computed = detail
                 .and_then(|row| string(row, column_details_columns::COMPUTED_DEFINITION))
-            {
-                Some(text) => {
-                    Some(parse_stored_expression(text, ExpressionKind::Value).map_err(internal)?)
-                }
-                None => None,
-            };
+                .map(str::to_owned);
             columns.push(ColumnMeta {
                 id: ColumnId(id),
                 name,
@@ -859,10 +852,7 @@ impl Stored {
                 Err(err) => left_out(meta.id, "a foreign key", &err),
             }
         }
-        for (rows, kind) in [
-            (&self.checks, ExpressionKind::Predicate),
-            (&self.defaults, ExpressionKind::Value),
-        ] {
+        for (rows, is_check) in [(&self.checks, true), (&self.defaults, false)] {
             for row in parented(rows, at::DATABASE_ID, at::PARENT_OBJECT_ID) {
                 let read = || -> Result<(ObjectId, String, ConstraintMeta), InternalError> {
                     let id = int(&row, at::OBJECT_ID)
@@ -873,21 +863,20 @@ impl Stored {
                     let definition = string(&row, at::DEFINITION)
                         .ok_or_else(|| missing(meta.id, &format!("the text of {name}")))?
                         .to_owned();
-                    let expr = parse_stored_expression(&definition, kind).map_err(internal)?;
                     let system_named = bit(&row, at::IS_SYSTEM_NAMED).unwrap_or(false);
-                    let constraint = match kind {
-                        ExpressionKind::Predicate => ConstraintMeta::Check {
+                    let constraint = if is_check {
+                        ConstraintMeta::Check {
                             constraint: ObjectId(id),
                             system_named,
-                            expr,
                             definition,
-                        },
-                        ExpressionKind::Value => ConstraintMeta::Default {
+                        }
+                    } else {
+                        ConstraintMeta::Default {
                             constraint: ObjectId(id),
                             system_named,
                             column: ColumnId(int(&row, at::PARENT_COLUMN_ID).unwrap_or(0)),
-                            expr,
-                        },
+                            definition,
+                        }
                     };
                     Ok((ObjectId(id), name, constraint))
                 };
@@ -901,11 +890,13 @@ impl Stored {
         let database_name = self.database_name(database);
         let mut objects = Vec::with_capacity(found.len());
         for (id, name, constraint) in found {
-            if let ConstraintMeta::Default { column, expr, .. } = &constraint
+            if let ConstraintMeta::Default {
+                column, definition, ..
+            } = &constraint
                 && let Some(target) = meta.columns.iter_mut().find(|c| c.id == *column)
                 && target.default.is_none()
             {
-                target.default = Some(expr.clone());
+                target.default = Some(definition.clone());
             }
             meta.constraints.push(constraint);
             objects.push(ObjectMeta {

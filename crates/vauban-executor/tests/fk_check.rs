@@ -9,7 +9,7 @@ use vauban_binder::{
 use vauban_catalog::{Catalog, ColumnDef, ConstraintDef, QualifiedName, SortedColumn, TableDef};
 use vauban_errors::SqlError;
 use vauban_executor::{ExecContext, ExecOutcome, ExecSession, execute_collect};
-use vauban_parser::{BinaryOp, ColumnRef, Expr, Ident, Literal, ParseOptions, Span, parse_batch};
+use vauban_parser::{ParseOptions, parse_batch};
 use vauban_planner::{
     NoIndexes, PhysicalDelete, PhysicalInsert, PhysicalPlan, PhysicalStatement, PhysicalUpdate,
     PlanContext, plan,
@@ -101,28 +101,15 @@ fn foreign_key(
             .iter()
             .map(|column| (*column).to_owned())
             .collect(),
-        on_delete: vauban_parser::RefAction::NoAction,
-        on_update: vauban_parser::RefAction::NoAction,
+        on_delete: vauban_catalog::RefAction::NoAction,
+        on_update: vauban_catalog::RefAction::NoAction,
     }
 }
 
 fn check_positive(column: &str) -> ConstraintDef {
     ConstraintDef::Check {
         name: Some("CK_positive".to_owned()),
-        expr: Expr::Binary {
-            op: BinaryOp::Gt,
-            op_span: Span::EMPTY,
-            left: Box::new(Expr::Column(ColumnRef {
-                qualifier: None,
-                name: Ident {
-                    value: column.to_owned(),
-                    quoted: false,
-                },
-                span: Span::EMPTY,
-            })),
-            right: Box::new(Expr::Literal(Literal::Integer("0".to_owned()), Span::EMPTY)),
-            span: Span::EMPTY,
-        },
+        expr: format!("([{column}]>(0))"),
     }
 }
 

@@ -1,6 +1,7 @@
+use vauban_catalog::RefAction;
 use vauban_catalog::{ConstraintDef, ObjectId, QualifiedName, TableDef};
 use vauban_errors::SqlError;
-use vauban_parser::{ObjectName, ParseOptions, RefAction, Statement, parse_batch};
+use vauban_parser::{ObjectName, ParseOptions, Statement, parse_batch};
 use vauban_types::{Collation, Len, SqlType};
 
 use crate::bound::{BoundStatement, DdlStatement};

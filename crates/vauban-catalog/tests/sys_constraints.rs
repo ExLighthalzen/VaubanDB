@@ -14,7 +14,6 @@ use vauban_catalog::{
     AlterTable, Catalog, ColumnDef, ConstraintDef, IdentitySpec, QualifiedName, SortedColumn,
     TableDef, TableMeta,
 };
-use vauban_parser::{Expr, Literal, Span};
 use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager};
 use vauban_types::{Len, SqlType, TypeInfo};
@@ -64,7 +63,7 @@ fn row_count(storage: &Arc<dyn Storage>, txn: &Arc<TransactionManager>, table: T
 }
 
 /// A column of a definition, with the default given and nothing else on it.
-fn column(name: &str, ty: SqlType, default: Option<Expr>) -> ColumnDef {
+fn column(name: &str, ty: SqlType, default: Option<String>) -> ColumnDef {
     ColumnDef {
         name: name.to_owned(),
         ty: TypeInfo::new(ty, true),
@@ -74,15 +73,14 @@ fn column(name: &str, ty: SqlType, default: Option<Expr>) -> ColumnDef {
     }
 }
 
-/// What `Display` writes for a tree the catalogue read back from its stored text: the text
-/// itself, `((0))` for `DEFAULT 0`.
-fn stored_text(expr: Option<&Expr>) -> Option<String> {
-    expr.map(ToString::to_string)
+/// The stored text a column holds, `((0))` for `DEFAULT 0`.
+fn stored_text(text: Option<&String>) -> Option<String> {
+    text.cloned()
 }
 
-/// The integer literal `value` as an [`Expr`].
-fn integer(value: &str) -> Expr {
-    Expr::Literal(Literal::Integer(value.to_owned()), Span::EMPTY)
+/// The stored text of the integer literal `value`, `((0))` for `0`.
+fn integer(value: &str) -> String {
+    format!("(({value}))")
 }
 
 /// The shape of the internal table `sys.foreign_keys` reads: 12 columns.
@@ -176,8 +174,8 @@ fn a_created_table_with_a_default_writes_the_default_constraints_row() {
         .expect("a column-level DEFAULT is stored by create_table");
     txn.commit(handle).expect("commit");
 
-    // The catalogue kept the tree read back from the stored text on the column, which is
-    // what the rows of `sys.default_constraints` are built from.
+    // The catalogue kept the stored text on the column, which is what the rows of
+    // `sys.default_constraints` are built from.
     assert_eq!(
         stored_text(meta.columns[1].default.as_ref()),
         Some("((0))".to_owned())
@@ -245,8 +243,8 @@ fn foreign_key(
             .iter()
             .map(|column| (*column).to_owned())
             .collect(),
-        on_delete: vauban_parser::RefAction::NoAction,
-        on_update: vauban_parser::RefAction::NoAction,
+        on_delete: vauban_catalog::RefAction::NoAction,
+        on_update: vauban_catalog::RefAction::NoAction,
     }
 }
 
@@ -481,8 +479,8 @@ fn a_foreign_key_that_points_at_nothing_is_refused_by_create_table() {
                         name: "tbl_parent".to_owned(),
                     },
                     referenced_columns: vec!["id".to_owned()],
-                    on_delete: vauban_parser::RefAction::NoAction,
-                    on_update: vauban_parser::RefAction::NoAction,
+                    on_delete: vauban_catalog::RefAction::NoAction,
+                    on_update: vauban_catalog::RefAction::NoAction,
                 }],
             },
         )
@@ -519,8 +517,7 @@ fn a_named_default_fills_the_column_and_keeps_its_name() {
         .expect("a named DEFAULT is accepted");
     txn.commit(handle).expect("commit");
 
-    // The column carries the tree read back from the stored text, which is what the
-    // executor reads...
+    // The column carries the stored text, which is what the binder reads...
     assert_eq!(
         stored_text(meta.columns[1].default.as_ref()),
         Some("((0))".to_owned())
@@ -838,8 +835,8 @@ fn create_table_with_a_foreign_key_writes_one_row_in_each_internal_table() {
                 name: "tbl_fk_parent".to_owned(),
             },
             referenced_columns: vec!["id".to_owned()],
-            on_delete: vauban_parser::RefAction::NoAction,
-            on_update: vauban_parser::RefAction::NoAction,
+            on_delete: vauban_catalog::RefAction::NoAction,
+            on_update: vauban_catalog::RefAction::NoAction,
         }],
     );
     assert_eq!(row_count(&storage, &txn, fk), 1);
@@ -910,8 +907,8 @@ fn a_two_column_foreign_key_writes_two_column_rows_in_key_order() {
                         name: "tbl_fk_parent2".to_owned(),
                     },
                     referenced_columns: vec!["a".to_owned(), "b".to_owned()],
-                    on_delete: vauban_parser::RefAction::NoAction,
-                    on_update: vauban_parser::RefAction::NoAction,
+                    on_delete: vauban_catalog::RefAction::NoAction,
+                    on_update: vauban_catalog::RefAction::NoAction,
                 }],
             ),
         )
@@ -944,8 +941,8 @@ fn drop_table_removes_foreign_key_rows() {
                 name: "tbl_fk_parent".to_owned(),
             },
             referenced_columns: vec!["id".to_owned()],
-            on_delete: vauban_parser::RefAction::NoAction,
-            on_update: vauban_parser::RefAction::NoAction,
+            on_delete: vauban_catalog::RefAction::NoAction,
+            on_update: vauban_catalog::RefAction::NoAction,
         }],
     );
     let handle = txn.begin(IsolationLevel::ReadCommitted);
@@ -972,8 +969,8 @@ fn alter_drop_constraint_removes_foreign_key_rows() {
                 name: "tbl_fk_parent".to_owned(),
             },
             referenced_columns: vec!["id".to_owned()],
-            on_delete: vauban_parser::RefAction::NoAction,
-            on_update: vauban_parser::RefAction::NoAction,
+            on_delete: vauban_catalog::RefAction::NoAction,
+            on_update: vauban_catalog::RefAction::NoAction,
         }],
     );
     let handle = txn.begin(IsolationLevel::ReadCommitted);
@@ -1135,8 +1132,8 @@ fn a_rolled_back_create_table_with_a_foreign_key_leaves_no_row() {
                         name: "tbl_fk_parent_rb".to_owned(),
                     },
                     referenced_columns: vec!["id".to_owned()],
-                    on_delete: vauban_parser::RefAction::NoAction,
-                    on_update: vauban_parser::RefAction::NoAction,
+                    on_delete: vauban_catalog::RefAction::NoAction,
+                    on_update: vauban_catalog::RefAction::NoAction,
                 }],
             ),
         )
@@ -1196,43 +1193,18 @@ fn bit_at(row: &[vauban_types::Value], position: usize) -> bool {
     }
 }
 
-/// The tree `vauban-parser` reads for `text`: the `WHERE` of `SELECT 1 WHERE <text>` for a
-/// predicate, the one item of `SELECT <text>` for a value.
-fn read_back(text: &str, predicate: bool) -> Expr {
-    use vauban_parser::{ParseOptions, QueryBody, SelectItem, Statement, parse_batch};
-    let batch = if predicate {
-        format!("SELECT 1 WHERE {text}")
-    } else {
-        format!("SELECT {text}")
-    };
-    let batch = parse_batch(&batch, &ParseOptions::default()).expect(text);
-    let [Statement::Select(select)] = batch.statements.as_slice() else {
-        panic!("{text} is not one SELECT");
-    };
-    let QueryBody::Select(spec) = &select.body else {
-        panic!("{text} is not one query specification");
-    };
-    if predicate {
-        return spec.where_.clone().expect(text);
-    }
-    let [SelectItem::Expr { expr, .. }] = spec.items.as_slice() else {
-        panic!("{text} is not one item");
-    };
-    expr.clone()
-}
-
 /// `CREATE TABLE dbo.<name> (a int NULL DEFAULT <a>, c datetime NULL DEFAULT <c>,
 /// CONSTRAINT <check_name> CHECK (<check>))`.
-fn table_with_expressions(name: &str, a: Expr, c: Expr, check: Expr) -> TableDef {
+fn table_with_expressions(name: &str, a: &str, c: &str, check: &str) -> TableDef {
     table(
         name,
         vec![
-            column("a", SqlType::Int, Some(a)),
-            column("c", SqlType::DateTime, Some(c)),
+            column("a", SqlType::Int, Some(a.to_owned())),
+            column("c", SqlType::DateTime, Some(c.to_owned())),
         ],
         vec![ConstraintDef::Check {
             name: Some(format!("ck_{name}")),
-            expr: check,
+            expr: check.to_owned(),
         }],
     )
 }
@@ -1273,9 +1245,9 @@ fn a_table_rebuilt_from_its_stored_text_holds_the_same_expressions() {
             &handle,
             &table_with_expressions(
                 "tbl_written",
-                read_back("-(1)", false),
-                read_back("CURRENT_TIMESTAMP", false),
-                read_back("a BETWEEN 1 AND 5", true),
+                "((-1))",
+                "(getdate())",
+                "([a]>=(1) AND [a]<=(5))",
             ),
         )
         .expect("the written table");
@@ -1292,18 +1264,13 @@ fn a_table_rebuilt_from_its_stored_text_holds_the_same_expressions() {
     let rebuilt = catalog
         .create_table(
             &handle,
-            &table_with_expressions(
-                "tbl_rebuilt",
-                read_back(&defaults[0], false),
-                read_back(&defaults[1], false),
-                read_back(&checks[0], true),
-            ),
+            &table_with_expressions("tbl_rebuilt", &defaults[0], &defaults[1], &checks[0]),
         )
         .expect("the table rebuilt from the stored text");
     txn.commit(handle).expect("commit");
     assert_eq!(stored_texts(&storage, &txn, &rebuilt), (checks, defaults));
 
-    // The same default value and the same predicate, tree for tree.
+    // The same default value and the same predicate, text for text.
     for position in 0..2 {
         assert_eq!(
             rebuilt.columns[position].default,
@@ -1314,9 +1281,9 @@ fn a_table_rebuilt_from_its_stored_text_holds_the_same_expressions() {
         meta.constraints
             .iter()
             .find_map(|constraint| match constraint {
-                vauban_catalog::ConstraintMeta::Check {
-                    expr, definition, ..
-                } => Some((expr.clone(), definition.clone())),
+                vauban_catalog::ConstraintMeta::Check { definition, .. } => {
+                    Some(definition.clone())
+                }
                 _ => None,
             })
             .expect("the check")

@@ -69,12 +69,11 @@
 use std::collections::BTreeMap;
 
 use vauban_errors::{InternalError, SqlResult};
-use vauban_parser::RefAction;
 use vauban_storage::{DbId, IndexId, Row};
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 
 use crate::bootstrap::SYSTEM_DATABASES;
-use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
+use crate::def::{InternalColumnDef, InternalTableDef, RefAction, SystemViewDef};
 use crate::ids::{ColumnId, ObjectId};
 use crate::index::IndexStore;
 use crate::meta::{ConstraintMeta, IndexMeta, QualifiedName, TableMeta};
@@ -722,7 +721,6 @@ fn text(value: &str) -> Value {
 mod tests {
     use std::sync::Arc;
 
-    use vauban_parser::{Expr, Literal, Span};
     use vauban_storage::{MemoryStorage, Storage, TableId};
     use vauban_txn::{IsolationLevel, TransactionManager};
 
@@ -875,10 +873,10 @@ mod tests {
         with(&store.indexes)
     }
 
-    /// The integer literal `value` as an [`Expr`], the shape `tests/sys_constraints.rs` gives
-    /// a `CHECK` predicate.
-    fn integer(value: &str) -> Expr {
-        Expr::Literal(Literal::Integer(value.to_owned()), Span::EMPTY)
+    /// The stored text of the integer literal `value`, the shape `tests/sys_constraints.rs`
+    /// gives a `CHECK` predicate.
+    fn integer(value: &str) -> String {
+        format!("(({value}))")
     }
 
     /// The names `sys_rows::write` stashes at `CREATE TABLE`, rebuilt from

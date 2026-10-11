@@ -464,7 +464,6 @@ fn text(value: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vauban_parser::{ParseOptions, Statement, parse_batch};
 
     use crate::meta::SnapshotIsolationState;
 
@@ -757,27 +756,6 @@ mod tests {
     }
 
     #[test]
-    fn the_databases_definition_parses_with_its_case() {
-        // The text of a view is T-SQL the engine reads, and the derived item is the first
-        // `CASE` of a definition of this file: the parser of the workspace is what judges
-        // its shape, where the tests above compare its text.
-        let definition = definition_of("databases");
-        let batch = parse_batch(&definition, &ParseOptions::default())
-            .unwrap_or_else(|err| panic!("sys.databases: {}\n{definition}", err.message));
-        assert_eq!(batch.statements.len(), 1);
-        assert!(matches!(batch.statements[0], Statement::Select(_)));
-        // Counter-check held in the test itself: the same text with the `END` of the `CASE`
-        // taken out is refused by the same parser, so the assertion above is not blind to a
-        // broken `CASE`.
-        let broken = definition.replace(" END AS nvarchar(60))", " AS nvarchar(60))");
-        assert_ne!(broken, definition);
-        assert!(
-            parse_batch(&broken, &ParseOptions::default()).is_err(),
-            "a `CASE` without its `END` is read by the parser: {broken}"
-        );
-    }
-
-    #[test]
     fn the_columns_written_null_are_the_ones_with_no_datum_behind_them() {
         // Counted on the select list itself, the module documentation naming the same 13.
         let written_null: Vec<&str> = DATABASES_VIEW
@@ -956,7 +934,9 @@ mod tests {
     #[test]
     fn a_reserved_column_name_is_delimited() {
         // `precision` is a reserved word of T-SQL and a column of `sys.types`; written bare
-        // it ends the select list at a syntax error of the parser of VaubanDB.
+        // it ends the select list at a syntax error of the parser of VaubanDB
+        // (`crates/vauban-binder/tests/system_view_definitions.rs`,
+        // `a_reserved_column_name_is_delimited`).
         let definition = definition_of("types");
         assert!(definition.contains("[precision]"), "{definition}");
         assert!(!definition.contains("       precision,"), "{definition}");

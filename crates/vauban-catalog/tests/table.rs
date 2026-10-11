@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use vauban_catalog::{Catalog, ColumnDef, IdentitySpec, ObjectId, QualifiedName, TableDef};
 use vauban_errors::SqlError;
-use vauban_parser::{Expr, Literal, Span};
 use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager, TxnHandle};
 use vauban_types::{Len, SqlType, TypeInfo};
@@ -296,7 +295,7 @@ fn not_null_and_identity_are_on_column_meta() {
         seed: 10,
         increment: 2,
     });
-    let zero = Expr::Literal(Literal::Integer("0".to_owned()), Span::EMPTY);
+    let zero = "((0))".to_owned();
     def.columns[1].default = Some(zero.clone());
 
     let handle = begin(&txn);
@@ -314,17 +313,17 @@ fn not_null_and_identity_are_on_column_meta() {
     assert_eq!(meta.columns[0].default, None);
     assert!(meta.columns[1].ty.nullable);
     assert_eq!(meta.columns[1].identity, None);
-    // The tree read back from the stored text `((0))`.
-    let stored = meta.columns[1].default.as_ref().map(ToString::to_string);
+    // The stored text `((0))`.
+    let stored = meta.columns[1].default.clone();
     assert_eq!(stored.as_deref(), Some("((0))"), "{zero}");
 }
 
-/// A bare `IDENTITY` is `IDENTITY(1, 1)`, and a computed column is stored as the tree read back
-/// from the text of its expression.
+/// A bare `IDENTITY` is `IDENTITY(1, 1)`, and a computed column is stored as the text of its
+/// expression.
 #[test]
 fn a_bare_identity_and_a_computed_column_are_stored_as_written() {
     let (catalog, _storage, txn) = instance();
-    let expr = Expr::Literal(Literal::Integer("42".to_owned()), Span::EMPTY);
+    let expr = "((42))".to_owned();
     let mut def = table(
         "t",
         vec![

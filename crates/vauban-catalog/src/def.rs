@@ -4,11 +4,10 @@
 //! A `*Def` is an **input**, close to what the parser produced but already resolved into
 //! catalogue terms (a [`TypeInfo`] rather than a `DataType`, a [`QualifiedName`] rather than
 //! an `ObjectName`); the matching `*Meta` of `meta.rs` is the **output**, with
-//! the identifiers the catalogue assigned. Turning a
-//! [`CreateTableStatement`](vauban_parser::CreateTableStatement) into a [`TableDef`] is the
-//! business of this crate, not of its callers.
+//! the identifiers the catalogue assigned. An expression (`DEFAULT`, `CHECK`, computed
+//! column) arrives as the text the catalogue stores and publishes: the caller writes it from
+//! the tree of its statement.
 
-use vauban_parser::{Expr, RefAction};
 use vauban_storage::{KeyColumn, Row};
 use vauban_types::TypeInfo;
 
@@ -30,21 +29,36 @@ pub struct SortedColumn {
 /// A column of a [`TableDef`]. The catalogue answers with a
 /// [`ColumnMeta`](crate::ColumnMeta), which adds the identifier and the position.
 ///
-/// Distinct from [`vauban_parser::ColumnDef`], which holds the text of the declaration: this
-/// one holds a resolved [`TypeInfo`].
+/// Distinct from the column of a parsed statement: this one holds a resolved [`TypeInfo`] and
+/// the stored text of its expressions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
     /// Name of the column.
     pub name: String,
     /// Type, nullability and collation of the column.
     pub ty: TypeInfo,
-    /// Expression of its `DEFAULT`, `None` when the column has no default clause.
-    pub default: Option<Expr>,
+    /// Stored text of its `DEFAULT`, `((0))` for `DEFAULT 0`, `None` when the column has no
+    /// default clause.
+    pub default: Option<String>,
     /// `IDENTITY` property, `None` for a column declared without the clause. A bare
     /// `IDENTITY` is [`IdentitySpec::default`].
     pub identity: Option<IdentitySpec>,
-    /// Expression of a computed column, `None` for a stored column.
-    pub computed: Option<Expr>,
+    /// Stored text of the expression of a computed column, `([a]+(1))` for `AS a + 1`, `None`
+    /// for a stored column.
+    pub computed: Option<String>,
+}
+
+/// The action of a `FOREIGN KEY` on `DELETE` or `UPDATE` of the row it points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefAction {
+    /// `NO ACTION`, the action of a clause left out.
+    NoAction,
+    /// `CASCADE`.
+    Cascade,
+    /// `SET NULL`.
+    SetNull,
+    /// `SET DEFAULT`.
+    SetDefault,
 }
 
 /// A constraint of a [`TableDef`].
@@ -90,8 +104,9 @@ pub enum ConstraintDef {
     Check {
         /// Name of the constraint, `None` when it was not written.
         name: Option<String>,
-        /// Predicate the rows must satisfy.
-        expr: Expr,
+        /// Stored text of the predicate the rows must satisfy, `([a]>=(0))` for
+        /// `CHECK (a >= 0)`.
+        expr: String,
     },
     /// `DEFAULT`.
     Default {
@@ -99,8 +114,9 @@ pub enum ConstraintDef {
         name: Option<String>,
         /// Column the default applies to.
         column: String,
-        /// Expression evaluated when the column is left out of an `INSERT`.
-        expr: Expr,
+        /// Stored text of the expression evaluated when the column is left out of an
+        /// `INSERT`, `((0))` for `DEFAULT 0`.
+        expr: String,
     },
 }
 

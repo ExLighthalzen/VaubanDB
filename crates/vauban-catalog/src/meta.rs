@@ -6,14 +6,10 @@
 //! mutations. `CREATE TABLE` takes a [`TableDef`](crate::TableDef) and gives back a
 //! [`TableMeta`].
 
-use vauban_errors::{InternalError, SqlResult};
-use vauban_parser::{
-    BinaryOp, ColumnRef, DataType, Expr, InList, Literal, ParseOptions, QueryBody, RefAction,
-    SelectItem, Span, Statement, TypeArg, UnaryOp, parse_batch,
-};
 use vauban_storage::{DbId, IndexId, KeyColumn, TableId};
 use vauban_types::{Collation, TypeInfo};
 
+use crate::def::RefAction;
 use crate::ids::{ColumnId, ObjectId};
 
 /// A name as a client wrote it, in three parts, database included.
@@ -225,14 +221,15 @@ pub struct ColumnMeta {
     /// Position of the column in the [`Row`](vauban_storage::Row) of `storage`, from `0`.
     /// Distinct from `id`, which keeps its value when a column before it is dropped.
     pub ordinal: u16,
-    /// Expression of the `DEFAULT` constraint of the column, the tree read back from its
-    /// stored text, `None` when it has no default.
-    pub default: Option<Expr>,
+    /// Stored text of the `DEFAULT` constraint of the column, the text
+    /// `sys.default_constraints.definition` publishes (`((0))` for `DEFAULT 0`), `None` when it
+    /// has no default.
+    pub default: Option<String>,
     /// `IDENTITY` property of the column, `None` for a column declared without the clause.
     pub identity: Option<IdentitySpec>,
-    /// Expression of a computed column, the tree read back from its normalised text, `None`
-    /// for a stored column.
-    pub computed: Option<Expr>,
+    /// Stored text of the expression of a computed column, the text
+    /// `sys.computed_columns.definition` publishes, `None` for a stored column.
+    pub computed: Option<String>,
 }
 
 /// An index, as `sys.indexes` publishes it.
@@ -302,12 +299,9 @@ pub enum ConstraintMeta {
         /// `true` when the catalogue made the name up, as in
         /// [`ConstraintMeta::ForeignKey`].
         system_named: bool,
-        /// Predicate the rows must satisfy: the tree `stored_expression` (this file) read back
-        /// from `definition`, not the tree the statement wrote.
-        expr: Expr,
-        /// Text `sys.check_constraints.definition` publishes: the normalised text
-        /// `stored_expression` writes, `([a]>=(0))` for `CHECK (a >= 0)`. `expr` is read
-        /// back from it, so a table rebuilt from this text holds the same predicate
+        /// Stored text of the predicate the rows must satisfy, the text
+        /// `sys.check_constraints.definition` publishes: `([a]>=(0))` for `CHECK (a >= 0)`.
+        /// A table rebuilt from its stored rows holds the same text
         /// (`tests/sys_constraints.rs`,
         /// `a_table_rebuilt_from_its_stored_text_holds_the_same_expressions`).
         definition: String,
@@ -323,11 +317,11 @@ pub enum ConstraintMeta {
         /// Column the default applies to. Its [`ColumnMeta::id`] counts from `1` and is the
         /// number `sys.default_constraints.parent_column_id` carries.
         column: ColumnId,
-        /// Expression evaluated when the column is left out of an `INSERT`: the tree read back
-        /// from the text `sys.default_constraints.definition` publishes, `((0))` for
+        /// Stored text of the expression evaluated when the column is left out of an
+        /// `INSERT`, the text `sys.default_constraints.definition` publishes: `((0))` for
         /// `DEFAULT 0` (`tests/sys_constraints.rs`,
         /// `a_table_rebuilt_from_its_stored_text_holds_the_same_expressions`).
-        expr: Expr,
+        definition: String,
     },
 }
 
@@ -336,13 +330,13 @@ impl ColumnMeta {
     /// the text `sys.computed_columns.definition` publishes, which the binder parses and
     /// binds (unit test `the_expression_texts_are_the_published_texts`).
     pub fn computed_text(&self) -> Option<String> {
-        self.computed.as_ref().map(definition_text)
+        self.computed.clone()
     }
 
     /// The stored text of the `DEFAULT` of the column, `None` for a column without one: the text
     /// `sys.default_constraints.definition` publishes, `((0))` for `DEFAULT 0`.
     pub fn default_text(&self) -> Option<String> {
-        self.default.as_ref().map(definition_text)
+        self.default.clone()
     }
 }
 
@@ -352,8 +346,8 @@ impl ConstraintMeta {
     /// `the_expression_texts_are_the_published_texts`).
     pub fn expression_text(&self) -> Option<String> {
         match self {
-            ConstraintMeta::Check { definition, .. } => Some(definition.clone()),
-            ConstraintMeta::Default { expr, .. } => Some(definition_text(expr)),
+            ConstraintMeta::Check { definition, .. }
+            | ConstraintMeta::Default { definition, .. } => Some(definition.clone()),
             ConstraintMeta::PrimaryKey(_)
             | ConstraintMeta::Unique(_)
             | ConstraintMeta::ForeignKey { .. } => None,
@@ -363,1444 +357,214 @@ impl ConstraintMeta {
 
 pub use crate::def::AlterTable;
 
-/// How the text of an object expression is read back: a `CHECK` is a predicate, a `DEFAULT`
-/// and a computed column are values. The two are parsed in different positions of a `SELECT`
-/// ([`parse_stored_expression`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExpressionKind {
-    /// The predicate of a `CHECK`.
-    Predicate,
-    /// The value of a `DEFAULT` or of a computed column.
-    Value,
-}
-
-/// The text the catalogue stores for `expr`, and the tree read back from that text.
+/// The column names the stored text of an object expression reads, in the order they are
+/// written, duplicates included.
 ///
-/// The text is the one `sys.check_constraints.definition`, `sys.default_constraints.definition`
-/// and `INFORMATION_SCHEMA.COLUMNS.COLUMN_DEFAULT` publish ([`definition_text`]); the tree is
-/// [`parse_stored_expression`] of that text, so that a [`TableMeta`] built from the statement
-/// and one rebuilt from its stored rows hold the same tree (unit test
-/// `a_tree_rebuilt_from_its_text_is_the_stored_tree`).
-///
-/// # Errors
-///
-/// [`InternalError::Bug`] when neither the normalised text nor the text `Display` writes
-/// reads back as one expression.
-pub(crate) fn stored_expression(expr: &Expr, kind: ExpressionKind) -> SqlResult<(String, Expr)> {
-    if let Some(text) = normalized_text(expr)
-        && let Ok(tree) = parse_stored_expression(&text, kind)
-    {
-        return Ok((text, tree));
+/// A name is the last part of a chain of identifiers (`a` in `[t].[a]`) that is not a call
+/// (`abs(`), a keyword, the type of a `CONVERT` or of an `AS`, a collation, a variable, or a
+/// part of a subquery or of an `OVER` clause. Strings and numbers are skipped. The first
+/// argument of a date-part function (`year` in `datepart(year,[c])`) is read as a name: a
+/// table that has no column of that name does not match it (unit test
+/// `the_column_names_of_a_stored_text`).
+pub(crate) fn column_names(text: &str) -> Vec<String> {
+    let tokens = expression_tokens(text);
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        let token = &tokens[at];
+        match token {
+            Token::Word(word) if word.eq_ignore_ascii_case("select") => {
+                at = after_enclosing_group(&tokens, at);
+                continue;
+            }
+            Token::Word(word)
+                if word.eq_ignore_ascii_case("over")
+                    && matches!(tokens.get(at + 1), Some(Token::Punct('('))) =>
+            {
+                at = after_enclosing_group(&tokens, at + 2);
+                continue;
+            }
+            Token::Word(word) if is_keyword(word) => {
+                // The name after `COLLATE`, `AS` or `FOR` is a collation, a type or a
+                // sequence: skip its chain.
+                if ["collate", "as", "for"]
+                    .iter()
+                    .any(|keyword| word.eq_ignore_ascii_case(keyword))
+                {
+                    at = after_chain(&tokens, at + 1);
+                } else {
+                    at += 1;
+                }
+                continue;
+            }
+            Token::Word(_) | Token::Bracketed(_) => {
+                let end = after_chain(&tokens, at);
+                let is_call = matches!(tokens.get(end), Some(Token::Punct('(')));
+                let is_type = at >= 2
+                    && matches!(tokens[at - 1], Token::Punct('('))
+                    && matches!(&tokens[at - 2], Token::Word(call)
+                        if call.eq_ignore_ascii_case("convert")
+                            || call.eq_ignore_ascii_case("try_convert"));
+                if !is_call
+                    && !is_type
+                    && let Some(Token::Word(last) | Token::Bracketed(last)) = tokens.get(end - 1)
+                {
+                    names.push(last.clone());
+                }
+                at = end;
+                continue;
+            }
+            Token::Punct(_) | Token::Other => at += 1,
+        }
     }
-    let text = display_text(expr);
-    let tree = parse_stored_expression(&text, kind)?;
-    Ok((text, tree))
+    names
 }
 
-/// The text the catalogue publishes for `expr`: the normalised form of
-/// [`normalized_text`], or, for a shape that function does not write (a subquery, a
-/// windowed call, a qualified column), the text `Display` writes between parentheses.
-///
-/// Applied to the tree [`stored_expression`] read back, it gives the stored text again (unit
-/// test `the_text_of_a_stored_tree_is_the_stored_text`).
-pub(crate) fn definition_text(expr: &Expr) -> String {
-    normalized_text(expr).unwrap_or_else(|| display_text(expr))
-}
-
-/// `Display` of `expr` between one pair of parentheses, one level of parentheses of `expr`
-/// itself taken off so that the text of a tree read back from this text is this text.
-fn display_text(expr: &Expr) -> String {
-    match expr {
-        Expr::Nested(inner, _) => format!("({inner})"),
-        other => format!("({other})"),
-    }
-}
-
-/// Reads back the text of an object expression.
-///
-/// A predicate is read as the `WHERE` of `SELECT 1 WHERE <text>`, a value as the one item of
-/// `SELECT <text>`. A type name written between brackets, `CONVERT([int],(1))`, is kept with
-/// its brackets by `vauban-parser`; it is taken off here so that the tree names the type
-/// `int`, as it would for `CONVERT(int, 1)`.
-///
-/// # Errors
-///
-/// The syntax error of `vauban-parser`, or [`InternalError::Bug`] when the text holds
-/// something else than one expression.
-pub(crate) fn parse_stored_expression(text: &str, kind: ExpressionKind) -> SqlResult<Expr> {
-    let batch = match kind {
-        ExpressionKind::Predicate => format!("SELECT 1 WHERE {text}"),
-        ExpressionKind::Value => format!("SELECT {text}"),
-    };
-    let batch = parse_batch(&batch, &ParseOptions::default())?;
-    let found = match batch.statements.as_slice() {
-        [Statement::Select(select)] => match &select.body {
-            QueryBody::Select(spec) if spec.from.is_empty() => match kind {
-                ExpressionKind::Predicate => spec.where_.clone(),
-                ExpressionKind::Value => match spec.items.as_slice() {
-                    [
-                        SelectItem::Expr {
-                            expr, alias: None, ..
-                        },
-                    ] if spec.where_.is_none() => Some(expr.clone()),
-                    _ => None,
-                },
-            },
-            _ => None,
-        },
-        _ => None,
-    };
-    let mut tree = found.ok_or_else(|| {
-        InternalError::Bug(format!(
-            "catalog: the stored expression {text} does not read back as one expression"
-        ))
-    })?;
-    unbracket_type_names(&mut tree);
-    Ok(tree)
-}
-
-/// Takes the brackets off the type names of the `CAST` and `CONVERT` calls of `expr`.
-fn unbracket_type_names(expr: &mut Expr) {
-    match expr {
-        Expr::Cast {
-            expr: inner, ty, ..
-        } => {
-            unbracket_type_name(ty);
-            unbracket_type_names(inner);
-        }
-        Expr::Convert {
-            ty,
-            expr: inner,
-            style,
-            ..
-        } => {
-            unbracket_type_name(ty);
-            unbracket_type_names(inner);
-            if let Some(style) = style {
-                unbracket_type_names(style);
-            }
-        }
-        Expr::Binary { left, right, .. } => {
-            unbracket_type_names(left);
-            unbracket_type_names(right);
-        }
-        Expr::Unary { expr: inner, .. }
-        | Expr::Nested(inner, _)
-        | Expr::IsNull { expr: inner, .. }
-        | Expr::Collate { expr: inner, .. } => unbracket_type_names(inner),
-        Expr::Function { args, .. } => args.iter_mut().for_each(unbracket_type_names),
-        Expr::Case {
-            operand,
-            arms,
-            else_,
-            ..
-        } => {
-            if let Some(operand) = operand {
-                unbracket_type_names(operand);
-            }
-            for arm in arms {
-                unbracket_type_names(&mut arm.when);
-                unbracket_type_names(&mut arm.then);
-            }
-            if let Some(else_) = else_ {
-                unbracket_type_names(else_);
-            }
-        }
-        Expr::In {
-            expr: inner, list, ..
-        } => {
-            unbracket_type_names(inner);
-            if let InList::Exprs(items) = list {
-                items.iter_mut().for_each(unbracket_type_names);
-            }
-        }
-        Expr::Like {
-            expr: inner,
-            pattern,
-            escape,
-            ..
-        } => {
-            unbracket_type_names(inner);
-            unbracket_type_names(pattern);
-            if let Some(escape) = escape {
-                unbracket_type_names(escape);
-            }
-        }
-        Expr::Between {
-            expr: inner,
-            low,
-            high,
-            ..
-        } => {
-            unbracket_type_names(inner);
-            unbracket_type_names(low);
-            unbracket_type_names(high);
-        }
-        _ => {}
-    }
-}
-
-/// `[varchar]` to `varchar`, `]]` inside the brackets to `]`.
-fn unbracket_type_name(ty: &mut DataType) {
-    if let Some(inner) = ty
-        .name
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-    {
-        ty.name = inner.replace("]]", "]");
-    }
-}
-
-/// Where an expression is written, which decides the parentheses around it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Slot {
-    /// The whole expression, inside the outer pair of parentheses.
-    Top,
-    /// An operand of a comparison or of `IS NULL`.
-    Comparison,
-    /// An operand of `+`, `-`, `&`, `|` or `^`.
-    Additive,
-    /// An operand of `*`, `/` or `%`.
-    Multiplicative,
-    /// The operand of a unary `-` or `~`.
-    Sign,
-    /// An operand of `AND`, `OR` or `NOT`.
-    Logic,
-    /// An argument of a call, a branch of a `CASE`, an operand of `LIKE` or `COLLATE`.
+/// A token of a stored expression text, as [`column_names`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    /// An identifier written bare, a keyword or a function name.
+    Word(String),
+    /// An identifier between brackets, `]]` read as `]`.
+    Bracketed(String),
+    /// `(`, `)`, `.` or `,`.
+    Punct(char),
+    /// A string, a number, a variable or an operator.
     Other,
 }
 
-/// The normalised text of `expr`, the form SQL Server publishes in the `definition` of a
-/// `CHECK` or of a `DEFAULT`, `None` for a shape this function does not write.
-///
-/// The rules, frozen by the unit test `the_definition_text_is_normalised` on the forms its
-/// corpus holds:
-///
-/// - the whole text is between one pair of parentheses, and the parentheses the statement
-///   wrote are dropped: `CHECK ((a > 0))` is `([a]>(0))`;
-/// - a column is between brackets, `]` doubled; a number is between parentheses, `(0)`,
-///   `(-1)`, `(1.5)`, a sign before a number folded into it (`-(1)` is `(-1)`, `- -1` is
-///   `(1)`); an integer outside the range of `int` gets a final point (`(2147483648.)`); a
-///   `float` is written with sixteen decimals and a three-digit exponent
-///   (`(1.0000000000000000e+003)`), a `money` with four decimals (`($5.0000)`); a string, a
-///   binary and `NULL` are bare (`'x'`, `N'x'`, `0xAB`, `NULL`);
-/// - operators are written without spaces, `AND`, `OR` and `NOT` with spaces; `!=` is `<>`,
-///   `!<` is `>=`, `!>` is `<=`;
-/// - an arithmetic operation inside another one is between parentheses, except a `*`, `/`
-///   or `%` under an additive one (`+`, `-`, `&`, `|`, `^`): `(1)+(2)*(3)` but
-///   `((1)+(2))*(3)` and `((1)+(2))+(3)`; an additive one under a comparison is between
-///   parentheses too: `([a]+(1))>(0)` but `[a]*(2)>(-1)`; a unary `-` over something else
-///   than a number is ` -` between parentheses under an operator, `( -[a])<(0)`, and bare
-///   in a call, a `CONVERT` or a `CASE`, `abs( -[a])`, `then  -[a]`; a column qualified by
-///   its table is `[t].[a]`;
-/// - an `OR` under an `AND` is between parentheses, as is a right operand of the same
-///   operator: `[a]=(1) OR ([a]=(2) OR [a]=(3))`; `NOT` puts parentheses around an `AND` or an
-///   `OR`;
-/// - `IN` is a chain of `OR` over the list read from its end (`a IN (1, 2)` is
-///   `[a]=(2) OR [a]=(1)`), `BETWEEN` an `AND` of `>=` and `<=`, `NOT LIKE` is `NOT … like`;
-/// - a function is in lower case, its arguments separated by a bare comma; `CURRENT_TIMESTAMP`
-///   is `getdate()`, `USER`, `CURRENT_USER` and `SESSION_USER` are `user_name()`,
-///   `SYSTEM_USER` is `suser_sname()`; `YEAR` is `datepart(year,…)` (`MONTH` and `DAY` are
-///   written on that shape, outside the corpus), and the first argument of `datepart`,
-///   `dateadd` and `datediff` is the full name of the part (`dd` is `day`);
-/// - `CAST` is `CONVERT([type],…)`, `TRY_CAST` and `TRY_CONVERT` without style are
-///   `TRY_CAST(… AS [type])`; `CASE`, `when`, `then`, `else`, `end`, `like`, `escape` and
-///   `collate` are in lower case.
-pub(crate) fn normalized_text(expr: &Expr) -> Option<String> {
-    Some(format!("({})", write(expr, Slot::Top)?))
-}
-
-/// The text of `expr` written in `slot`. See [`normalized_text`].
-fn write(expr: &Expr, slot: Slot) -> Option<String> {
-    match expr {
-        Expr::Nested(inner, _)
-        | Expr::Unary {
-            op: UnaryOp::Plus,
-            expr: inner,
-            ..
-        } => write(inner, slot),
-        Expr::Literal(literal, _) => literal_text(literal, false),
-        Expr::Unary {
-            op: UnaryOp::Minus,
-            expr: inner,
-            ..
-        } => match signed_literal(inner, true) {
-            Some((literal, negative)) => literal_text(literal, negative),
-            // ` -[a]`, between parentheses under an operator: `( -[a])<(0)`; as the whole
-            // expression the outer pair stands for them: `( -((1)+(1)))`.
-            None => {
-                // Bare in a call, a `CONVERT` or a `CASE` too: `abs( -[a])`,
-                // `then  -[a]`, `case  -[a] when`.
-                let text = format!(" -{}", write(inner, Slot::Sign)?);
-                Some(if matches!(slot, Slot::Top | Slot::Other) {
-                    text
-                } else {
-                    format!("({text})")
-                })
+/// The tokens of `text`.
+fn expression_tokens(text: &str) -> Vec<Token> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        if c == '\'' || ((c == 'N' || c == 'n') && chars.get(at + 1) == Some(&'\'')) {
+            at += if c == '\'' { 1 } else { 2 };
+            while at < chars.len() {
+                if chars[at] == '\'' {
+                    if chars.get(at + 1) == Some(&'\'') {
+                        at += 2;
+                        continue;
+                    }
+                    break;
+                }
+                at += 1;
             }
-        },
-        Expr::Unary {
-            op: UnaryOp::BitNot,
-            expr: inner,
-            ..
-        } => {
-            let text = format!("~{}", write(inner, Slot::Sign)?);
-            Some(if slot == Slot::Sign {
-                format!("({text})")
-            } else {
-                text
-            })
-        }
-        Expr::Unary {
-            op: UnaryOp::Not,
-            expr: inner,
-            ..
-        } => Some(format!("NOT {}", negated_text(inner)?)),
-        Expr::Column(column) => column_text(column),
-        Expr::Variable { name, .. } => name.starts_with("@@").then(|| name.to_ascii_lowercase()),
-        Expr::Binary {
-            op, left, right, ..
-        } => binary_text(*op, left, right, slot),
-        Expr::Function {
-            name,
-            args,
-            star: false,
-            distinct: false,
-            over: None,
-            ..
-        } if name.server.is_none() && name.database.is_none() && name.schema.is_none() => {
-            function_text(&name.name.value, args)
-        }
-        Expr::Case {
-            operand,
-            arms,
-            else_,
-            ..
-        } => {
-            let mut text = String::from("case");
-            if let Some(operand) = operand {
-                text.push(' ');
-                text.push_str(&write(operand, Slot::Other)?);
+            at += 1;
+            tokens.push(Token::Other);
+        } else if c == '[' {
+            let mut name = String::new();
+            at += 1;
+            while at < chars.len() {
+                if chars[at] == ']' {
+                    if chars.get(at + 1) == Some(&']') {
+                        name.push(']');
+                        at += 2;
+                        continue;
+                    }
+                    break;
+                }
+                name.push(chars[at]);
+                at += 1;
             }
-            for arm in arms {
-                text.push_str(" when ");
-                text.push_str(&write(&arm.when, Slot::Other)?);
-                text.push_str(" then ");
-                text.push_str(&write(&arm.then, Slot::Other)?);
+            at += 1;
+            tokens.push(Token::Bracketed(name));
+        } else if c == '@' || c == '$' || c.is_ascii_digit() {
+            at += 1;
+            while at < chars.len() && (chars[at].is_alphanumeric() || "_@#$.".contains(chars[at])) {
+                at += 1;
             }
-            // `case when (1)=(1) then (1) else (0) end`, and two spaces before `end` without
-            // an `else`: `case [a] when (1) then 'x'  end`.
-            text.push(' ');
-            if let Some(else_) = else_ {
-                text.push_str("else ");
-                text.push_str(&write(else_, Slot::Other)?);
+            tokens.push(Token::Other);
+        } else if c.is_alphabetic() || c == '_' || c == '#' {
+            let start = at;
+            while at < chars.len() && (chars[at].is_alphanumeric() || "_@#$".contains(chars[at])) {
+                at += 1;
             }
-            text.push_str(" end");
-            Some(text)
-        }
-        Expr::Cast {
-            expr: inner,
-            ty,
-            try_,
-            ..
-        } => conversion_text(ty, inner, None, *try_),
-        Expr::Convert {
-            ty,
-            expr: inner,
-            style,
-            try_,
-            ..
-        } => conversion_text(ty, inner, style.as_deref(), *try_),
-        Expr::IsNull {
-            expr: inner,
-            negated,
-            ..
-        } => Some(format!(
-            "{} IS {}NULL",
-            write(inner, Slot::Comparison)?,
-            if *negated { "NOT " } else { "" }
-        )),
-        Expr::In {
-            expr: inner,
-            list: InList::Exprs(items),
-            negated,
-            ..
-        } => {
-            let chain = in_as_chain(inner, items)?;
-            if *negated {
-                Some(format!("NOT {}", negated_text(&chain)?))
-            } else {
-                write(&chain, slot)
-            }
-        }
-        Expr::Like {
-            expr: inner,
-            pattern,
-            escape,
-            negated,
-            ..
-        } => {
-            let mut text = format!(
-                "{} like {}",
-                write(inner, Slot::Other)?,
-                write(pattern, Slot::Other)?
-            );
-            if let Some(escape) = escape {
-                text.push_str(&format!(" escape {} ", write(escape, Slot::Other)?));
-            }
-            Some(if *negated {
-                format!("NOT {text}")
-            } else {
-                text
-            })
-        }
-        Expr::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-            ..
-        } => {
-            let range = binary(
-                BinaryOp::And,
-                binary(BinaryOp::Ge, (**inner).clone(), (**low).clone()),
-                binary(BinaryOp::Le, (**inner).clone(), (**high).clone()),
-            );
-            if *negated {
-                Some(format!("NOT {}", negated_text(&range)?))
-            } else {
-                write(&range, slot)
-            }
-        }
-        Expr::Collate {
-            expr: inner,
-            collation,
-            ..
-        } => Some(format!(
-            "({}) collate {collation}",
-            write(inner, Slot::Other)?
-        )),
-        Expr::NextValueFor {
-            sequence,
-            over: None,
-            ..
-        } => {
-            let parts: Vec<String> = [&sequence.database, &sequence.schema]
-                .into_iter()
-                .flatten()
-                .chain(std::iter::once(&sequence.name))
-                .map(|part| bracketed(&part.value))
-                .collect();
-            Some(format!("NEXT VALUE FOR {}", parts.join(".")))
-        }
-        _ => None,
-    }
-}
-
-/// A binary node built from two operands, with no text behind it.
-fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
-    Expr::Binary {
-        op,
-        op_span: Span::EMPTY,
-        left: Box::new(left),
-        right: Box::new(right),
-        span: Span::EMPTY,
-    }
-}
-
-/// `e IN (i1, …, in)` as `e=in OR … OR e=i1`, `None` for an empty list.
-fn in_as_chain(expr: &Expr, items: &[Expr]) -> Option<Expr> {
-    let mut items = items.iter().rev();
-    let first = items.next()?;
-    let mut chain = binary(BinaryOp::Eq, expr.clone(), first.clone());
-    for item in items {
-        chain = binary(
-            BinaryOp::Or,
-            chain,
-            binary(BinaryOp::Eq, expr.clone(), item.clone()),
-        );
-    }
-    Some(chain)
-}
-
-/// The operand of `NOT`: between parentheses when it is an `AND` or an `OR`.
-fn negated_text(expr: &Expr) -> Option<String> {
-    let text = write(expr, Slot::Logic)?;
-    Some(if logic_operator(expr).is_some() {
-        format!("({text})")
-    } else {
-        text
-    })
-}
-
-/// `AND` or `OR` when `expr` is written as one: the operator itself, an `IN` over two items
-/// or more (a chain of `OR`), a `BETWEEN` (an `AND`).
-fn logic_operator(expr: &Expr) -> Option<BinaryOp> {
-    match expr {
-        Expr::Nested(inner, _)
-        | Expr::Unary {
-            op: UnaryOp::Plus,
-            expr: inner,
-            ..
-        } => logic_operator(inner),
-        Expr::Binary {
-            op: op @ (BinaryOp::And | BinaryOp::Or),
-            ..
-        } => Some(*op),
-        Expr::In {
-            list: InList::Exprs(items),
-            negated: false,
-            ..
-        } if items.len() > 1 => Some(BinaryOp::Or),
-        Expr::Between { negated: false, .. } => Some(BinaryOp::And),
-        _ => None,
-    }
-}
-
-/// The text of a binary operation written in `slot`.
-fn binary_text(op: BinaryOp, left: &Expr, right: &Expr, slot: Slot) -> Option<String> {
-    if let Some(keyword) = match op {
-        BinaryOp::And => Some("AND"),
-        BinaryOp::Or => Some("OR"),
-        _ => None,
-    } {
-        let mut left_text = write(left, Slot::Logic)?;
-        if op == BinaryOp::And && logic_operator(left) == Some(BinaryOp::Or) {
-            left_text = format!("({left_text})");
-        }
-        let mut right_text = write(right, Slot::Logic)?;
-        if let Some(child) = logic_operator(right)
-            && (child == op || op == BinaryOp::And)
+            tokens.push(Token::Word(chars[start..at].iter().collect()));
+        } else if c == '.'
+            && chars.get(at + 1).is_some_and(char::is_ascii_digit)
+            && !matches!(tokens.last(), Some(Token::Word(_) | Token::Bracketed(_)))
         {
-            right_text = format!("({right_text})");
+            at += 1;
+            while at < chars.len() && (chars[at].is_alphanumeric() || chars[at] == '.') {
+                at += 1;
+            }
+            tokens.push(Token::Other);
+        } else if "().,".contains(c) {
+            tokens.push(Token::Punct(c));
+            at += 1;
+        } else {
+            if !c.is_whitespace() {
+                tokens.push(Token::Other);
+            }
+            at += 1;
         }
-        return Some(format!("{left_text} {keyword} {right_text}"));
     }
-    let (symbol, comparison, additive) = match op {
-        BinaryOp::Eq => ("=", true, false),
-        BinaryOp::Ne => ("<>", true, false),
-        BinaryOp::Lt => ("<", true, false),
-        BinaryOp::Le | BinaryOp::NotGt => ("<=", true, false),
-        BinaryOp::Gt => (">", true, false),
-        BinaryOp::Ge | BinaryOp::NotLt => (">=", true, false),
-        BinaryOp::Mul => ("*", false, false),
-        BinaryOp::Div => ("/", false, false),
-        BinaryOp::Mod => ("%", false, false),
-        BinaryOp::Add | BinaryOp::Concat => ("+", false, true),
-        BinaryOp::Sub => ("-", false, true),
-        BinaryOp::BitAnd => ("&", false, true),
-        BinaryOp::BitOr => ("|", false, true),
-        BinaryOp::BitXor => ("^", false, true),
-        BinaryOp::And | BinaryOp::Or => return None,
-    };
-    if comparison {
-        return Some(format!(
-            "{}{symbol}{}",
-            write(left, Slot::Comparison)?,
-            write(right, Slot::Comparison)?
-        ));
-    }
-    let operand = if additive {
-        Slot::Additive
-    } else {
-        Slot::Multiplicative
-    };
-    let text = format!(
-        "{}{symbol}{}",
-        write(left, operand)?,
-        write(right, operand)?
-    );
-    // `(1)+(2)*(3)`, `((1)+(2))*(3)`, `((1)+(2))+(3)`, `([a]*[a2])*[b2]`.
-    let wrapped = match slot {
-        Slot::Multiplicative | Slot::Sign => true,
-        Slot::Additive | Slot::Comparison => additive,
-        Slot::Top | Slot::Logic | Slot::Other => false,
-    };
-    Some(if wrapped { format!("({text})") } else { text })
+    tokens
 }
 
-/// The functions whose first argument names a part of a date.
-const DATE_PART_FUNCTIONS: [&str; 6] = [
-    "datepart",
-    "dateadd",
-    "datediff",
-    "datediff_big",
-    "datename",
-    "datetrunc",
-];
-
-/// The text of a call of the unqualified function `name`.
-fn function_text(name: &str, args: &[Expr]) -> Option<String> {
-    let name = name.to_ascii_lowercase();
-    if matches!(name.as_str(), "year" | "month" | "day")
-        && let [arg] = args
-    {
-        return Some(format!("datepart({name},{})", write(arg, Slot::Other)?));
-    }
-    let mut texts = Vec::with_capacity(args.len());
-    for (position, arg) in args.iter().enumerate() {
-        let part = (position == 0 && DATE_PART_FUNCTIONS.contains(&name.as_str()))
-            .then(|| date_part_name(arg))
-            .flatten();
-        texts.push(match part {
-            Some(part) => part,
-            None => write(arg, Slot::Other)?,
-        });
-    }
-    Some(format!("{name}({})", texts.join(",")))
-}
-
-/// The full name of the date part an unquoted name designates, `day` for `dd`; `None` for
-/// another shape of argument.
-///
-/// The corpus of `the_definition_text_is_normalised` holds `dd` and `year`; the other names
-/// follow the abbreviation table of `DATEPART`, and a name outside it is kept in lower case.
-fn date_part_name(arg: &Expr) -> Option<String> {
-    let Expr::Column(ColumnRef {
-        qualifier: None,
-        name,
-        ..
-    }) = arg
-    else {
-        return None;
-    };
-    if name.quoted {
-        return None;
-    }
-    let written = name.value.to_ascii_lowercase();
-    let full = match written.as_str() {
-        "yy" | "yyyy" => "year",
-        "qq" | "q" => "quarter",
-        "mm" | "m" => "month",
-        "dy" | "y" => "dayofyear",
-        "dd" | "d" => "day",
-        "wk" | "ww" => "week",
-        "dw" | "w" => "weekday",
-        "hh" => "hour",
-        "mi" | "n" => "minute",
-        "ss" | "s" => "second",
-        "ms" => "millisecond",
-        "mcs" => "microsecond",
-        "ns" => "nanosecond",
-        "tz" => "tzoffset",
-        "isowk" | "isoww" => "iso_week",
-        other => other,
-    };
-    Some(full.to_owned())
-}
-
-/// `CONVERT([type],expr[,style])`, or `TRY_CAST(expr AS [type])` for a `TRY_CAST` and for a
-/// `TRY_CONVERT` without style.
-fn conversion_text(ty: &DataType, expr: &Expr, style: Option<&Expr>, try_: bool) -> Option<String> {
-    let ty = type_text(ty)?;
-    let expr = write(expr, Slot::Other)?;
-    match (try_, style) {
-        (true, None) => Some(format!("TRY_CAST({expr} AS {ty})")),
-        (true, Some(_)) => None,
-        (false, None) => Some(format!("CONVERT({ty},{expr})")),
-        (false, Some(style)) => Some(format!(
-            "CONVERT({ty},{expr},{})",
-            write(style, Slot::Other)?
-        )),
-    }
-}
-
-/// `[varchar](10)`, `[decimal](10,2)`, `[nvarchar](max)`, `[int]`.
-fn type_text(ty: &DataType) -> Option<String> {
-    let name = ty
-        .name
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .map_or_else(|| ty.name.clone(), |inner| inner.replace("]]", "]"));
-    let mut text = bracketed(&name.to_ascii_lowercase());
-    if !ty.args.is_empty() {
-        let mut args = Vec::with_capacity(ty.args.len());
-        for arg in &ty.args {
-            args.push(match arg {
-                TypeArg::Number(number) => number.to_string(),
-                TypeArg::Max => "max".to_owned(),
-                TypeArg::Ident(_) => return None,
-            });
-        }
-        text.push_str(&format!("({})", args.join(",")));
-    }
-    Some(text)
-}
-
-/// `[name]`, `]` doubled.
-fn bracketed(name: &str) -> String {
-    format!("[{}]", name.replace(']', "]]"))
-}
-
-/// A column between brackets, or the call a niladic name stands for. A column qualified by
-/// its table is `[t].[a]`, each part with the case it was written with; a qualifier of more
-/// parts is not written.
-fn column_text(column: &ColumnRef) -> Option<String> {
-    if let Some(qualifier) = &column.qualifier {
-        if qualifier.server.is_some() || qualifier.database.is_some() || qualifier.schema.is_some()
+/// The index after the chain of identifiers that starts at `at` (`[t].[a]`, `dbo.t.a`), `at`
+/// itself when no identifier starts there.
+fn after_chain(tokens: &[Token], at: usize) -> usize {
+    let mut end = at;
+    while matches!(tokens.get(end), Some(Token::Word(_) | Token::Bracketed(_))) {
+        end += 1;
+        if matches!(tokens.get(end), Some(Token::Punct('.')))
+            && matches!(
+                tokens.get(end + 1),
+                Some(Token::Word(_) | Token::Bracketed(_))
+            )
         {
-            return None;
-        }
-        return Some(format!(
-            "{}.{}",
-            bracketed(&qualifier.name.value),
-            bracketed(&column.name.value)
-        ));
-    }
-    if !column.name.quoted {
-        let niladic = match column.name.value.to_ascii_uppercase().as_str() {
-            "CURRENT_TIMESTAMP" => Some("getdate()"),
-            "USER" | "CURRENT_USER" | "SESSION_USER" => Some("user_name()"),
-            "SYSTEM_USER" => Some("suser_sname()"),
-            _ => None,
-        };
-        if let Some(call) = niladic {
-            return Some(call.to_owned());
+            end += 1;
+        } else {
+            break;
         }
     }
-    Some(bracketed(&column.name.value))
+    end
 }
 
-/// The numeric literal `expr` is once its signs are folded, with whether it is negative:
-/// `negative` is the sign already met. `None` when `expr` is not a sign over a number.
-fn signed_literal(expr: &Expr, negative: bool) -> Option<(&Literal, bool)> {
-    match expr {
-        Expr::Nested(inner, _)
-        | Expr::Unary {
-            op: UnaryOp::Plus,
-            expr: inner,
-            ..
-        } => signed_literal(inner, negative),
-        Expr::Unary {
-            op: UnaryOp::Minus,
-            expr: inner,
-            ..
-        } => signed_literal(inner, !negative),
-        Expr::Literal(
-            literal @ (Literal::Integer(_)
-            | Literal::Decimal(_)
-            | Literal::Float(_)
-            | Literal::Money(_)),
-            _,
-        ) => Some((literal, negative)),
-        _ => None,
+/// The index after the `)` that closes the group `at` is inside of, the end of `tokens` for
+/// a group left open.
+fn after_enclosing_group(tokens: &[Token], at: usize) -> usize {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(at) {
+        match token {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') if depth == 0 => return index + 1,
+            Token::Punct(')') => depth -= 1,
+            _ => {}
+        }
     }
+    tokens.len()
 }
 
-/// The text of a literal, `negative` for a number under an odd count of `-`.
-fn literal_text(literal: &Literal, negative: bool) -> Option<String> {
-    match literal {
-        Literal::Integer(digits) => integer_text(digits, negative),
-        Literal::Decimal(text) => decimal_text(text, negative),
-        Literal::Float(text) => float_text(text, negative),
-        Literal::Money(text) => money_text(text, negative),
-        _ if negative => None,
-        Literal::Str { value, unicode } => Some(format!(
-            "{}'{}'",
-            if *unicode { "N" } else { "" },
-            value.replace('\'', "''")
-        )),
-        Literal::Binary(hex) => Some(format!("0x{}", hex.to_ascii_uppercase())),
-        Literal::Null => Some("NULL".to_owned()),
-        Literal::Default => None,
-    }
-}
-
-/// The digits of `digits` without their leading zeros, `0` for zero.
-fn without_leading_zeros(digits: &str) -> &str {
-    let trimmed = digits.trim_start_matches('0');
-    if trimmed.is_empty() { "0" } else { trimmed }
-}
-
-/// `(7)` for `007`, `(-2147483648)`, and `(2147483648.)` for an integer `int` does not hold,
-/// which SQL Server reads as a `numeric`.
-fn integer_text(digits: &str, negative: bool) -> Option<String> {
-    let digits = without_leading_zeros(digits);
-    if digits.len() > 38 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let value: u128 = digits.parse().ok()?;
-    let sign = if negative && value != 0 { "-" } else { "" };
-    let limit = if negative {
-        2_147_483_648
-    } else {
-        2_147_483_647
-    };
-    let point = if value > limit { "." } else { "" };
-    Some(format!("({sign}{digits}{point})"))
-}
-
-/// `(0.5)` for `.5` and for `00.5`, `(1.)` for `1.`, `(1.50)` for `1.50`.
-fn decimal_text(text: &str, negative: bool) -> Option<String> {
-    let (whole, fraction) = text.split_once('.')?;
-    let sign = if negative { "-" } else { "" };
-    Some(format!(
-        "({sign}{}.{fraction})",
-        without_leading_zeros(whole)
-    ))
-}
-
-/// `(1.0000000000000000e+003)` for `1e3`: sixteen decimals, a signed exponent of three
-/// digits.
-fn float_text(text: &str, negative: bool) -> Option<String> {
-    let value: f64 = text.parse().ok()?;
-    let value = if negative { -value } else { value };
-    let written = format!("{value:.16e}");
-    let (mantissa, exponent) = written.split_once('e')?;
-    let exponent: i32 = exponent.parse().ok()?;
-    let sign = if exponent < 0 { '-' } else { '+' };
-    Some(format!("({mantissa}e{sign}{:03})", exponent.unsigned_abs()))
-}
-
-/// `($5.0000)` for `$5`, `($-5.2500)` for `$-5.25`, `($1.2346)` for `$1.23456`: four
-/// decimals, the fifth rounding away from zero.
-fn money_text(text: &str, negative: bool) -> Option<String> {
-    let (written_negative, unsigned) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, text.strip_prefix('+').unwrap_or(text)),
-    };
-    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
-    if !whole
-        .bytes()
-        .chain(fraction.bytes())
-        .all(|byte| byte.is_ascii_digit())
-        || whole.len() > 30
-    {
-        return None;
-    }
-    let whole: u128 = if whole.is_empty() {
-        0
-    } else {
-        whole.parse().ok()?
-    };
-    let mut kept = String::from(fraction);
-    while kept.len() < 5 {
-        kept.push('0');
-    }
-    let fourths: u128 = kept[..4].parse().ok()?;
-    let round_up = kept.as_bytes()[4] >= b'5';
-    let scaled = whole * 10_000 + fourths + u128::from(round_up);
-    let sign = if (negative != written_negative) && scaled != 0 {
-        "-"
-    } else {
-        ""
-    };
-    Some(format!(
-        "(${sign}{}.{:04})",
-        scaled / 10_000,
-        scaled % 10_000
-    ))
+/// The words of a stored expression text that are not names.
+fn is_keyword(word: &str) -> bool {
+    const KEYWORDS: [&str; 23] = [
+        "and", "or", "not", "null", "is", "in", "like", "between", "case", "when", "then", "else",
+        "end", "escape", "collate", "as", "exists", "next", "value", "for", "some", "any", "all",
+    ];
+    KEYWORDS
+        .iter()
+        .any(|keyword| word.eq_ignore_ascii_case(keyword))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use ExpressionKind::{Predicate as P, Value as V};
-
-    /// Expressions as a statement writes them, with the text SQL Server publishes in
-    /// `definition` for each: a `DEFAULT` (`V`) or a `CHECK` (`P`) over the columns
-    /// `a int, a2 int, b2 int, b varchar(20), n nvarchar(20), c datetime, d decimal(10,2),
-    /// [my col] int, [a]]b] int`, some of them qualified by the name of their table.
-    const NORMALISED: &[(ExpressionKind, &str, &str)] = &[
-        (V, "0", "((0))"),
-        (V, "(0)", "((0))"),
-        (V, "((0))", "((0))"),
-        (V, "-1", "((-1))"),
-        (V, "(-1)", "((-1))"),
-        (V, "- 1", "((-1))"),
-        (V, "+1", "((1))"),
-        (V, "-(1)", "((-1))"),
-        (V, "1.5", "((1.5))"),
-        (V, "-1.5", "((-1.5))"),
-        (V, ".5", "((0.5))"),
-        (V, "1.", "((1.))"),
-        (V, "1e3", "((1.0000000000000000e+003))"),
-        (V, "1.5E-3", "((1.5000000000000000e-003))"),
-        (V, "$5", "(($5.0000))"),
-        (V, "$-5.25", "(($-5.2500))"),
-        (V, "'x'", "('x')"),
-        (V, "''", "('')"),
-        (V, "'it''s'", "('it''s')"),
-        (V, "N'x'", "(N'x')"),
-        (V, "NULL", "(NULL)"),
-        (V, "null", "(NULL)"),
-        (V, "getdate()", "(getdate())"),
-        (V, "GETDATE()", "(getdate())"),
-        (V, "GetDate ( )", "(getdate())"),
-        (V, "CURRENT_TIMESTAMP", "(getdate())"),
-        (V, "sysdatetime()", "(sysdatetime())"),
-        (V, "getutcdate()", "(getutcdate())"),
-        (V, "newid()", "(newid())"),
-        (V, "NEWSEQUENTIALID()", "(newsequentialid())"),
-        (V, "0x01", "(0x01)"),
-        (V, "0xAbCd", "(0xABCD)"),
-        (V, "0x", "(0x)"),
-        (V, "1+1", "((1)+(1))"),
-        (V, "1 + 2 * 3", "((1)+(2)*(3))"),
-        (V, "(1+2)*3", "(((1)+(2))*(3))"),
-        (V, "1-(-2)", "((1)-(-2))"),
-        (V, "'a'+'b'", "('a'+'b')"),
-        (V, "CONVERT(int,1)", "(CONVERT([int],(1)))"),
-        (V, "CAST(1 AS int)", "(CONVERT([int],(1)))"),
-        (V, "cast('1' as int)", "(CONVERT([int],'1'))"),
-        (
-            V,
-            "CONVERT(varchar(10), getdate(), 103)",
-            "(CONVERT([varchar](10),getdate(),(103)))",
-        ),
-        (V, "user_name()", "(user_name())"),
-        (V, "SUSER_SNAME()", "(suser_sname())"),
-        (V, "CURRENT_USER", "(user_name())"),
-        (V, "SYSTEM_USER", "(suser_sname())"),
-        (V, "SESSION_USER", "(user_name())"),
-        (V, "USER", "(user_name())"),
-        (V, "2147483648", "((2147483648.))"),
-        (V, "9223372036854775807", "((9223372036854775807.))"),
-        (V, "ABS(-5)", "(abs((-5)))"),
-        (V, "UPPER('x')", "(upper('x'))"),
-        (V, "DATEPART(year, getdate())", "(datepart(year,getdate()))"),
-        (
-            V,
-            "DATEADD(day, 1, getdate())",
-            "(dateadd(day,(1),getdate()))",
-        ),
-        (
-            V,
-            "CASE WHEN 1=1 THEN 1 ELSE 0 END",
-            "(case when (1)=(1) then (1) else (0) end)",
-        ),
-        (V, "ISNULL(NULL,1)", "(isnull(NULL,(1)))"),
-        (V, "COALESCE(NULL,2)", "(coalesce(NULL,(2)))"),
-        (V, "@@SERVERNAME", "(@@servername)"),
-        (V, "@@SPID", "(@@spid)"),
-        (V, "1", "((1))"),
-        (V, "'true'", "('true')"),
-        (V, "~1", "(~(1))"),
-        (V, "5 % 2", "((5)%(2))"),
-        (V, "6/3", "((6)/(3))"),
-        (V, "1&3", "((1)&(3))"),
-        (V, "1|2", "((1)|(2))"),
-        (V, "1^3", "((1)^(3))"),
-        (
-            V,
-            "'x' COLLATE Latin1_General_CS_AS",
-            "(('x') collate Latin1_General_CS_AS)",
-        ),
-        (V, "'2020-01-01'", "('2020-01-01')"),
-        (V, "0.0", "((0.0))"),
-        (V, "CONCAT('a', 'b', 1)", "(concat('a','b',(1)))"),
-        (V, "NEXT VALUE FOR dbo.seq", "(NEXT VALUE FOR [dbo].[seq])"),
-        (P, "a>0", "([a]>(0))"),
-        (P, "a >= 0", "([a]>=(0))"),
-        (P, "a<>0", "([a]<>(0))"),
-        (P, "a!=0", "([a]<>(0))"),
-        (P, "a !< 0", "([a]>=(0))"),
-        (P, "a !> 0", "([a]<=(0))"),
-        (P, "a>0 AND b<'z'", "([a]>(0) AND [b]<'z')"),
-        (P, "a>0 OR a<-10", "([a]>(0) OR [a]<(-10))"),
-        (P, "NOT a>0", "(NOT [a]>(0))"),
-        (P, "NOT (a>0)", "(NOT [a]>(0))"),
-        (P, "a IS NULL", "([a] IS NULL)"),
-        (P, "a IS NOT NULL", "([a] IS NOT NULL)"),
-        (P, "a BETWEEN 1 AND 5", "([a]>=(1) AND [a]<=(5))"),
-        (P, "a NOT BETWEEN 1 AND 5", "(NOT ([a]>=(1) AND [a]<=(5)))"),
-        (P, "a IN (1,2,3)", "([a]=(3) OR [a]=(2) OR [a]=(1))"),
-        (P, "a NOT IN (1, 2)", "(NOT ([a]=(2) OR [a]=(1)))"),
-        (P, "b LIKE 'x%'", "([b] like 'x%')"),
-        (P, "b NOT LIKE 'x%'", "(NOT [b] like 'x%')"),
-        (P, "b LIKE 'x!%' ESCAPE '!'", "([b] like 'x!%' escape '!' )"),
-        (P, "len(b)>0", "(len([b])>(0))"),
-        (P, "LEN(b) > 0", "(len([b])>(0))"),
-        (P, "a+1>0", "(([a]+(1))>(0))"),
-        (P, "a*2>-1", "([a]*(2)>(-1))"),
-        (P, "(a>0)", "([a]>(0))"),
-        (P, "((a>0))", "([a]>(0))"),
-        (
-            P,
-            "a > 0 AND (b < 'm' OR a = 5)",
-            "([a]>(0) AND ([b]<'m' OR [a]=(5)))",
-        ),
-        (
-            P,
-            "(a > 0 AND b < 'm') OR a = 5",
-            "([a]>(0) AND [b]<'m' OR [a]=(5))",
-        ),
-        (
-            P,
-            "a > 0 AND b < 'm' OR a = 5",
-            "([a]>(0) AND [b]<'m' OR [a]=(5))",
-        ),
-        (
-            P,
-            "a > 0 OR b < 'm' AND a = 5",
-            "([a]>(0) OR [b]<'m' AND [a]=(5))",
-        ),
-        (
-            P,
-            "CASE WHEN a>0 THEN 1 ELSE 0 END=1",
-            "(case when [a]>(0) then (1) else (0) end=(1))",
-        ),
-        (
-            P,
-            "CASE a WHEN 1 THEN 'x' END = 'x'",
-            "(case [a] when (1) then 'x'  end='x')",
-        ),
-        (P, "a > -1", "([a]>(-1))"),
-        (P, "b <> ''", "([b]<>'')"),
-        (P, "n = N'x'", "([n]=N'x')"),
-        (P, "d=1.5", "([d]=(1.5))"),
-        (P, "CAST(a AS bigint)>0", "(CONVERT([bigint],[a])>(0))"),
-        (
-            P,
-            "CONVERT(varchar(10),a)<>''",
-            "(CONVERT([varchar](10),[a])<>'')",
-        ),
-        (P, "ISNULL(a,0)>0", "(isnull([a],(0))>(0))"),
-        (P, "COALESCE(a,0) > 0", "(coalesce([a],(0))>(0))"),
-        (P, "a % 2 = 0", "([a]%(2)=(0))"),
-        (P, "a - a2 > 0", "(([a]-[a2])>(0))"),
-        (P, "a/2>0", "([a]/(2)>(0))"),
-        (P, "-a<0", "(( -[a])<(0))"),
-        (P, "~a<>0", "(~[a]<>(0))"),
-        (P, "a&1=0", "(([a]&(1))=(0))"),
-        (P, "upper(b)='X'", "(upper([b])='X')"),
-        (
-            P,
-            "b COLLATE Latin1_General_CS_AS = 'x'",
-            "(([b]) collate Latin1_General_CS_AS='x')",
-        ),
-        (P, "[a]>0", "([a]>(0))"),
-        (P, "[my col] > 0", "([my col]>(0))"),
-        (P, "a2 > a", "([a2]>[a])"),
-        (P, "c < getdate()", "([c]<getdate())"),
-        (P, "c>'2020-01-01'", "([c]>'2020-01-01')"),
-        (P, "a = 2147483648", "([a]=(2147483648.))"),
-        (P, "a=+1", "([a]=(1))"),
-        (P, "a = -(1)", "([a]=(-1))"),
-        (P, "a = 1 + 2 * 3", "([a]=((1)+(2)*(3)))"),
-        (P, "a = (1 + 2) * 3", "([a]=((1)+(2))*(3))"),
-        (P, "a*(a2+1)>0", "([a]*([a2]+(1))>(0))"),
-        (P, "a-(a2-1)>0", "(([a]-([a2]-(1)))>(0))"),
-        (P, "a-a2-1>0", "((([a]-[a2])-(1))>(0))"),
-        (
-            P,
-            "a > 0 AND a < 10 AND a <> 5",
-            "([a]>(0) AND [a]<(10) AND [a]<>(5))",
-        ),
-        (
-            P,
-            "a = 1 OR a = 2 OR a = 3",
-            "([a]=(1) OR [a]=(2) OR [a]=(3))",
-        ),
-        (P, "NOT a IS NULL", "(NOT [a] IS NULL)"),
-        (
-            P,
-            "NOT (a IS NULL OR b IS NULL)",
-            "(NOT ([a] IS NULL OR [b] IS NULL))",
-        ),
-        (P, "a IN (1)", "([a]=(1))"),
-        (P, "b IN ('a','b')", "([b]='b' OR [b]='a')"),
-        (P, "a=0x01", "([a]=0x01)"),
-        (P, "b = 'it''s'", "([b]='it''s')"),
-        (P, "DATALENGTH(b) < 10", "(datalength([b])<(10))"),
-        (P, "b > N'a'", "([b]>N'a')"),
-        (P, "c = CURRENT_TIMESTAMP", "([c]=getdate())"),
-        (P, "a = @@SPID", "([a]=@@spid)"),
-        (V, "007", "((7))"),
-        (V, "0.50", "((0.50))"),
-        (V, "1.50e0", "((1.5000000000000000e+000))"),
-        (V, "-2147483648", "((-2147483648))"),
-        (V, "-0", "((0))"),
-        (V, "'a' + 'b' + 'c'", "(('a'+'b')+'c')"),
-        (V, "1 + 2 + 3", "(((1)+(2))+(3))"),
-        (V, "1 - 2 - 3", "(((1)-(2))-(3))"),
-        (V, "1 - (2 - 3)", "((1)-((2)-(3)))"),
-        (V, "2 * 3 * 4", "(((2)*(3))*(4))"),
-        (V, "2 * (3 * 4)", "((2)*((3)*(4)))"),
-        (V, "12 / 2 / 3", "(((12)/(2))/(3))"),
-        (V, "-(-1)", "((1))"),
-        (V, "-(1+1)", "( -((1)+(1)))"),
-        (V, "+(1)", "((1))"),
-        (V, "- -1", "((1))"),
-        (V, "1.50", "((1.50))"),
-        (V, "00.5", "((0.5))"),
-        (V, "0x0a", "(0x0A)"),
-        (V, "N''", "(N'')"),
-        (V, "CAST(NULL AS int)", "(CONVERT([int],NULL))"),
-        (
-            V,
-            "CONVERT(datetime, '2020-01-01')",
-            "(CONVERT([datetime],'2020-01-01'))",
-        ),
-        (
-            V,
-            "CONVERT(nvarchar(max), N'x')",
-            "(CONVERT([nvarchar](max),N'x'))",
-        ),
-        (
-            V,
-            "CAST(1 AS decimal(10, 2))",
-            "(CONVERT([decimal](10,2),(1)))",
-        ),
-        (V, "CAST(0 AS bit)", "(CONVERT([bit],(0)))"),
-        (V, "CAST(1 AS float)", "(CONVERT([float],(1)))"),
-        (V, "CAST('x' AS varchar)", "(CONVERT([varchar],'x'))"),
-        (V, "SYSUTCDATETIME()", "(sysutcdatetime())"),
-        (V, "SYSDATETIMEOFFSET()", "(sysdatetimeoffset())"),
-        (V, "HOST_NAME()", "(host_name())"),
-        (V, "APP_NAME()", "(app_name())"),
-        (V, "DB_NAME()", "(db_name())"),
-        (V, "@@VERSION", "(@@version)"),
-        (V, "1e0", "((1.0000000000000000e+000))"),
-        (V, "2.5E+10", "((2.5000000000000000e+010))"),
-        (V, "$0", "(($0.0000))"),
-        (V, "$1.23456", "(($1.2346))"),
-        (V, "ISNULL(NULL, 'x')", "(isnull(NULL,'x'))"),
-        (V, "COALESCE(NULL, NULL, 3)", "(coalesce(NULL,NULL,(3)))"),
-        (V, "NULLIF(1, 0)", "(nullif((1),(0)))"),
-        (V, "LEFT('abc', 1)", "(left('abc',(1)))"),
-        (V, "(1)*(-1)", "((1)*(-1))"),
-        (V, "~~1", "(~(~(1)))"),
-        (V, "-~1", "( -(~(1)))"),
-        (V, "~-1", "(~(-1))"),
-        (V, "-1e3", "((-1.0000000000000000e+003))"),
-        (V, "-$5", "(($-5.0000))"),
-        (V, "PI()", "(pi())"),
-        (V, "ROUND(1.5, 0)", "(round((1.5),(0)))"),
-        (V, "SPACE(1)", "(space((1)))"),
-        (V, "1 + -1", "((1)+(-1))"),
-        (V, "1 * -1", "((1)*(-1))"),
-        (V, "(1)", "((1))"),
-        (V, "REPLICATE('a', 3)", "(replicate('a',(3)))"),
-        (
-            V,
-            "DATEADD(dd, -1, GETDATE())",
-            "(dateadd(day,(-1),getdate()))",
-        ),
-        (
-            V,
-            "DATEDIFF(day, '2020-01-01', getdate())",
-            "(datediff(day,'2020-01-01',getdate()))",
-        ),
-        (V, "YEAR(getdate())", "(datepart(year,getdate()))"),
-        (V, "FORMAT(1, 'N')", "(format((1),'N'))"),
-        (V, "TRY_CAST('1' AS int)", "(TRY_CAST('1' AS [int]))"),
-        (V, "TRY_CONVERT(int, '1')", "(TRY_CAST('1' AS [int]))"),
-        (V, "CHECKSUM(1)", "(checksum((1)))"),
-        (V, "1", "((1))"),
-        (V, "1.5e-10", "((1.5000000000000000e-010))"),
-        (V, "123456789012345678.0e5", "((1.2345678901234568e+022))"),
-        (V, "1.5e0", "((1.5000000000000000e+000))"),
-        (V, "12345678901234567890123", "((12345678901234567890123.))"),
-        (
-            V,
-            "CASE 1 WHEN 1 THEN 2 WHEN 3 THEN 4 ELSE 5 END",
-            "(case (1) when (1) then (2) when (3) then (4) else (5) end)",
-        ),
-        (
-            V,
-            "'a' + CAST(1 AS varchar(10))",
-            "('a'+CONVERT([varchar](10),(1)))",
-        ),
-        (V, "1 + (2)", "((1)+(2))"),
-        (V, "(1 + 2)", "((1)+(2))"),
-        (V, "((1 + 2))", "((1)+(2))"),
-        (P, "a*a2*b2>0", "(([a]*[a2])*[b2]>(0))"),
-        (P, "a*(a2*b2)>0", "([a]*([a2]*[b2])>(0))"),
-        (P, "(a*2)>0", "([a]*(2)>(0))"),
-        (P, "a+(1+2)>0", "(([a]+((1)+(2)))>(0))"),
-        (P, "a+1+2>0", "((([a]+(1))+(2))>(0))"),
-        (
-            P,
-            "a=1 OR (a=2 OR a=3)",
-            "([a]=(1) OR ([a]=(2) OR [a]=(3)))",
-        ),
-        (P, "(a=1 OR a=2) OR a=3", "([a]=(1) OR [a]=(2) OR [a]=(3))"),
-        (
-            P,
-            "a=1 AND (a2=2 AND b='x')",
-            "([a]=(1) AND ([a2]=(2) AND [b]='x'))",
-        ),
-        (
-            P,
-            "(a=1 AND a2=2) AND b='x'",
-            "([a]=(1) AND [a2]=(2) AND [b]='x')",
-        ),
-        (P, "-(a+1)<0", "(( -([a]+(1)))<(0))"),
-        (P, "- -a<0", "(( -( -[a]))<(0))"),
-        (P, "NOT NOT a>0", "(NOT NOT [a]>(0))"),
-        (P, "~(a+1)<>0", "(~([a]+(1))<>(0))"),
-        (P, "a IN (a2, 1+1)", "([a]=((1)+(1)) OR [a]=[a2])"),
-        (P, "[a]]b] > 0", "([a]]b]>(0))"),
-        (P, "b LIKE N'x%'", "([b] like N'x%')"),
-        (P, "b LIKE 'x' + '%'", "([b] like 'x'+'%')"),
-        (P, "CONVERT(varchar, a)<>''", "(CONVERT([varchar],[a])<>'')"),
-        (
-            P,
-            "CONVERT(varchar(max), a)<>''",
-            "(CONVERT([varchar](max),[a])<>'')",
-        ),
-        (
-            P,
-            "CAST(a AS decimal(10,2))>0",
-            "(CONVERT([decimal](10,2),[a])>(0))",
-        ),
-        (
-            P,
-            "CAST(a AS nvarchar(max))<>N''",
-            "(CONVERT([nvarchar](max),[a])<>N'')",
-        ),
-        (P, "TRY_CAST(a AS int) > 0", "(TRY_CAST([a] AS [int])>(0))"),
-        (P, "COALESCE(a, a2, 0)>0", "(coalesce([a],[a2],(0))>(0))"),
-        (P, "NULLIF(a,0) > 0", "(nullif([a],(0))>(0))"),
-        (P, "a = NULL", "([a]=NULL)"),
-        (P, "b + 'x' = 'yx'", "(([b]+'x')='yx')"),
-        (
-            P,
-            "a IS NULL AND b IS NULL",
-            "([a] IS NULL AND [b] IS NULL)",
-        ),
-        (P, "LEFT(b,1)='x'", "(left([b],(1))='x')"),
-        (P, "DATEADD(dd, 1, c) > c", "(dateadd(day,(1),[c])>[c])"),
-        (
-            P,
-            "DATEDIFF(day, c, getdate()) < 5",
-            "(datediff(day,[c],getdate())<(5))",
-        ),
-        (P, "YEAR(c) > 2000", "(datepart(year,[c])>(2000))"),
-        (P, "CHARINDEX('x', b) > 0", "(charindex('x',[b])>(0))"),
-        (P, "SUBSTRING(b,1,2)='ab'", "(substring([b],(1),(2))='ab')"),
-        (P, "LTRIM(RTRIM(b)) <> ''", "(ltrim(rtrim([b]))<>'')"),
-        (P, "ROUND(d, 1) > 0", "(round([d],(1))>(0))"),
-        (
-            P,
-            "CASE WHEN a>0 THEN 'x' WHEN a<0 THEN 'y' END='x'",
-            "(case when [a]>(0) then 'x' when [a]<(0) then 'y'  end='x')",
-        ),
-        (
-            P,
-            "CASE WHEN a > 0 THEN 1 END = 1",
-            "(case when [a]>(0) then (1)  end=(1))",
-        ),
-        (P, "a > 0 AND NOT b = 'x'", "([a]>(0) AND NOT [b]='x')"),
-        (P, "NOT (a > 0) AND b = 'x'", "(NOT [a]>(0) AND [b]='x')"),
-        (
-            P,
-            "NOT (a > 0 AND b = 'x') OR a2 = 1",
-            "(NOT ([a]>(0) AND [b]='x') OR [a2]=(1))",
-        ),
-        (
-            P,
-            "a2 BETWEEN a AND a + 10",
-            "([a2]>=[a] AND [a2]<=([a]+(10)))",
-        ),
-        (
-            P,
-            "b NOT LIKE 'x%' ESCAPE '!'",
-            "(NOT [b] like 'x%' escape '!' )",
-        ),
-        (
-            P,
-            "a = 1 AND a2 = 2 OR b = 'x' AND n = N'y'",
-            "([a]=(1) AND [a2]=(2) OR [b]='x' AND [n]=N'y')",
-        ),
-        (
-            P,
-            "(a = 1 OR a2 = 2) AND (b = 'x' OR n = N'y')",
-            "(([a]=(1) OR [a2]=(2)) AND ([b]='x' OR [n]=N'y'))",
-        ),
-        (P, "a+a2*3>0", "(([a]+[a2]*(3))>(0))"),
-        (P, "(a+a2)*3>0", "(([a]+[a2])*(3)>(0))"),
-        (P, "a*3+a2>0", "(([a]*(3)+[a2])>(0))"),
-        (P, "a-a2+1>0", "((([a]-[a2])+(1))>(0))"),
-        (P, "a/(a2*2)>0", "([a]/([a2]*(2))>(0))"),
-        (P, "a%a2%2=0", "(([a]%[a2])%(2)=(0))"),
-        (P, "a&a2|1>0", "((([a]&[a2])|(1))>(0))"),
-        (P, "a|a2&1>0", "((([a]|[a2])&(1))>(0))"),
-        (P, "a^1>0", "(([a]^(1))>(0))"),
-        (P, "a=a2", "([a]=[a2])"),
-        (P, "1=1", "((1)=(1))"),
-        (P, "a2 < a OR a2 IS NULL", "([a2]<[a] OR [a2] IS NULL)"),
-        (P, "b IN ('x')", "([b]='x')"),
-        (P, "b NOT IN ('x', 'y')", "(NOT ([b]='y' OR [b]='x'))"),
-        (P, "a NOT IN (1)", "(NOT [a]=(1))"),
-        (P, "a IN (1, NULL)", "([a]=NULL OR [a]=(1))"),
-        (
-            P,
-            "c BETWEEN '2020-01-01' AND '2021-01-01'",
-            "([c]>='2020-01-01' AND [c]<='2021-01-01')",
-        ),
-        (P, "d > -0.5", "([d]>(-0.5))"),
-        (P, "d >= 0.0", "([d]>=(0.0))"),
-        (P, "a > 1.5e0", "([a]>(1.5000000000000000e+000))"),
-        (P, "d < $5", "([d]<($5.0000))"),
-        (P, "NOT a IN (1,2)", "(NOT ([a]=(2) OR [a]=(1)))"),
-        (P, "NOT a BETWEEN 1 AND 2", "(NOT ([a]>=(1) AND [a]<=(2)))"),
-        (P, "NOT b LIKE 'x'", "(NOT [b] like 'x')"),
-        (P, "(b) LIKE 'x'", "([b] like 'x')"),
-        (P, "b LIKE ('x')", "([b] like 'x')"),
-        (P, "(a) IS NULL", "([a] IS NULL)"),
-        (P, "a + 1 IS NULL", "(([a]+(1)) IS NULL)"),
-        (P, "ISNULL(b,'') <> ''", "(isnull([b],'')<>'')"),
-        (P, "(((a)))>(((0)))", "([a]>(0))"),
-        (P, "a <= 0x0A", "([a]<=0x0A)"),
-        (
-            P,
-            "len(b) between 1 and 5",
-            "(len([b])>=(1) AND len([b])<=(5))",
-        ),
-        (
-            P,
-            "b > 'a' COLLATE Latin1_General_CS_AS",
-            "([b]>('a') collate Latin1_General_CS_AS)",
-        ),
-        (P, "abs(-a)>0", "(abs( -[a])>(0))"),
-        (
-            P,
-            "CONVERT(varchar(10),-a)<>''",
-            "(CONVERT([varchar](10), -[a])<>'')",
-        ),
-        (P, "CAST(-a AS bigint)>0", "(CONVERT([bigint], -[a])>(0))"),
-        (
-            P,
-            "CASE WHEN a>0 THEN -a ELSE -a2 END>0",
-            "(case when [a]>(0) then  -[a] else  -[a2] end>(0))",
-        ),
-        (
-            P,
-            "CASE -a WHEN 1 THEN 1 END=1",
-            "(case  -[a] when (1) then (1)  end=(1))",
-        ),
-        (
-            P,
-            "CASE WHEN a>0 THEN -(a+1) END>0",
-            "(case when [a]>(0) then  -([a]+(1))  end>(0))",
-        ),
-        (P, "coalesce(-a,0)>0", "(coalesce( -[a],(0))>(0))"),
-        (P, "-a IN (1,2)", "(( -[a])=(2) OR ( -[a])=(1))"),
-        (P, "-a IS NULL", "(( -[a]) IS NULL)"),
-        (P, "-a BETWEEN 1 AND 2", "(( -[a])>=(1) AND ( -[a])<=(2))"),
-        (
-            P,
-            "CASE WHEN -a>0 THEN 1 END=1",
-            "(case when ( -[a])>(0) then (1)  end=(1))",
-        ),
-        (P, "abs(-(-a))>0", "(abs( -( -[a]))>(0))"),
-        (P, "abs(-~a)>0", "(abs( -(~[a]))>(0))"),
-        (P, "isnull(-a, -1)>0", "(isnull( -[a],(-1))>(0))"),
-        (P, "abs(~a)>0", "(abs(~[a])>(0))"),
-        (
-            P,
-            "CASE WHEN a>0 THEN ~a END>0",
-            "(case when [a]>(0) then ~[a]  end>(0))",
-        ),
-        (P, "q1.a > 0", "([q1].[a]>(0))"),
-        (P, "[q3].[my col] > 0", "([q3].[my col]>(0))"),
-        (
-            P,
-            "q4.a + q4.a2 > 0 AND abs(q4.a) IN (1, 2)",
-            "(([q4].[a]+[q4].[a2])>(0) AND (abs([q4].[a])=(2) OR abs([q4].[a])=(1)))",
-        ),
-        (P, "[q]]5].a > 0", "([q]]5].[a]>(0))"),
-        (P, "Q6.A > 0", "([Q6].[A]>(0))"),
-    ];
-
-    /// The tree of `text` as a statement writes it.
-    fn written(kind: ExpressionKind, text: &str) -> Expr {
-        parse_stored_expression(text, kind)
-            .unwrap_or_else(|error| panic!("{text} does not parse: {error:?}"))
-    }
-
-    #[test]
-    fn the_definition_text_is_normalised() {
-        let mut wrong = Vec::new();
-        for (kind, input, expected) in NORMALISED {
-            let text = normalized_text(&written(*kind, input));
-            if text.as_deref() != Some(*expected) {
-                wrong.push(format!("{input}: {text:?}, expected {expected}"));
-            }
-        }
-        assert!(
-            wrong.is_empty(),
-            "{} of {}:\n{}",
-            wrong.len(),
-            NORMALISED.len(),
-            wrong.join("\n")
-        );
-        assert_eq!(NORMALISED.len(), 313);
-    }
-
-    #[test]
-    fn the_text_of_a_stored_tree_is_the_stored_text() {
-        for (kind, input, expected) in NORMALISED {
-            let (text, tree) = stored_expression(&written(*kind, input), *kind).expect(input);
-            assert_eq!(text, *expected, "{input}");
-            assert_eq!(definition_text(&tree), text, "{input}");
-        }
-    }
-
-    #[test]
-    fn a_tree_rebuilt_from_its_text_is_the_stored_tree() {
-        for (kind, input, _) in NORMALISED {
-            let stored = stored_expression(&written(*kind, input), *kind).expect(input);
-            let rebuilt = parse_stored_expression(&stored.0, *kind).expect(input);
-            assert_eq!(rebuilt, stored.1, "{input}");
-            assert_eq!(
-                stored_expression(&rebuilt, *kind).expect(input),
-                stored,
-                "{input}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_shape_left_unnormalised_keeps_the_text_display_writes() {
-        // A column qualified by a schema and a subquery are not normalised: the text is
-        // `Display` between one pair of parentheses, and reads back to the same text.
-        for (kind, input) in [
-            (P, "dbo.t.a > 0"),
-            (P, "(dbo.t.a > 0)"),
-            (V, "(SELECT 1)"),
-            (P, "a IN (SELECT 1)"),
-        ] {
-            let tree = written(kind, input);
-            assert_eq!(normalized_text(&tree), None, "{input}");
-            let (text, stored) = stored_expression(&tree, kind).expect(input);
-            assert_eq!(text, display_text(&tree), "{input}");
-            assert_eq!(definition_text(&stored), text, "{input}");
-            assert_eq!(stored_expression(&stored, kind).expect(input).0, text);
-        }
-    }
-
-    #[test]
-    fn a_bracketed_type_name_reads_back_bare() {
-        let tree = parse_stored_expression("(CONVERT([varchar](10),[a])<>'')", P).expect("parse");
-        let Expr::Nested(inner, _) = &tree else {
-            panic!("{tree:?}");
-        };
-        let Expr::Binary { left, .. } = inner.as_ref() else {
-            panic!("{inner:?}");
-        };
-        let Expr::Convert { ty, .. } = left.as_ref() else {
-            panic!("{left:?}");
-        };
-        assert_eq!(ty.name, "varchar");
-        assert_eq!(ty.args, vec![TypeArg::Number(10)]);
-    }
-
     #[test]
     fn the_expression_texts_are_the_published_texts() {
-        let (_, zero) = stored_expression(&written(V, "0"), V).expect("0");
-        let (definition, check) = stored_expression(&written(P, "a >= 0"), P).expect("a >= 0");
         let column = ColumnMeta {
             id: ColumnId(1),
             name: "a".to_owned(),
             ty: vauban_types::TypeInfo::new(vauban_types::SqlType::Int, true),
             ordinal: 0,
-            default: Some(zero.clone()),
+            default: Some("((0))".to_owned()),
             identity: None,
-            computed: Some(written(V, "a + 1")),
+            computed: Some("([a]+(1))".to_owned()),
         };
         assert_eq!(column.default_text().as_deref(), Some("((0))"));
         assert_eq!(column.computed_text().as_deref(), Some("([a]+(1))"));
@@ -1808,20 +572,47 @@ mod tests {
             constraint: ObjectId(7),
             system_named: true,
             column: ColumnId(1),
-            expr: zero,
+            definition: "((0))".to_owned(),
         };
         assert_eq!(default.expression_text().as_deref(), Some("((0))"));
         let check = ConstraintMeta::Check {
             constraint: ObjectId(8),
             system_named: false,
-            expr: check,
-            definition,
+            definition: "([a]>=(0))".to_owned(),
         };
         assert_eq!(check.expression_text().as_deref(), Some("([a]>=(0))"));
         assert_eq!(
             ConstraintMeta::PrimaryKey(IndexId(1)).expression_text(),
             None
         );
+    }
+
+    #[test]
+    fn the_column_names_of_a_stored_text() {
+        let cases: [(&str, &[&str]); 16] = [
+            ("([a]>=(0))", &["a"]),
+            ("([q4].[a]+[q4].[a2])", &["a", "a2"]),
+            ("([a]]b]>(0) AND [my col]<(1))", &["a]b", "my col"]),
+            ("(abs([a])=(2) OR abs([a])=(1))", &["a", "a"]),
+            ("(CONVERT([varchar](10),[b])<>'')", &["b"]),
+            ("(TRY_CAST([b] AS [int]))", &["b"]),
+            ("([b] like 'x[a]%' escape '!')", &["b"]),
+            ("([n]=N'[a]''s')", &["n"]),
+            ("([b] collate Latin1_General_CS_AS='x')", &["b"]),
+            ("(datepart(year,[c])>(2000))", &["year", "c"]),
+            ("((1.0000000000000000e+003)+($5.0000)+0xAB)", &[]),
+            (
+                "(case when [a]>(0) then  -[a] else [b] end)",
+                &["a", "a", "b"],
+            ),
+            ("([a] IS NOT NULL AND @@spid>(0))", &["a"]),
+            ("(dbo.t.a>(0))", &["a"]),
+            ("([a] IN (SELECT [x] FROM [s]) OR [b]>(0))", &["a", "b"]),
+            ("(sum([a]) over (partition by [b]))", &["a"]),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(column_names(text), expected.to_vec(), "{text}");
+        }
     }
 
     #[test]

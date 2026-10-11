@@ -9,11 +9,11 @@
 
 use std::sync::Arc;
 
+use vauban_catalog::RefAction;
 use vauban_catalog::{
     Catalog, ColumnDef, ConstraintDef, IndexDef, ObjectId, QualifiedName, SortedColumn, TableDef,
     TableMeta,
 };
-use vauban_parser::RefAction;
 use vauban_storage::{DbId, MemoryStorage, Storage, TableId};
 use vauban_txn::{IsolationLevel, TransactionManager};
 use vauban_types::{Len, SqlType, TypeInfo, Value};

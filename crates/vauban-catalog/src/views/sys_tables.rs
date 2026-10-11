@@ -947,7 +947,7 @@ fn text(value: &str) -> Value {
 mod tests {
     use std::sync::Arc;
 
-    use vauban_parser::{Expr, Literal, RefAction, Span};
+    use crate::def::RefAction;
     use vauban_storage::{MemoryStorage, Storage, TableId};
     use vauban_txn::{IsolationLevel, TransactionManager};
 
@@ -2120,7 +2120,6 @@ mod tests {
         // A table with the four kinds of constraint: the three that carry an `ObjectId` of
         // their own get a row here, `PRIMARY KEY` does not (module documentation, asserted
         // below on the length of `rows`).
-        let placeholder = Expr::Literal(Literal::Null, Span::EMPTY);
         let mut target = TableMeta {
             id: ObjectId(1_000_100),
             storage_id: TableId(9),
@@ -2155,14 +2154,13 @@ mod tests {
         target.constraints.push(ConstraintMeta::Check {
             constraint: ObjectId(1_000_102),
             system_named: false,
-            expr: placeholder.clone(),
             definition: "(1)".to_owned(),
         });
         target.constraints.push(ConstraintMeta::Default {
             constraint: ObjectId(1_000_103),
             system_named: false,
             column: crate::ids::ColumnId(1),
-            expr: placeholder,
+            definition: "(NULL)".to_owned(),
         });
         let names = BTreeMap::from([(ObjectId(1_000_102), "ck_written".to_owned())]);
 

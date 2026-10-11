@@ -79,6 +79,7 @@ mod setop;
 mod sort;
 mod star;
 mod statement;
+mod stored_text;
 mod subquery;
 mod txn_stmt;
 mod update_delete;
@@ -100,6 +101,7 @@ pub use context::{
 pub use datatype::resolve_declared_type;
 pub use execute::{BoundExecArg, BoundExecTarget, BoundExecute};
 pub use statement::bind;
+pub use stored_text::{ExpressionKind, parse_stored_expression};
 pub use variables::BatchVariables;
 /// The `SET <option>` a [`BoundStatement::SetOption`] carries, as the parser built it.
 pub use vauban_parser::SetOptionStatement;

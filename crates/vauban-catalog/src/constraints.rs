@@ -67,25 +67,23 @@
 //!
 //! Each expression is stored as text, the one `sys.check_constraints.definition` and
 //! `sys.default_constraints.definition` publish (`([a]>=(0))` for `CHECK (a >= 0)`, `((0))`
-//! for `DEFAULT 0`), and the tree the constraint and its column hold is read back from that
-//! text (`meta.rs`, `stored_expression`): a table rebuilt from its stored text holds the same
-//! trees as the table the statement built (`tests/sys_constraints.rs`,
+//! for `DEFAULT 0`). The caller writes that text; the constraint and its column hold it as
+//! given, and a table rebuilt from its stored rows holds the same texts as the table the
+//! statement built (`tests/sys_constraints.rs`,
 //! `a_table_rebuilt_from_its_stored_text_holds_the_same_expressions`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_parser::{Expr, RefAction};
 use vauban_storage::{DbId, IndexId, TableId, TxnId};
 use vauban_txn::{CommitAction, RollbackAction, TxnHandle};
 use vauban_types::{SqlType, TypeInfo};
 
 use crate::catalog::Catalog;
-use crate::def::{ColumnDef, ConstraintDef, TableDef};
+use crate::def::{ColumnDef, ConstraintDef, RefAction, TableDef};
 use crate::ids::{ColumnId, ObjectId};
 use crate::meta::{
-    ColumnMeta, ConstraintMeta, ExpressionKind, IndexMeta, ObjectKind, ObjectMeta, QualifiedName,
-    TableMeta, stored_expression,
+    ColumnMeta, ConstraintMeta, IndexMeta, ObjectKind, ObjectMeta, QualifiedName, TableMeta,
 };
 use crate::table::{self, TableStore};
 use crate::views::sys_constraints::generated_constraint_name;
@@ -473,13 +471,11 @@ pub(crate) fn apply_table_constraints(
             ConstraintDef::Check { name, expr } => {
                 let written = name.clone();
                 let name = name_for("CK", written.as_deref(), None, meta);
-                let (definition, expr) = stored_expression(expr, ExpressionKind::Predicate)?;
                 let id = register(store, meta, &database, &mut made, &name)?;
                 meta.constraints.push(ConstraintMeta::Check {
                     constraint: id,
                     system_named: written.is_none(),
-                    expr,
-                    definition,
+                    definition: expr.clone(),
                 });
             }
             ConstraintDef::Default { name, column, expr } => {
@@ -493,14 +489,13 @@ pub(crate) fn apply_table_constraints(
                         meta.name
                     ))
                 })?;
-                let (_, expr) = stored_expression(expr, ExpressionKind::Value)?;
                 let id = register(store, meta, &database, &mut made, &name)?;
                 columns_with_a_named_default.push(target);
                 meta.constraints.push(ConstraintMeta::Default {
                     constraint: id,
                     system_named: written.is_none(),
                     column: target,
-                    expr,
+                    definition: expr.clone(),
                 });
             }
         }
@@ -516,7 +511,7 @@ pub(crate) fn apply_table_constraints(
             _ => None,
         })
         .collect();
-    let bare: Vec<(String, ColumnId, Expr)> = meta
+    let bare: Vec<(String, ColumnId, String)> = meta
         .columns
         .iter()
         .filter(|column| !columns_with_a_named_default.contains(&column.id))
@@ -528,18 +523,17 @@ pub(crate) fn apply_table_constraints(
                 .map(|expr| (column.name.clone(), column.id, expr))
         })
         .collect();
-    for (column_name, column, expr) in bare {
+    for (column_name, column, definition) in bare {
         let name = name_for("DF", None, Some(&column_name), meta);
-        let (_, expr) = stored_expression(&expr, ExpressionKind::Value)?;
         let id = register(store, meta, &database, &mut made, &name)?;
         meta.constraints.push(ConstraintMeta::Default {
             constraint: id,
             system_named: true,
             column,
-            expr,
+            definition,
         });
     }
-    store_column_expressions(meta)?;
+    store_column_defaults(meta);
     let objects: Vec<ObjectMeta> = store
         .constraints
         .of_table(meta.id)
@@ -1393,35 +1387,25 @@ fn compatible_types(here: &TypeInfo, there: &TypeInfo) -> bool {
     here.ty == there.ty
 }
 
-/// Puts on each column of `meta` the trees read back from the stored text: the `DEFAULT` of
-/// the first [`ConstraintMeta::Default`] that names the column, and its computed expression.
-///
-/// A column whose default the statement wrote (`ColumnMeta::default` filled by `table.rs` or
-/// by `alter.rs` from the [`ColumnDef`]) receives the tree of its constraint, so that the
-/// column and the constraint hold one tree, the one [`stored_expression`] read back from the
-/// text the rows carry.
-///
-/// # Errors
-///
-/// Those of [`stored_expression`].
-fn store_column_expressions(meta: &mut TableMeta) -> SqlResult<()> {
-    let mut defaults: Vec<(ColumnId, Expr)> = Vec::new();
+/// Puts on each column of `meta` the stored text of the `DEFAULT` of the first
+/// [`ConstraintMeta::Default`] that names the column, so that the column and its constraint
+/// hold one text.
+fn store_column_defaults(meta: &mut TableMeta) {
+    let mut defaults: Vec<(ColumnId, String)> = Vec::new();
     for constraint in &meta.constraints {
-        if let ConstraintMeta::Default { column, expr, .. } = constraint
+        if let ConstraintMeta::Default {
+            column, definition, ..
+        } = constraint
             && !defaults.iter().any(|(seen, _)| seen == column)
         {
-            defaults.push((*column, expr.clone()));
+            defaults.push((*column, definition.clone()));
         }
     }
     for column in &mut meta.columns {
-        if let Some((_, expr)) = defaults.iter().find(|(id, _)| *id == column.id) {
-            column.default = Some(expr.clone());
-        }
-        if let Some(computed) = &column.computed {
-            column.computed = Some(stored_expression(computed, ExpressionKind::Value)?.1);
+        if let Some((_, definition)) = defaults.iter().find(|(id, _)| *id == column.id) {
+            column.default = Some(definition.clone());
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

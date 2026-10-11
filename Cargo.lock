@@ -1497,7 +1497,6 @@ version = "0.0.5"
 dependencies = [
  "tracing",
  "vauban-errors",
- "vauban-parser",
  "vauban-storage",
  "vauban-txn",
  "vauban-types",

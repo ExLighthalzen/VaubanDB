@@ -36,7 +36,7 @@ use vauban_catalog::{
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{
     AlterTableAction, AlterTableStatement, Clustering, ColumnConstraintKind,
-    ColumnDef as AstColumnDef, Ident, IndexColumn, ObjectName, RefAction, Span, TableConstraint,
+    ColumnDef as AstColumnDef, Expr, Ident, IndexColumn, ObjectName, Span, TableConstraint,
     TableConstraintKind,
 };
 use vauban_types::{Collation, TypeInfo};
@@ -44,11 +44,15 @@ use vauban_types::{Collation, TypeInfo};
 use crate::bound::{BoundStatement, DdlStatement};
 use crate::context::{BindContext, CatalogView, ResolvedTable, ResolvedTableKind};
 use crate::datatype::resolve_data_type;
-use crate::ddl::{check_check_expression, check_default_expression, table_name};
+use crate::ddl::{
+    catalog_action, check_check_expression, check_default_expression, stored_text_or_defer,
+    table_name,
+};
 use crate::expr::Scope;
 use crate::names::from_needs_the_catalogue;
 use crate::query::{not_implemented, not_yet};
 use crate::star::Source;
+use crate::stored_text::{ExpressionKind, stored_text};
 
 /// State 4 for error 2705 when an `ALTER TABLE … ADD` names a column the table already has.
 const DUPLICATE_COLUMN_2705_ALTER_TABLE_STATE: u8 = 4;
@@ -184,13 +188,22 @@ fn bind_add_columns(
     }
     let base = u32::try_from(resolved.columns.len() + 1).unwrap_or(u32::MAX);
     let mut added = Vec::with_capacity(columns.len());
+    let mut deferred = None;
     for (offset, column) in columns.iter().enumerate() {
         let position = base.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
-        let (def, default_name) = column_def(column, position, span)?;
-        if let Some(expr) = &def.default {
+        let (mut def, default_name, written) = column_def(column, position, span)?;
+        if let Some(expr) = written {
             check_default_expression(expr, &def.ty, span.line, ctx)?;
+            def.default = Some(stored_text_or_defer(
+                expr,
+                ExpressionKind::Value,
+                &mut deferred,
+            ));
         }
         added.push((Box::new(def), default_name));
+    }
+    if let Some(err) = deferred {
+        return Err(err);
     }
     if added.len() == 1 {
         let (column, default_name) = added.remove(0);
@@ -396,13 +409,15 @@ fn table_constraint_def(
             check_check_expression(expr, scope, ctx).map_err(|err| on_statement(err, span))?;
             Ok(ConstraintDef::Check {
                 name,
-                expr: expr.clone(),
+                expr: stored_text(expr, ExpressionKind::Predicate)?,
             })
         }
     }
 }
 
-/// Binds one column of an `ALTER TABLE … ADD`, and the name written on its `DEFAULT`, if any.
+/// Binds one column of an `ALTER TABLE … ADD`, and the name and the expression written on its
+/// `DEFAULT`, if any. [`ColumnDef::default`] is left empty: [`bind_add_columns`] fills it with
+/// the stored text once the expression is checked.
 ///
 /// A `CONSTRAINT df DEFAULT 0` keeps `df`: [`bind_add_columns`] carries it apart from
 /// [`ColumnDef::default`], which has no field for a name, to
@@ -411,11 +426,11 @@ fn table_constraint_def(
 /// `plan_change`) — the same split `crates/vauban-binder/src/ddl.rs`'s `column_of` makes for
 /// `CREATE TABLE` between [`ColumnDef::default`] and a named [`vauban_catalog::ConstraintDef::Default`]
 /// (unit test `add_column_with_a_named_default_keeps_its_name`).
-fn column_def(
-    column: &AstColumnDef,
+fn column_def<'c>(
+    column: &'c AstColumnDef,
     position: u32,
     span: &Span,
-) -> SqlResult<(ColumnDef, Option<String>)> {
+) -> SqlResult<(ColumnDef, Option<String>, Option<&'c Expr>)> {
     if column.computed.is_some() {
         return Err(SqlError::from(InternalError::Bug(format!(
             "bind_alter_table: the computed column '{}' is not implemented yet",
@@ -433,7 +448,7 @@ fn column_def(
             ColumnConstraintKind::Null => nullable = true,
             ColumnConstraintKind::NotNull => nullable = false,
             ColumnConstraintKind::Default(expr) if default.is_none() => {
-                default = Some(expr.clone());
+                default = Some(expr);
                 default_name = constraint.name.as_ref().map(|ident| ident.value.clone());
             }
             ColumnConstraintKind::PrimaryKey { .. }
@@ -454,16 +469,17 @@ fn column_def(
         ColumnDef {
             name: column.name.value.clone(),
             ty: info,
-            default,
+            default: None,
             identity: column.identity.as_ref().map(|identity| IdentitySpec {
                 seed: identity.seed.unwrap_or(IdentitySpec::default().seed),
                 increment: identity
                     .increment
                     .unwrap_or(IdentitySpec::default().increment),
             }),
-            computed: column.computed.clone(),
+            computed: None,
         },
         default_name,
+        default,
     ))
 }
 
@@ -502,8 +518,8 @@ fn foreign_key(
             .iter()
             .map(|ident| ident.value.clone())
             .collect(),
-        on_delete: reference.on_delete.unwrap_or(RefAction::NoAction),
-        on_update: reference.on_update.unwrap_or(RefAction::NoAction),
+        on_delete: catalog_action(reference.on_delete),
+        on_update: catalog_action(reference.on_update),
     })
 }
 
