@@ -58,13 +58,13 @@
 //! server, which no [`CatalogSnapshot`] serves and which `binder/catalog_view.rs` refuses in
 //! the same way; row 9 is the spelling the tests hold.
 //!
-//! ## Two answers this file leaves to a later reader API of the catalogue
+//! ## `DB_NAME(id)`, `SCHEMA_NAME` and `SCHEMA_ID`
 //!
-//! `DB_NAME(id)` needs a lookup by identifier that [`CatalogSnapshot`] does not publish for
-//! a database other than the current one: it answers a database by **name**
-//! ([`CatalogSnapshot::database`]) and
-//! `database_name` answers the **current** one and `None` for another identifier, where SQL
-//! Server answers `tempdb` for 2 (`database_name_answers_the_current_database_only`).
+//! `DB_NAME(id)` answers the name of the database of that identifier among the databases
+//! the snapshot holds ([`CatalogSnapshot::database_by_id`]), the current one or another:
+//! `DB_NAME(2)` is `tempdb` from `master` (`database_name_answers_any_database_of_the_snapshot`).
+//! `0` names the current database, as `DB_NAME()` does; an identifier no database carries,
+//! negative or too large, answers `None`.
 //!
 //! [`EvalContext::schema_name`] reads [`CatalogSnapshot::schema_name`]: the three schemas
 //! the bootstrap writes (`dbo` 1, `INFORMATION_SCHEMA` 3, `sys` 4; unit test
@@ -74,7 +74,8 @@
 //! [`EvalContext::schema_id`] answers the default schema, `dbo` = 1, and `None` for another
 //! name, where SQL Server answers 2, 3 and 4 for `guest`, `INFORMATION_SCHEMA` and `sys`
 //! (`schema_id_of_another_schema_is_not_resolved_yet`). Reading those three by name needs the
-//! same lookup [`CatalogSnapshot::schema_name`] already provides in the other direction.
+//! same lookup [`CatalogSnapshot::schema_name`] already provides in the other direction, a
+//! reader API the catalogue does not publish yet.
 
 use std::cell::OnceCell;
 use std::cmp::Ordering;
@@ -131,8 +132,7 @@ const DEFAULT_SCHEMA: &str = "dbo";
 /// The identifier of [`DEFAULT_SCHEMA`], answered by `SCHEMA_ID()` and `SCHEMA_ID('dbo')`:
 /// `1` for each, the number the bootstrap of `catalog` writes for `dbo` in `sys.schemas`.
 /// Written here rather than read there: [`CatalogSnapshot`] publishes no schema entry
-/// (module documentation, section "Two answers this file leaves to a later reader API of
-/// the catalogue").
+/// (module documentation, section "`DB_NAME(id)`, `SCHEMA_NAME` and `SCHEMA_ID`").
 const DEFAULT_SCHEMA_ID: i32 = 1;
 
 /// Most parts a name of `OBJECT_ID` may carry: server, database, schema, object.
@@ -669,16 +669,19 @@ impl EvalContext for SessionEvalContext<'_> {
         i32::try_from(database.id.0).ok()
     }
 
-    /// The name of the database of identifier `id` (`DB_NAME(id)`), answered for the
-    /// **current** database and `None` for another identifier, the bound of the module
-    /// documentation, section "Two answers this file leaves to a later reader API of the
-    /// catalogue" (`database_name_answers_the_current_database_only`).
+    /// The name of the database of identifier `id` (`DB_NAME(id)`), read from the snapshot
+    /// for the current database and for another one alike, the spelling the catalogue holds
+    /// (`database_name_answers_any_database_of_the_snapshot`).
     ///
-    /// `DB_NAME(-1)` is `NULL` here as on SQL Server.
+    /// `DB_NAME(0)` names the current database, as `DB_NAME()` does; `DB_NAME(-1)` and an
+    /// identifier no database carries are `NULL`, as on SQL Server.
     fn database_name(&self, id: i32) -> Option<String> {
         let catalog = self.catalog()?;
-        let current = catalog.database(&self.state.database)?;
-        (i32::try_from(current.id.0) == Ok(id)).then(|| current.name.clone())
+        let database = match u32::try_from(id).ok()? {
+            0 => catalog.database(&self.state.database)?,
+            id => catalog.database_by_id(vauban_storage::DbId(id))?,
+        };
+        Some(database.name.clone())
     }
 
     /// The name of the schema of identifier `id` (`SCHEMA_NAME(id)`), read from the
@@ -693,8 +696,8 @@ impl EvalContext for SessionEvalContext<'_> {
 
     /// The identifier of the schema `name`, or of the session's default schema when `name`
     /// is `None` (`SCHEMA_ID`): [`DEFAULT_SCHEMA_ID`] for [`DEFAULT_SCHEMA`], `None` for a
-    /// name that is not it, the bound of the module documentation, section "Two answers
-    /// this file leaves to a later reader API of the catalogue"
+    /// name that is not it, the bound of the module documentation, section
+    /// "`DB_NAME(id)`, `SCHEMA_NAME` and `SCHEMA_ID`"
     /// (`schema_id_of_another_schema_is_not_resolved_yet`).
     ///
     /// The comparison is [`Collation::DEFAULT`], the one [`CatalogSnapshot::database`] uses

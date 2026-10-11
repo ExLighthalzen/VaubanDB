@@ -841,8 +841,8 @@ fn a_view_named_with_a_database_filters_on_that_database() {
     assert_eq!(filter_db_ids(&unnamed), vec![Vec::<String>::new()]);
 }
 
-/// The text a database part gives a definition: both calls pinned, the name of the database
-/// read from the internal table, and a quote of the written name doubled inside the literal.
+/// The text a database part gives a definition: both calls pinned to the identifier of the
+/// written name, and a quote of that name doubled inside the literal.
 #[test]
 fn the_database_part_pins_db_id_and_db_name() {
     let database = Ident {
@@ -852,9 +852,28 @@ fn the_database_part_pins_db_id_and_db_name() {
     let text = "SELECT DB_NAME() AS c FROM t WHERE database_id = DB_ID()";
     assert_eq!(
         in_named_database(text, Some(&database)),
-        "SELECT (SELECT name FROM master.dbo.vauban_sys_databases WHERE database_id = \
-         DB_ID(N'it''s')) AS c FROM t WHERE database_id = DB_ID(N'it''s')"
+        "SELECT DB_NAME(DB_ID(N'it''s')) AS c FROM t WHERE database_id = DB_ID(N'it''s')"
     );
+}
+
+/// A written database name that spells one of the two calls stays inside its literal.
+#[test]
+fn a_database_name_spelling_a_call_is_not_replaced_again() {
+    let text = "SELECT DB_NAME() AS c FROM t WHERE database_id = DB_ID()";
+    for written in ["DB_ID()", "DB_NAME()"] {
+        let database = Ident {
+            value: written.to_owned(),
+            ..object_name(&["x"]).name
+        };
+        assert_eq!(
+            in_named_database(text, Some(&database)),
+            format!(
+                "SELECT DB_NAME(DB_ID(N'{written}')) AS c FROM t WHERE database_id = \
+                 DB_ID(N'{written}')"
+            ),
+            "{written}"
+        );
+    }
 }
 
 /// Without a database part, or without either call, the definition is the catalogue's text,

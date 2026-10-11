@@ -173,13 +173,12 @@ fn part<'a>(written: Option<&'a Ident>, default: &'a str) -> &'a str {
 /// their catalog column as `DB_NAME()`. Both calls answer the database of the session when
 /// the statement runs, which is the database of the view when the name carries no database
 /// part. When it carries one, `d2.sys.tables` read from `master`, the two calls are pinned
-/// to that database: `DB_ID()` becomes `DB_ID(N'd2')`, and `DB_NAME()` becomes the `name`
-/// of that identifier in `master.dbo.vauban_sys_databases`, the spelling the catalogue holds
-/// rather than the one written. `DB_NAME(id)` is not used for the second: the session
-/// answers it for its current database alone. The text is the catalogue's own, so the two
-/// spellings are matched as the definitions write them; a definition without either call is
-/// returned as it is (unit tests `a_view_named_with_a_database_filters_on_that_database`
-/// and `a_view_named_without_a_database_keeps_its_definition`).
+/// to that database: `DB_ID()` becomes `DB_ID(N'd2')`, and `DB_NAME()` becomes
+/// `DB_NAME(DB_ID(N'd2'))`, which answers the spelling the catalogue holds rather than the
+/// one written. The text is the catalogue's own, so the two spellings are matched as the
+/// definitions write them; a definition without either call is returned as it is (unit
+/// tests `a_view_named_with_a_database_filters_on_that_database` and
+/// `a_view_named_without_a_database_keeps_its_definition`).
 fn in_named_database<'a>(definition: &'a str, database: Option<&Ident>) -> Cow<'a, str> {
     let Some(database) = database else {
         return Cow::Borrowed(definition);
@@ -188,11 +187,12 @@ fn in_named_database<'a>(definition: &'a str, database: Option<&Ident>) -> Cow<'
         return Cow::Borrowed(definition);
     }
     let id = format!("DB_ID(N'{}')", database.value.replace('\'', "''"));
-    let name =
-        format!("(SELECT name FROM master.dbo.vauban_sys_databases WHERE database_id = {id})");
+    // `DB_NAME()` is first spelled through `DB_ID()`, so that the written name is inserted
+    // by the last replacement and stays inside its literal
+    // (`a_database_name_spelling_a_call_is_not_replaced_again`).
     Cow::Owned(
         definition
-            .replace("DB_NAME()", &name)
+            .replace("DB_NAME()", "DB_NAME(DB_ID())")
             .replace("DB_ID()", &id),
     )
 }

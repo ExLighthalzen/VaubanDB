@@ -310,21 +310,32 @@ fn db_id_master_is_some() {
 }
 
 #[test]
-fn database_name_answers_the_current_database_only() {
+fn database_name_answers_any_database_of_the_snapshot() {
     let (snapshot, _) = catalogue_with_a_table();
     let state = state();
     let ctx = SessionEvalContext::new(&state, Some(&snapshot));
     let ctx: &dyn EvalContext = &ctx;
     let master = ctx.database_id(None).expect("`master` has an identifier");
     assert_eq!(ctx.database_name(master), Some("master".to_owned()));
-    // `DB_NAME(-1)`: NULL here and on SQL Server.
-    assert_eq!(ctx.database_name(-1), None);
-    // The bound of the module documentation: another database of the same instance is
-    // NULL here, where SQL Server answers its name (`DB_NAME(2)` is `tempdb`).
+    // Another database of the same instance answers its own name, read from `master`.
     let tempdb = ctx
         .database_id(Some("tempdb"))
         .expect("`tempdb` is in the bootstrap");
-    assert_eq!(ctx.database_name(tempdb), None);
+    assert_eq!(ctx.database_name(tempdb), Some("tempdb".to_owned()));
+    assert_eq!(tempdb, 2, "`DB_NAME(2)` is `tempdb`");
+    // `DB_NAME(0)` is the current database, `master` for this session.
+    assert_eq!(ctx.database_name(0), Some("master".to_owned()));
+    // `DB_NAME(-1)` and an identifier no database carries: NULL.
+    assert_eq!(ctx.database_name(-1), None);
+    assert_eq!(ctx.database_name(999), None);
+    assert_eq!(ctx.database_name(i32::MAX), None);
+    // From another current database, `0` follows it and `1` still names `master`.
+    let mut in_tempdb = state.clone();
+    in_tempdb.database = "tempdb".into();
+    let ctx = SessionEvalContext::new(&in_tempdb, Some(&snapshot));
+    let ctx: &dyn EvalContext = &ctx;
+    assert_eq!(ctx.database_name(0), Some("tempdb".to_owned()));
+    assert_eq!(ctx.database_name(master), Some("master".to_owned()));
 }
 
 /// `SCHEMA_NAME(1)`, `(3)`, `(4)` and `(99)` answer `dbo`, `INFORMATION_SCHEMA`, `sys`
