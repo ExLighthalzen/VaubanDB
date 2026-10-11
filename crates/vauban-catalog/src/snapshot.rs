@@ -211,6 +211,16 @@
 //! table whose `Sch-M` their transaction holds (`tests/snapshot.rs`,
 //! `a_name_another_transaction_creates_is_pending`).
 //!
+//! `sys.objects`, `sys.tables` and `sys.all_objects` list the tables of a database, so a
+//! resolution of one of them reaches each user table of that database and each name
+//! pending there: the binding of `SELECT name FROM sys.tables` waits for a `CREATE TABLE`,
+//! a `DROP TABLE`, an `ALTER TABLE` or a `CREATE INDEX` another transaction has not
+//! committed in that database, and lists the tables as that transaction left them
+//! (`tests/snapshot.rs`, `a_view_listing_the_tables_reaches_each_table_of_its_database`;
+//! `crates/vauban-session/tests/ddl_visibility.rs`,
+//! `sys_tables_waits_for_an_uncommitted_ddl_of_its_database`). `sys.columns` and
+//! `sys.databases` do not wait (same test in `tests/snapshot.rs`).
+//!
 //! # Comparison of names
 //!
 //! A database name is compared under [`Collation::DEFAULT`], the collation of `master`, as
@@ -383,6 +393,16 @@ pub(crate) const SYSTEM_OBJECT_IDS: &[(&str, &str, i32)] = &[
     (DBO, "vauban_sys_object_high_water", 100_043),
 ];
 
+/// The system views whose rows list the tables of a database, by their line of
+/// [`SYSTEM_OBJECT_IDS`]: `sys.objects`, `sys.tables` and `sys.all_objects`.
+///
+/// A name resolution that reaches one of them reaches every user table of the database it
+/// is read from, so a binding of `SELECT name FROM sys.tables` waits for a `CREATE`, a
+/// `DROP`, an `ALTER` or a `CREATE INDEX` another transaction has not committed there
+/// (section "What a binding waits for"; `tests/snapshot.rs`,
+/// `a_view_listing_the_tables_reaches_each_table_of_its_database`).
+const TABLE_LISTING_VIEWS: [i32; 3] = [-1, -2, -23];
+
 /// The constant [`SYSTEM_OBJECT_IDS`] gives the system object `schema.name`, `None` for a pair
 /// it does not list.
 ///
@@ -529,8 +549,9 @@ impl CatalogSnapshot {
     /// next, so a user table whose schema is not `sys` keeps its own identifier
     /// (`tests/snapshot.rs`, `a_user_table_named_like_a_system_view_does_not_shadow_it`).
     ///
-    /// A user table it reaches, and the storage table of a name it does not find that another
-    /// open transaction has created or dropped, are kept for
+    /// A user table it reaches, the storage table of a name it does not find that another
+    /// open transaction has created or dropped, and, for a view of [`TABLE_LISTING_VIEWS`],
+    /// the tables and pending names of the database `db` names, are kept for
     /// [`CatalogSnapshot::take_resolved_tables`] (section "What a binding waits for").
     pub fn resolve_object(
         &self,
@@ -552,6 +573,9 @@ impl CatalogSnapshot {
         let reached: Vec<Resolved> = match found {
             Some(object) if object.id.0 >= table::FIRST_USER_OBJECT_ID => {
                 vec![Resolved::Table(object.id)]
+            }
+            Some(object) if TABLE_LISTING_VIEWS.contains(&object.id.0) => {
+                self.tables_listed_in(database.id)
             }
             Some(_) => Vec::new(),
             None => self
@@ -582,7 +606,9 @@ impl CatalogSnapshot {
     /// A user table [`CatalogSnapshot::resolve_object`] found counts with the storage table
     /// of the version this snapshot holds; a name it did not find counts with the storage
     /// table of each table of that name another open transaction has created or dropped
-    /// without committing. A system view and an internal table of `master` do not count.
+    /// without committing. A view of [`TABLE_LISTING_VIEWS`] counts with each table of the
+    /// database it was read from and each name pending there; another system view and an
+    /// internal table of `master` do not count.
     /// With `with_foreign_keys`, a table found also brings the tables its `FOREIGN KEY`
     /// constraints reference and the tables whose `FOREIGN KEY` references it, the ones a
     /// write of its rows checks (`tests/snapshot.rs`,
@@ -641,6 +667,25 @@ impl CatalogSnapshot {
             }
         }
         tables
+    }
+
+    /// What a view of [`TABLE_LISTING_VIEWS`] reaches in `database`: each user table this
+    /// snapshot holds there, and the storage table of each table another open transaction
+    /// has created or dropped there without committing (section "What a binding waits
+    /// for").
+    fn tables_listed_in(&self, database: DbId) -> Vec<Resolved> {
+        let held = self
+            .tables
+            .iter()
+            .filter(|(id, meta)| id.0 >= table::FIRST_USER_OBJECT_ID && meta.database == database)
+            .map(|(id, _)| Resolved::Table(*id));
+        let pending = self
+            .waits
+            .pending
+            .iter()
+            .filter(|pending| pending.database == database)
+            .map(|pending| Resolved::Pending(pending.storage));
+        held.chain(pending).collect()
     }
 
     /// The system view written `schema.name`, `None` when the two parts match no entry of

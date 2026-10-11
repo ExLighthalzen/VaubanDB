@@ -1654,7 +1654,7 @@ fn an_internal_table_is_flagged_internal() {
 }
 
 /// What `take_resolved_tables` hands back: the storage table of each user table a name
-/// reached, each once, nothing for a system view or a name that resolves to nothing, and an
+/// reached, each once, nothing for `sys.columns` or a name that resolves to nothing, and an
 /// empty list once drained. With the foreign keys, `child` brings `parent`, which its key
 /// references, and `parent` brings `child`, which references it.
 #[test]
@@ -1685,7 +1685,7 @@ fn the_resolved_tables_are_the_user_tables_a_name_reached() {
     }
     assert!(
         snapshot
-            .resolve_object("d", Some("sys"), "tables", "dbo")
+            .resolve_object("d", Some("sys"), "columns", "dbo")
             .is_some()
     );
     assert_eq!(snapshot.take_resolved_tables(true), vec![other.storage_id]);
@@ -1731,5 +1731,67 @@ fn a_name_another_transaction_creates_is_pending() {
     let after = catalog.snapshot(&reader);
     assert!(after.resolve_object("d", None, "x", "dbo").is_none());
     assert!(after.take_resolved_tables(false).is_empty());
+    manager.commit(reader).expect("commit of the reader");
+}
+
+/// `sys.tables`, `sys.objects` and `sys.all_objects` reach each user table of the database
+/// they are read from, the table another open transaction creates there without committing
+/// included, and none of another database; `sys.columns` and `sys.databases` reach none.
+#[test]
+fn a_view_listing_the_tables_reaches_each_table_of_its_database() {
+    let (catalog, manager) = instance();
+    database(&catalog, &manager, "d");
+    database(&catalog, &manager, "e");
+    let first = table(&catalog, &manager, &def("d", "dbo", "first"));
+    let second = table(&catalog, &manager, &def("d", "dbo", "second"));
+    let elsewhere = table(&catalog, &manager, &def("e", "dbo", "elsewhere"));
+    let writer = begin(&manager);
+    let created = catalog
+        .create_table(&writer, &def("d", "dbo", "created"))
+        .expect("create_table");
+
+    let reader = begin(&manager);
+    let snapshot = catalog.snapshot(&reader);
+    for view in ["tables", "OBJECTS", "all_objects"] {
+        assert!(
+            snapshot
+                .resolve_object("d", Some("sys"), view, "dbo")
+                .is_some()
+        );
+        let mut reached = snapshot.take_resolved_tables(false);
+        reached.sort();
+        let mut expected = vec![first.storage_id, second.storage_id, created.storage_id];
+        expected.sort();
+        assert_eq!(reached, expected, "sys.{view}");
+    }
+    assert!(
+        snapshot
+            .resolve_object("e", Some("sys"), "tables", "dbo")
+            .is_some()
+    );
+    assert_eq!(
+        snapshot.take_resolved_tables(false),
+        vec![elsewhere.storage_id]
+    );
+    for view in ["columns", "databases"] {
+        assert!(
+            snapshot
+                .resolve_object("d", Some("sys"), view, "dbo")
+                .is_some()
+        );
+        assert!(
+            snapshot.take_resolved_tables(false).is_empty(),
+            "sys.{view}"
+        );
+    }
+
+    manager.rollback(writer).expect("rollback of the create");
+    let after = catalog.snapshot(&reader);
+    let _ = after.resolve_object("d", Some("sys"), "tables", "dbo");
+    let mut reached = after.take_resolved_tables(false);
+    reached.sort();
+    let mut expected = vec![first.storage_id, second.storage_id];
+    expected.sort();
+    assert_eq!(reached, expected);
     manager.commit(reader).expect("commit of the reader");
 }

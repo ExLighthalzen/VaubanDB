@@ -1207,14 +1207,16 @@ fn plan_indexes(engine: &Arc<Engine>) -> (usize, usize) {
     (seen, held)
 }
 
-/// A `CREATE INDEX` another session has not committed: `sys.indexes` does not list it, a plan
-/// does not seek through it although `storage` holds it, and a read of the table waits for
-/// the end of that session; a `ROLLBACK` leaves the index out, a `COMMIT` puts it in.
+/// A `CREATE INDEX` another session has not committed: a plan does not seek through it
+/// although `storage` holds it, and a read of the table waits for the end of that session,
+/// as `sys.indexes` joined to `sys.tables` does
+/// (`sys_tables_waits_for_an_uncommitted_ddl_of_its_database`); a `ROLLBACK` leaves the
+/// index out, a `COMMIT` puts it in.
 #[test]
 fn an_uncommitted_create_index_is_waited_for_then_left_out() {
     let engine = engine();
     let mut a = session(&engine, 61);
-    let mut b = session(&engine, 62);
+    let b = session(&engine, 62);
     run(
         &mut a,
         "CREATE TABLE dbo.t (a int, b int); INSERT INTO dbo.t VALUES (1, 2);",
@@ -1222,7 +1224,6 @@ fn an_uncommitted_create_index_is_waited_for_then_left_out() {
 
     run(&mut a, "BEGIN TRANSACTION; CREATE INDEX ix ON dbo.t (a);");
     assert_eq!(names(&run(&mut a, INDEX_NAMES)), vec!["ix"]);
-    assert!(names(&run(&mut b, INDEX_NAMES)).is_empty());
     assert_eq!(plan_indexes(&engine), (0, 1));
     let waiting = Waiting::start(b, "SELECT b FROM dbo.t WHERE a = 1;");
     run(&mut a, "ROLLBACK TRANSACTION;");
@@ -1419,4 +1420,66 @@ fn a_delete_waits_for_a_foreign_key_another_session_has_not_committed() {
         ints(&run(&mut a, "SELECT a FROM dbo.p ORDER BY a;")),
         vec![3]
     );
+}
+
+/// `SELECT name FROM sys.tables` of a session while another one holds a `CREATE TABLE`, a
+/// `DROP TABLE`, an `ALTER TABLE` or a `CREATE INDEX` it has not committed in the same
+/// database: the read waits for the end of that transaction, then lists the tables it left;
+/// under `SET LOCK_TIMEOUT 100` it ends in 1222. A session that holds no `DDL` lets the read
+/// through at once.
+#[test]
+fn sys_tables_waits_for_an_uncommitted_ddl_of_its_database() {
+    const LIST: &str = "SELECT name FROM sys.tables WHERE name IN ('x', 'y') ORDER BY name;";
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let b = session(&engine, 62);
+    run(&mut a, "CREATE TABLE dbo.y (a int);");
+
+    run(&mut a, "BEGIN TRANSACTION; CREATE TABLE dbo.x (a int);");
+    let waiting = Waiting::start(b, LIST);
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (b, events) = waiting.finish();
+    assert_eq!(names(&events), vec!["y"], "{events:#?}");
+
+    run(&mut a, "BEGIN TRANSACTION; CREATE TABLE dbo.x (a int);");
+    let waiting = Waiting::start(b, LIST);
+    run(&mut a, "COMMIT TRANSACTION;");
+    let (b, events) = waiting.finish();
+    assert_eq!(names(&events), vec!["x", "y"], "{events:#?}");
+
+    run(&mut a, "BEGIN TRANSACTION; DROP TABLE dbo.x;");
+    let waiting = Waiting::start(b, LIST);
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (b, events) = waiting.finish();
+    assert_eq!(names(&events), vec!["x", "y"], "{events:#?}");
+
+    run(&mut a, "BEGIN TRANSACTION; DROP TABLE dbo.x;");
+    let waiting = Waiting::start(
+        b,
+        "SELECT name FROM sys.objects WHERE name IN ('x', 'y') ORDER BY name;",
+    );
+    run(&mut a, "COMMIT TRANSACTION;");
+    let (b, events) = waiting.finish();
+    assert_eq!(names(&events), vec!["y"], "{events:#?}");
+
+    run(&mut a, "BEGIN TRANSACTION; ALTER TABLE dbo.y ADD c int;");
+    let waiting = Waiting::start(b, LIST);
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (b, events) = waiting.finish();
+    assert_eq!(names(&events), vec!["y"], "{events:#?}");
+
+    run(&mut a, "BEGIN TRANSACTION; CREATE INDEX ix ON dbo.y (a);");
+    let waiting = Waiting::start(
+        b,
+        "SELECT name FROM sys.all_objects WHERE name IN ('x', 'y') ORDER BY name;",
+    );
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    let (mut b, events) = waiting.finish();
+    assert_eq!(names(&events), vec!["y"], "{events:#?}");
+
+    run(&mut b, "SET LOCK_TIMEOUT 100;");
+    run(&mut a, "BEGIN TRANSACTION; CREATE TABLE dbo.x (a int);");
+    assert_eq!(errors(&run_on(&mut b, LIST)), vec![1222]);
+    run(&mut a, "ROLLBACK TRANSACTION;");
+    assert_eq!(names(&run(&mut b, LIST)), vec!["y"]);
 }
