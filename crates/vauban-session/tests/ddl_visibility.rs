@@ -133,6 +133,10 @@ impl Waiting {
         Waiting { done, thread }
     }
 
+    fn still_waits(&self) -> bool {
+        self.done.recv_timeout(Duration::from_millis(300)).is_err()
+    }
+
     fn finish(self) -> (Session, Vec<Event>) {
         let _ = self.done.recv_timeout(Duration::from_secs(10));
         self.thread.join().expect("thread of the waiting session")
@@ -674,17 +678,17 @@ fn an_insert_bound_before_a_committed_alter_is_bound_again() {
 /// statement at a time. `SELECT 0` and the read (5) run before the `INSERT`, `SELECT 3` and
 /// `SELECT 4` after it.
 const HELD_BY_AN_IF: [&str; 2] = [
-    "IF 1 = 1\nBEGIN\n  SELECT 0;\n  EXEC ('SELECT a FROM dbo.w');\n  \
+    "IF 1 = 1\nBEGIN\n  SELECT 0;\n  SELECT a FROM dbo.w;\n  \
      INSERT INTO dbo.t (a) VALUES (2);\n  SELECT 3;\nEND\nSELECT 4;",
-    "CREATE TABLE dbo.o (a int);\nIF 1 = 1\nBEGIN\n  SELECT 0;\n  EXEC ('SELECT a FROM dbo.w');\n  \
+    "CREATE TABLE dbo.o (a int);\nIF 1 = 1\nBEGIN\n  SELECT 0;\n  SELECT a FROM dbo.w;\n  \
      INSERT INTO dbo.t (a) VALUES (2);\n  SELECT 3;\nEND\nSELECT 4;",
 ];
 
 /// A loop of two turns whose `INSERT`, on line 5, writes `10 + @i`: the first turn ends on
 /// a read of `dbo.w` that waits for the other session, the second runs after it.
-const HELD_BY_A_WHILE: &str = "DECLARE @i int = 0;\nWHILE @i < 2\nBEGIN\n  \
+const HELD_BY_A_WHILE: &str = "DECLARE @i int = 0; DECLARE @n int;\nWHILE @i < 2\nBEGIN\n  \
      SELECT @i;\n  INSERT INTO dbo.t (a) VALUES (10 + @i);\n  SET @i = @i + 1;\n  \
-     IF @i = 1 EXEC ('DECLARE @n int; SELECT @n = a FROM dbo.w;');\nEND\nSELECT 9;";
+     IF @i = 1 SELECT @n = a FROM dbo.w;\nEND\nSELECT 9;";
 
 /// Runs `text` on a session of `engine` while another one, in a transaction, holds the row
 /// of `dbo.w` that `text` reads, runs `ddl` while `text` waits for that row, then commits;
@@ -786,13 +790,13 @@ fn a_held_statement_whose_table_was_dropped_is_208() {
 
 /// A block whose `IF`, on line 4, tests the rows of `dbo.t` after a read of `dbo.w` that
 /// waits for the other session: `SELECT 1` when `dbo.t` holds one row, `SELECT 2` otherwise.
-const CONDITION_HELD_BY_AN_IF: &str = "IF 1 = 1\nBEGIN\n  EXEC ('SELECT a FROM dbo.w');\n  \
+const CONDITION_HELD_BY_AN_IF: &str = "IF 1 = 1\nBEGIN\n  SELECT a FROM dbo.w;\n  \
      IF (SELECT COUNT(*) FROM dbo.t) = 1 SELECT 1; ELSE SELECT 2;\nEND\nSELECT 4;";
 
 /// A loop whose condition, on line 2, counts the rows of `dbo.t`: its first test runs before
 /// a read of `dbo.w` that waits for the other session, its second test right after it.
 const CONDITION_OF_A_WHILE: &str = "DECLARE @i int = 0;\nWHILE (SELECT COUNT(*) FROM dbo.t) > @i\n\
-     BEGIN\n  SET @i = @i + 1;\n  IF @i = 1 EXEC ('SELECT a FROM dbo.w');\nEND\nSELECT @i;";
+     BEGIN\n  SET @i = @i + 1;\n  IF @i = 1 SELECT a FROM dbo.w;\nEND\nSELECT @i;";
 
 /// The condition of an `IF` held by a block, or of a `WHILE`, tested after another session
 /// rebuilt its table by an `ALTER TABLE` and wrote a second row, reads the rebuilt table:
@@ -838,6 +842,127 @@ fn a_condition_whose_table_was_dropped_is_208() {
         );
         assert_eq!(ints(&events), vec![5], "{text}");
     }
+}
+
+/// A block that reads `dbo.t1`, waiting for the row another session holds, then `dbo.t2`:
+/// that session alters `dbo.t2` meanwhile without waiting, since the read of `dbo.t1` holds
+/// the schema of `dbo.t1` alone, then commits; the block reads both tables, the second
+/// one as altered.
+#[test]
+fn a_held_statement_holds_the_schema_of_its_own_tables_only() {
+    for text in [
+        "IF 1 = 1\nBEGIN\n  SELECT a FROM dbo.t1;\n  SELECT a FROM dbo.t2;\nEND",
+        "DECLARE @i int = 0;\nWHILE @i < 1\nBEGIN\n  SELECT a FROM dbo.t1;\n  \
+         SELECT a FROM dbo.t2;\n  SET @i = @i + 1;\nEND",
+    ] {
+        let engine = engine();
+        let mut a = session(&engine, 61);
+        let b = session(&engine, 62);
+        run(
+            &mut a,
+            "CREATE TABLE dbo.t1 (a int); INSERT INTO dbo.t1 VALUES (1); \
+             CREATE TABLE dbo.t2 (a int); INSERT INTO dbo.t2 VALUES (2); \
+             BEGIN TRANSACTION; UPDATE dbo.t1 SET a = 1;",
+        );
+        let waiting = Waiting::start(b, text);
+        run(&mut a, "ALTER TABLE dbo.t2 ADD c int;");
+        run(&mut a, "COMMIT TRANSACTION;");
+        let (_b, events) = waiting.finish();
+        assert!(errors(&events).is_empty(), "{text}: {events:#?}");
+        assert_eq!(ints(&events), vec![1, 2], "{text}");
+    }
+}
+
+/// A write held by a block waits, as it would written alone, for an `ALTER TABLE` another
+/// session has not committed on the table its `FOREIGN KEY` checks, then writes its row.
+#[test]
+fn a_held_write_waits_for_the_table_its_foreign_key_checks() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let b = session(&engine, 62);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.x (id int PRIMARY KEY); INSERT INTO dbo.x VALUES (1); \
+         CREATE TABLE dbo.y (id int, x_id int REFERENCES dbo.x (id));",
+    );
+    run(&mut a, "BEGIN TRANSACTION; ALTER TABLE dbo.x ADD c int;");
+    let waiting = Waiting::start(
+        b,
+        "IF 1 = 1\nBEGIN\n  SELECT 0;\n  INSERT INTO dbo.y VALUES (1, 1);\nEND",
+    );
+    run(&mut a, "COMMIT TRANSACTION;");
+    let (_b, events) = waiting.finish();
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(ints(&run(&mut a, "SELECT x_id FROM dbo.y;")), vec![1]);
+}
+
+/// A condition that reads `dbo.w`, waiting for the row a first session holds, then
+/// `dbo.t` under `NOLOCK`, which takes no lock of its rows: an `ALTER TABLE dbo.t` of a
+/// third session waits for the end of the condition, which reads `dbo.t` as it was, then
+/// runs.
+#[test]
+fn a_condition_holds_the_schema_of_the_tables_it_reads() {
+    for text in [
+        "IF 1 = 1\nBEGIN\n  SELECT 0;\n  \
+         IF (SELECT COUNT(*) FROM dbo.w) + (SELECT COUNT(*) FROM dbo.t WITH (NOLOCK)) = 2 SELECT 1; \
+         ELSE SELECT 2;\nEND",
+        "IF (SELECT COUNT(*) FROM dbo.w) + (SELECT COUNT(*) FROM dbo.t WITH (NOLOCK)) = 2 SELECT 1; \
+         ELSE SELECT 2;",
+    ] {
+        let engine = engine();
+        let mut a = session(&engine, 61);
+        let b = session(&engine, 62);
+        let c = session(&engine, 63);
+        run(
+            &mut a,
+            "CREATE TABLE dbo.w (a int); INSERT INTO dbo.w VALUES (5); \
+             CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1); \
+             BEGIN TRANSACTION; UPDATE dbo.w SET a = 5;",
+        );
+        let condition = Waiting::start(b, text);
+        let alter = Waiting::start(c, "ALTER TABLE dbo.t ADD c int;");
+        run(&mut a, "COMMIT TRANSACTION;");
+        let (_b, events) = condition.finish();
+        assert!(errors(&events).is_empty(), "{text}: {events:#?}");
+        assert_eq!(ints(&events).last(), Some(&1), "{text}: {events:#?}");
+        let (_c, events) = alter.finish();
+        assert!(errors(&events).is_empty(), "{text}: {events:#?}");
+        assert_eq!(
+            run(&mut a, "SELECT a, c FROM dbo.t;"),
+            vec![Event::Row(vec![Value::I32(1), Value::Null])]
+        );
+    }
+}
+
+/// A condition held by a block, reached while a third session has altered its table
+/// without committing, waits for that session, then reads the table as altered: the block
+/// is bound again.
+#[test]
+fn a_condition_waits_for_the_ddl_of_its_table_then_reads_the_new_table() {
+    let engine = engine();
+    let mut a = session(&engine, 61);
+    let b = session(&engine, 62);
+    let mut c = session(&engine, 63);
+    run(
+        &mut a,
+        "CREATE TABLE dbo.w (a int); INSERT INTO dbo.w VALUES (5); \
+         CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1); \
+         BEGIN TRANSACTION; UPDATE dbo.w SET a = 5;",
+    );
+    let waiting = Waiting::start(b, CONDITION_HELD_BY_AN_IF);
+    run(
+        &mut c,
+        "BEGIN TRANSACTION; ALTER TABLE dbo.t ADD c int; INSERT INTO dbo.t (a) VALUES (2);",
+    );
+    run(&mut a, "COMMIT TRANSACTION;");
+    assert!(
+        waiting.still_waits(),
+        "the condition waits for the transaction of the third session"
+    );
+    run(&mut c, "COMMIT TRANSACTION;");
+    let (_b, events) = waiting.finish();
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(ints(&events), vec![5, 2, 4]);
 }
 
 /// A transaction that has read a table in `READ COMMITTED`, its statement over, does not

@@ -34,16 +34,19 @@
 //! `an_insert_bound_before_a_committed_alter_is_bound_again`). In the session transaction,
 //! the end of the statement gives back that `Sch-S` and the `IS` of its `READ COMMITTED`
 //! reads (`vauban_txn::TransactionManager::end_statement`); a one-statement transaction
-//! gives back everything when it ends.
+//! gives back everything when it ends. A statement held by an `IF`, a `WHILE` or a
+//! `BEGIN … END` takes the `Sch-S` of the tables it names, not of every table its holder
+//! was bound against (`tests/ddl_visibility.rs`,
+//! `a_held_statement_holds_the_schema_of_its_own_tables_only`).
 
 use std::sync::Arc;
 
 use vauban_binder::{DdlStatement, TxnStatement};
-use vauban_catalog::CatalogSnapshot;
+use vauban_catalog::{CatalogSnapshot, ConstraintMeta, TableMeta};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_executor::{ExecContext, ExecOutcome, ExecSession, StatementSink};
-use vauban_planner::PhysicalStatement;
-use vauban_storage::{DbId, Storage, TableId};
+use vauban_planner::{PhysicalPlan, PhysicalStatement, SubPlan};
+use vauban_storage::{DbId, IndexId, Storage, TableId};
 use vauban_tds::EnvChange;
 use vauban_txn::TxnHandle;
 
@@ -64,21 +67,155 @@ use crate::state::SessionState;
 /// A table the binding did not find, the name another open transaction was creating or
 /// dropping, comes without a database: its `Sch-S` is waited for and its presence is not
 /// looked up.
+///
+/// The stamp of a statement that holds others (an `IF`, a `WHILE`, a `BEGIN … END`) also
+/// keeps, for each of its tables, the indexes a seek reaches it by and, when the statement
+/// holds a write, the tables its `FOREIGN KEY` constraints tie it to: what
+/// [`SchemaStamp::of_held`] needs to narrow the stamp to one statement it holds, and
+/// [`SchemaStamp::of_conditions`] to the tests of its conditions.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SchemaStamp(Arc<Vec<(TableId, Option<DbId>)>>);
+pub(crate) struct SchemaStamp {
+    tables: Arc<Vec<(TableId, Option<DbId>)>>,
+    reach: Arc<Vec<TableReach>>,
+    conditions: Option<Arc<Vec<TableId>>>,
+}
+
+/// How the statements a block holds reach one table of its stamp.
+#[derive(Debug, Clone)]
+struct TableReach {
+    table: TableId,
+    /// The indexes of the table, the clustered one included.
+    indexes: Vec<IndexId>,
+    /// The tables a `FOREIGN KEY` of this table references, and those whose `FOREIGN KEY`
+    /// references it: a write of its rows checks them. Empty unless the holder writes.
+    linked: Vec<TableId>,
+}
 
 impl SchemaStamp {
     /// The stamp of a binding against `snapshot` that reached `tables`.
     pub(crate) fn of(snapshot: &CatalogSnapshot, tables: &[TableId]) -> Self {
-        Self(Arc::new(
-            tables
+        Self {
+            tables: Arc::new(
+                tables
+                    .iter()
+                    .map(|table| {
+                        let database = snapshot.table_by_storage(*table).map(|meta| meta.database);
+                        (*table, database)
+                    })
+                    .collect(),
+            ),
+            reach: Arc::default(),
+            conditions: None,
+        }
+    }
+
+    /// The stamp of `holder`, a statement that holds others, bound against `snapshot`,
+    /// whose binding reached `tables`.
+    pub(crate) fn of_holder(
+        snapshot: &CatalogSnapshot,
+        tables: &[TableId],
+        holder: &PhysicalStatement,
+    ) -> Self {
+        let writes = holds_a_write(holder);
+        let reach = tables
+            .iter()
+            .filter_map(|table| snapshot.table_by_storage(*table))
+            .map(|meta| {
+                let mut indexes: Vec<IndexId> = snapshot
+                    .indexes_of(meta.id)
+                    .iter()
+                    .map(|index| index.id)
+                    .collect();
+                indexes.extend(meta.clustered);
+                let linked = if writes {
+                    foreign_key_neighbours(snapshot, meta)
+                } else {
+                    Vec::new()
+                };
+                TableReach {
+                    table: meta.storage_id,
+                    indexes,
+                    linked,
+                }
+            })
+            .collect();
+        let mut stamp = Self::of(snapshot, tables);
+        stamp.reach = Arc::new(reach);
+        let mut named = Named::default();
+        conditions_named(holder, &mut named);
+        stamp.conditions = stamp.resolve(&named).map(Arc::new);
+        stamp
+    }
+
+    /// The part of this stamp, the one of the statement that holds `held`, that `held`
+    /// names: the tables it reads or writes and, for a write, the tables its `FOREIGN KEY`
+    /// constraints check, as the binding of the same statement at the top level would reach
+    /// (`tests/ddl_visibility.rs`,
+    /// `a_held_statement_holds_the_schema_of_its_own_tables_only`).
+    ///
+    /// The whole stamp when that part cannot be told: a `DDL` statement, or a seek on an
+    /// index no table of the stamp has.
+    pub(crate) fn of_held(&self, held: &PhysicalStatement) -> Self {
+        let mut named = Named::default();
+        if !statement_named(held, &mut named) {
+            return self.clone();
+        }
+        match self.resolve(&named) {
+            Some(tables) => self.narrowed(&tables),
+            None => self.clone(),
+        }
+    }
+
+    /// The part of this stamp the conditions of its `IF` and `WHILE` statements read,
+    /// the whole stamp when that cannot be told (`tests/ddl_visibility.rs`,
+    /// `a_condition_holds_the_schema_of_the_tables_it_reads`).
+    ///
+    /// The conditions of one statement share this part: the host that tests a condition is
+    /// not told which one it is.
+    pub(crate) fn of_conditions(&self) -> Self {
+        match &self.conditions {
+            Some(tables) => self.narrowed(tables),
+            None => self.clone(),
+        }
+    }
+
+    /// The storage tables of this stamp.
+    pub(crate) fn tables(&self) -> Vec<TableId> {
+        self.tables.iter().map(|(table, _)| *table).collect()
+    }
+
+    /// The tables `named` reaches, the indexes it seeks turned into their tables and the
+    /// tables its writes check added; `None` for an index this stamp does not know.
+    fn resolve(&self, named: &Named) -> Option<Vec<TableId>> {
+        let mut tables = named.tables.clone();
+        for index in &named.indexes {
+            let reach = self
+                .reach
                 .iter()
-                .map(|table| {
-                    let database = snapshot.table_by_storage(*table).map(|meta| meta.database);
-                    (*table, database)
-                })
-                .collect(),
-        ))
+                .find(|reach| reach.indexes.contains(index))?;
+            tables.push(reach.table);
+        }
+        for written in &named.written {
+            if let Some(reach) = self.reach.iter().find(|reach| reach.table == *written) {
+                tables.extend(reach.linked.iter().copied());
+            }
+        }
+        Some(tables)
+    }
+
+    /// The entries of this stamp whose table is one of `tables`, in the order of the stamp.
+    fn narrowed(&self, tables: &[TableId]) -> Self {
+        Self {
+            tables: Arc::new(
+                self.tables
+                    .iter()
+                    .filter(|(table, _)| tables.contains(table))
+                    .copied()
+                    .collect(),
+            ),
+            reach: Arc::default(),
+            conditions: None,
+        }
     }
 
     /// The storage tables the binding read that are no longer in `storage`.
@@ -88,7 +225,7 @@ impl SchemaStamp {
     pub(crate) fn gone_tables(&self, storage: &dyn Storage) -> Vec<TableId> {
         let mut listed: Vec<(DbId, Option<Vec<TableId>>)> = Vec::new();
         let mut gone = Vec::new();
-        for (table, database) in self.0.iter() {
+        for (table, database) in self.tables.iter() {
             let Some(database) = database else { continue };
             let position = match listed.iter().position(|(db, _)| db == database) {
                 Some(position) => position,
@@ -110,6 +247,205 @@ impl SchemaStamp {
             }
         }
         gone
+    }
+}
+
+/// The storage tables the `FOREIGN KEY` constraints of `meta` reference, and those of the
+/// tables whose `FOREIGN KEY` references it.
+fn foreign_key_neighbours(snapshot: &CatalogSnapshot, meta: &TableMeta) -> Vec<TableId> {
+    let mut linked = Vec::new();
+    for constraint in &meta.constraints {
+        if let ConstraintMeta::ForeignKey {
+            referenced_table, ..
+        } = constraint
+            && let Some(referenced) = snapshot.table(*referenced_table)
+        {
+            linked.push(referenced.storage_id);
+        }
+    }
+    for other in snapshot.tables() {
+        let references = other.constraints.iter().any(|constraint| {
+            matches!(
+                constraint,
+                ConstraintMeta::ForeignKey { referenced_table, .. } if *referenced_table == meta.id
+            )
+        });
+        if references {
+            linked.push(other.storage_id);
+        }
+    }
+    linked
+}
+
+/// What a statement names in its plans: the tables it scans or writes, the indexes it
+/// seeks, and the tables it writes.
+#[derive(Debug, Default)]
+struct Named {
+    tables: Vec<TableId>,
+    indexes: Vec<IndexId>,
+    written: Vec<TableId>,
+}
+
+/// Whether `statement` holds an `INSERT`, an `UPDATE` or a `DELETE`, itself included.
+pub(crate) fn holds_a_write(statement: &PhysicalStatement) -> bool {
+    match statement {
+        PhysicalStatement::Insert(_)
+        | PhysicalStatement::Update(_)
+        | PhysicalStatement::Delete(_) => true,
+        PhysicalStatement::If { then_, else_, .. } => {
+            holds_a_write(then_) || else_.as_deref().is_some_and(holds_a_write)
+        }
+        PhysicalStatement::While { body, .. } => holds_a_write(body),
+        PhysicalStatement::Block(statements) => statements.iter().any(holds_a_write),
+        _ => false,
+    }
+}
+
+/// Adds to `named` what `statement` names; `false` for a statement whose tables its plan
+/// does not show, a `DDL` statement.
+fn statement_named(statement: &PhysicalStatement, named: &mut Named) -> bool {
+    match statement {
+        PhysicalStatement::Query(plan) | PhysicalStatement::SelectAssign { input: plan, .. } => {
+            plan_named(plan, named);
+        }
+        PhysicalStatement::Insert(insert) => {
+            named.tables.push(insert.table);
+            named.written.push(insert.table);
+            plan_named(&insert.source, named);
+        }
+        PhysicalStatement::SelectInto(into) => plan_named(&into.source, named),
+        PhysicalStatement::Update(update) => {
+            named.tables.push(update.table);
+            named.written.push(update.table);
+            plan_named(&update.input, named);
+        }
+        PhysicalStatement::Delete(delete) => {
+            named.tables.push(delete.table);
+            named.written.push(delete.table);
+            plan_named(&delete.input, named);
+        }
+        PhysicalStatement::SetVariable { subplans, .. } => subplans_named(subplans, named),
+        PhysicalStatement::Declare(declarations) => {
+            for declaration in declarations {
+                subplans_named(&declaration.subplans, named);
+            }
+        }
+        PhysicalStatement::If {
+            condition,
+            then_,
+            else_,
+        } => {
+            subplans_named(&condition.subplans, named);
+            if !statement_named(then_, named) {
+                return false;
+            }
+            if let Some(else_) = else_
+                && !statement_named(else_, named)
+            {
+                return false;
+            }
+        }
+        PhysicalStatement::While { condition, body } => {
+            subplans_named(&condition.subplans, named);
+            return statement_named(body, named);
+        }
+        PhysicalStatement::Block(statements) => {
+            return statements
+                .iter()
+                .all(|statement| statement_named(statement, named));
+        }
+        PhysicalStatement::Return(value) => {
+            if let Some(value) = value {
+                subplans_named(&value.subplans, named);
+            }
+        }
+        PhysicalStatement::Ddl(_) => return false,
+        // A statement left unbound gets its own stamp when it is bound; an `EXECUTE` runs
+        // a body bound on its own; the rest reads no table.
+        PhysicalStatement::Use { .. }
+        | PhysicalStatement::Break
+        | PhysicalStatement::Continue
+        | PhysicalStatement::Goto { .. }
+        | PhysicalStatement::Label { .. }
+        | PhysicalStatement::Print(_)
+        | PhysicalStatement::Transaction(_)
+        | PhysicalStatement::Execute(_)
+        | PhysicalStatement::SetOption(_)
+        | PhysicalStatement::Deferred(_) => {}
+    }
+    true
+}
+
+/// Adds to `named` what the conditions of the `IF` and `WHILE` statements `statement`
+/// holds name, itself included.
+fn conditions_named(statement: &PhysicalStatement, named: &mut Named) {
+    match statement {
+        PhysicalStatement::If {
+            condition,
+            then_,
+            else_,
+        } => {
+            subplans_named(&condition.subplans, named);
+            conditions_named(then_, named);
+            if let Some(else_) = else_ {
+                conditions_named(else_, named);
+            }
+        }
+        PhysicalStatement::While { condition, body } => {
+            subplans_named(&condition.subplans, named);
+            conditions_named(body, named);
+        }
+        PhysicalStatement::Block(statements) => {
+            for statement in statements {
+                conditions_named(statement, named);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn subplans_named(subplans: &[SubPlan], named: &mut Named) {
+    for subplan in subplans {
+        plan_named(&subplan.plan, named);
+    }
+}
+
+/// Adds to `named` the tables `plan` scans and the indexes it seeks, those of the
+/// subqueries it evaluates included.
+fn plan_named(plan: &PhysicalPlan, named: &mut Named) {
+    match plan {
+        PhysicalPlan::OneRow | PhysicalPlan::Values { .. } => {}
+        PhysicalPlan::TableScan { table, .. } => named.tables.push(*table),
+        PhysicalPlan::IndexSeek { index, .. } => named.indexes.push(*index),
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Top { input, .. }
+        | PhysicalPlan::HashAggregate { input, .. }
+        | PhysicalPlan::StreamAggregate { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::TopN { input, .. }
+        | PhysicalPlan::Distinct(input) => plan_named(input, named),
+        PhysicalPlan::NestedLoopJoin { outer, inner, .. } => {
+            plan_named(outer, named);
+            plan_named(inner, named);
+        }
+        PhysicalPlan::HashJoin { build, probe, .. } => {
+            plan_named(build, named);
+            plan_named(probe, named);
+        }
+        PhysicalPlan::SubqueryEval {
+            input, subplans, ..
+        } => {
+            plan_named(input, named);
+            subplans_named(subplans, named);
+        }
+        PhysicalPlan::Union { inputs, .. }
+        | PhysicalPlan::Except { inputs, .. }
+        | PhysicalPlan::Intersect { inputs, .. } => {
+            for input in inputs {
+                plan_named(input, named);
+            }
+        }
     }
 }
 
@@ -297,7 +633,7 @@ pub(crate) fn execute_in_a_transaction(
 ///
 /// A refused `Sch-S` gives back the ones taken before it, in a session transaction that
 /// outlives the statement.
-fn hold_schema(
+pub(crate) fn hold_schema(
     state: &SessionState,
     engine: &Engine,
     cancel: &CancelHandle,
@@ -307,7 +643,7 @@ fn hold_schema(
     let timeout = lock_timeout_from_ms(state.options.lock_timeout);
     let wait = cancel.token().lock_wait();
     let mut held = Vec::new();
-    for (table, _) in stamp.0.iter() {
+    for (table, _) in stamp.tables.iter() {
         match engine
             .txn
             .hold_schema_stability(handle, *table, timeout, &wait)

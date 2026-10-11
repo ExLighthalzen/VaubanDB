@@ -936,23 +936,25 @@ impl Session {
             let variables_before = batch_variables.clone();
             let _ = snapshot.take_resolved_tables(false);
             let bound = self.bind_one(padded, raw.clone(), snapshot, state, batch_variables);
+            // A statement that holds a write waits on the tables its `FOREIGN KEY`
+            // constraints tie that write to, as the write would at the top level.
             let writes = matches!(
                 &bound,
-                Ok(PreparedStatement::Bound {
-                    statement: PhysicalStatement::Insert(_)
-                        | PhysicalStatement::Update(_)
-                        | PhysicalStatement::Delete(_),
-                    ..
-                })
+                Ok(PreparedStatement::Bound { statement, .. })
+                    if txn_session::holds_a_write(statement)
             );
             let tables = snapshot.take_resolved_tables(writes);
             match self.wait_for_schema(binding, &tables) {
                 Ok(false) => {
                     return bound.map(|prepared| match prepared {
-                        PreparedStatement::Bound { statement, .. } => PreparedStatement::Bound {
-                            statement,
-                            stamp: SchemaStamp::of(snapshot, &tables),
-                        },
+                        PreparedStatement::Bound { statement, .. } => {
+                            let stamp = if compiled_in_place(&statement) {
+                                SchemaStamp::of_holder(snapshot, &tables, &statement)
+                            } else {
+                                SchemaStamp::of(snapshot, &tables)
+                            };
+                            PreparedStatement::Bound { statement, stamp }
+                        }
                         other => other,
                     });
                 }
@@ -1094,6 +1096,7 @@ impl Session {
     fn within_a_transaction(
         &mut self,
         step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
+        schema: Option<(&SchemaStamp, &[TableId])>,
         sink: &mut dyn ResultSink,
     ) -> SqlResult<()> {
         let engine = Arc::clone(&self.engine);
@@ -1103,8 +1106,22 @@ impl Session {
             &mut self.exec,
             &self.cancel,
             step,
+            schema,
             sink,
         )
+    }
+
+    /// Waits until no other transaction holds the `Sch-M` of `tables`, the tables a
+    /// condition reads, in the session transaction when one is open and in one opened for
+    /// the wait otherwise ([`Session::wait_for_schema`]).
+    fn wait_for_condition_schema(&self, tables: &[TableId]) -> SqlResult<bool> {
+        if let Some(session_txn) = &self.state.txn {
+            return self.wait_for_schema(&session_txn.handle, tables);
+        }
+        let binding = self.engine.txn.begin(IsolationLevel::ReadCommitted);
+        let waited = self.wait_for_schema(&binding, tables);
+        self.engine.txn.commit(binding)?;
+        waited
     }
 
     /// Runs one bound `EXECUTE` in a transaction, like [`execute_in_a_transaction`] but
@@ -1180,12 +1197,18 @@ impl Session {
 /// transaction of the session when one is open and in one of its own otherwise, then
 /// closes it. `SET NOCOUNT` of the running level is the one of `state`, which a call sets
 /// aside with the rest of the level (`interp/frame.rs` of the executor).
+///
+/// With a `schema`, the step holds the `Sch-S` of the tables of its stamp until it ends, as
+/// a statement does ([`txn_session::execute_in_a_transaction`]); a table of the stamp that
+/// is gone once that `Sch-S` is held, and that the second member does not list, fails the
+/// step before it runs.
 fn within_a_transaction(
     state: &mut SessionState,
     engine: &Arc<Engine>,
     exec: &mut ExecSession,
     cancel: &CancelHandle,
     step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
+    schema: Option<(&SchemaStamp, &[TableId])>,
     sink: &mut dyn ResultSink,
 ) -> SqlResult<()> {
     exec.nocount = state.options.nocount;
@@ -1203,23 +1226,53 @@ fn within_a_transaction(
             "within_a_transaction: the session transaction has no handle".to_owned(),
         )));
     };
-    let result = {
-        let snap = engine.txn.statement_snapshot(&handle);
-        let eval = SessionEvalContext::deferred(state, &engine.catalog, &handle)
-            .with_schema_waits(&engine.txn, cancel.token().lock_wait());
-        let token = cancel.token();
-        let mut ctx = ExecContext::scalar(&eval, state.options.to_binder())
-            .with_engine(engine.storage.as_ref(), &engine.txn, &snap)
-            .with_catalog(&engine.catalog)
-            .with_handle(&handle)
-            .with_cancel(&token)
-            .with_session(exec);
-        step(&mut ctx)
+    let explicit = matches!(txn, StatementTxn::Explicit);
+    let held = match schema {
+        Some((stamp, went_by_this_session)) => {
+            match txn_session::hold_schema(state, engine, cancel, &handle, stamp) {
+                Ok((held, gone))
+                    if gone
+                        .iter()
+                        .any(|table| !went_by_this_session.contains(table)) =>
+                {
+                    Err((held, gone_before_it_ran()))
+                }
+                Ok((held, _)) => Ok(held),
+                Err(err) => Err((Vec::new(), err)),
+            }
+        }
+        None => Ok(Vec::new()),
     };
-    // The `IS` of a `READ COMMITTED` read the step made goes with it, as with a statement.
-    let result = match (&txn, result) {
-        (StatementTxn::Explicit, Ok(())) => engine.txn.end_statement(&handle, &[]),
-        (_, result) => result,
+    let (held, result) = match held {
+        Ok(held) => {
+            let result = {
+                let snap = engine.txn.statement_snapshot(&handle);
+                let eval = SessionEvalContext::deferred(state, &engine.catalog, &handle)
+                    .with_schema_waits(&engine.txn, cancel.token().lock_wait());
+                let token = cancel.token();
+                let mut ctx = ExecContext::scalar(&eval, state.options.to_binder())
+                    .with_engine(engine.storage.as_ref(), &engine.txn, &snap)
+                    .with_catalog(&engine.catalog)
+                    .with_handle(&handle)
+                    .with_cancel(&token)
+                    .with_session(&mut *exec);
+                step(&mut ctx)
+            };
+            (held, result)
+        }
+        Err((held, err)) => (held, Err(err)),
+    };
+    // The `IS` of a `READ COMMITTED` read the step made goes with it, as with a statement,
+    // and so does the `Sch-S` it held, even when it failed in a transaction it left open.
+    let result = match (explicit, result) {
+        (true, Ok(())) => engine.txn.end_statement(&handle, &held),
+        (true, Err(err)) => {
+            if !held.is_empty() && exec.txn.is_some() {
+                let _ = engine.txn.end_statement(&handle, &held);
+            }
+            Err(err)
+        }
+        (false, result) => result,
     };
     txn_session::finish_statement(
         state,
@@ -1341,7 +1394,9 @@ struct BatchHost<'h> {
     batch_variables: BatchVariables,
     /// What the binding of each statement written at the top level read, for the statements
     /// it holds: a statement held by an `IF`, a `WHILE` or a `BEGIN … END` runs on the
-    /// tables its root was bound against.
+    /// tables its root was bound against, and holds the `Sch-S` of the ones it names
+    /// ([`SchemaStamp::of_held`]); a condition, of the ones the conditions of its root read
+    /// ([`SchemaStamp::of_conditions`]).
     held_stamps: Vec<SchemaStamp>,
     /// How many times in a row the running statement was sent back to be bound again
     /// ([`BatchHost::run_rebound`]).
@@ -1371,7 +1426,11 @@ impl Host for BatchHost<'_> {
         self.session.cancel.check()?;
         match stmt {
             Some(stmt) => {
-                let stamp = self.held_stamps.get(site.root).cloned().unwrap_or_default();
+                let stamp = self
+                    .held_stamps
+                    .get(site.root)
+                    .map(|stamp| stamp.of_held(stmt))
+                    .unwrap_or_default();
                 self.run_bound(stmt, site, None, (&stamp, false))
             }
             None => self.run_root(site),
@@ -1384,11 +1443,17 @@ impl Host for BatchHost<'_> {
         evaluate: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<Value>,
     ) -> SqlResult<Result<bool, SqlError>> {
         let mut value = None;
+        let stamp = self
+            .held_stamps
+            .get(site.root)
+            .map(SchemaStamp::of_conditions)
+            .unwrap_or_default();
         let opened = self.session.within_a_transaction(
             &mut |ctx: &mut ExecContext<'_>| {
                 value = Some(evaluate(ctx));
                 Ok(())
             },
+            Some((&stamp, &self.went_by_this_body)),
             &mut *self.sink,
         );
         let evaluated = match (opened, value) {
@@ -1419,7 +1484,8 @@ impl Host for BatchHost<'_> {
         _site: Site,
         step: &mut dyn FnMut(&mut ExecContext<'_>) -> SqlResult<()>,
     ) -> SqlResult<()> {
-        self.session.within_a_transaction(step, &mut *self.sink)
+        self.session
+            .within_a_transaction(step, None, &mut *self.sink)
     }
 
     fn locate(&self, err: SqlError, site: Site) -> SqlError {
@@ -1541,9 +1607,18 @@ impl Host for BatchHost<'_> {
     /// dropped itself does not (`tests/ddl_visibility.rs`,
     /// `a_condition_whose_table_was_rebuilt_reads_the_new_table`).
     fn tables_went(&mut self, site: Site) -> bool {
-        let Some(stamp) = self.held_stamps.get(site.root) else {
+        let Some(stamp) = self.held_stamps.get(site.root).cloned() else {
             return false;
         };
+        // The tables the condition reads are waited for first, as the `Sch-S` of a
+        // statement is, so that a `DDL` another transaction ends meanwhile sends the
+        // condition back to be bound again (`tests/ddl_visibility.rs`,
+        // `a_condition_waits_for_the_ddl_of_its_table_then_reads_the_new_table`). A wait
+        // that fails is met again by the `Sch-S` of the condition, which raises its error.
+        let read = stamp.of_conditions().tables();
+        if !read.is_empty() && self.session.wait_for_condition_schema(&read).is_err() {
+            return false;
+        }
         stamp
             .gone_tables(self.session.engine.storage.as_ref())
             .iter()
