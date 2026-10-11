@@ -10,7 +10,7 @@ use std::sync::Arc;
 use vauban_binder::{
     BindContext, ColumnBinding, LockHints, OutputColumn, OutputSchema, SessionOptions, bind,
 };
-use vauban_catalog::{Catalog, ObjectId};
+use vauban_catalog::{Catalog, ConstraintMeta, ObjectId};
 use vauban_errors::SqlError;
 use vauban_executor::{ExecContext, ExecOutcome, execute_collect};
 use vauban_parser::{ParseOptions, parse_batch};
@@ -450,6 +450,85 @@ fn add_check_reads_the_existing_rows_with_the_query_evaluator() {
     let snapshot = fixture.catalog.snapshot(&handle);
     let ck = snapshot.resolve_object("master", Some("dbo"), "ck", "dbo");
     assert!(ck.is_none(), "a refused CHECK is not added");
+    fixture
+        .txn
+        .rollback(handle)
+        .expect("the transaction rolls back");
+}
+
+/// The number of `FOREIGN KEY` constraints of `master.dbo.table`, under `handle`.
+fn foreign_keys_of(fixture: &Fixture, handle: &TxnHandle, table: &str) -> usize {
+    let snapshot = fixture.catalog.snapshot(handle);
+    snapshot
+        .table(table_object(fixture, handle, table))
+        .expect("the table meta is there")
+        .constraints
+        .iter()
+        .filter(|constraint| matches!(constraint, ConstraintMeta::ForeignKey { .. }))
+        .count()
+}
+
+/// `ALTER TABLE ADD FOREIGN KEY` reads the rows the table already holds: a key no parent
+/// row holds is the 547 of `ALTER TABLE`, naming the constraint, the parent table and its
+/// first referenced column, and the constraint is not added; a `NULL` key passes; once the
+/// orphan is gone the same statement adds the constraint.
+#[test]
+fn add_foreign_key_reads_the_existing_rows() {
+    let fixture = Fixture::new();
+    let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);
+    for text in [
+        "CREATE TABLE dbo.p (id int NOT NULL PRIMARY KEY);",
+        "CREATE TABLE dbo.e (id int NOT NULL, p int NULL);",
+        "INSERT INTO dbo.p VALUES (1), (2);",
+        "INSERT INTO dbo.e VALUES (10, 1), (11, NULL), (12, 3);",
+    ] {
+        run_on(&fixture, &handle, text).unwrap_or_else(|err| panic!("{text}: {err:?}"));
+    }
+    let add = "ALTER TABLE dbo.e ADD CONSTRAINT fk_e_p FOREIGN KEY (p) REFERENCES dbo.p (id);";
+    {
+        let err = run_on(&fixture, &handle, add).expect_err("row 12 has no parent");
+        assert_eq!((err.number, err.severity, err.state), (547, 16, 0));
+        assert_eq!(
+            err.message,
+            "ALTER TABLE violates the FOREIGN KEY constraint \"fk_e_p\" in database \
+             \"master\", table \"dbo.p\", column 'id'."
+        );
+        assert_eq!(foreign_keys_of(&fixture, &handle, "e"), 0, "not added");
+    }
+    run_on(&fixture, &handle, "DELETE FROM dbo.e WHERE id = 12;").expect("delete the orphan");
+    run_on(&fixture, &handle, add).expect("the foreign key holds once the orphan is gone");
+    assert_eq!(foreign_keys_of(&fixture, &handle, "e"), 1);
+    fixture
+        .txn
+        .rollback(handle)
+        .expect("the transaction rolls back");
+}
+
+/// A foreign key of a table towards itself added over rows that hold it, a row naming
+/// itself as its parent included, is added; a row whose parent is missing is the 547 of a
+/// `FOREIGN KEY SAME TABLE`.
+#[test]
+fn add_foreign_key_towards_the_same_table_reads_its_own_rows() {
+    let fixture = Fixture::new();
+    let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);
+    for text in [
+        "CREATE TABLE dbo.h (id int NOT NULL PRIMARY KEY, parent int NULL);",
+        "INSERT INTO dbo.h VALUES (1, 1), (2, 1), (3, NULL), (4, 9);",
+    ] {
+        run_on(&fixture, &handle, text).unwrap_or_else(|err| panic!("{text}: {err:?}"));
+    }
+    let add = "ALTER TABLE dbo.h ADD CONSTRAINT fk_h FOREIGN KEY (parent) REFERENCES dbo.h (id);";
+    let err = run_on(&fixture, &handle, add).expect_err("row 4 has no parent");
+    assert_eq!((err.number, err.severity, err.state), (547, 16, 0));
+    assert_eq!(
+        err.message,
+        "ALTER TABLE violates the FOREIGN KEY SAME TABLE constraint \"fk_h\" in database \
+         \"master\", table \"dbo.h\", column 'id'."
+    );
+    assert_eq!(foreign_keys_of(&fixture, &handle, "h"), 0, "not added");
+    run_on(&fixture, &handle, "DELETE FROM dbo.h WHERE id = 4;").expect("delete the orphan");
+    run_on(&fixture, &handle, add).expect("the foreign key holds once the orphan is gone");
+    assert_eq!(foreign_keys_of(&fixture, &handle, "h"), 1);
     fixture
         .txn
         .rollback(handle)

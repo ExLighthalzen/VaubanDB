@@ -157,9 +157,12 @@ fn write<'a>(
     if let Some(mark) = mark {
         ctx.unwind_to(mark);
     }
-    let count = match outcome? {
-        Some(count) => count,
-        None => return Ok(ExecOutcome::Cancelled),
+    let outcome = outcome?;
+    // A cancelled statement keeps the rows it wrote: the keys they set aside are checked
+    // either way.
+    target.checks.finish(ctx)?;
+    let Some(count) = outcome else {
+        return Ok(ExecOutcome::Cancelled);
     };
     if let Some(session) = ctx.session.as_deref_mut() {
         session.rowcount = i64::try_from(count).unwrap_or(i64::MAX);

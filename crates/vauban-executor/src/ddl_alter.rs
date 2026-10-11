@@ -23,6 +23,8 @@
 //! - the predicate of an added `CHECK`, over each row the table already holds, before the
 //!   constraint is added: the first row it finds false is the 547 of `ALTER TABLE`
 //!   (`tests/ddl_alter.rs`, `add_check_reads_the_existing_rows_with_the_query_evaluator`);
+//!   likewise the key of an added `FOREIGN KEY`, sought in its parent
+//!   (`tests/ddl_alter.rs`, `add_foreign_key_reads_the_existing_rows`);
 //! - the `DEFAULT` of a `NOT NULL` column added to a table that holds rows, once per
 //!   existing row, through [`Catalog::alter_table_filling`] (`tests/ddl_alter.rs`,
 //!   `add_not_null_columns_with_non_literal_defaults_fill_existing_rows`).
@@ -52,6 +54,7 @@ use vauban_types::Value;
 
 use crate::context::ExecContext;
 use crate::dml::assign::assign_value;
+use crate::dml::fk_check::AddedForeignKey;
 use crate::expr::eval_expr;
 use crate::row::ExecOutcome;
 
@@ -86,6 +89,19 @@ pub(crate) fn execute_alter_table(
             {
                 let expr = parse_stored_expression(expr, ExpressionKind::Predicate)?;
                 refuse_check_violated_by_existing_rows(meta, &snap, database, name, &expr, ctx)?;
+            }
+            if let AlterTable::AddConstraint { constraint } = action
+                && let ConstraintDef::ForeignKey {
+                    name,
+                    columns,
+                    referenced,
+                    referenced_columns,
+                    ..
+                } = constraint.as_ref()
+                && let Some(key) =
+                    AddedForeignKey::resolve(meta, &snap, columns, referenced, referenced_columns)
+            {
+                refuse_foreign_key_violated_by_existing_rows(&key, database, name, meta, ctx)?;
             }
             let added = added_columns(action);
             let outcome = if added.is_empty() {
@@ -174,6 +190,28 @@ fn refuse_check_violated_by_existing_rows(
         }
     }
     Ok(())
+}
+
+/// Refuses a `FOREIGN KEY` that a row the table already holds breaks (547).
+///
+/// The schema locks of the table and of its parent are taken first, so that no other
+/// transaction writes a row of either between this read and the addition of the constraint.
+fn refuse_foreign_key_violated_by_existing_rows(
+    key: &AddedForeignKey<'_>,
+    database: &str,
+    name: &Option<String>,
+    meta: &TableMeta,
+    ctx: &ExecContext<'_>,
+) -> SqlResult<()> {
+    let handle = ctx.handle()?;
+    let manager = ctx
+        .txn
+        .ok_or_else(|| bug("ALTER TABLE: ADD FOREIGN KEY needs a transaction manager"))?;
+    let storage = ctx.storage()?;
+    manager.schema_modify_lock(handle, meta.storage_id)?;
+    manager.schema_modify_lock(handle, key.parent_storage())?;
+    let rows_snapshot = manager.statement_snapshot(handle);
+    key.refuse_rows_without_parent(storage, &rows_snapshot, database, name.as_deref())
 }
 
 /// The predicate `expr` bound against the row of `meta`, as the `WHERE` of

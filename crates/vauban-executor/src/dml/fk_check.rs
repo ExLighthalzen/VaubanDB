@@ -14,14 +14,36 @@
 //! transaction has added and not committed is not checked on either of its tables
 //! (`fk_check/tests/mod.rs`, `a_foreign_key_another_transaction_has_not_committed_is_not_checked`).
 //!
+//! # A foreign key of a table towards itself: checked at the end of the statement
+//!
+//! A `FOREIGN KEY` whose parent is the written table itself is checked once the statement
+//! has written all its rows, not row by row: a row may name itself as its parent, rows of one
+//! `INSERT` may name each other, and a `DELETE` of a whole hierarchy leaves no orphan
+//! behind it (`fk_check/tests/mod.rs`, `a_row_may_reference_itself_or_a_row_of_the_same_statement`,
+//! `deleting_a_whole_hierarchy_leaves_no_orphan`). [`WriteChecks::check_row`] and
+//! [`WriteChecks::check_no_referencing_rows`] set those keys aside, and
+//! [`WriteChecks::finish`] reads them against the rows the statement leaves: first the keys
+//! the statement removed that a remaining row still references (`SAME TABLE REFERENCE`),
+//! then the keys the written rows reference that no row holds (`FOREIGN KEY SAME TABLE`).
+//!
+//! # The rows a table holds when a foreign key is added
+//!
+//! [`refuse_rows_without_parent`] reads them for `ALTER TABLE ADD FOREIGN KEY`: a row whose
+//! key no parent row holds is the 547 of `ALTER TABLE`, and the constraint is not added
+//! (`tests/ddl_alter.rs`, `add_foreign_key_reads_the_existing_rows`).
+//!
 //! A `CHECK` the plan does not carry, because its stored text did not bind, is not skipped:
 //! a row written under it is refused with the internal error, which names the constraint
 //! (`tests/fk_check.rs`, `a_check_missing_from_the_plan_refuses_the_row`).
 
+use std::cell::RefCell;
+
 use vauban_binder::{BoundExpr, BoundObjectExpression};
-use vauban_catalog::{CatalogSnapshot, ColumnId, ConstraintMeta, ObjectId, TableMeta};
+use vauban_catalog::{
+    CatalogSnapshot, ColumnId, ConstraintMeta, ObjectId, QualifiedName, TableMeta,
+};
 use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_storage::{Direction, IndexId, KeyRange, TableId};
+use vauban_storage::{Direction, IndexId, KeyRange, Snapshot, Storage, TableId};
 use vauban_types::Value;
 
 use crate::context::ExecContext;
@@ -42,6 +64,19 @@ pub(crate) struct WriteChecks {
     rules: Vec<Rule>,
     /// The foreign keys of other tables that point at this one.
     incoming: Vec<Incoming>,
+    /// The keys of the foreign keys of the table towards itself, set aside until
+    /// [`WriteChecks::finish`].
+    deferred: RefCell<Deferred>,
+}
+
+/// The keys a statement sets aside for the foreign keys of its table towards itself.
+#[derive(Default)]
+struct Deferred {
+    /// Keys the written rows reference: the position of the rule in `rules`, and the key.
+    referencing: Vec<(usize, Vec<Value>)>,
+    /// Keys the statement removed: the position of the foreign key in `incoming`, and the
+    /// key.
+    removed: Vec<(usize, Vec<Value>)>,
 }
 
 /// One `CHECK` or outgoing `FOREIGN KEY` of the written table.
@@ -62,6 +97,8 @@ enum Rule {
         parent: String,
         /// The first referenced column, which the 547 text names.
         column: Option<String>,
+        /// Whether the parent is the written table itself.
+        same_table: bool,
     },
 }
 
@@ -80,6 +117,10 @@ struct Incoming {
     object: String,
     /// The first key column of the child, which the 547 text names.
     column: Option<String>,
+    /// Whether the child is the written table itself.
+    same_table: bool,
+    /// The index of the written table the foreign key reads its key in.
+    referenced_index: IndexId,
 }
 
 impl WriteChecks {
@@ -137,6 +178,7 @@ impl WriteChecks {
                         index: *referenced_index,
                         parent: format!("{}.{}", parent.schema, parent.name),
                         column: column_name(parent, referenced_columns.first()),
+                        same_table: *referenced_table == table.id,
                     });
                 }
                 ConstraintMeta::PrimaryKey(_)
@@ -155,6 +197,7 @@ impl WriteChecks {
             object: format!("{}.{}", table.schema, table.name),
             rules,
             incoming,
+            deferred: RefCell::new(Deferred::default()),
         })
     }
 
@@ -165,8 +208,11 @@ impl WriteChecks {
     ///
     /// 547 for the first constraint `row` breaks; the internal error for a `CHECK` the plan
     /// carries no predicate for; what evaluating a predicate or seeking a key raises.
+    ///
+    /// The key of a foreign key of the table towards itself is set aside for
+    /// [`WriteChecks::finish`] (module documentation).
     pub(crate) fn check_row(&self, row: &Row, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
-        for rule in &self.rules {
+        for (position, rule) in self.rules.iter().enumerate() {
             match rule {
                 Rule::Check { name, predicate } => {
                     let Some(predicate) = predicate else {
@@ -197,9 +243,14 @@ impl WriteChecks {
                     index,
                     parent,
                     column,
+                    same_table,
                 } => {
                     let key = key_values(row, ordinals)?;
                     if key.iter().any(|value| matches!(value, Value::Null)) {
+                        continue;
+                    }
+                    if *same_table {
+                        self.deferred.borrow_mut().referencing.push((position, key));
                         continue;
                     }
                     if !key_exists(ctx, *index, &key)? {
@@ -227,14 +278,21 @@ impl WriteChecks {
     ///
     /// 547 for the first foreign key that still finds a child row; what reading the child
     /// raises.
+    ///
+    /// The key of a foreign key of the table towards itself is set aside for
+    /// [`WriteChecks::finish`] (module documentation).
     pub(crate) fn check_no_referencing_rows(
         &self,
         row: &Row,
         ctx: &mut ExecContext<'_>,
     ) -> SqlResult<()> {
-        for reference in &self.incoming {
+        for (position, reference) in self.incoming.iter().enumerate() {
             let key = key_values(row, &reference.referenced_ordinals)?;
             if key.iter().any(|value| matches!(value, Value::Null)) {
+                continue;
+            }
+            if reference.same_table {
+                self.deferred.borrow_mut().removed.push((position, key));
                 continue;
             }
             if child_row_exists(ctx, reference, &key)? {
@@ -246,6 +304,69 @@ impl WriteChecks {
                         &self.database,
                         &reference.object,
                         reference.column.as_deref(),
+                    ),
+                    0,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks the keys [`WriteChecks::check_row`] and
+    /// [`WriteChecks::check_no_referencing_rows`] set aside, after the last row the
+    /// statement writes.
+    ///
+    /// A removed key that a row of the table still holds is no loss; one that a remaining
+    /// row still references is the 547 of a `SAME TABLE REFERENCE`. A referenced key that no
+    /// row holds is then the 547 of a `FOREIGN KEY SAME TABLE`.
+    ///
+    /// # Errors
+    ///
+    /// 547 for the first key that breaks; what seeking or reading the table raises.
+    pub(crate) fn finish(&self, ctx: &mut ExecContext<'_>) -> SqlResult<()> {
+        let deferred = std::mem::take(&mut *self.deferred.borrow_mut());
+        for (position, key) in &deferred.removed {
+            let Some(reference) = self.incoming.get(*position) else {
+                return Err(bug("FOREIGN KEY: a set-aside key names no foreign key"));
+            };
+            if key_exists(ctx, reference.referenced_index, key)? {
+                continue;
+            }
+            if child_row_exists(ctx, reference, key)? {
+                return Err(at(
+                    SqlError::fk_violation(
+                        self.statement,
+                        "SAME TABLE REFERENCE",
+                        &reference.name,
+                        &self.database,
+                        &reference.object,
+                        single_column(&reference.child_ordinals, &reference.column),
+                    ),
+                    0,
+                ));
+            }
+        }
+        for (position, key) in &deferred.referencing {
+            let Some(Rule::ForeignKey {
+                name,
+                ordinals,
+                index,
+                parent,
+                column,
+                ..
+            }) = self.rules.get(*position)
+            else {
+                return Err(bug("FOREIGN KEY: a set-aside key names no foreign key"));
+            };
+            if !key_exists(ctx, *index, key)? {
+                return Err(at(
+                    SqlError::fk_violation(
+                        self.statement,
+                        "FOREIGN KEY SAME TABLE",
+                        name,
+                        &self.database,
+                        parent,
+                        single_column(ordinals, column),
                     ),
                     0,
                 ));
@@ -276,6 +397,7 @@ fn resolve_incoming(table: &TableMeta, snap: &CatalogSnapshot) -> SqlResult<Vec<
                 columns,
                 referenced_table,
                 referenced_columns,
+                referenced_index,
                 ..
             } = constraint
             else {
@@ -293,6 +415,8 @@ fn resolve_incoming(table: &TableMeta, snap: &CatalogSnapshot) -> SqlResult<Vec<
                 referenced_ordinals: ordinals(table, referenced_columns)?,
                 object: format!("{}.{}", child.schema, child.name),
                 column: column_name(child, columns.first()),
+                same_table: child.id == table.id,
+                referenced_index: *referenced_index,
             };
             found.push(((child.id, *constraint), incoming));
         }
@@ -329,8 +453,16 @@ fn index_for_key(
 }
 
 fn key_exists(ctx: &mut ExecContext<'_>, index: IndexId, key: &[Value]) -> SqlResult<bool> {
-    let storage = ctx.storage()?;
-    let snap = ctx.snapshot()?;
+    seek_finds(ctx.storage()?, ctx.snapshot()?, index, key)
+}
+
+/// Whether `index` holds `key` for the reader of `snap`.
+fn seek_finds(
+    storage: &dyn Storage,
+    snap: &Snapshot,
+    index: IndexId,
+    key: &[Value],
+) -> SqlResult<bool> {
     let mut iter = storage.seek(
         snap,
         index,
@@ -338,6 +470,158 @@ fn key_exists(ctx: &mut ExecContext<'_>, index: IndexId, key: &[Value]) -> SqlRe
         Direction::Forward,
     )?;
     Ok(iter.next().transpose()?.is_some())
+}
+
+/// A `FOREIGN KEY` that `ALTER TABLE ADD` is about to add, resolved in the catalogue
+/// snapshot of the statement.
+pub(crate) struct AddedForeignKey<'s> {
+    /// The table the constraint is added to.
+    table: &'s TableMeta,
+    /// The table it points at, `table` itself for a foreign key of a table towards itself.
+    parent: &'s TableMeta,
+    /// The ordinals of the key columns in a row of `table`.
+    ordinals: Vec<usize>,
+    /// The index of `parent` the key is sought in.
+    index: IndexId,
+    /// The first referenced column, which the 547 text names.
+    column: Option<String>,
+}
+
+impl<'s> AddedForeignKey<'s> {
+    /// Resolves the `FOREIGN KEY (columns) REFERENCES referenced (referenced_columns)` that
+    /// `ALTER TABLE` adds to `table`, as the catalogue will: the columns by name, the
+    /// primary key of the parent when `referenced_columns` is empty, and the unique index of
+    /// the parent whose key is those columns, in that order.
+    ///
+    /// `None` when one of these does not resolve: the catalogue then refuses the constraint
+    /// with its own error, and there is no row to read.
+    pub(crate) fn resolve(
+        table: &'s TableMeta,
+        snap: &'s CatalogSnapshot,
+        columns: &[String],
+        referenced: &QualifiedName,
+        referenced_columns: &[String],
+    ) -> Option<Self> {
+        let database = snap.database_by_id(table.database)?;
+        let parent = if referenced.database.eq_ignore_ascii_case(&database.name)
+            && referenced.schema.eq_ignore_ascii_case(&table.schema)
+            && referenced.name.eq_ignore_ascii_case(&table.name)
+        {
+            table
+        } else {
+            let object = snap.resolve_object(
+                &referenced.database,
+                Some(&referenced.schema),
+                &referenced.name,
+                &referenced.schema,
+            )?;
+            snap.table(object.id)?
+        };
+        let ordinals = ordinals_named(table, columns)?;
+        let indexes = snap.indexes_of(parent.id);
+        let parent_ordinals: Vec<usize> = if referenced_columns.is_empty() {
+            let key = indexes.iter().find(|index| index.primary_key)?;
+            key.columns
+                .iter()
+                .map(|key| usize::from(key.column))
+                .collect()
+        } else {
+            ordinals_named(parent, referenced_columns)?
+        };
+        if parent_ordinals.len() != ordinals.len() {
+            return None;
+        }
+        let index = indexes.iter().find(|index| {
+            index.unique
+                && index.columns.len() == parent_ordinals.len()
+                && index
+                    .columns
+                    .iter()
+                    .zip(parent_ordinals.iter())
+                    .all(|(key, ordinal)| usize::from(key.column) == *ordinal)
+        })?;
+        let column = parent_ordinals
+            .first()
+            .and_then(|ordinal| parent.columns.get(*ordinal))
+            .map(|column| column.name.clone());
+        Some(Self {
+            table,
+            parent,
+            ordinals,
+            index: index.id,
+            column,
+        })
+    }
+
+    /// The storage table of the parent.
+    pub(crate) fn parent_storage(&self) -> TableId {
+        self.parent.storage_id
+    }
+
+    /// Refuses the constraint when a row of the table, read under `rows`, holds a key no
+    /// parent row holds (547); a key with a `NULL` in it references nothing and passes.
+    ///
+    /// `name` is the name of the constraint, `None` when the statement does not write one.
+    ///
+    /// # Errors
+    ///
+    /// 547 for the first such row; what reading the table or seeking the parent raises.
+    pub(crate) fn refuse_rows_without_parent(
+        &self,
+        storage: &dyn Storage,
+        rows: &Snapshot,
+        database: &str,
+        name: Option<&str>,
+    ) -> SqlResult<()> {
+        for item in storage.scan(rows, self.table.storage_id)? {
+            let (_, row) = item?;
+            let key = key_values(&row.0, &self.ordinals)?;
+            if key.iter().any(|value| matches!(value, Value::Null)) {
+                continue;
+            }
+            if !seek_finds(storage, rows, self.index, &key)? {
+                let kind = if self.parent.id == self.table.id {
+                    "FOREIGN KEY SAME TABLE"
+                } else {
+                    "FOREIGN KEY"
+                };
+                return Err(SqlError::fk_violation(
+                    "ALTER TABLE",
+                    kind,
+                    name.unwrap_or("FOREIGN KEY"),
+                    database,
+                    &format!("{}.{}", self.parent.schema, self.parent.name),
+                    single_column(&self.ordinals, &self.column),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The column a 547 names for a key of `ordinals`: `column` for a key of one column, none
+/// for a key of several (`fk_check/tests/mod.rs`, `a_composite_key_names_no_column`).
+fn single_column<'c>(ordinals: &[usize], column: &'c Option<String>) -> Option<&'c str> {
+    if ordinals.len() == 1 {
+        column.as_deref()
+    } else {
+        None
+    }
+}
+
+/// The ordinals of the columns of `table` named `names`, `None` when one is not a column of
+/// the table.
+fn ordinals_named(table: &TableMeta, names: &[String]) -> Option<Vec<usize>> {
+    names
+        .iter()
+        .map(|name| {
+            table
+                .columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(name))
+                .map(|column| usize::from(column.ordinal))
+        })
+        .collect()
 }
 
 fn child_row_exists(

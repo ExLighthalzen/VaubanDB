@@ -94,6 +94,8 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
         while let Some(row) = root.next(ctx)? {
             if ctx.cancelled() {
                 root.close();
+                // The rows written so far stay: the keys they set aside are checked first.
+                target.checks.finish(ctx)?;
                 return Ok(ExecOutcome::Cancelled);
             }
             let (id, identity) = write_one(&row, stmt, &source_types, &target, ctx)?;
@@ -105,6 +107,7 @@ pub(crate) fn execute(stmt: &PhysicalInsert, ctx: &mut ExecContext<'_>) -> SqlRe
         }
         root.close();
     }
+    target.checks.finish(ctx)?;
 
     if let Some(session) = ctx.session.as_deref_mut() {
         session.rowcount = count as i64;
