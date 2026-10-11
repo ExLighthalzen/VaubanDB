@@ -13,6 +13,7 @@ use crate::context::ExecContext;
 use crate::control;
 use crate::errors::at;
 use crate::row::ExecOutcome;
+use crate::txn_exec;
 
 use super::compile::{Escape, Instr, Labels, Placement, compile_roots};
 use super::frame::Frame;
@@ -162,10 +163,28 @@ fn run_from(
             } => {
                 if *loop_head && host.cancelled() {
                     Step::Stop(End::Cancelled)
+                } else if host.tables_went(*site) {
+                    // Nothing is evaluated: the root that holds the condition is bound
+                    // again, as for a statement that came back with `Ran::Rebind`.
+                    match rebinding {
+                        Rebinding::Here => rebind_root(program, &mut replaced, pc, *site, host)?,
+                        Rebinding::Above => {
+                            return Ok(Ended::Rebind {
+                                at: pc,
+                                site: *site,
+                            });
+                        }
+                        Rebinding::Refused => fail(gone_error(), *otherwise, *site, host)?,
+                    }
                 } else {
                     let mut evaluate = |ctx: &mut ExecContext<'_>| {
-                        control::eval_statement_expr(&condition.expr, &condition.subplans, ctx)
-                            .map_err(|err| condition_error(err, condition.expr.line))
+                        let value =
+                            control::eval_statement_expr(&condition.expr, &condition.subplans, ctx)
+                                .map_err(|err| condition_error(err, condition.expr.line));
+                        if let Err(err) = &value {
+                            end_failed_condition(ctx, err)?;
+                        }
+                        value
                     };
                     match host.condition(*site, &mut evaluate)? {
                         Ok(true) => {
@@ -275,6 +294,11 @@ fn rebind_root(
         .code
         .iter()
         .position(|instr| site_of(instr).is_some_and(|at| at.root == site.root));
+    if let Some(start) = start
+        && let Some(step) = condition_left_unbound(program, start, pc, site, &statement, host)?
+    {
+        return Ok(step);
+    }
     let range = start.and_then(|start| {
         let roots = [Some(&statement)];
         let sub = compile_roots(&roots, Labels::Open, false, Placement::Within(site.root)).ok()?;
@@ -293,6 +317,65 @@ fn rebind_root(
             Ok(Step::Go(pc))
         }
         _ => fail(gone_error(), pc + 1, site, host),
+    }
+}
+
+/// The step of the condition at `pc` when the new binding of its root, `statement`, left
+/// the statement that holds the condition unbound: the binder does that with an `IF` or a
+/// `WHILE` held by a block whose condition names a table that is no longer there. The
+/// instructions of the root before the condition keep their kinds in the new binding, so
+/// the statement left unbound stands at the position of the condition; it is bound now,
+/// and the error of that binding is the error of the condition
+/// (`interp::tests::a_condition_left_unbound_by_the_new_binding_answers_its_binding_error`).
+///
+/// `None` when the new binding holds no such statement there, or when that statement
+/// binds: the caller answers then as for a new binding of another shape.
+fn condition_left_unbound(
+    program: &Program<'_>,
+    start: usize,
+    pc: usize,
+    site: Site,
+    statement: &PhysicalStatement,
+    host: &mut dyn Host,
+) -> SqlResult<Option<Step>> {
+    let Some(Instr::Test { otherwise, .. }) = program.code.get(pc) else {
+        return Ok(None);
+    };
+    let Some(offset) = pc.checked_sub(start) else {
+        return Ok(None);
+    };
+    let roots = [Some(statement)];
+    let Ok(sub) = compile_roots(&roots, Labels::Open, false, Placement::Within(site.root)) else {
+        return Ok(None);
+    };
+    let (Some(old), Some(new)) = (program.code.get(start..pc), sub.code.get(..offset)) else {
+        return Ok(None);
+    };
+    let same_kinds = old
+        .iter()
+        .zip(new)
+        .all(|(a, b)| std::mem::discriminant(a) == std::mem::discriminant(b));
+    let Some(Instr::Run {
+        stmt: Some(PhysicalStatement::Deferred(deferred)),
+        site: held,
+        ..
+    }) = sub.code.get(offset)
+    else {
+        return Ok(None);
+    };
+    if !same_kinds {
+        return Ok(None);
+    }
+    let checked = host.within(*held, &mut |ctx: &mut ExecContext<'_>| {
+        let bound = control::bind_and_plan(deferred, ctx)?;
+        compile_checks(&bound, ctx)
+    });
+    match checked {
+        Ok(()) => Ok(None),
+        Err(err) => {
+            let err = host.locate(err, *held);
+            go_on_or_stop(err, Origin::Statement, *otherwise, host).map(Some)
+        }
     }
 }
 
@@ -717,6 +800,21 @@ pub(crate) fn evaluate_return(value: &StatementExpr, ctx: &mut ExecContext<'_>) 
 /// written below its `IF` answers its own line.
 pub(crate) fn condition_error(err: SqlError, line: u32) -> SqlError {
     err.with_line(line)
+}
+
+/// What a condition whose evaluation raised `err` leaves to the transaction: under `SET
+/// XACT_ABORT ON` the transaction is rolled back, as after a statement that raised it
+/// (`interp::tests::an_error_of_a_condition_under_xact_abort_rolls_the_transaction_back`).
+/// A condition writes nothing, so without `XACT_ABORT` there is nothing to undo.
+fn end_failed_condition(ctx: &mut ExecContext<'_>, err: &SqlError) -> SqlResult<()> {
+    let xact_abort = ctx
+        .session
+        .as_deref()
+        .is_some_and(|session| session.xact_abort);
+    if xact_abort {
+        txn_exec::end_statement(ctx, &Err(err.clone()))?;
+    }
+    Ok(())
 }
 
 /// The internal error 50000 for a broken precondition.

@@ -398,6 +398,57 @@ fn datepart_9810_is_statement_scoped_unless_xact_abort_is_on() {
     assert_eq!(rows(&events), vec![vec![Value::I32(1)]], "{events:#?}");
 }
 
+/// Under `SET XACT_ABORT ON`, an error raised by the condition of an `IF` or of a `WHILE`
+/// (8134, 512) rolls the transaction back, announced by its ENVCHANGE, and stops the batch,
+/// as the error of a statement does: the next batch reads `@@TRANCOUNT` 0 and none of the
+/// rows of the transaction. Under `XACT_ABORT OFF` the batch goes on and the transaction
+/// stays open with its row.
+#[test]
+fn an_error_of_a_condition_under_xact_abort_rolls_the_transaction_back() {
+    for (condition, number) in [
+        ("IF 1 / 0 = 1 PRINT 'x';", 8134),
+        ("IF (SELECT a FROM dbo.x) = 1 PRINT 'x';", 512),
+        ("WHILE 1 / 0 = 1 BREAK;", 8134),
+        ("WHILE (SELECT a FROM dbo.x) = 1 BREAK;", 512),
+        ("IF 1 = 1 BEGIN SELECT 6; IF 1 / 0 = 1 PRINT 'x'; END", 8134),
+    ] {
+        for xact_abort in [true, false] {
+            let mut session = session();
+            let (_, result) = run_on(
+                &mut session,
+                "CREATE TABLE dbo.x (a int); INSERT INTO dbo.x VALUES (1), (2);",
+            );
+            result.expect("the table is created");
+            let option = if xact_abort { "ON" } else { "OFF" };
+            let (events, _) = run_on(
+                &mut session,
+                &format!(
+                    "SET XACT_ABORT {option}; BEGIN TRANSACTION; INSERT INTO dbo.x VALUES (3); \
+                     {condition} SELECT 7;"
+                ),
+            );
+            assert_eq!(only_error(&events).number, number, "{condition} {option}");
+            let rolled_back = events
+                .iter()
+                .any(|event| matches!(event, Event::EnvChange(EnvChange::RollbackTransaction(_))));
+            assert_eq!(rolled_back, xact_abort, "{condition} {option}: {events:#?}");
+            let last = rows(&events).last().cloned();
+            assert_eq!(
+                last == Some(vec![Value::I32(7)]),
+                !xact_abort,
+                "{condition} {option}: {events:#?}"
+            );
+            let (events, _) = run_on(&mut session, "SELECT @@TRANCOUNT, COUNT(*) FROM dbo.x;");
+            let expected = if xact_abort { [0, 2] } else { [1, 3] };
+            assert_eq!(
+                rows(&events),
+                vec![expected.map(Value::I32).to_vec()],
+                "{condition} {option}"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // The line of a run-time error
 // ---------------------------------------------------------------------------------------

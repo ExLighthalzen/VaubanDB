@@ -90,6 +90,14 @@
 //! of another shape, or a statement bound when the program reached it, fails with the
 //! internal error.
 //!
+//! The condition of an `IF` or of a `WHILE` takes the same path when the host answers that
+//! the tables of its root went ([`Host::tables_went`]): nothing of it is evaluated, and the
+//! condition of the new binding is tested in its place
+//! (`interp::tests::a_condition_whose_tables_went_is_tested_from_the_new_binding`). A new
+//! binding that left the statement holding the condition unbound answers the error of
+//! binding that statement
+//! (`interp::tests::a_condition_left_unbound_by_the_new_binding_answers_its_binding_error`).
+//!
 //! # A statement run alone
 //!
 //! `control.rs` runs a single `IF`, `WHILE` or `BEGIN … END` handed to [`crate::execute`]
@@ -486,6 +494,19 @@ pub trait Host {
     fn rebind(&mut self, site: Site) -> SqlResult<Result<PhysicalStatement, SqlError>> {
         let _ = site;
         Ok(Err(run::gone_error()))
+    }
+
+    /// Whether a table the statement written at the top level of the body at `site` was
+    /// bound against went after that binding, by another transaction. The condition of an
+    /// `IF` or of a `WHILE` it holds is then not evaluated: the program binds the root again
+    /// ([`Host::rebind`]) and tests the condition of the new binding in its place, as it
+    /// runs a statement that came back with [`Ran::Rebind`]
+    /// (`interp::tests::a_condition_whose_tables_went_is_tested_from_the_new_binding`).
+    ///
+    /// A host that does not override this method answers `false`.
+    fn tables_went(&mut self, site: Site) -> bool {
+        let _ = site;
+        false
     }
 }
 

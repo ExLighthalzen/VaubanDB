@@ -784,6 +784,62 @@ fn a_held_statement_whose_table_was_dropped_is_208() {
     assert_eq!(ints(&events), vec![0, 1]);
 }
 
+/// A block whose `IF`, on line 4, tests the rows of `dbo.t` after a read of `dbo.w` that
+/// waits for the other session: `SELECT 1` when `dbo.t` holds one row, `SELECT 2` otherwise.
+const CONDITION_HELD_BY_AN_IF: &str = "IF 1 = 1\nBEGIN\n  EXEC ('SELECT a FROM dbo.w');\n  \
+     IF (SELECT COUNT(*) FROM dbo.t) = 1 SELECT 1; ELSE SELECT 2;\nEND\nSELECT 4;";
+
+/// A loop whose condition, on line 2, counts the rows of `dbo.t`: its first test runs before
+/// a read of `dbo.w` that waits for the other session, its second test right after it.
+const CONDITION_OF_A_WHILE: &str = "DECLARE @i int = 0;\nWHILE (SELECT COUNT(*) FROM dbo.t) > @i\n\
+     BEGIN\n  SET @i = @i + 1;\n  IF @i = 1 EXEC ('SELECT a FROM dbo.w');\nEND\nSELECT @i;";
+
+/// The condition of an `IF` held by a block, or of a `WHILE`, tested after another session
+/// rebuilt its table by an `ALTER TABLE` and wrote a second row, reads the rebuilt table:
+/// the statement that holds it is bound again.
+#[test]
+fn a_condition_whose_table_was_rebuilt_reads_the_new_table() {
+    for (text, expected) in [
+        (CONDITION_HELD_BY_AN_IF, vec![5, 2, 4]),
+        (CONDITION_OF_A_WHILE, vec![5, 2]),
+    ] {
+        let engine = engine();
+        let mut a = session(&engine, 61);
+        run(
+            &mut a,
+            "CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1);",
+        );
+        let events = held_while_another_session_commits(
+            &engine,
+            text,
+            "ALTER TABLE dbo.t ADD c int; INSERT INTO dbo.t (a) VALUES (2);",
+        );
+        assert!(errors(&events).is_empty(), "{text}: {events:#?}");
+        assert_eq!(ints(&events), expected, "{text}");
+    }
+}
+
+/// The same conditions, when the other session drops the table: 208 on the line of the
+/// statement that holds the condition, and the batch stops there, after what ran before.
+#[test]
+fn a_condition_whose_table_was_dropped_is_208() {
+    for (text, line) in [(CONDITION_HELD_BY_AN_IF, 4), (CONDITION_OF_A_WHILE, 2)] {
+        let engine = engine();
+        let mut a = session(&engine, 61);
+        run(
+            &mut a,
+            "CREATE TABLE dbo.t (a int); INSERT INTO dbo.t VALUES (1);",
+        );
+        let events = held_while_another_session_commits(&engine, text, "DROP TABLE dbo.t;");
+        assert_eq!(
+            numbers_and_lines(&events),
+            vec![(208, line)],
+            "{text}: {events:#?}"
+        );
+        assert_eq!(ints(&events), vec![5], "{text}");
+    }
+}
+
 /// A transaction that has read a table in `READ COMMITTED`, its statement over, does not
 /// hold back an `ALTER TABLE` of another session; one that read it in `REPEATABLE READ`, or
 /// wrote a row of it, does, until it ends. The reading transaction goes on, and reads the

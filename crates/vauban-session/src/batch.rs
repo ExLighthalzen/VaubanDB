@@ -1407,6 +1407,7 @@ impl Host for BatchHost<'_> {
             // at 0 (`tests/run_batch_pipeline.rs`,
             // `a_condition_puts_the_row_count_and_the_last_error_back_to_zero`).
             Ok(value) => {
+                self.held_rebinds = 0;
                 self.session.state.rowcount = 0;
                 self.session.state.last_error = 0;
                 Ok(Ok(matches!(value, Value::Bit(true))))
@@ -1536,6 +1537,21 @@ impl Host for BatchHost<'_> {
 
     fn xact_abort(&self) -> bool {
         self.session.state.options.xact_abort
+    }
+
+    /// Reads what the binding of the root at `site` was bound against, as a statement it
+    /// holds does before it runs: a table another transaction dropped or rebuilt since then
+    /// sends the condition back to be bound again with its root, and a table this body
+    /// dropped itself does not (`tests/ddl_visibility.rs`,
+    /// `a_condition_whose_table_was_rebuilt_reads_the_new_table`).
+    fn tables_went(&mut self, site: Site) -> bool {
+        let Some(stamp) = self.held_stamps.get(site.root) else {
+            return false;
+        };
+        stamp
+            .gone_tables(self.session.engine.storage.as_ref())
+            .iter()
+            .any(|table| !self.went_by_this_body.contains(table))
     }
 
     /// Binds the statement written at `site` again, as [`BatchHost::run_rebound`] does for

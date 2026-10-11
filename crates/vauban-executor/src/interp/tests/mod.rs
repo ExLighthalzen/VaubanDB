@@ -733,13 +733,18 @@ fn a_raised_token_stops_a_loop_at_its_next_jump_backward() {
 }
 
 /// A [`Host`] over one context that sends back the statements it is handed at the given
-/// turns ([`Ran::Rebind`]), and answers each [`Host::rebind`] with `binding`.
+/// turns ([`Ran::Rebind`]), answers [`Host::tables_went`] at the given tests of a
+/// condition, and answers each [`Host::rebind`] with `binding`.
 struct Rebinding<'r, 'a> {
     inner: SingleContext<'r, 'a>,
     /// How many statements the host was handed so far.
     handed: usize,
     /// The turns, counted from 1, whose statement is sent back.
     send_back: Vec<usize>,
+    /// How many tests of a condition the host was asked about so far.
+    tested: usize,
+    /// The tests, counted from 1, whose tables went.
+    went: Vec<usize>,
     /// What [`Host::rebind`] answers.
     binding: Result<PhysicalStatement, SqlError>,
     /// The sites [`Host::rebind`] was asked for.
@@ -803,6 +808,11 @@ impl Host for Rebinding<'_, '_> {
         self.rebound.push(site);
         Ok(self.binding.clone())
     }
+
+    fn tables_went(&mut self, _site: Site) -> bool {
+        self.tested += 1;
+        self.went.contains(&self.tested)
+    }
 }
 
 /// Runs `text` through a [`Rebinding`] host that sends back the statements handed to it at
@@ -814,19 +824,39 @@ fn rebinding(
     send_back: &[usize],
     binding: Result<PhysicalStatement, SqlError>,
 ) -> (ProgramEnd, Vec<Site>, Vec<Value>, Vec<u32>) {
+    rebinding_tests(text, send_back, &[], binding)
+}
+
+/// [`rebinding`], the host answering also that the tables of the condition went at the
+/// tests of `went`.
+fn rebinding_tests(
+    text: &str,
+    send_back: &[usize],
+    went: &[usize],
+    binding: Result<PhysicalStatement, SqlError>,
+) -> (ProgramEnd, Vec<Site>, Vec<Value>, Vec<u32>) {
     let statements = planned(text, None, None);
     let program = Program::compile(&statements).expect("the program compiles");
     let eval = StaticContext::default();
     let mut session = ExecSession::default();
     let mut sink = CollectSink::new();
     let mut calls = Recorder::default();
+    // A catalogue, for a statement the new binding left unbound and the program binds.
+    let fixture = Fixture::new();
+    let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);
+    let snap = fixture.txn.statement_snapshot(&handle);
     let (end, rebound) = {
-        let mut ctx =
-            ExecContext::scalar(&eval, SessionOptions::default()).with_session(&mut session);
+        let mut ctx = ExecContext::scalar(&eval, SessionOptions::default())
+            .with_engine(fixture.storage.as_ref(), &fixture.txn, &snap)
+            .with_catalog(&fixture.catalog)
+            .with_handle(&handle)
+            .with_session(&mut session);
         let mut host = Rebinding {
             inner: SingleContext::new(&mut ctx, &mut sink, &mut calls),
             handed: 0,
             send_back: send_back.to_vec(),
+            tested: 0,
+            went: went.to_vec(),
             binding,
             rebound: Vec::new(),
         };
@@ -835,6 +865,10 @@ fn rebinding(
             .expect("the sink takes everything");
         (end, host.rebound)
     };
+    fixture
+        .txn
+        .rollback(handle)
+        .expect("the transaction rolls back");
     let numbers = sink.errors().iter().map(|error| error.number).collect();
     (end, rebound, first_column(&sink), numbers)
 }
@@ -920,4 +954,137 @@ fn an_error_of_the_new_binding_is_the_error_of_the_statement() {
     let (_, _, rows, errors) = rebinding(text, &[3], Ok(other_shape));
     assert!(!rows.contains(&Value::I32(5)), "{rows:?}");
     assert_eq!(errors, vec![50000]);
+}
+
+/// A condition whose tables went is not evaluated: the root that holds it is bound again,
+/// and the condition of the new binding is tested in its place. The statements that ran
+/// before it, the first turn of the loop included, are not run again.
+#[test]
+fn a_condition_whose_tables_went_is_tested_from_the_new_binding() {
+    let binding =
+        second_root("DECLARE @i int; WHILE @i < 3 BEGIN SELECT 100 + @i; SET @i = @i + 1; END;");
+    let (end, rebound, rows, errors) = rebinding_tests(
+        "DECLARE @i int = 0; WHILE @i < 2 BEGIN SELECT 10 + @i; SET @i = @i + 1; END; \
+         SELECT 9;",
+        &[],
+        &[2],
+        Ok(binding),
+    );
+    assert_eq!(end, ProgramEnd::Completed);
+    assert_eq!(rebound.len(), 1, "{rebound:?}");
+    assert_eq!(
+        rows,
+        vec![
+            Value::I32(10),
+            Value::I32(101),
+            Value::I32(102),
+            Value::I32(9)
+        ]
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+
+    // The test of an `IF` held by a block: the new binding takes the other branch.
+    let binding = planned(
+        "IF 1 = 1 BEGIN SELECT 2; IF 1 = 0 SELECT 3; ELSE SELECT 30; END;",
+        None,
+        None,
+    )
+    .swap_remove(0);
+    let (end, rebound, rows, errors) = rebinding_tests(
+        "SELECT 1; IF 1 = 1 BEGIN SELECT 2; IF 1 = 1 SELECT 3; ELSE SELECT 30; END; SELECT 4;",
+        &[],
+        &[2],
+        Ok(binding),
+    );
+    assert_eq!(end, ProgramEnd::Completed);
+    assert_eq!(rebound.len(), 1, "{rebound:?}");
+    assert_eq!(
+        rows,
+        vec![Value::I32(1), Value::I32(2), Value::I32(30), Value::I32(4)]
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// The error of the new binding of a condition whose tables went is the error of the
+/// condition: 208 ends the level, after the statements that ran.
+#[test]
+fn an_error_of_the_new_binding_of_a_condition_is_its_error() {
+    let (end, _, rows, errors) = rebinding_tests(
+        "SELECT 1; IF 1 = 1 BEGIN SELECT 2; IF 1 = 1 SELECT 3; END; SELECT 4;",
+        &[],
+        &[2],
+        Err(SqlError::invalid_object_name("t")),
+    );
+    assert!(
+        matches!(&end, ProgramEnd::LevelAborted(err) if err.number == 208),
+        "{end:?}"
+    );
+    assert_eq!(rows, vec![Value::I32(1), Value::I32(2)]);
+    assert_eq!(errors, vec![208]);
+}
+
+/// Under `SET XACT_ABORT ON`, an error raised by the condition of an `IF` or of a `WHILE`
+/// rolls the transaction back, as the error of a statement does, and ends the program;
+/// without it the transaction stays open and the program goes on.
+#[test]
+fn an_error_of_a_condition_under_xact_abort_rolls_the_transaction_back() {
+    let fixture = Fixture::new();
+    let mut session = ExecSession::default();
+    fixture.run("CREATE TABLE dbo.t (a int);", &mut session);
+    for condition in ["IF 1 / 0 = 1 SELECT 1;", "WHILE 1 / 0 = 1 BREAK;"] {
+        let text =
+            format!("BEGIN TRANSACTION; INSERT INTO dbo.t VALUES (1); {condition} SELECT 7;");
+        session.xact_abort = true;
+        let (end, sink) = fixture.run(&text, &mut session);
+        assert!(
+            matches!(&end, ProgramEnd::Aborted(err) if err.number == 8134),
+            "{condition}: {end:?}"
+        );
+        assert!(sink.rows.is_empty(), "{condition}: {sink:?}");
+        assert!(session.txn.is_none(), "{condition}");
+        assert_eq!(session.trancount, 0, "{condition}");
+
+        session.xact_abort = false;
+        let (end, sink) = fixture.run(&text, &mut session);
+        assert_eq!(end, ProgramEnd::Completed, "{condition}");
+        assert_eq!(first_column(&sink), vec![Value::I32(7)], "{condition}");
+        assert!(session.txn.is_some(), "{condition}");
+        assert_eq!(session.trancount, 1, "{condition}");
+        fixture.run("ROLLBACK TRANSACTION;", &mut session);
+        assert!(session.txn.is_none(), "{condition}");
+    }
+}
+
+/// The new binding of a root whose block holds an `IF` naming a table that is gone leaves
+/// that `IF` unbound: the condition answers the error of binding it now, 208, and the level
+/// ends after the statements that ran.
+#[test]
+fn a_condition_left_unbound_by_the_new_binding_answers_its_binding_error() {
+    let fixture = Fixture::new();
+    let handle = fixture.txn.begin(IsolationLevel::ReadCommitted);
+    let snapshot = fixture.catalog.snapshot(&handle);
+    let binding = planned(
+        "IF 1 = 1 BEGIN SELECT 2; IF EXISTS (SELECT * FROM dbo.gone) SELECT 3; END;",
+        Some(&snapshot),
+        Some(fixture.storage.as_ref()),
+    )
+    .swap_remove(0);
+    fixture.txn.commit(handle).expect("the transaction commits");
+    assert!(
+        matches!(&binding, PhysicalStatement::If { .. }),
+        "{binding:?}"
+    );
+    let (end, rebound, rows, errors) = rebinding_tests(
+        "SELECT 1; IF 1 = 1 BEGIN SELECT 2; IF 1 = 1 SELECT 3; END; SELECT 4;",
+        &[],
+        &[2],
+        Ok(binding),
+    );
+    assert_eq!(rebound.len(), 1, "{rebound:?}");
+    assert!(
+        matches!(&end, ProgramEnd::LevelAborted(err) if err.number == 208),
+        "{end:?}"
+    );
+    assert_eq!(rows, vec![Value::I32(1), Value::I32(2)]);
+    assert_eq!(errors, vec![208]);
 }
