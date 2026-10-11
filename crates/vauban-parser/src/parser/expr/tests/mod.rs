@@ -1165,3 +1165,108 @@ fn starts_a_value_agrees_with_the_grammar() {
         operands.len()
     );
 }
+
+/// The single arm of the searched `CASE` that an `IIF(…)` is read as, and its `ELSE`.
+fn iif_parts(text: &str) -> (String, String, String) {
+    match &e(text) {
+        Expr::Case {
+            operand: None,
+            arms,
+            else_: Some(else_),
+            ..
+        } if arms.len() == 1 => (shape(&arms[0].when), shape(&arms[0].then), shape(else_)),
+        other => unreachable!("{text} is a searched CASE with one arm, got {other:?}"),
+    }
+}
+
+/// `IIF(c, a, b)` is the searched `CASE WHEN c THEN a ELSE b END`: its first argument is
+/// a search condition, read with each of the predicates below.
+#[test]
+fn iif_is_a_searched_case() {
+    let (when, then, else_) = iif_parts("IIF(@e IS NULL, N'', @e)");
+    assert_eq!(when, "IsNull(@e)");
+    assert_eq!(then, "N''");
+    assert_eq!(else_, "@e");
+    for (text, condition) in [
+        ("IIF(1 = 1, 'a', 'b')", "Eq(1, 1)"),
+        ("IIF(1 = 1 AND 2 > 1, 1, 0)", "And(Eq(1, 1), Gt(2, 1))"),
+        (
+            "IIF(1 = 0 OR NOT 1 = 0, 1, 0)",
+            "Or(Eq(1, 0), Not(Eq(1, 0)))",
+        ),
+        ("IIF(1 IN (1, 2), 1, 0)", "In(1, 1, 2)"),
+        ("IIF('ab' LIKE 'a%', 1, 0)", "Like('ab', 'a%')"),
+        ("IIF(1 BETWEEN 0 AND 2, 1, 0)", "Between(1, 0, 2)"),
+        ("IIF(NULL IS NOT NULL, 1, 0)", "IsNotNull(NULL)"),
+        ("iif(1 = 1, 1, 0)", "Eq(1, 1)"),
+        ("Iif(1 = 1, 1, 0)", "Eq(1, 1)"),
+    ] {
+        assert_eq!(iif_parts(text).0, condition, "{text}");
+    }
+    match &e("IIF(EXISTS (SELECT 1 FROM sys.objects WHERE 1 = 0), 1, 0)") {
+        Expr::Case { arms, .. } => assert!(matches!(arms[0].when, Expr::Exists(..))),
+        other => unreachable!("an IIF is a CASE, got {other:?}"),
+    }
+    // A condition that is not a predicate still parses; the binder refuses it.
+    assert_eq!(iif_parts("IIF(1, 2, 3)").0, "1");
+    // Nested, and used as an operand.
+    let (_, then, _) = iif_parts("iif(1 = 1, IIF(2 = 2, 'a', 'b'), 'c')");
+    assert_eq!(then, "CASE WHEN 2 = 2 THEN 'a' ELSE 'b' END");
+    assert_eq!(
+        shape(&e("IIF(1 = 1, 1, 0) = 1")),
+        "Eq(CASE WHEN 1 = 1 THEN 1 ELSE 0 END, 1)"
+    );
+    assert!(try_v("IIF(1 = 1, 1, 0)").is_ok());
+    // It prints as the CASE it is.
+    assert_eq!(
+        roundtrip("IIF(@e IS NULL, N'', @e)"),
+        "CASE WHEN @e IS NULL THEN N'' ELSE @e END"
+    );
+}
+
+/// The span of the `CASE` an `IIF` is read as covers the written `IIF(…)`, from its name
+/// to its `)`.
+#[test]
+fn iif_span_covers_the_written_call() {
+    let text = "IIF(1 = 1,\n 1,\n 'a')";
+    match e(text) {
+        Expr::Case { span, .. } => {
+            assert_eq!(span.line, 1);
+            assert_eq!(span.offset, 0);
+            assert_eq!(span.len as usize, text.len());
+        }
+        other => unreachable!("an IIF is a CASE, got {other:?}"),
+    }
+}
+
+/// A delimited or qualified `IIF` is an ordinary call, whose arguments are values.
+#[test]
+fn delimited_or_qualified_iif_is_a_call() {
+    for text in ["[IIF](1, 2, 3)", "dbo.IIF(1, 2, 3)"] {
+        assert!(matches!(e(text), Expr::Function { .. }), "{text}");
+    }
+    for text in ["[IIF](1 = 1, 1, 2)", "dbo.IIF(1 = 1, 1, 2)"] {
+        let refused = error(text);
+        assert_eq!(refused.number, 102, "{text}");
+        assert_eq!(refused.message, "Syntax error near '='.", "{text}");
+    }
+}
+
+/// `IIF` takes three arguments, and its results are values.
+#[test]
+fn iif_argument_errors() {
+    for (text, token) in [
+        ("IIF(1 = 1, 2)", ")"),
+        ("IIF(1 = 1, 2, 3, 4)", ","),
+        ("IIF(1 = 1, 1 = 1, 0)", "="),
+    ] {
+        let refused = error(text);
+        assert_eq!(refused.number, 102, "{text}");
+        assert_eq!(
+            refused.message,
+            format!("Syntax error near '{token}'."),
+            "{text}"
+        );
+        assert_eq!(refused.line, 1, "{text}");
+    }
+}

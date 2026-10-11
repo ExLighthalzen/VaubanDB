@@ -14,6 +14,7 @@ use vauban_parser::{
     TableConstraint, TableConstraintKind, TableDefinition, TableHint, TableRef, Top, TypeArg,
     UnaryOp, UpdateStatement, WindowFrame, With,
 };
+use vauban_parser::{ParseOptions, parse_batch};
 
 // ---------------------------------------------------------------------------
 // Builders. `Span::EMPTY` everywhere: a span never changes what `Display` writes.
@@ -619,6 +620,29 @@ fn display_case_cast_convert() {
         ty("varchar", vec![TypeArg::Max]).to_string(),
         "varchar(MAX)"
     );
+}
+
+/// `IIF(c, a, b)` is read as `CASE WHEN c THEN a ELSE b END` and printed so; the printed
+/// text parses back to an equal tree.
+#[test]
+fn display_iif_is_printed_as_its_case() {
+    let options = ParseOptions {
+        quoted_identifier: true,
+    };
+    let parse = |text: &str| match parse_batch(text, &options) {
+        Ok(batch) => batch,
+        Err(error) => unreachable!("{text} should parse: {error:?}"),
+    };
+    let iif = parse("SELECT IIF(1 = 1, 'a', 'b')");
+    let case = parse("SELECT CASE WHEN 1 = 1 THEN 'a' ELSE 'b' END");
+    assert_eq!(iif, case);
+    let printed = iif.to_string();
+    assert_eq!(printed, case.to_string());
+    assert!(
+        printed.contains("CASE WHEN 1 = 1 THEN 'a' ELSE 'b' END"),
+        "{printed}"
+    );
+    assert_eq!(parse(&printed), iif);
 }
 
 #[test]

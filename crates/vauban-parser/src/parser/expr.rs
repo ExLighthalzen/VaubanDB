@@ -491,6 +491,9 @@ fn parse_primary(p: &mut Parser, min_bp: u8) -> SqlResult<Expr> {
     if p.at_keyword(Keyword::Case) {
         return parse_case(p);
     }
+    if at_iif(p) {
+        return parse_iif(p);
+    }
     if p.at_keyword(Keyword::Cast) || p.at_keyword(Keyword::TryCast) {
         return parse_cast(p);
     }
@@ -1020,6 +1023,51 @@ fn parse_case_body(p: &mut Parser, start: usize) -> SqlResult<Expr> {
         operand,
         arms,
         else_,
+        span: p.span_from(start),
+    };
+    enclose_niladic_diagnostics(&mut expr);
+    Ok(expr)
+}
+
+/// Whether the cursor stands on `IIF(`: the bare, one-part word `IIF`, in upper, lower or
+/// mixed case, right before a `(`.
+///
+/// `[IIF](…)` and `dbo.IIF(…)` are not this shape and stay ordinary calls, read by
+/// `parse_call` with value arguments (`delimited_or_qualified_iif_is_a_call` in the unit
+/// tests).
+fn at_iif(p: &Parser) -> bool {
+    matches!(
+        &p.peek().kind,
+        TokenKind::Ident { value, quoted: false } if value.eq_ignore_ascii_case("IIF")
+    ) && matches!(p.peek_at(1).kind, TokenKind::Punct(Punct::LeftParen))
+}
+
+/// Reads `IIF(<condition>, <then>, <else>)` as the searched `CASE WHEN <condition> THEN
+/// <then> ELSE <else> END`, which is what the function is a shorthand for: the binder and
+/// the executor then type and evaluate it as that `CASE`, and `Display` prints it so.
+///
+/// The condition is read in predicate position, the two results in value position, and
+/// the call takes three arguments: `IIF(1 = 1, 2)` fails on its `)` and
+/// `IIF(1 = 1, 2, 3, 4)` on its third `,`. The span of the tree covers the written
+/// `IIF(…)`.
+///
+/// # Errors
+///
+/// The syntax error that stopped the parse.
+fn parse_iif(p: &mut Parser) -> SqlResult<Expr> {
+    let start = p.mark();
+    p.advance();
+    p.expect_punct(Punct::LeftParen)?;
+    let when = parse_expr(p)?;
+    p.expect_punct(Punct::Comma)?;
+    let then = parse_value_expr(p)?;
+    p.expect_punct(Punct::Comma)?;
+    let else_ = parse_value_expr(p)?;
+    p.expect_punct(Punct::RightParen)?;
+    let mut expr = Expr::Case {
+        operand: None,
+        arms: vec![CaseArm { when, then }],
+        else_: Some(Box::new(else_)),
         span: p.span_from(start),
     };
     enclose_niladic_diagnostics(&mut expr);
