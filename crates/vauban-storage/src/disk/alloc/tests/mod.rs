@@ -1,7 +1,31 @@
 use super::super::control::Control;
+use super::super::page::Lsn;
 use super::super::temp::TempDir;
 use super::super::{CONTROL_FILE_NAME, DATA_FILE_NAME, DiskOptions};
 use super::*;
+
+/// A hook on the syncs of `data`.
+pub(crate) type SyncHook = Box<dyn FnMut(&DiskStorage)>;
+
+std::thread_local! {
+    /// What the tests of the thread do after each sync of `data` the allocator makes.
+    static DATA_SYNCED: std::cell::RefCell<Option<SyncHook>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Calls the hook of the thread after a sync of `data` ([`sync_data`]).
+pub(crate) fn note_data_sync(storage: &DiskStorage) {
+    DATA_SYNCED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(storage);
+        }
+    });
+}
+
+/// Hands `hook` the syncs of `data` the allocator makes on this thread, `None` to stop.
+pub(crate) fn on_data_sync(hook: Option<SyncHook>) {
+    DATA_SYNCED.with(|slot| *slot.borrow_mut() = hook);
+}
 
 /// An empty instance in a temporary directory, with the guard that removes it.
 fn instance(label: &str) -> (TempDir, DiskStorage) {
@@ -295,6 +319,61 @@ fn free_clears_in_progress_so_the_link_reaches_data() {
     );
     assert_eq!(on_disk.slot_count(), 0);
     assert_eq!(on_disk.lower(), 40);
+}
+
+#[test]
+fn a_freed_page_keeps_the_number_of_its_last_record() {
+    use super::super::wal::{PageSet, PageWrite, WalRecordKind};
+    let (_dir, storage) = instance("free-keeps-the-lsn");
+    let id = allocate(&storage).expect("allocate");
+    let mut set = PageSet::new(&storage, true);
+    set.write(id, |page| {
+        page.set_kind(PageKind::Overflow);
+        page.0[100] = 5;
+    })
+    .expect("write the page");
+    let lsn = set.commit(|_| Ok(())).expect("commit").expect("a record");
+    assert!(
+        storage.wal.durable_lsn() < lsn,
+        "the record is not durable yet"
+    );
+
+    // A later record of the journal, of another page.
+    let later = storage
+        .wal
+        .append(WalRecordKind::Begin, crate::TxnId(9), &[])
+        .expect("append");
+    free(&storage, id).expect("free the page");
+    assert!(
+        storage.wal.durable_lsn() >= later,
+        "the free synced the journal first"
+    );
+    let on_disk = storage.data.read_page(id).expect("the page reads back");
+    assert_eq!(on_disk.kind().expect("the kind"), PageKind::Free);
+    assert_eq!(
+        on_disk.lsn(),
+        later,
+        "the number of the last record of the journal"
+    );
+    // The redo of that record leaves the free page as it stands.
+    let record = storage
+        .wal
+        .records()
+        .expect("records")
+        .into_iter()
+        .find(|record| record.kind == WalRecordKind::PageWrite && record.lsn == lsn)
+        .expect("the record");
+    let write = PageWrite::decode(&record.payload).expect("decode");
+    let mut on_data = std::collections::BTreeMap::new();
+    assert_eq!(
+        write.redo(&storage, lsn, None, &mut on_data).expect("redo"),
+        (0, 1)
+    );
+    assert_eq!(
+        free_list(&storage).expect("the free list"),
+        vec![id],
+        "the page is free and listed once"
+    );
 }
 
 /// A `free_head` naming a page of another kind is corruption, not a page handed out.

@@ -9,10 +9,13 @@
 //! Other tests cover the preconditions `ClusteredTable::create` and `open` enforce, and
 //! the on-disk shape of a version payload (prefix, overflow link, column bytes).
 
+use std::path::Path;
+
 use vauban_types::{SqlString, SqlType};
 
+use super::super::page::{PAGE_SIZE, Page, PageKind};
 use super::super::temp::TempDir;
-use super::super::wal::{WalRecord, WalRecordKind};
+use super::super::wal::{PageWrite, WalRecord, WalRecordKind};
 use super::super::{DiskOptions, alloc};
 use super::*;
 
@@ -108,9 +111,21 @@ fn slots_in_data(storage: &DiskStorage, id: PageId) -> u16 {
         .slot_count()
 }
 
-/// The kind of each record, in order.
+/// The kind of each record but the page records, in order: what the transactions wrote, the
+/// pages of the trees apart.
 fn kinds(records: &[WalRecord]) -> Vec<WalRecordKind> {
-    records.iter().map(|record| record.kind).collect()
+    records
+        .iter()
+        .map(|record| record.kind)
+        .filter(|kind| *kind != WalRecordKind::PageWrite)
+        .collect()
+}
+
+/// Makes the journal durable, then writes each page the pool may write: what a checkpoint
+/// does with the pages.
+fn settle(storage: &DiskStorage) {
+    storage.wal.flush().expect("sync the journal");
+    storage.pool.flush_all().expect("flush the pool");
 }
 
 /// The message of an error the test expects to be a caller bug.
@@ -460,7 +475,7 @@ fn clustered_leaf_stays_out_of_data_until_commit() {
     let (leaf, directory) = (table.tree_root(), table.directory_root());
     // The pages the creation left are written first, so what `data` holds next comes from
     // the row.
-    storage.pool.flush_all().expect("flush what create left");
+    settle(&storage);
     assert_eq!(slots_in_data(&storage, leaf), 0);
     assert_eq!(slots_in_data(&storage, directory), 0);
 
@@ -526,20 +541,32 @@ fn a_rolled_back_write_lets_its_pages_reach_data() {
     table.rollback(TxnId(4)).expect("roll back");
 
     // The undo took the entry away and the rollback lifted the flag, so the pages go out.
-    // What says they went out is the LSN they carry in `data`: the record of the insert
-    // named the leaf, and the undo left that LSN on the page
-    // (`BufferPool::mark_dirty` does not move one backwards).
+    // What says they went out is the LSN they carry in `data`: the last page record that
+    // named the leaf, the one of the undo, made durable by the rollback.
     storage.pool.flush_all().expect("flush after the rollback");
     let records = journal(&storage);
-    let insert = records
+    let undo = records
         .iter()
-        .find(|record| record.kind == WalRecordKind::Insert)
-        .expect("the record of the insert");
+        .rev()
+        .find(|record| {
+            record.kind == WalRecordKind::PageWrite
+                && PageWrite::decode(&record.payload)
+                    .expect("a page record reads back")
+                    .pages
+                    .iter()
+                    .any(|delta| delta.page == leaf)
+        })
+        .expect("the page record of the undo");
+    let abort = records
+        .iter()
+        .find(|record| record.kind == WalRecordKind::Abort)
+        .expect("the record of the rollback");
+    assert!(undo.lsn > abort.lsn, "the undo follows the rollback");
     let page = storage
         .data
         .read_page(leaf)
         .expect("read the leaf from data");
-    assert_eq!(page.lsn(), insert.lsn);
+    assert_eq!(page.lsn(), undo.lsn);
     assert_eq!(
         page.slot_count(),
         0,
@@ -553,7 +580,7 @@ fn a_leaf_shared_by_two_txns_loses_its_flag_at_the_first_commit() {
     let (_dir, storage) = instance("clustered-shared-leaf");
     let mut table = table_of(&storage, pair_shape());
     let leaf = table.tree_root();
-    storage.pool.flush_all().expect("flush what create left");
+    settle(&storage);
 
     table.insert(TxnId(4), &pair(1, 2)).expect("insert by 4");
     table.insert(TxnId(5), &pair(2, 2)).expect("insert by 5");
@@ -588,7 +615,7 @@ fn a_rollback_lets_the_leaf_of_a_running_txn_reach_data() {
     let (_dir, storage) = instance("clustered-shared-leaf-rollback");
     let mut table = table_of(&storage, pair_shape());
     let leaf = table.tree_root();
-    storage.pool.flush_all().expect("flush what create left");
+    settle(&storage);
 
     table.insert(TxnId(4), &pair(1, 2)).expect("insert by 4");
     table.insert(TxnId(5), &pair(2, 2)).expect("insert by 5");
@@ -618,7 +645,7 @@ fn the_overflow_chain_of_an_uncommitted_long_row_is_not_flagged() {
     };
     let mut table = table_of(&storage, shape);
     let leaf = table.tree_root();
-    storage.pool.flush_all().expect("flush what create left");
+    settle(&storage);
     let long = Row(vec![
         Value::I32(1),
         Value::String(SqlString {
@@ -1294,4 +1321,467 @@ fn a_second_rollback_to_the_same_savepoint_cancels_the_write_between() {
 /// The round as a key offset.
 fn key_of(round: usize) -> i32 {
     i32::try_from(round).expect("a round")
+}
+
+// --- A crash at each write of a split -----------------------------------------------------
+
+/// A table of a `varchar(900)` clustered key and an `int`: a leaf holds four rows of a key of
+/// 846 characters, and an internal page four separators, so a few rows split a leaf, then
+/// the root, then an internal page.
+fn wide_shape() -> TableShape {
+    TableShape {
+        columns: vec![
+            TypeInfo::new(SqlType::VarChar(Len::Fixed(900)), true),
+            TypeInfo::new(SqlType::Int, true),
+        ],
+        clustered_key: Some(first_column()),
+    }
+}
+
+/// The row of number `n`: a key of about 846 characters that sorts by `n` scattered, and
+/// `value`.
+fn wide(n: i32, value: i32) -> Row {
+    let scattered = (n * 37) % 101;
+    Row(vec![
+        Value::String(SqlString {
+            text: format!("{scattered:03}-{n:02}{}", "w".repeat(840)),
+        }),
+        Value::I32(value),
+    ])
+}
+
+/// The three files of the instance in `dir`, as they stand.
+fn files_of(dir: &Path) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let read = |name: &str| std::fs::read(dir.join(name)).expect("read a file of the instance");
+    (
+        read(super::super::DATA_FILE_NAME),
+        read(super::super::CONTROL_FILE_NAME),
+        read(super::super::WAL_FILE_NAME),
+    )
+}
+
+/// The number and the end offset of each record of the journal `wal`.
+fn record_ends(wal: &[u8]) -> Vec<(Lsn, usize)> {
+    let mut ends = Vec::new();
+    let mut at = 0;
+    while at + 4 <= wal.len() {
+        let len = u32::from_le_bytes(wal[at..at + 4].try_into().expect("four bytes")) as usize;
+        if len < 14 || at + 4 + len > wal.len() {
+            break;
+        }
+        let lsn = u64::from_le_bytes(wal[at + 6..at + 14].try_into().expect("eight bytes"));
+        at += 4 + len;
+        ends.push((Lsn(lsn), at));
+    }
+    ends
+}
+
+/// Each content the pages the page records past `from` name went through, the record that
+/// left it first: the page as `data` holds it is the content before the first of them.
+fn page_versions(
+    data: &[u8],
+    records: &[WalRecord],
+    from: Lsn,
+) -> BTreeMap<PageId, Vec<(Lsn, Page)>> {
+    let mut versions: BTreeMap<PageId, Vec<(Lsn, Page)>> = BTreeMap::new();
+    for record in records.iter().filter(|record| record.lsn > from) {
+        if record.kind != WalRecordKind::PageWrite {
+            continue;
+        }
+        let write = PageWrite::decode(&record.payload).expect("a page record reads back");
+        for delta in write.pages {
+            let at = usize::try_from(delta.page.0).expect("a page number") * PAGE_SIZE;
+            let mut page = match versions.get(&delta.page).and_then(|done| done.last()) {
+                Some((_, page)) => page.clone(),
+                None if delta.whole => Page::empty(PageKind::Free, delta.page),
+                None => {
+                    let mut bytes = [0u8; PAGE_SIZE];
+                    bytes.copy_from_slice(&data[at..at + PAGE_SIZE]);
+                    Page(bytes)
+                }
+            };
+            for (offset, bytes) in &delta.ranges {
+                let offset = usize::from(*offset);
+                page.0[offset..offset + bytes.len()].copy_from_slice(bytes);
+            }
+            page.set_lsn(record.lsn);
+            page.seal();
+            versions
+                .entry(delta.page)
+                .or_default()
+                .push((record.lsn, page));
+        }
+    }
+    versions
+}
+
+/// The rows of [`wide`] a reader sees, as `(RowId, n, value)`.
+type WideRows = [(RowId, i32, i32)];
+
+/// The rows a settled reader sees, as `(RowId, n, value)`.
+fn wide_rows(storage: &DiskStorage, table: TableId) -> Vec<(RowId, i32, i32)> {
+    crate::Storage::scan(storage, &settled(), table)
+        .expect("scan")
+        .map(|row| {
+            let (id, row) = row.expect("a row of the scan");
+            match (row.0.first(), row.0.get(1)) {
+                (Some(Value::String(key)), Some(Value::I32(value))) => {
+                    let n = key.text[4..]
+                        .split('w')
+                        .next()
+                        .and_then(|n| n.parse().ok())
+                        .expect("the number of the key");
+                    (id, n, *value)
+                }
+                other => panic!("row {id} carries {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// Opens the instance in `dir` twice, and checks each time that both trees of `table` keep
+/// their invariants and that the rows read are `expected`, each one found by its `RowId` too.
+fn reopen_and_check(dir: &Path, table: TableId, expected: &WideRows, label: &str) {
+    use super::super::btree::KeyOrder;
+    use super::super::btree::concurrency::assert_tree_valid;
+    for round in 0..2 {
+        let storage = DiskStorage::open(dir, DiskOptions::default())
+            .unwrap_or_else(|e| panic!("{label}, round {round}: open: {e:?}"));
+        let entry = storage
+            .lock_catalogue()
+            .expect("the catalogue")
+            .table(table)
+            .cloned()
+            .expect("the table");
+        let (columns, types) = ClusteredTable::tree_key(&entry.shape, table).expect("the key");
+        let order = KeyOrder::new(&columns, &types).expect("the order of the tree");
+        let directory = KeyOrder::new(&ClusteredTable::directory_key(), &[tie_type()])
+            .expect("the order of the directory");
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let versions = assert_tree_valid(&storage, entry.tree_root.expect("a tree"), &order);
+            let rows = assert_tree_valid(
+                &storage,
+                entry.directory_root.expect("a directory"),
+                &directory,
+            );
+            (versions, rows)
+        }));
+        let (versions, rows) =
+            checked.unwrap_or_else(|_| panic!("{label}, round {round}: a tree is broken"));
+        assert_eq!(
+            rows,
+            expected.len(),
+            "{label}, round {round}: the directory"
+        );
+        assert!(
+            versions >= expected.len(),
+            "{label}, round {round}: {versions} versions"
+        );
+        let mut read = wide_rows(&storage, table);
+        read.sort_unstable();
+        assert_eq!(read, expected, "{label}, round {round}");
+        for (id, n, value) in expected {
+            let got = crate::Storage::get(&storage, &settled(), table, *id)
+                .unwrap_or_else(|e| panic!("{label}, round {round}: get {id}: {e:?}"));
+            assert_eq!(
+                got,
+                Some(wide(*n, *value)),
+                "{label}, round {round}: get {id}"
+            );
+        }
+    }
+}
+
+/// Plays each crash an insert left behind: the journal cut after each of its records, and
+/// `data` holding, for each page the insert wrote, the page before it or one of the contents
+/// the records up to the cut gave it, up to `limit` combinations per cut. Answers the number
+/// of crashes played.
+fn play_crashes(
+    files: &(Vec<u8>, Vec<u8>, Vec<u8>),
+    from: Lsn,
+    table: TableId,
+    (before, after): (&WideRows, &WideRows),
+    commit: Lsn,
+    label: &str,
+) -> usize {
+    const LIMIT: usize = 24;
+    let (data, ctl, wal) = files;
+    let ends = record_ends(wal);
+    let records: Vec<WalRecord> = {
+        let dir = TempDir::created("clustered-split-journal");
+        std::fs::write(dir.child(super::super::WAL_FILE_NAME), wal).expect("write");
+        let journal = super::super::wal::Wal::open(&dir.child(super::super::WAL_FILE_NAME))
+            .expect("read the journal back");
+        journal
+            .iter()
+            .expect("iterate")
+            .collect::<Result<_, _>>()
+            .expect("records")
+    };
+    let versions = page_versions(data, &records, from);
+    let mut played = 0;
+    let cuts: Vec<(Lsn, usize)> = ends
+        .iter()
+        .copied()
+        .filter(|(lsn, _)| *lsn >= from)
+        .collect();
+    for (cut, end) in cuts {
+        let pages: Vec<(PageId, Vec<&Page>)> = versions
+            .iter()
+            .map(|(id, all)| {
+                let mut options: Vec<&Page> = Vec::new();
+                options.extend(
+                    all.iter()
+                        .filter(|(lsn, _)| *lsn <= cut)
+                        .map(|(_, page)| page),
+                );
+                (*id, options)
+            })
+            .collect();
+        let combinations: usize = pages.iter().map(|(_, options)| options.len() + 1).product();
+        let step = combinations.div_ceil(LIMIT).max(1);
+        let expected = if cut >= commit { after } else { before };
+        for combination in (0..combinations).step_by(step) {
+            let mut image = data.clone();
+            let mut rest = combination;
+            let mut written = Vec::new();
+            for (id, options) in &pages {
+                let choice = rest % (options.len() + 1);
+                rest /= options.len() + 1;
+                if choice == 0 {
+                    continue;
+                }
+                let page = options[choice - 1];
+                let at = usize::try_from(id.0).expect("a page number") * PAGE_SIZE;
+                image[at..at + PAGE_SIZE].copy_from_slice(&page.0);
+                written.push((*id, page.lsn()));
+            }
+            let dir = TempDir::created("clustered-split-image");
+            std::fs::write(dir.child(super::super::DATA_FILE_NAME), &image).expect("data");
+            std::fs::write(dir.child(super::super::CONTROL_FILE_NAME), ctl).expect("ctl");
+            std::fs::write(dir.child(super::super::WAL_FILE_NAME), &wal[..end]).expect("wal");
+            reopen_and_check(
+                dir.path(),
+                table,
+                expected,
+                &format!("{label}: journal cut at {cut}, pages written {written:?}"),
+            );
+            played += 1;
+        }
+    }
+    played
+}
+
+/// The height of the tree rooted at `root`, its leaves counted.
+fn height(storage: &DiskStorage, root: PageId) -> usize {
+    let mut levels = 1;
+    let mut page = root;
+    loop {
+        let pin = storage.pool.pin(page).expect("pin");
+        let child = pin
+            .with_page(|page| match page.kind() {
+                Ok(PageKind::BTreeInternal) => Some(super::super::btree::leftmost_child(page)),
+                _ => None,
+            })
+            .expect("read");
+        match child {
+            Some(child) => {
+                levels += 1;
+                page = child;
+            }
+            None => return levels,
+        }
+    }
+}
+
+/// The pages of the trees the page records past `from` name.
+fn tree_pages(records: &[WalRecord], from: Lsn) -> BTreeSet<PageId> {
+    records
+        .iter()
+        .filter(|record| record.lsn > from && record.kind == WalRecordKind::PageWrite)
+        .filter_map(|record| {
+            let write = PageWrite::decode(&record.payload).expect("a page record");
+            let tree = write.pages.iter().any(|delta| {
+                delta.kind == PageKind::BTreeLeaf.as_byte()
+                    || delta.kind == PageKind::BTreeInternal.as_byte()
+            });
+            tree.then(|| {
+                write
+                    .pages
+                    .iter()
+                    .map(|delta| delta.page)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .flatten()
+        .collect()
+}
+
+#[test]
+fn a_crash_at_each_write_of_a_split_reopens_a_valid_tree() {
+    use crate::Storage;
+    let dir = TempDir::created("clustered-split-crash");
+    let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+    let db = storage.create_database("a").expect("database");
+    let table = storage.create_table(db, &wide_shape()).expect("table");
+    let root = |storage: &DiskStorage| {
+        storage
+            .lock_catalogue()
+            .expect("the catalogue")
+            .table(table)
+            .and_then(|entry| entry.tree_root)
+            .expect("the root")
+    };
+    let mut rows: Vec<(RowId, i32, i32)> = Vec::new();
+    let mut shapes = BTreeSet::new();
+    let mut played = 0;
+    // Inserts, one per transaction, then updates of the rows they left; the crashes of the
+    // first write of each shape are played.
+    for step in 0..240usize {
+        if shapes.len() == 5 {
+            break;
+        }
+        storage.checkpoint().expect("checkpoint");
+        let from = storage.wal.last_lsn().expect("the last record");
+        let levels = height(&storage, root(&storage));
+        let txn = TxnId(storage.next_txn_id());
+        let before = rows.clone();
+        let updating = shapes.len() >= 3 || step >= 120;
+        if updating {
+            let at = (step * 7) % rows.len();
+            let (id, n, value) = rows[at];
+            storage
+                .update(txn, table, id, &wide(n, value + 1_000))
+                .expect("update");
+            rows[at].2 = value + 1_000;
+        } else {
+            let n = i32::try_from(step).expect("a step");
+            let id = storage.insert(txn, table, &wide(n, n)).expect("insert");
+            rows.push((id, n, n));
+            rows.sort_unstable();
+        }
+        storage.commit(txn).expect("commit");
+        let records = journal(&storage);
+        let commit = records
+            .iter()
+            .find(|record| record.kind == WalRecordKind::Commit && record.txn == txn)
+            .expect("the commit")
+            .lsn;
+        let split = tree_pages(&records, from).len() >= 3;
+        let grown = height(&storage, root(&storage)) > levels;
+        let shape = match (updating, grown, levels, split) {
+            (false, true, 1, _) => "the root leaf splits",
+            (false, true, _, _) => "an internal root splits",
+            (false, false, _, true) => "a leaf under the root splits",
+            (true, _, _, true) => "an update splits a leaf",
+            (true, _, _, false) => "an update rewrites the version it replaces",
+            _ => continue,
+        };
+        if !shapes.insert(shape) {
+            continue;
+        }
+        played += play_crashes(
+            &files_of(dir.path()),
+            from,
+            table,
+            (&before, &rows),
+            commit,
+            &format!("{shape} (step {step})"),
+        );
+    }
+    assert_eq!(shapes.len(), 5, "{shapes:?}");
+    assert!(played > 100, "{played} crashes played");
+}
+
+/// A table of an `int` clustered key and a `varchar(max)`.
+fn long_text_shape() -> TableShape {
+    TableShape {
+        columns: vec![
+            TypeInfo::new(SqlType::Int, true),
+            TypeInfo::new(SqlType::VarChar(Len::Max), true),
+        ],
+        clustered_key: Some(first_column()),
+    }
+}
+
+/// A row of [`long_text_shape`]: `key`, then `text`.
+fn key_text(key: i32, text: &str) -> Row {
+    Row(vec![
+        Value::I32(key),
+        Value::String(SqlString {
+            text: text.to_string(),
+        }),
+    ])
+}
+
+#[test]
+fn a_loser_that_rewrote_a_long_row_during_a_checkpoint_leaves_the_row_readable() {
+    use crate::Storage;
+    let dir = TempDir::created("clustered-loser-long-row");
+    let long = "L".repeat(9_000);
+    let (table, expected) = {
+        let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+        let db = storage.create_database("a").expect("database");
+        let table = storage.create_table(db, &long_text_shape()).expect("table");
+        storage.checkpoint().expect("checkpoint");
+        let first = TxnId(storage.next_txn_id());
+        let mut ids = Vec::new();
+        for key in 0..5 {
+            let text = if key == 2 {
+                long.clone()
+            } else {
+                format!("v{key}")
+            };
+            ids.push((
+                storage
+                    .insert(first, table, &key_text(key, &text))
+                    .expect("insert"),
+                key,
+                text,
+            ));
+        }
+        storage.commit(first).expect("commit");
+        // A loser rewrites the long row with a longer one; a winner that shares the leaf
+        // commits and a checkpoint writes what the two left.
+        let loser = TxnId(storage.next_txn_id());
+        storage
+            .update(loser, table, ids[2].0, &key_text(2, &"M".repeat(12_000)))
+            .expect("update by the loser");
+        let winner = TxnId(storage.next_txn_id());
+        storage
+            .insert(winner, table, &key_text(50_000, "w"))
+            .expect("insert by the winner");
+        storage.commit(winner).expect("commit the winner");
+        storage.checkpoint().expect("checkpoint");
+        let mut expected: Vec<(i32, String)> =
+            ids.into_iter().map(|(_, key, text)| (key, text)).collect();
+        expected.push((50_000, "w".to_string()));
+        (table, expected)
+    };
+    for life in 0..3 {
+        let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+        let rows: Vec<(RowId, Row)> = storage
+            .scan(&settled(), table)
+            .expect("scan")
+            .map(|row| row.expect("a row of the scan"))
+            .collect();
+        let read: Vec<(i32, String)> = rows
+            .iter()
+            .map(|(_, row)| match (&row.0[0], &row.0[1]) {
+                (Value::I32(key), Value::String(text)) => (*key, text.text.clone()),
+                other => panic!("life {life}: a row carries {other:?}"),
+            })
+            .collect();
+        assert_eq!(read, expected, "life {life}");
+        for (id, _) in &rows {
+            let txn = TxnId(storage.next_txn_id());
+            storage
+                .update(txn, table, *id, &key_text(-1, "u"))
+                .unwrap_or_else(|e| panic!("life {life}: update {id}: {e:?}"));
+            storage.rollback(txn).expect("rollback the update");
+        }
+        if life == 1 {
+            storage.checkpoint().expect("checkpoint");
+        }
+    }
 }

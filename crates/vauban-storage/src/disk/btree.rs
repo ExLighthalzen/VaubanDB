@@ -91,19 +91,23 @@
 //! key of it differs from both of its neighbours
 //! (`tests::split_internal_refuses_a_page_it_cannot_promote_out_of`).
 //!
-//! # What a split leaves behind
+//! # What a write leaves behind
 //!
-//! The pages a write changes are marked through the [`PageWrites`] the tree carries. A tree
-//! starts at [`PageWrites::unlogged`]: the pages come back dirty at `page_lsn` 0 and
-//! `in_progress` false, so a caller that wants the split in the data file flushes the pool
-//! (`a_split_reaches_the_data_file_when_the_pool_is_flushed`), and a crash before that flush
-//! leaves the page as it was, plus the page [`super::alloc::allocate`] took out of the free
-//! list. A caller whose writes are described by a journal record calls [`BTree::hold_writes`]
-//! with the LSN of that record: each page then carries that LSN and the `in_progress` flag
-//! until the caller drains [`BTree::take_held_pages`] and lifts it, which is the no-steal rule
-//! of the heap (`a_held_write_marks_its_pages_and_hands_them_back`). The pages the
-//! `PageWrites` of a tree marks are the ones its own calls touch; a page another writer of the
-//! same pool flags is that writer's business.
+//! One call of [`BTree::insert`] or [`BTree::delete`] writes its pages — the leaf, and on a
+//! split the fresh page, the leaf to the right, the parent and the new root — through one
+//! [`PageSet`], logged as one [`super::wal::WalRecordKind::PageWrite`] record that carries the
+//! move of the root too ([`RootMove`]): the redo replays a split whole or leaves it out
+//! (`super::clustered::tests::a_crash_at_each_write_of_a_split_reopens_a_valid_tree`). A tree
+//! of a clustered table is logged ([`BTree::create_logged`], [`BTree::open_logged`]); the tree
+//! of a non-clustered index is not ([`BTree::create`], [`BTree::open`]), the instance building
+//! it again from the rows at each `open` (`DiskStorage::rebuild_indexes`).
+//!
+//! The pages are then marked through the [`PageWrites`] the tree carries, without the
+//! `in_progress` flag until a caller whose writes belong to a transaction calls
+//! [`BTree::hold_writes`]: each page then carries the flag until the caller drains
+//! [`BTree::take_held_pages`] and lifts it, the no-steal rule of the heap
+//! (`a_held_write_marks_its_pages_and_hands_them_back`,
+//! `a_split_reaches_the_data_file_when_the_pool_is_flushed`).
 //!
 //! # Latches
 //!
@@ -131,7 +135,8 @@ use super::DiskStorage;
 use super::alloc::allocate;
 use super::encode::{decode_row, encode_row};
 use super::page::{HEADER_SIZE, Lsn, PAGE_SIZE, Page, PageId, PageKind};
-use crate::{Direction, KeyColumn, KeyRange, Row};
+use super::wal::{PageSet, RootMove, TreeRole};
+use crate::{Direction, KeyColumn, KeyRange, Row, TableId};
 
 /// Offset, in a leaf, of the identifier of the leaf to its left.
 pub(crate) const OFF_LEAF_PREV: usize = HEADER_SIZE;
@@ -367,6 +372,8 @@ pub(crate) fn internal_put(
 ///
 /// The separator is the first key of the right leaf, and that key stays in the leaf.
 ///
+/// The pages are read from and written in `set`, which puts them in the pool at its commit.
+///
 /// # Errors
 ///
 /// [`InternalError::Bug`] for a page whose kind is not [`PageKind::BTreeLeaf`], for a leaf of
@@ -376,13 +383,8 @@ pub(crate) fn internal_put(
 /// refusal comes before the allocation. The errors of [`super::alloc::allocate`] and of
 /// the buffer pool otherwise. A failure after the allocation leaves the allocated page outside
 /// the free list, the orphan the DDL protocol of [`crate::Storage`] describes.
-pub(crate) fn split_leaf(
-    storage: &DiskStorage,
-    left: PageId,
-    writes: &mut PageWrites,
-) -> Result<Split, InternalError> {
-    let left_pin = storage.pool.pin(left)?;
-    let (entries, next) = left_pin.with_page(|page| {
+pub(crate) fn split_leaf(set: &mut PageSet<'_>, left: PageId) -> Result<Split, InternalError> {
+    let (entries, next) = set.read(left, |page| {
         expect_kind(page, PageKind::BTreeLeaf)?;
         let entries = owned_entries(page, LEAF_DIRECTORY)?;
         Ok::<_, InternalError>((entries, leaf_next(page)))
@@ -404,35 +406,25 @@ pub(crate) fn split_leaf(
     })?;
     let separator = entries[middle].0.clone();
 
-    let right = allocate(storage)?;
-    let right_pin = storage.pool.pin(right)?;
-    right_pin.with_page_mut(|page| {
+    let right = allocate(set.storage())?;
+    set.write(right, |page| {
         init_leaf(page);
         set_leaf_prev(page, Some(left));
         set_leaf_next(page, next);
         fill(page, LEAF_DIRECTORY, &entries[middle..], right)
     })??;
-    writes.mark(storage, right)?;
-    drop(right_pin);
-
-    left_pin.with_page_mut(|page| {
+    set.write(left, |page| {
         clear_entries(page, LEAF_DIRECTORY);
         set_leaf_next(page, Some(right));
         fill(page, LEAF_DIRECTORY, &entries[..middle], left)
     })??;
-    writes.mark(storage, left)?;
-    drop(left_pin);
-
     if let Some(far) = next {
-        let far_pin = storage.pool.pin(far)?;
-        far_pin.with_page_mut(|page| {
+        set.write(far, |page| {
             expect_kind(page, PageKind::BTreeLeaf)?;
             set_leaf_prev(page, Some(right));
             Ok::<_, InternalError>(())
         })??;
-        writes.mark(storage, far)?;
     }
-
     Ok(Split { right, separator })
 }
 
@@ -455,14 +447,10 @@ pub(crate) fn split_leaf(
 /// single child (`tests::split_internal_refuses_a_page_of_two_keys`), and for a page holding no
 /// key that differs from both of its neighbours
 /// (`tests::split_internal_refuses_a_page_it_cannot_promote_out_of`); the errors of
-/// [`super::alloc::allocate`] and of the buffer pool otherwise.
-pub(crate) fn split_internal(
-    storage: &DiskStorage,
-    left: PageId,
-    writes: &mut PageWrites,
-) -> Result<Split, InternalError> {
-    let left_pin = storage.pool.pin(left)?;
-    let (entries, leftmost) = left_pin.with_page(|page| {
+/// [`super::alloc::allocate`] and of the buffer pool otherwise. The pages are written in `set`,
+/// as [`split_leaf`] writes them.
+pub(crate) fn split_internal(set: &mut PageSet<'_>, left: PageId) -> Result<Split, InternalError> {
+    let (entries, leftmost) = set.read(left, |page| {
         expect_kind(page, PageKind::BTreeInternal)?;
         let entries = owned_entries(page, INTERNAL_DIRECTORY)?;
         Ok::<_, InternalError>((entries, leftmost_child(page)))
@@ -488,47 +476,32 @@ pub(crate) fn split_internal(
     let separator = entries[promoted].0.clone();
     let right_leftmost = child_of(left, &entries[promoted].1)?;
 
-    let right = allocate(storage)?;
-    let right_pin = storage.pool.pin(right)?;
-    right_pin.with_page_mut(|page| {
+    let right = allocate(set.storage())?;
+    set.write(right, |page| {
         init_internal(page, right_leftmost);
         fill(page, INTERNAL_DIRECTORY, &entries[promoted + 1..], right)
     })??;
-    writes.mark(storage, right)?;
-    drop(right_pin);
-
-    left_pin.with_page_mut(|page| {
+    set.write(left, |page| {
         clear_entries(page, INTERNAL_DIRECTORY);
         set_leftmost_child(page, leftmost);
         fill(page, INTERNAL_DIRECTORY, &entries[..promoted], left)
     })??;
-    writes.mark(storage, left)?;
-
     Ok(Split { right, separator })
 }
 
-/// How the pages a write of a tree changes are marked in the buffer pool.
+/// How the pages a write of a tree changes are flagged in the buffer pool, once the
+/// [`PageSet`] of the write has put them there.
 ///
-/// Two shapes. [`PageWrites::unlogged`] is what the page layer does on its own: a page comes
-/// back dirty at `page_lsn` 0 and without the `in_progress` flag, so a flush of the pool writes
-/// it. After [`PageWrites::hold`], each page a write touches takes the LSN of the journal
-/// record that describes that write and carries `in_progress`: the pool then leaves it out of
-/// `data` while the transaction runs ([`super::buffer::BufferPool::flush_all`] skips a page
-/// flagged that way, and the eviction refuses it) and writes it once the record is durable and
-/// the flag lifted. The pages flagged are collected for [`PageWrites::take_held`], which the
-/// owner of the transaction drains to lift the flag at `commit` or `rollback`
-/// (`super::clustered::ClusteredTable::release_pages`).
-///
-/// This is the no-steal rule [`super::version::HeapTable::note_page`] applies to a heap page,
-/// brought to the pages of a tree
-/// (`super::clustered::tests::clustered_leaf_stays_out_of_data_until_commit`). An index whose
-/// writes are not journalled keeps [`PageWrites::unlogged`], which is what [`BTree::create`]
-/// and [`BTree::open`] start from.
+/// [`PageWrites::free`] leaves the flag as it stands. After [`PageWrites::hold`], each page a
+/// write touches carries `in_progress`, so the pool leaves it out of `data` while the
+/// transaction runs, and is collected for [`PageWrites::take_held`], which the owner of the
+/// transaction drains to lift the flag at `commit` or `rollback`: the no-steal rule
+/// [`super::version::HeapTable::note_page`] applies to a heap page
+/// (`super::clustered::tests::clustered_leaf_stays_out_of_data_until_commit`).
 #[derive(Debug)]
 pub(crate) struct PageWrites {
-    /// LSN written in the header of each page marked, `Lsn(0)` when no record describes the
-    /// write. [`super::buffer::BufferPool::mark_dirty`] does not move a page LSN backwards, so
-    /// `Lsn(0)` leaves the LSN the page carries.
+    /// LSN a page marked is tied to beside the one of its page write, `Lsn(0)` outside a
+    /// transaction; [`super::buffer::BufferPool::mark_dirty`] keeps the larger of the two.
     lsn: Lsn,
     /// Whether a page marked carries `in_progress`.
     hold: bool,
@@ -537,8 +510,8 @@ pub(crate) struct PageWrites {
 }
 
 impl PageWrites {
-    /// Marks with no journal record behind the write: `Lsn(0)`, no flag, nothing collected.
-    pub(crate) fn unlogged() -> Self {
+    /// Marks outside a transaction: no flag, nothing collected.
+    pub(crate) fn free() -> Self {
         Self {
             lsn: Lsn(0),
             hold: false,
@@ -558,19 +531,19 @@ impl PageWrites {
         std::mem::take(&mut self.held)
     }
 
-    /// Marks a page a write has just rewritten: dirty at the LSN of this marker, flagged or
-    /// not as the marker says.
-    ///
-    /// The caller holds the pin: [`super::buffer::BufferPool::mark_dirty`] asks for one, and so
-    /// does [`super::buffer::BufferPool::set_in_progress`] when it sets the flag.
+    /// Marks a page a write has just rewritten, the caller holding its pin: dirty at the LSN
+    /// of this marker, and flagged when the marker holds its writes. A marker that does not
+    /// hold leaves the flag as it stands, so a page a running transaction flagged keeps it
+    /// through the write of a vacuum
+    /// (`tests::a_write_outside_a_transaction_leaves_the_flag_of_a_running_one`).
     ///
     /// # Errors
     ///
     /// Those of the buffer pool.
     fn mark(&mut self, storage: &DiskStorage, id: PageId) -> Result<(), InternalError> {
         storage.pool.mark_dirty(id, self.lsn)?;
-        storage.pool.set_in_progress(id, self.hold)?;
         if self.hold {
+            storage.pool.set_in_progress(id, true)?;
             self.held.insert(id);
         }
         Ok(())
@@ -958,8 +931,9 @@ struct OrderColumn {
 /// (`tests::negative_ints_sort_below_zero_as_compare_orders_them`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyOrder {
-    /// The columns of the key, in key order.
-    columns: Vec<OrderColumn>,
+    /// The columns of the key, in key order; a boxed slice, one word shorter than a `Vec`
+    /// (`clippy::large_enum_variant` weighs the two trees of a clustered table).
+    columns: Box<[OrderColumn]>,
 }
 
 impl KeyOrder {
@@ -989,7 +963,9 @@ impl KeyOrder {
                 collation: info.collation.unwrap_or(Collation::DEFAULT),
             });
         }
-        Ok(Self { columns: out })
+        Ok(Self {
+            columns: out.into_boxed_slice(),
+        })
     }
 
     /// Number of columns of the key.
@@ -1434,11 +1410,10 @@ fn goes_right(order: &KeyOrder, separator: &[u8], probe: &Probe) -> Result<bool,
 ///
 /// A leaf that loses its last entry stays in the chain, empty: there is no merge and no page
 /// given back to the allocator, and a walk steps over it
-/// (`tests::an_emptied_leaf_stays_in_the_chain_and_a_seek_steps_over_it`). No journal record is
-/// written here either: the tree marks its pages with the LSN its caller gives
-/// [`BTree::hold_writes`], and appends nothing to the journal itself. A tree left at
-/// [`PageWrites::unlogged`] — what an index ([`super::index`]) uses — reaches the data file at the
-/// next flush of the pool, with no record behind it.
+/// (`tests::an_emptied_leaf_stays_in_the_chain_and_a_seek_steps_over_it`). A tree of an index
+/// ([`BTree::create`], [`BTree::open`]) writes no journal record: its pages reach the data file
+/// at the next flush of the pool, with no record behind them, and the instance builds the tree
+/// again at each `open`.
 #[derive(Debug)]
 pub(crate) struct BTree<'storage> {
     /// The instance the pages belong to.
@@ -1448,9 +1423,12 @@ pub(crate) struct BTree<'storage> {
     root: PageId,
     /// The order the keys follow.
     order: KeyOrder,
-    /// How the pages of a write are marked in the pool: [`PageWrites::unlogged`] until a
-    /// caller asks for [`BTree::hold_writes`].
+    /// How the pages of a write are flagged in the pool: [`PageWrites::free`] until a caller
+    /// asks for [`BTree::hold_writes`].
     writes: PageWrites,
+    /// The clustered table and the role of the tree, for a tree whose writes are journalled;
+    /// `None` for the tree of an index.
+    owner: Option<(TableId, TreeRole)>,
 }
 
 impl<'storage> BTree<'storage> {
@@ -1464,22 +1442,46 @@ impl<'storage> BTree<'storage> {
         columns: &[KeyColumn],
         types: &[TypeInfo],
     ) -> Result<Self, InternalError> {
-        let order = KeyOrder::new(columns, types)?;
+        Self::created(storage, KeyOrder::new(columns, types)?, None)
+    }
+
+    /// Creates an empty tree whose writes are journalled, the tree `role` of the clustered
+    /// table `table`: the formatting of its root leaf is the first record it writes.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`BTree::create`], and of the journal.
+    pub(crate) fn create_logged(
+        storage: &'storage DiskStorage,
+        columns: &[KeyColumn],
+        types: &[TypeInfo],
+        owner: (TableId, TreeRole),
+    ) -> Result<Self, InternalError> {
+        Self::created(storage, KeyOrder::new(columns, types)?, Some(owner))
+    }
+
+    /// Allocates the root of a tree of `order` and writes an empty leaf over it.
+    fn created(
+        storage: &'storage DiskStorage,
+        order: KeyOrder,
+        owner: Option<(TableId, TreeRole)>,
+    ) -> Result<Self, InternalError> {
         let root = allocate(storage)?;
-        let pin = storage.pool.pin(root)?;
-        pin.with_page_mut(init_leaf)?;
-        let mut writes = PageWrites::unlogged();
-        writes.mark(storage, root)?;
-        drop(pin);
-        Ok(Self {
+        let mut tree = Self {
             storage,
             root,
             order,
-            writes,
-        })
+            writes: PageWrites::free(),
+            owner,
+        };
+        let mut set = PageSet::new(storage, owner.is_some());
+        set.write(root, init_leaf)?;
+        tree.commit(set)?;
+        Ok(tree)
     }
 
-    /// Attaches to the tree whose root is `root`, leaving the pages as they stand.
+    /// Attaches to the tree whose root is `root`, leaving the pages as they stand; its writes
+    /// are not journalled, the shape of the tree of an index.
     ///
     /// # Errors
     ///
@@ -1494,8 +1496,31 @@ impl<'storage> BTree<'storage> {
             storage,
             root,
             order: KeyOrder::new(columns, types)?,
-            writes: PageWrites::unlogged(),
+            writes: PageWrites::free(),
+            owner: None,
         })
+    }
+
+    /// Attaches to the tree `role` of the clustered table `table`, rooted at `root`; its
+    /// writes are journalled. The errors of [`KeyOrder::new`].
+    pub(crate) fn open_logged(
+        storage: &'storage DiskStorage,
+        root: PageId,
+        columns: &[KeyColumn],
+        types: &[TypeInfo],
+        owner: (TableId, TreeRole),
+    ) -> Result<Self, InternalError> {
+        let mut tree = Self::open(storage, root, columns, types)?;
+        tree.owner = Some(owner);
+        Ok(tree)
+    }
+
+    /// Logs and puts in the pool what `set` wrote, each page marked by the [`PageWrites`] of
+    /// the tree, and answers the number of the record ([`PageSet::commit`]).
+    fn commit(&mut self, set: PageSet<'_>) -> Result<Option<Lsn>, InternalError> {
+        let storage = self.storage;
+        let writes = &mut self.writes;
+        set.commit(|id| writes.mark(storage, id))
     }
 
     /// The root of the tree. It moves when a split reaches the root
@@ -1505,14 +1530,10 @@ impl<'storage> BTree<'storage> {
     }
 
     /// The writes that follow carry `lsn` and the `in_progress` flag on the pages they change
-    /// ([`PageWrites::hold`]), so the pool keeps those pages out of `data` until the flag is
-    /// lifted (`tests::a_held_write_marks_its_pages_and_hands_them_back`).
-    ///
-    /// A tree starts at [`PageWrites::unlogged`]; this call moves it and the next one moves the
-    /// LSN again. The caller lifts the flag by draining [`BTree::take_held_pages`] and calling
-    /// [`super::buffer::BufferPool::set_in_progress`] with `false`, which
+    /// ([`PageWrites::hold`]), so the pool keeps those pages out of `data` until the caller
+    /// drains [`BTree::take_held_pages`] and lifts the flag, which
     /// `super::clustered::ClusteredTable` does at `commit` and at `rollback`
-    /// (`super::clustered::tests::clustered_leaf_stays_out_of_data_until_commit`).
+    /// (`tests::a_held_write_marks_its_pages_and_hands_them_back`).
     pub(crate) fn hold_writes(&mut self, lsn: Lsn) {
         self.writes.hold(lsn);
     }
@@ -1552,6 +1573,22 @@ impl<'storage> BTree<'storage> {
     /// errors of [`split_leaf`], [`split_internal`], [`allocate`] and of the buffer pool
     /// otherwise.
     pub(crate) fn insert(&mut self, key: &[Value], payload: &[u8]) -> Result<(), InternalError> {
+        let mut set = PageSet::new(self.storage, self.owner.is_some());
+        let root = self.insert_in(&mut set, key, payload)?;
+        self.commit(set)?;
+        self.root = root.unwrap_or(self.root);
+        Ok(())
+    }
+
+    /// The body of [`BTree::insert`], its pages written in `set`; answers the new root when a
+    /// split reached the root. The descent reads the internal pages from the pool, which a set
+    /// that has not split anything yet leaves as they are.
+    fn insert_in(
+        &self,
+        set: &mut PageSet<'_>,
+        key: &[Value],
+        payload: &[u8],
+    ) -> Result<Option<PageId>, InternalError> {
         self.order.check_key(key)?;
         let bytes = encode_entry_key(key, payload);
         if bytes.len() > MAX_INSERT_BYTES {
@@ -1568,16 +1605,39 @@ impl<'storage> BTree<'storage> {
             payload: PayloadBound::At(payload.to_vec()),
         };
         let (leaf, mut path) = self.descend(&probe)?;
-        let Some(mut split) = self.put_in_leaf(leaf, &bytes, &probe)? else {
-            return Ok(());
-        };
-        while let Some(parent) = path.pop() {
-            match self.put_in_internal(parent, &split)? {
-                Some(higher) => split = higher,
-                None => return Ok(()),
+        let mut root = None;
+        let mut split = self.put_in_leaf(set, leaf, &bytes, &probe)?;
+        while let Some(done) = split.take() {
+            match path.pop() {
+                Some(parent) => split = self.put_in_internal(set, parent, &done)?,
+                None => root = Some(self.grow_root(set, &done)?),
             }
         }
-        self.grow_root(&split)
+        Ok(root)
+    }
+
+    /// Replaces the entry `(key, old)` by `(key, new)` and answers whether it was there: one
+    /// [`BTree::delete`] and one [`BTree::insert`] journalled as one record, so a crash does not
+    /// leave the tree without either (`tests::a_replace_is_one_record`). The delete comes first,
+    /// which leaves the internal pages the descent of the insert reads as they are.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`BTree::delete`] and [`BTree::insert`].
+    pub(crate) fn replace(
+        &mut self,
+        key: &[Value],
+        old: &[u8],
+        new: &[u8],
+    ) -> Result<bool, InternalError> {
+        let mut set = PageSet::new(self.storage, self.owner.is_some());
+        if !self.delete_in(&mut set, key, old)? {
+            return Ok(false);
+        }
+        let root = self.insert_in(&mut set, key, new)?;
+        self.commit(set)?;
+        self.root = root.unwrap_or(self.root);
+        Ok(true)
     }
 
     /// Takes one entry `(key, payload)` out of the tree and answers whether it was there.
@@ -1592,6 +1652,19 @@ impl<'storage> BTree<'storage> {
     ///
     /// Those of [`BTree::insert`] for the key, and the errors of the buffer pool.
     pub(crate) fn delete(&mut self, key: &[Value], payload: &[u8]) -> Result<bool, InternalError> {
+        let mut set = PageSet::new(self.storage, self.owner.is_some());
+        let removed = self.delete_in(&mut set, key, payload)?;
+        self.commit(set)?;
+        Ok(removed)
+    }
+
+    /// The body of [`BTree::delete`], the leaf written in `set`.
+    fn delete_in(
+        &self,
+        set: &mut PageSet<'_>,
+        key: &[Value],
+        payload: &[u8],
+    ) -> Result<bool, InternalError> {
         self.order.check_key(key)?;
         let probe = Probe {
             values: key.to_vec(),
@@ -1600,8 +1673,7 @@ impl<'storage> BTree<'storage> {
         let Some(cursor) = self.find_first(&probe)? else {
             return Ok(false);
         };
-        let pin = self.storage.pool.pin(cursor.leaf)?;
-        let removed = pin.with_page_mut(|page| {
+        set.write(cursor.leaf, |page| {
             expect_kind(page, PageKind::BTreeLeaf)?;
             let entry = {
                 let (bytes, _) = entry_at(page, LEAF_DIRECTORY, cursor.index)?;
@@ -1612,11 +1684,7 @@ impl<'storage> BTree<'storage> {
             }
             remove_slot(page, LEAF_DIRECTORY, cursor.index)?;
             Ok::<_, InternalError>(true)
-        })??;
-        if removed {
-            self.writes.mark(self.storage, cursor.leaf)?;
-        }
-        Ok(removed)
+        })?
     }
 
     /// The entries of `range`, in the order `dir` asks for, materialised in a `Vec`.
@@ -1812,33 +1880,34 @@ impl<'storage> BTree<'storage> {
     }
 
     /// Puts an entry in a leaf, splitting the leaf when it has no room, and answers the split
-    /// the parent has to record.
+    /// the parent has to record. The pages are written in `set`.
     fn put_in_leaf(
-        &mut self,
+        &self,
+        set: &mut PageSet<'_>,
         leaf: PageId,
         bytes: &[u8],
         probe: &Probe,
     ) -> Result<Option<Split>, InternalError> {
-        let pin = self.storage.pool.pin(leaf)?;
-        let put = pin.with_page_mut(|page| {
+        let put = set.write(leaf, |page| {
             expect_kind(page, PageKind::BTreeLeaf)?;
             place_in_leaf(page, &self.order, probe, bytes)
         })??;
         if put == Put::Inserted {
-            self.writes.mark(self.storage, leaf)?;
             return Ok(None);
         }
-        pin.with_page(|page| leaf_split_fits(page, &self.order, probe, bytes))??;
-        drop(pin);
+        set.read(leaf, |page| {
+            leaf_split_fits(page, &self.order, probe, bytes)
+        })??;
 
-        let split = split_leaf(self.storage, leaf, &mut self.writes)?;
+        let split = split_leaf(set, leaf)?;
         let target = if goes_right(&self.order, &split.separator, probe)? {
             split.right
         } else {
             leaf
         };
-        let pin = self.storage.pool.pin(target)?;
-        let put = pin.with_page_mut(|page| place_in_leaf(page, &self.order, probe, bytes))??;
+        let put = set.write(target, |page| {
+            place_in_leaf(page, &self.order, probe, bytes)
+        })??;
         if put == Put::Full {
             return Err(InternalError::Bug(format!(
                 "leaf {target}, a half of the split of leaf {leaf}, has no room for an entry of \
@@ -1846,38 +1915,37 @@ impl<'storage> BTree<'storage> {
                 bytes.len()
             )));
         }
-        self.writes.mark(self.storage, target)?;
         Ok(Some(split))
     }
 
     /// Records a split in the parent of the page that split, splitting the parent in turn when
-    /// it has no room, and answers the split the grandparent has to record.
+    /// it has no room, and answers the split the grandparent has to record. The pages are
+    /// written in `set`.
     fn put_in_internal(
-        &mut self,
+        &self,
+        set: &mut PageSet<'_>,
         parent: PageId,
         split: &Split,
     ) -> Result<Option<Split>, InternalError> {
         let probe = probe_of(&split.separator)?;
-        let pin = self.storage.pool.pin(parent)?;
-        let put = pin.with_page_mut(|page| {
+        let put = set.write(parent, |page| {
             expect_kind(page, PageKind::BTreeInternal)?;
             place_in_internal(page, &self.order, &probe, &split.separator, split.right)
         })??;
         if put == Put::Inserted {
-            self.writes.mark(self.storage, parent)?;
             return Ok(None);
         }
-        pin.with_page(|page| internal_split_fits(page, &self.order, &probe, &split.separator))??;
-        drop(pin);
+        set.read(parent, |page| {
+            internal_split_fits(page, &self.order, &probe, &split.separator)
+        })??;
 
-        let higher = split_internal(self.storage, parent, &mut self.writes)?;
+        let higher = split_internal(set, parent)?;
         let target = if goes_right(&self.order, &higher.separator, &probe)? {
             higher.right
         } else {
             parent
         };
-        let pin = self.storage.pool.pin(target)?;
-        let put = pin.with_page_mut(|page| {
+        let put = set.write(target, |page| {
             place_in_internal(page, &self.order, &probe, &split.separator, split.right)
         })??;
         if put == Put::Full {
@@ -1887,17 +1955,16 @@ impl<'storage> BTree<'storage> {
                 split.separator.len()
             )));
         }
-        self.writes.mark(self.storage, target)?;
         Ok(Some(higher))
     }
 
-    /// Gives the tree a new root of one separator and two children, the old root on the left,
-    /// and moves [`BTree::root`] to it.
-    fn grow_root(&mut self, split: &Split) -> Result<(), InternalError> {
+    /// Writes in `set` a new root of one separator and two children, the old root on the
+    /// left, its move noted in `set` ([`RootMove`]), and answers it for the caller to move
+    /// [`BTree::root`] once `set` is committed.
+    fn grow_root(&self, set: &mut PageSet<'_>, split: &Split) -> Result<PageId, InternalError> {
         let root = allocate(self.storage)?;
         let old = self.root;
-        let pin = self.storage.pool.pin(root)?;
-        pin.with_page_mut(|page| {
+        set.write(root, |page| {
             init_internal(page, old);
             check_entry_size(root, split.separator.len(), CHILD_BYTES)?;
             if put_entry(
@@ -1914,10 +1981,10 @@ impl<'storage> BTree<'storage> {
             }
             Ok(())
         })??;
-        self.writes.mark(self.storage, root)?;
-        drop(pin);
-        self.root = root;
-        Ok(())
+        if let Some((table, role)) = self.owner {
+            set.note_root(RootMove { table, role, root });
+        }
+        Ok(root)
     }
 }
 
@@ -1972,6 +2039,6 @@ fn upper_probe(bound: &Bound<Vec<Value>>) -> Probe {
 
 #[cfg(test)]
 #[path = "btree/tests/concurrency.rs"]
-mod concurrency;
+pub(crate) mod concurrency;
 #[cfg(test)]
 mod tests;

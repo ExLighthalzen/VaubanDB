@@ -53,6 +53,31 @@
 //! went away is rebuilt from the journal
 //! (`super::tests::ddl_survives_reopen_without_checkpoint`), and one whose pages reached
 //! `data` is read back from them (`super::tests::ddl_survives_reopen`).
+//!
+//! # The pages are journalled
+//!
+//! [`store`] writes the pages of the chain through one [`PageSet`]: what it changes, the
+//! formatting and the link of a page the chain grows by included, is one
+//! [`super::wal::WalRecordKind::PageWrite`] record, and [`load`] replays the records of the
+//! catalogue pages by their `page_lsn` before it walks the chain. A crash in the middle of the
+//! writes of a chain of several pages, or between the link of a page and its formatting,
+//! therefore reads back as the catalogue of the last record whole
+//! (`tests::a_chain_whose_pages_missed_data_reads_back_from_the_journal`), and a chain that
+//! still meets a page that is not a catalogue page is an error rather than an empty catalogue
+//! (`tests::a_chain_cut_by_a_free_page_is_an_error`).
+//!
+//! The record follows the one the caller made durable (a DDL statement, a commit). A stream of
+//! another length than the one the chain holds — a DDL statement adds or takes away an entry —
+//! waits for its record to be durable in turn, through the group commit of the journal
+//! ([`super::wal::WalHandle::wait_durable`]), so the pages may leave for `data` at the next
+//! checkpoint (`super::tests::a_checkpointed_catalogue_reads_back_with_an_emptied_journal`). A
+//! stream of the same length — what a commit writes after the rows moved the counter of a table
+//! or a split moved a root, eight bytes in place each — leaves the pages at the number of the
+//! record of the caller and waits for nothing ([`PageSet::commit_behind`]): a crash may leave
+//! such a page on `data` without its record, a stream that reads back with each such field at
+//! one of its two values, and the recovery takes the row counters from the row records and the
+//! roots from the page records of the splits ([`super::recover`])
+//! (`tests::a_catalogue_of_the_same_length_is_rewritten_in_place_without_a_sync`).
 
 use std::collections::BTreeMap;
 
@@ -62,7 +87,7 @@ use vauban_types::{Collation, Len, SqlType, TypeInfo};
 use super::DiskStorage;
 use super::alloc;
 use super::page::{HEADER_SIZE, Lsn, PAGE_SIZE, Page, PageId, PageKind};
-use super::wal::{WalRecord, WalRecordKind};
+use super::wal::{PageSet, PageWrite, WalRecord, WalRecordKind};
 use crate::{DbId, IndexId, IndexShape, KeyColumn, TableId, TableShape};
 
 /// Value written in the first byte of the stream by this build.
@@ -470,18 +495,23 @@ pub(crate) fn create_database_payload(db: DbId, name: &str) -> Vec<u8> {
 /// when the instance has not allocated it yet.
 ///
 /// The caller holds the lock of the catalogue, which is what keeps two threads from allocating
-/// two roots; the control block is taken under it, the order [`alloc`] documents.
+/// two roots; the control block is taken under it, the order [`alloc`] documents. The
+/// formatting of the root is journalled and synced before `vauban.ctl` names it, so the root
+/// the control file names reads back as a meta page once its record is replayed.
 ///
 /// # Errors
 ///
-/// Those of [`alloc::allocate`], of the buffer pool and of
+/// Those of [`alloc::allocate`], of the buffer pool, of the journal and of
 /// [`super::control::Control::write`].
 pub(crate) fn ensure_root(storage: &DiskStorage) -> Result<PageId, InternalError> {
     if let Some(root) = storage.control()?.meta_root {
         return Ok(root);
     }
     let root = alloc::allocate(storage)?;
-    format_page(storage, root, Lsn(0))?;
+    let mut set = PageSet::new(storage, true);
+    set.write(root, format_meta)?;
+    set.commit(|id| storage.pool.set_in_progress(id, false))?;
+    storage.wal.flush()?;
     let mut control = storage.lock_control()?;
     let mut updated = *control;
     updated.meta_root = Some(root);
@@ -495,11 +525,15 @@ pub(crate) fn ensure_root(storage: &DiskStorage) -> Result<PageId, InternalError
 /// An instance whose `vauban.ctl` names no root has written no DDL and answers the empty
 /// catalogue (`an_instance_without_a_root_loads_an_empty_catalogue`).
 ///
+/// The page records of the journal that write catalogue pages are replayed first, each on a
+/// page whose `page_lsn` is below it, so the chain read is the one the last [`store`] left in
+/// the journal and not a mix of what reached `data` (`redo_the_catalogue_pages`).
+///
 /// # Errors
 ///
 /// [`InternalError::Corruption`] for a page of the chain that is not a [`PageKind::Meta`] one,
-/// for a chain longer than [`MAX_CHAIN_PAGES`] and for a stream this build does not read; the
-/// errors of the buffer pool otherwise.
+/// a free page among them, for a chain longer than [`MAX_CHAIN_PAGES`] and for a stream this
+/// build does not read; the errors of the journal and of the buffer pool otherwise.
 pub(crate) fn load(
     storage: &DiskStorage,
     root: Option<PageId>,
@@ -507,9 +541,14 @@ pub(crate) fn load(
     let Some(root) = root else {
         return Ok(Catalogue::default());
     };
+    redo_the_catalogue_pages(storage)?;
     let chain = chain(storage, root)?;
     if !chain.whole {
-        return Ok(Catalogue::default());
+        return Err(InternalError::Corruption(format!(
+            "the chain of meta pages rooted at {root} reaches page {}, a free page, after the \
+             redo of the catalogue pages the journal holds",
+            chain.pages.last().copied().unwrap_or(root)
+        )));
     }
     let mut bytes = Vec::new();
     for id in chain.pages {
@@ -524,18 +563,42 @@ pub(crate) fn load(
     Catalogue::decode(&bytes)
 }
 
-/// Writes `catalogue` over the chain that starts at `root`, growing the chain when the stream
-/// needs more pages than it holds.
-///
-/// The pages are marked dirty at `lsn`, the record of the DDL statement the caller has just
-/// made durable: the page may then leave for `data`, the journal being ahead of it
-/// ([`super::buffer::BufferPool::flush`]). The pages the stream no longer fills keep their
-/// place in the chain with an empty chunk.
+/// Replays the page records of the journal that write a page of the catalogue, each on a page
+/// whose `page_lsn` is below its number, and answers how many pages it wrote.
 ///
 /// # Errors
 ///
-/// Those of [`load`] for the walk of the chain, of [`alloc::allocate`] for a page the chain
-/// grows by, and of the buffer pool.
+/// The errors of the journal, of [`PageWrite::decode`] and of [`PageWrite::redo`].
+pub(crate) fn redo_the_catalogue_pages(storage: &DiskStorage) -> Result<usize, InternalError> {
+    let mut written = 0;
+    let mut on_data = BTreeMap::new();
+    for record in storage.wal.records()? {
+        if record.kind != WalRecordKind::PageWrite {
+            continue;
+        }
+        let write = PageWrite::decode(&record.payload)?;
+        written += write
+            .redo(storage, record.lsn, Some(PageKind::Meta), &mut on_data)?
+            .0;
+    }
+    Ok(written)
+}
+
+/// Writes `catalogue` over the chain that starts at `root`, growing the chain when the stream
+/// needs more pages than it holds.
+///
+/// The pages are written through one [`PageSet`]: the change is one record, appended after
+/// `lsn`, the record of the DDL statement or of the commit the caller has just made durable,
+/// and a page whose bytes do not change is left out of it. The pages the stream no longer fills
+/// keep their place in the chain with an empty chunk. A stream of another length waits for the
+/// record to be durable; one of the same length leaves its pages at `lsn`, as the module
+/// documentation says.
+///
+/// # Errors
+///
+/// [`InternalError::Corruption`] for a chain that meets a free page; those of [`load`] for the
+/// walk of the chain, of [`alloc::allocate`] for a page the chain grows by, of the journal and
+/// of the buffer pool.
 pub(crate) fn store(
     storage: &DiskStorage,
     root: PageId,
@@ -547,26 +610,32 @@ pub(crate) fn store(
     let walk = chain(storage, root)?;
     let mut pages = walk.pages;
     if !walk.whole {
-        // The walk stopped on a page the allocator had written and this file had not: its
-        // formatting stayed in the buffer pool of an instance that went away. It is written
-        // again here, and the pages that used to follow it are lost with its link.
-        let unformatted = *pages.last().unwrap_or(&root);
-        format_page(storage, unformatted, lsn)?;
+        return Err(InternalError::Corruption(format!(
+            "the chain of meta pages rooted at {root} reaches page {}, a free page",
+            pages.last().copied().unwrap_or(root)
+        )));
     }
+    let same_length = pages.len() >= chunks.len() && stream_len(storage, &pages)? == bytes.len();
+    let mut set = PageSet::new(storage, true);
     while pages.len() < chunks.len() {
         let fresh = alloc::allocate(storage)?;
-        format_page(storage, fresh, lsn)?;
+        set.write(fresh, format_meta)?;
         let previous = *pages.last().unwrap_or(&root);
-        link(storage, previous, fresh, lsn)?;
+        set.write(previous, |page| write_u64(page, OFF_NEXT, fresh.0))?;
         pages.push(fresh);
     }
     for (position, id) in pages.iter().copied().enumerate() {
         let chunk = chunks.get(position).copied().unwrap_or(&[][..]);
-        let pin = storage.pool.pin(id)?;
-        pin.with_page_mut(|page| write_chunk(page, chunk))?;
+        set.write(id, |page| write_chunk(page, chunk))?;
+    }
+    let mark = |id| {
         storage.pool.mark_dirty(id, lsn)?;
-        storage.pool.set_in_progress(id, false)?;
-        drop(pin);
+        storage.pool.set_in_progress(id, false)
+    };
+    if same_length {
+        set.commit_behind(lsn, mark)?;
+    } else if let Some(written) = set.commit(mark)? {
+        storage.wal.wait_durable(written)?;
     }
     Ok(())
 }
@@ -592,11 +661,10 @@ enum Step {
 
 /// Walks the chain that starts at `root`, stopping at the first page that is not a meta page.
 ///
-/// A page of kind [`PageKind::Free`] is one [`alloc::allocate`] wrote and this file did not:
-/// its formatting stayed in the buffer pool of an instance that went away, so the walk stops
-/// there with `whole` false. Its link is gone with it, which is why the pages behind it are
-/// not walked. Any other kind is [`InternalError::Corruption`]: nothing of this build writes a
-/// heap or a tree page where the catalogue says a meta page is.
+/// A page of kind [`PageKind::Free`] stops the walk with `whole` false: a page the allocator
+/// wrote and this file did not, which the callers refuse, the formatting and the link of a page
+/// of the chain being one record. Any other kind is [`InternalError::Corruption`]: nothing of
+/// this build writes a heap or a tree page where the catalogue says a meta page is.
 fn chain(storage: &DiskStorage, root: PageId) -> Result<Chain, InternalError> {
     let mut pages = Vec::new();
     let mut current = Some(root);
@@ -633,28 +701,23 @@ fn chain(storage: &DiskStorage, root: PageId) -> Result<Chain, InternalError> {
     Ok(Chain { pages, whole: true })
 }
 
-/// Writes an empty meta page over `id`, zeroing the bytes past the common header.
-fn format_page(storage: &DiskStorage, id: PageId, lsn: Lsn) -> Result<(), InternalError> {
-    let pin = storage.pool.pin(id)?;
-    pin.with_page_mut(|page| {
-        page.0[HEADER_SIZE..].fill(0);
-        page.set_kind(PageKind::Meta);
-        page.set_slot_count(0);
-        page.set_lower(CHUNK_START as u16);
-        write_u64(page, OFF_NEXT, NO_NEXT);
-    })?;
-    storage.pool.mark_dirty(id, lsn)?;
-    storage.pool.set_in_progress(id, false)?;
-    Ok(())
+/// Writes an empty meta page over `page`, zeroing the bytes past the common header.
+fn format_meta(page: &mut Page) {
+    page.0[HEADER_SIZE..].fill(0);
+    page.set_kind(PageKind::Meta);
+    page.set_slot_count(0);
+    page.set_lower(CHUNK_START as u16);
+    write_u64(page, OFF_NEXT, NO_NEXT);
 }
 
-/// Chains `to` after `from`.
-fn link(storage: &DiskStorage, from: PageId, to: PageId, lsn: Lsn) -> Result<(), InternalError> {
-    let pin = storage.pool.pin(from)?;
-    pin.with_page_mut(|page| write_u64(page, OFF_NEXT, to.0))?;
-    storage.pool.mark_dirty(from, lsn)?;
-    storage.pool.set_in_progress(from, false)?;
-    Ok(())
+/// The length of the stream the meta pages `pages` hold, their chunks added up.
+fn stream_len(storage: &DiskStorage, pages: &[PageId]) -> Result<usize, InternalError> {
+    let mut len = 0;
+    for id in pages {
+        let pin = storage.pool.pin(*id)?;
+        len += pin.with_page(|page| read_chunk(page, *id))??.len();
+    }
+    Ok(len)
 }
 
 /// The chunk the page carries.

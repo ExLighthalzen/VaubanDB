@@ -108,7 +108,9 @@ fn uncommitted_insert_gone_after_reopen() {
     let recovery = storage.recovery().clone();
     assert_eq!(recovery.winners, Vec::new());
     assert_eq!(recovery.losers, vec![TxnId(4)]);
-    assert_eq!((recovery.applied, recovery.skipped), (0, 0));
+    // The redo replays the insert of the loser on the page the pool lost; the resume takes
+    // it back.
+    assert_eq!((recovery.applied, recovery.skipped), (1, 0));
     let mut table = resumed(&storage);
     assert_eq!(table.get(&snap(9, 100), id).expect("get"), None);
     assert_eq!(table.scan(&snap(9, 100)).expect("scan"), Vec::new());
@@ -232,7 +234,9 @@ fn abort_is_not_redone() {
     let recovery = storage.recovery().clone();
     assert_eq!(recovery.winners, Vec::new());
     assert_eq!(recovery.losers, vec![TxnId(4)]);
-    assert_eq!((recovery.applied, recovery.skipped), (0, 0));
+    // The insert is read and left alone: the page on `data` carries the compensation of the
+    // undo, past it.
+    assert_eq!((recovery.applied, recovery.skipped), (0, 1));
     let table = resumed(&storage);
     assert_eq!(table.get(&snap(9, 100), id).expect("get"), None);
     assert_eq!(table.status(TxnId(4)), TxnStatus::Aborted);
@@ -512,7 +516,7 @@ fn a_begin_alone_changes_nothing() {
     let recovery = storage.recovery().clone();
     assert_eq!(
         (recovery.applied, recovery.skipped, recovery.unplaced),
-        (0, 0, 0)
+        (0, 1, 0)
     );
     assert_eq!(
         resumed(&storage).scan(&snap(9, 100)).expect("scan"),
@@ -703,7 +707,8 @@ fn a_redo_played_twice_gives_the_same_pages() {
             table.delete(TxnId(6), *id).expect("delete");
         }
         table.commit(TxnId(6)).expect("commit");
-        // A loser, whose records the redo leaves out.
+        // A loser: the redo replays its insert, and the first resume takes it back by a
+        // compensation the second redo replays.
         table.insert(TxnId(7), &row(99)).expect("insert");
         head
     };
@@ -712,9 +717,9 @@ fn a_redo_played_twice_gives_the_same_pages() {
         let storage = open(&dir);
         let recovery = storage.recovery().clone();
         assert!(recovery.applied > 0, "{recovery:?}");
+        let rows = resumed(&storage).scan(&snap(9, 100)).expect("scan");
         let pages = pool_pages(&storage, head);
         assert!(pages.len() >= 3, "the heap spans {} pages", pages.len());
-        let rows = resumed(&storage).scan(&snap(9, 100)).expect("scan");
         (recovery, pages, rows)
     };
     // Dropped without a checkpoint: the second redo starts again from the same `data`.
@@ -756,9 +761,7 @@ fn a_chained_page_whose_formatting_missed_data_is_formatted_again() {
         (ids, head)
     };
     let storage = open(&dir);
-    let second = Heap::open(&storage, TABLE, head)
-        .redo_chain()
-        .expect("chain")[1];
+    let second = Heap::open(&storage, TABLE, head).pages().expect("chain")[1];
     assert_ne!(second, head);
     let table = resumed(&storage);
     let rows = table.scan(&snap(9, 100)).expect("scan");
@@ -1296,9 +1299,7 @@ fn crash_at_each_write(seed: u64, checkpoints: bool, lives: bool) -> usize {
             continue;
         }
         // One page of the heap goes to `data`, when the pool may write it.
-        let pages: Vec<PageId> = Heap::open(&storage, TABLE, head)
-            .redo_chain()
-            .expect("chain");
+        let pages: Vec<PageId> = Heap::open(&storage, TABLE, head).pages().expect("chain");
         let page = pages[rng.below(pages.len() as u64) as usize];
         if storage.pool.flush(page).is_ok() {
             flushed += 1;
@@ -1654,15 +1655,15 @@ fn a_compensation_inside_an_outer_rolled_back_range_is_replayed() {
     let storage = open(&dir);
     let recovery = storage.recovery().clone();
     assert_eq!(recovery.winners, vec![TxnId(4), TxnId(6)]);
-    // The compensation of 3 sits between the first savepoint and the second rollback, the
-    // range the scan cancels; it is replayed all the same and takes 3 out of the page `data`
-    // held, where its committed writer would make it visible. 2 was on that page too; 4
-    // never reached it.
+    // The compensation of 3 sits between the first savepoint and the second rollback; it is
+    // replayed and takes 3 out of the page `data` held, where its committed writer would make
+    // it visible. 2 was on that page too, and 4, which never reached it, is put back by its
+    // insert and taken out by its compensation: three compensations change the heap.
     assert_eq!(
         resumed(&storage).scan(&snap(9, 100)).expect("scan"),
         expected
     );
-    assert_eq!(recovery.released, 2);
+    assert_eq!(recovery.released, 3);
     assert_eq!(placed(&storage).len(), 2);
 }
 
@@ -1817,7 +1818,13 @@ fn a_loser_taken_back_by_a_recovery_cut_short_is_taken_back_by_the_next() {
     }
     for pass in 0..2 {
         let storage = open(&dir);
-        assert_eq!(storage.recovery().released, 2, "reopen {pass}");
+        // The two compensations of the losers, and the two of each rollback of an earlier
+        // pass, replayed on the pages the pool of that pass lost.
+        assert_eq!(
+            storage.recovery().released,
+            2 + 2 * usize::try_from(pass).expect("a pass"),
+            "reopen {pass}"
+        );
         let before = journal_len(&storage);
         let mut table = resumed(&storage);
         assert_eq!(journal_len(&storage), before, "reopen {pass}: nothing left");
@@ -1832,5 +1839,339 @@ fn a_loser_taken_back_by_a_recovery_cut_short_is_taken_back_by_the_next() {
             .update(TxnId(20 + pass), id, &row(15))
             .expect("update");
         table.rollback(TxnId(20 + pass)).expect("rollback");
+    }
+}
+
+// --- Pages of structure and long rows ------------------------------------------------------
+
+/// The rows a settled reader sees in `table` of a reopened instance, through the trait.
+fn scanned_rows(storage: &DiskStorage, table: TableId) -> Vec<(RowId, Row)> {
+    crate::Storage::scan(storage, &snap(999, 1_000), table)
+        .expect("scan")
+        .map(|row| row.expect("a row of the scan"))
+        .collect()
+}
+
+#[test]
+fn a_head_page_whose_formatting_missed_data_is_formatted_from_its_table_record() {
+    let dir = TempDir::created("recover-head-format");
+    let (second, rows) = {
+        let storage = open(&dir);
+        let db = storage.create_database("a").expect("database");
+        // A first table fills its head page and reaches `data`, then is dropped: its head
+        // page goes back to the free list, its rows on it.
+        let first = storage.create_table(db, &int_shape()).expect("table");
+        for value in 0..50 {
+            crate::Storage::insert(&storage, TxnId(4), first, &row(value)).expect("insert");
+        }
+        crate::Storage::commit(&storage, TxnId(4)).expect("commit");
+        storage.checkpoint().expect("checkpoint");
+        storage.drop_table(first).expect("drop");
+        // The second table takes that page as its head; its formatting stays in the pool.
+        let second = storage.create_table(db, &int_shape()).expect("table");
+        let mut rows = Vec::new();
+        for value in 100..103 {
+            let id =
+                crate::Storage::insert(&storage, TxnId(5), second, &row(value)).expect("insert");
+            rows.push((id, row(value)));
+        }
+        crate::Storage::commit(&storage, TxnId(5)).expect("commit");
+        (second, rows)
+    };
+    for round in 0..2 {
+        let storage = open(&dir);
+        assert_eq!(scanned_rows(&storage, second), rows, "round {round}");
+    }
+}
+
+#[test]
+fn a_page_the_heap_grew_by_reads_back_when_its_link_alone_reached_data() {
+    let dir = TempDir::created("recover-grown-link");
+    let mut expected: Vec<(RowId, Row)> = Vec::new();
+    let head = {
+        let storage = open(&dir);
+        let head = install_text(&storage);
+        let mut table = HeapTable::open(&storage, TABLE, head, text_shape());
+        while Heap::open(&storage, TABLE, head)
+            .pages()
+            .expect("pages")
+            .len()
+            < 2
+        {
+            let value = text_row('a', 500);
+            let id = table.insert(TxnId(4), &value).expect("insert");
+            expected.push((id, value));
+        }
+        table.commit(TxnId(4)).expect("commit");
+        // The head page reaches `data` with its link; the page it links to does not.
+        storage.pool.flush(head).expect("flush the head page");
+        head
+    };
+    for life in 0..2u64 {
+        let storage = open(&dir);
+        let mut table = resumed_text(&storage, head);
+        assert_eq!(
+            table.scan(&snap(999, 1_000)).expect("scan"),
+            expected,
+            "life {life}"
+        );
+        // A life: the heap grows again, the pages before the last one reach `data`.
+        let pages = Heap::open(&storage, TABLE, head)
+            .pages()
+            .expect("pages")
+            .len();
+        while Heap::open(&storage, TABLE, head)
+            .pages()
+            .expect("pages")
+            .len()
+            < pages + 1
+        {
+            let value = text_row('b', 700);
+            let id = table.insert(TxnId(10 + life), &value).expect("insert");
+            expected.push((id, value));
+        }
+        table.commit(TxnId(10 + life)).expect("commit");
+        let pages = Heap::open(&storage, TABLE, head).pages().expect("pages");
+        for page in &pages[..pages.len() - 1] {
+            storage.pool.flush(*page).expect("flush a page");
+        }
+    }
+    let storage = open(&dir);
+    assert_eq!(
+        resumed_text(&storage, head)
+            .scan(&snap(999, 1_000))
+            .expect("scan"),
+        expected
+    );
+}
+
+/// An instance with one long committed row in a table of [`text_shape`], checkpointed, then
+/// `change` committed on it, and the page of its stub alone written to `data`. Answers the
+/// head page and the rows a reader sees after the change.
+fn long_row_then(dir: &TempDir, update: bool) -> (PageId, Vec<(RowId, Row)>) {
+    let storage = open(dir);
+    let head = install_text(&storage);
+    let mut table = HeapTable::open(&storage, TABLE, head, text_shape());
+    let long = text_row('L', 9_000);
+    let id = table.insert(TxnId(4), &long).expect("insert a long row");
+    table.commit(TxnId(4)).expect("commit");
+    storage.checkpoint().expect("checkpoint");
+    let rows = if update {
+        let shorter = text_row('U', 100);
+        table.update(TxnId(5), id, &shorter).expect("update");
+        vec![(id, shorter)]
+    } else {
+        table.delete(TxnId(5), id).expect("delete");
+        Vec::new()
+    };
+    table.commit(TxnId(5)).expect("commit");
+    // The stub page reaches `data`, carrying the number of the change; the first page of
+    // the chain, where the `xmax` sits, does not.
+    storage
+        .pool
+        .flush(head)
+        .expect("flush the page of the stub");
+    (head, rows)
+}
+
+#[test]
+fn a_delete_of_a_long_row_whose_stub_page_alone_reached_data_is_redone() {
+    for update in [false, true] {
+        let dir = TempDir::created("recover-long-xmax");
+        let (head, rows) = long_row_then(&dir, update);
+        for round in 0..2 {
+            let storage = open(&dir);
+            assert_each_version_once(&storage, head, &format!("update {update}, round {round}"));
+            assert_eq!(
+                resumed_text(&storage, head)
+                    .scan(&snap(999, 1_000))
+                    .expect("scan"),
+                rows,
+                "update {update}, round {round}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_root_moved_by_a_split_is_found_again_without_the_meta_pages() {
+    let dir = TempDir::created("recover-root-move");
+    let shape = TableShape {
+        columns: vec![
+            TypeInfo::new(SqlType::Int, true),
+            TypeInfo::new(SqlType::Int, true),
+        ],
+        clustered_key: Some(vec![crate::KeyColumn {
+            column: 0,
+            descending: false,
+        }]),
+    };
+    let (table, moved, rows) = {
+        let storage = open(&dir);
+        let db = storage.create_database("a").expect("database");
+        let table = storage.create_table(db, &shape).expect("table");
+        let root = |storage: &DiskStorage| {
+            storage
+                .lock_catalogue()
+                .expect("the catalogue")
+                .table(table)
+                .and_then(|entry| entry.tree_root)
+                .expect("a root")
+        };
+        let first = root(&storage);
+        let mut rows = Vec::new();
+        let mut txn = 10;
+        while root(&storage) == first {
+            let value = Row(vec![Value::I32(rows.len() as i32), Value::I32(7)]);
+            let id = crate::Storage::insert(&storage, TxnId(txn), table, &value).expect("insert");
+            crate::Storage::commit(&storage, TxnId(txn)).expect("commit");
+            rows.push((id, value));
+            txn += 1;
+        }
+        // The meta pages that name the new root stay in the pool.
+        (table, root(&storage), rows)
+    };
+    for round in 0..2 {
+        let storage = open(&dir);
+        let root = storage
+            .lock_catalogue()
+            .expect("the catalogue")
+            .table(table)
+            .and_then(|entry| entry.tree_root);
+        assert_eq!(root, Some(moved), "round {round}");
+        assert_eq!(scanned_rows(&storage, table), rows, "round {round}");
+    }
+}
+
+// --- A crash that loses the writes `data` had not synced ---------------------------------
+
+/// The data file of the instance in `dir`, as a sync of it left it.
+fn data_of(dir: &TempDir) -> Vec<u8> {
+    std::fs::read(dir.child(super::super::DATA_FILE_NAME)).expect("read data")
+}
+
+/// A copy of the instance in `dir` with `data` replaced by `synced`: what a power cut leaves
+/// when the writes `data` took since its last sync are lost.
+fn power_cut(dir: &TempDir, synced: &[u8], label: &str) -> TempDir {
+    let image = TempDir::created(label);
+    for name in [super::super::CONTROL_FILE_NAME, super::super::WAL_FILE_NAME] {
+        std::fs::copy(dir.child(name), image.child(name)).expect("copy a file");
+    }
+    std::fs::write(image.child(super::super::DATA_FILE_NAME), synced).expect("write data");
+    image
+}
+
+#[test]
+fn a_free_list_reads_back_after_a_crash_that_loses_the_unsynced_writes() {
+    let dir = TempDir::created("recover-free-power-cut");
+    let synced = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    {
+        let storage = open(&dir);
+        let db = storage.create_database("a").expect("database");
+        let table = storage.create_table(db, &text_shape()).expect("table");
+        for _ in 0..3 {
+            crate::Storage::insert(&storage, TxnId(4), table, &text_row('L', 20_000))
+                .expect("insert a long row");
+        }
+        crate::Storage::commit(&storage, TxnId(4)).expect("commit");
+        storage.checkpoint().expect("checkpoint");
+        *synced.borrow_mut() = data_of(&dir);
+        let seen = std::rc::Rc::clone(&synced);
+        let path = dir.child(super::super::DATA_FILE_NAME);
+        super::super::alloc::tests::on_data_sync(Some(Box::new(move |_| {
+            *seen.borrow_mut() = std::fs::read(&path).expect("read data");
+        })));
+        // The drop hands the heap and the overflow chains back to the free list.
+        storage.drop_table(table).expect("drop");
+        super::super::alloc::tests::on_data_sync(None);
+    };
+    let image = power_cut(&dir, &synced.borrow(), "recover-free-power-cut-image");
+    for round in 0..2 {
+        let storage = DiskStorage::open(image.path(), DiskOptions::default())
+            .unwrap_or_else(|e| panic!("round {round}: open: {e:?}"));
+        let listed = super::super::alloc::free_list(&storage).expect("the free list");
+        assert!(!listed.is_empty(), "round {round}");
+        // Each listed page is handed out again as a page a table may take.
+        let db = storage.databases().expect("databases")[0].0;
+        let again = storage
+            .create_table(db, &text_shape())
+            .expect("a table more");
+        crate::Storage::insert(&storage, TxnId(10 + round), again, &text_row('n', 20_000))
+            .expect("insert");
+        crate::Storage::commit(&storage, TxnId(10 + round)).expect("commit");
+    }
+}
+
+#[test]
+fn a_head_page_data_lost_with_its_unsynced_writes_is_written_again() {
+    let dir = TempDir::created("recover-head-power-cut");
+    let (synced, table, rows) = {
+        let storage = open(&dir);
+        let db = storage.create_database("a").expect("database");
+        storage.checkpoint().expect("checkpoint");
+        let synced = data_of(&dir);
+        // The head page of the table grows the file, a write `data` never syncs.
+        let table = storage.create_table(db, &int_shape()).expect("table");
+        let id = crate::Storage::insert(&storage, TxnId(4), table, &row(7)).expect("insert");
+        crate::Storage::commit(&storage, TxnId(4)).expect("commit");
+        (synced, table, vec![(id, row(7))])
+    };
+    let image = power_cut(&dir, &synced, "recover-head-power-cut-image");
+    for round in 0..2 {
+        let storage = DiskStorage::open(image.path(), DiskOptions::default())
+            .unwrap_or_else(|e| panic!("round {round}: open: {e:?}"));
+        assert_eq!(scanned_rows(&storage, table), rows, "round {round}");
+    }
+}
+
+#[test]
+fn a_dropped_table_whose_head_page_data_lost_reopens() {
+    let dir = TempDir::created("recover-dropped-head-power-cut");
+    let (synced, kept, rows) = {
+        let storage = open(&dir);
+        let db = storage.create_database("a").expect("database");
+        storage.checkpoint().expect("checkpoint");
+        let synced = data_of(&dir);
+        // A table whose head page `data` never syncs takes a short and a long row, then is
+        // dropped; a second table outlives it.
+        let doomed = storage.create_table(db, &text_shape()).expect("table");
+        crate::Storage::insert(&storage, TxnId(4), doomed, &text_row('s', 10)).expect("insert");
+        crate::Storage::insert(&storage, TxnId(4), doomed, &text_row('L', 15_000))
+            .expect("insert a long row");
+        crate::Storage::commit(&storage, TxnId(4)).expect("commit");
+        storage.drop_table(doomed).expect("drop");
+        let kept = storage.create_table(db, &int_shape()).expect("table");
+        let id = crate::Storage::insert(&storage, TxnId(5), kept, &row(3)).expect("insert");
+        crate::Storage::commit(&storage, TxnId(5)).expect("commit");
+        (synced, kept, vec![(id, row(3))])
+    };
+    let image = power_cut(&dir, &synced, "recover-dropped-head-power-cut-image");
+    for round in 0..2 {
+        let storage = DiskStorage::open(image.path(), DiskOptions::default())
+            .unwrap_or_else(|e| panic!("round {round}: open: {e:?}"));
+        assert_eq!(scanned_rows(&storage, kept), rows, "round {round}");
+    }
+}
+
+#[test]
+fn the_head_page_of_a_table_dropped_empty_stays_in_the_free_list() {
+    let dir = TempDir::created("recover-dropped-empty-head");
+    {
+        let storage = open(&dir);
+        let db = storage.create_database("a").expect("database");
+        // No row ever reaches the head page: its number is the one its formatting left.
+        let empty = storage.create_table(db, &int_shape()).expect("table");
+        storage.drop_table(empty).expect("drop");
+    }
+    for round in 0..2u64 {
+        let storage = open(&dir);
+        let listed = super::super::alloc::free_list(&storage)
+            .unwrap_or_else(|e| panic!("round {round}: the free list: {e:?}"));
+        assert!(!listed.is_empty(), "round {round}");
+        let db = storage.databases().expect("databases")[0].0;
+        let table = storage
+            .create_table(db, &int_shape())
+            .unwrap_or_else(|e| panic!("round {round}: create: {e:?}"));
+        storage.drop_table(table).expect("drop");
     }
 }

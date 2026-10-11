@@ -61,6 +61,19 @@ fn page_of(storage: &DiskStorage, id: PageId) -> Page {
     pin.with_page(Page::clone).expect("read the cached page")
 }
 
+/// Runs `split` on the page `left` through a set that writes no record, and puts the pages it
+/// wrote in the pool.
+fn split_now(
+    storage: &DiskStorage,
+    left: PageId,
+    split: fn(&mut PageSet<'_>, PageId) -> Result<Split, InternalError>,
+) -> Result<Split, InternalError> {
+    let mut set = PageSet::new(storage, false);
+    let done = split(&mut set, left)?;
+    set.commit(|_| Ok(()))?;
+    Ok(done)
+}
+
 /// A key of a fixed width, so that the byte order of the keys is their numeric order.
 fn key(number: usize) -> Vec<u8> {
     format!("k{number:04}").into_bytes()
@@ -91,7 +104,7 @@ fn filled_leaf(storage: &DiskStorage) -> (PageId, usize) {
             count
         })
         .expect("the test holds the only pin");
-    PageWrites::unlogged()
+    PageWrites::free()
         .mark(storage, id)
         .expect("mark the leaf dirty");
     drop(pin);
@@ -237,7 +250,7 @@ fn split_leaf_separator() {
     assert!(count >= 2, "{count} entries to share");
     let before = entries_of(&page_of(&storage, left));
 
-    let split = split_leaf(&storage, left, &mut PageWrites::unlogged()).expect("split the leaf");
+    let split = split_now(&storage, left, split_leaf).expect("split the leaf");
     let left_page = page_of(&storage, left);
     let right_page = page_of(&storage, split.right);
     let left_entries = entries_of(&left_page);
@@ -290,7 +303,7 @@ fn split_leaf_separator() {
 fn split_leaf_relinks_the_old_next_sibling() {
     let (_dir, storage) = instance("split-relink");
     let (first, _) = filled_leaf(&storage);
-    let far = split_leaf(&storage, first, &mut PageWrites::unlogged())
+    let far = split_now(&storage, first, split_leaf)
         .expect("a first split")
         .right;
     // `first` is half empty now; filling it again and splitting it puts a page between
@@ -306,12 +319,12 @@ fn split_leaf_relinks_the_old_next_sibling() {
         }
     })
     .expect("the test holds the only pin");
-    PageWrites::unlogged()
+    PageWrites::free()
         .mark(&storage, first)
         .expect("mark the leaf dirty");
     drop(pin);
 
-    let middle = split_leaf(&storage, first, &mut PageWrites::unlogged())
+    let middle = split_now(&storage, first, split_leaf)
         .expect("a second split")
         .right;
     assert_ne!(middle, far);
@@ -337,8 +350,7 @@ fn split_leaf_refuses_a_page_of_one_entry() {
     .expect("the test holds the only pin");
     drop(pin);
 
-    let err = split_leaf(&storage, id, &mut PageWrites::unlogged())
-        .expect_err("one entry cannot be shared");
+    let err = split_now(&storage, id, split_leaf).expect_err("one entry cannot be shared");
     assert!(matches!(err, InternalError::Bug(_)), "{err:?}");
     assert!(err.to_string().contains("1 entries"), "{err}");
     assert_eq!(
@@ -367,7 +379,7 @@ fn internal_put_and_split() {
             keys
         })
         .expect("the test holds the only pin");
-    PageWrites::unlogged()
+    PageWrites::free()
         .mark(&storage, left)
         .expect("mark the page dirty");
     drop(pin);
@@ -385,8 +397,7 @@ fn internal_put_and_split() {
     let keys_before = internal_keys(&before);
     let children_before = internal_children(&before);
 
-    let split = split_internal(&storage, left, &mut PageWrites::unlogged())
-        .expect("split the internal page");
+    let split = split_now(&storage, left, split_internal).expect("split the internal page");
     let left_page = page_of(&storage, left);
     let right_page = page_of(&storage, split.right);
     assert_eq!(
@@ -441,8 +452,7 @@ fn split_internal_refuses_a_page_of_two_keys() {
     .expect("the test holds the only pin");
     drop(pin);
 
-    let err = split_internal(&storage, id, &mut PageWrites::unlogged())
-        .expect_err("two keys cannot be shared");
+    let err = split_now(&storage, id, split_internal).expect_err("two keys cannot be shared");
     assert!(matches!(err, InternalError::Bug(_)), "{err:?}");
     assert!(err.to_string().contains("2 keys"), "{err}");
 }
@@ -501,14 +511,52 @@ fn a_held_write_marks_its_pages_and_hands_them_back() {
 }
 
 #[test]
+fn a_write_outside_a_transaction_leaves_the_flag_of_a_running_one() {
+    let (_dir, storage) = instance("btree-free-write-keeps-the-flag");
+    let mut tree = int_tree(&storage);
+    let root = tree.root();
+    storage.pool.flush_all().expect("flush the fresh root");
+    tree.hold_writes(Lsn(0));
+    tree.insert(&[Value::I32(1)], &rid(1))
+        .expect("insert under a transaction");
+    // A second handle on the tree, outside a transaction, as a vacuum writes the leaf.
+    let mut other = BTree::open(&storage, root, &ascending(), &int_types()).expect("open");
+    other
+        .insert(&[Value::I32(2)], &rid(2))
+        .expect("insert outside a transaction");
+    storage.pool.flush_all().expect("flush");
+    assert_eq!(
+        storage
+            .data
+            .read_page(root)
+            .expect("read the root from data")
+            .slot_count(),
+        0,
+        "the leaf of the running transaction kept its flag"
+    );
+    storage
+        .pool
+        .set_in_progress(root, false)
+        .expect("the transaction ends");
+    storage.pool.flush_all().expect("flush");
+    assert_eq!(
+        storage
+            .data
+            .read_page(root)
+            .expect("read the root from data")
+            .slot_count(),
+        2
+    );
+}
+
+#[test]
 fn a_split_reaches_the_data_file_when_the_pool_is_flushed() {
     let dir = TempDir::created("split-durable");
     let (left, right, separator, left_keys, right_keys) = {
         let storage =
             DiskStorage::open(dir.path(), DiskOptions::default()).expect("create an instance");
         let (left, _) = filled_leaf(&storage);
-        let split =
-            split_leaf(&storage, left, &mut PageWrites::unlogged()).expect("split the leaf");
+        let split = split_now(&storage, left, split_leaf).expect("split the leaf");
         let left_keys = keys_of(&page_of(&storage, left));
         let right_keys = keys_of(&page_of(&storage, split.right));
         storage.pool.flush_all().expect("flush the pool");
@@ -592,7 +640,7 @@ fn leaf_of_runs(storage: &DiskStorage, runs: usize, width: usize) -> (PageId, us
             count
         })
         .expect("the test holds the only pin");
-    PageWrites::unlogged()
+    PageWrites::free()
         .mark(storage, id)
         .expect("mark the leaf dirty");
     drop(pin);
@@ -661,7 +709,7 @@ fn split_leaf_keeps_a_run_of_equal_keys_on_one_side() {
         "the cut the byte sizes pick falls inside a run of equal keys"
     );
 
-    let split = split_leaf(&storage, left, &mut PageWrites::unlogged()).expect("split the leaf");
+    let split = split_now(&storage, left, split_leaf).expect("split the leaf");
     let left_entries = entries_of(&page_of(&storage, left));
     let right_entries = entries_of(&page_of(&storage, split.right));
     assert_eq!(
@@ -705,8 +753,7 @@ fn split_leaf_refuses_a_run_it_cannot_cut() {
     assert_eq!(before.len(), count);
     assert!(before.windows(2).all(|pair| pair[0].0 == pair[1].0));
 
-    let err = split_leaf(&storage, left, &mut PageWrites::unlogged())
-        .expect_err("a page of one key has no cut");
+    let err = split_now(&storage, left, split_leaf).expect_err("a page of one key has no cut");
     assert!(matches!(err, InternalError::Bug(_)), "{err:?}");
     assert!(err.to_string().contains("carry one key"), "{err}");
     assert_eq!(
@@ -738,7 +785,7 @@ fn split_internal_promotes_a_key_out_of_a_run() {
         }
     })
     .expect("the test holds the only pin");
-    PageWrites::unlogged()
+    PageWrites::free()
         .mark(&storage, id)
         .expect("mark the page dirty");
     drop(pin);
@@ -755,8 +802,7 @@ fn split_internal_promotes_a_key_out_of_a_run() {
         "the middle is in the run"
     );
 
-    let split =
-        split_internal(&storage, id, &mut PageWrites::unlogged()).expect("split the internal page");
+    let split = split_now(&storage, id, split_internal).expect("split the internal page");
     let left_page = page_of(&storage, id);
     let right_page = page_of(&storage, split.right);
     let left_keys = internal_keys(&left_page);
@@ -807,13 +853,12 @@ fn split_internal_refuses_a_page_it_cannot_promote_out_of() {
         }
     })
     .expect("the test holds the only pin");
-    PageWrites::unlogged()
+    PageWrites::free()
         .mark(&storage, id)
         .expect("mark the page dirty");
     drop(pin);
 
-    let err = split_internal(&storage, id, &mut PageWrites::unlogged())
-        .expect_err("each key equals a neighbour");
+    let err = split_now(&storage, id, split_internal).expect_err("each key equals a neighbour");
     assert!(matches!(err, InternalError::Bug(_)), "{err:?}");
     assert!(err.to_string().contains("4 keys"), "{err}");
     assert_eq!(internal_keys(&page_of(&storage, id)).len(), 4);
@@ -845,7 +890,7 @@ fn equal_keys_stay_on_one_side_of_a_split() {
                 put
             })
             .expect("the test holds the only pin");
-        PageWrites::unlogged()
+        PageWrites::free()
             .mark(&storage, id)
             .expect("mark the leaf dirty");
         drop(pin);
@@ -864,7 +909,7 @@ fn equal_keys_stay_on_one_side_of_a_split() {
         if before[balanced - 1].0 == before[balanced].0 {
             straddled += 1;
         }
-        match split_leaf(&storage, id, &mut PageWrites::unlogged()) {
+        match split_now(&storage, id, split_leaf) {
             Ok(split) => {
                 let left = entries_of(&page_of(&storage, id));
                 let right = entries_of(&page_of(&storage, split.right));
@@ -1119,6 +1164,49 @@ fn a_third_level_appears_when_the_root_splits() {
         "the children of the root are internal pages, so the tree has three levels"
     );
     assert_eq!(ints(&all(&tree)), (0..2_000).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_replace_is_one_record() {
+    use super::super::wal::{TreeRole, WalRecordKind};
+    let (_dir, storage) = instance("btree-replace");
+    let page_records = |storage: &DiskStorage| {
+        storage
+            .wal
+            .records()
+            .expect("read the journal")
+            .iter()
+            .filter(|record| record.kind == WalRecordKind::PageWrite)
+            .count()
+    };
+    let mut tree = BTree::create_logged(
+        &storage,
+        &ascending(),
+        &int_types(),
+        (crate::TableId(1), TreeRole::Versions),
+    )
+    .expect("create a journalled tree");
+    for number in 0..40 {
+        tree.insert(&[Value::I32(number)], &rid(number as u64))
+            .expect("insert");
+    }
+    let before = page_records(&storage);
+    assert!(
+        tree.replace(&[Value::I32(7)], &rid(7), &rid(700))
+            .expect("replace")
+    );
+    assert_eq!(page_records(&storage), before + 1, "one record for the two");
+    let found = tree
+        .seek(&KeyRange::Point(vec![Value::I32(7)]), Direction::Forward)
+        .expect("seek");
+    assert_eq!(found, vec![(vec![Value::I32(7)], rid(700))]);
+    // An entry the tree does not hold is left alone, and nothing is journalled.
+    assert!(
+        !tree
+            .replace(&[Value::I32(7)], &rid(7), &rid(9))
+            .expect("replace")
+    );
+    assert_eq!(page_records(&storage), before + 1);
 }
 
 #[test]

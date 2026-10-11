@@ -1,12 +1,14 @@
 //! The write-ahead journal of an on-disk instance: `<dir>/wal`, an append-only file of
 //! records.
 //!
-//! A record names what changed (a row inserted in a table, a transaction committed), not the
-//! bytes of a page; a row record of a heap table also names the pages it changed and the
-//! operation it made on each, which is what the redo compares with their `page_lsn`. What the
-//! payload of a row record holds is [`super::wal_payload`], and
-//! [`super::version::HeapTable`] is what appends a record before it changes a page; here the
-//! file, the record format, the log sequence numbers and `sync_all` are what is written.
+//! A record names what changed (a row inserted in a table, a transaction committed); a row
+//! record of a heap table also names the pages it changed and the operation it made on each,
+//! which is what the redo compares with their `page_lsn`. What the payload of a row record holds
+//! is [`super::wal_payload`], and [`super::version::HeapTable`] is what appends a record before
+//! it changes a page. The changes of structure — the pages of a tree, the formatting and the
+//! link of a heap page, an overflow chain, a freed page, the catalogue — are carried as bytes
+//! instead, by a [`WalRecordKind::PageWrite`] (section "Page writes" below). Here the file, the
+//! record format, the log sequence numbers and `sync_all` are what is written.
 //!
 //! # Record format, little-endian
 //!
@@ -136,6 +138,7 @@
 //! record is not covered yet has not returned
 //! (`storage_impl::tests::no_commit_returns_before_its_record_is_synced`).
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -143,11 +146,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use vauban_errors::InternalError;
 
-use crate::TxnId;
+use crate::{TableId, TxnId};
 
+use super::DiskStorage;
 use super::buffer::DurableLsn;
 use super::crc::crc32;
-use super::page::{Lsn, PageId};
+use super::page::{Lsn, PAGE_SIZE, Page, PageId, PageKind};
 
 /// Value written in the `version` field of a record by this build.
 pub(crate) const RECORD_VERSION: u8 = 1;
@@ -217,6 +221,10 @@ pub(crate) enum WalRecordKind {
     /// A vacuum took a version out of a heap slot. The payload is a
     /// [`super::wal_payload::SlotRelease`].
     Purge = 17,
+    /// Bytes of one or more pages, as a write left them: the pages of a tree a write changed,
+    /// the formatting and the link of a page a heap grows by, the pages of an overflow chain,
+    /// a page the allocator frees, the pages of the catalogue. The payload is a [`PageWrite`].
+    PageWrite = 18,
 }
 
 impl WalRecordKind {
@@ -243,6 +251,7 @@ impl WalRecordKind {
             15 => Ok(Self::RollbackTo),
             16 => Ok(Self::Compensation),
             17 => Ok(Self::Purge),
+            18 => Ok(Self::PageWrite),
             other => Err(InternalError::Corruption(format!(
                 "unknown wal record kind {other}"
             ))),
@@ -373,6 +382,574 @@ impl CheckpointPayload {
         })
     }
 }
+
+// ---------------------------------------------------------------------------- Page writes
+//
+// A change of structure is logged as the bytes it leaves in its pages. The section below holds
+// the payload of such a record ([`PageWrite`]), the set of page copies a change is computed on
+// before anything reaches the pool ([`PageSet`]), and the redo of the record by the `page_lsn`
+// of each page it names ([`PageWrite::redo`]).
+
+/// Bytes of the common header a page write leaves out: the `page_lsn` (16..24), which the
+/// record that carries the write sets, and the checksum (24..28), which the pool computes when
+/// it seals the page ([`Page`] lays the header out).
+const UNLOGGED_HEADER: std::ops::Range<usize> = 16..28;
+
+/// Gap, in bytes, below which two changed ranges of one page are logged as one range: a range
+/// costs four bytes of offset and length, so a shorter gap costs less carried than cut.
+const MERGE_GAP: usize = 4;
+
+/// Largest number of pages one [`PageSet`] of an overflow chain logs in one record, so that
+/// the record stays under [`MAX_PAYLOAD_LEN`]: 64 whole pages of 8 180 bytes each.
+pub(crate) const PAGES_PER_RECORD: usize = 64;
+
+/// Which tree of a clustered table a [`RootMove`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeRole {
+    /// The tree of the versions.
+    Versions = 1,
+    /// The directory from a row to the key of its newest version.
+    Directory = 2,
+}
+
+/// The root of a tree of a clustered table moved: the split that reached the old root gave
+/// the tree a new one. The record of that split carries the move, and the recovery hands it to
+/// the catalogue ([`super::recover`]), so the tree is reached from the root its pages describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RootMove {
+    /// The table the tree belongs to.
+    pub(crate) table: TableId,
+    /// Which of its two trees.
+    pub(crate) role: TreeRole,
+    /// The new root.
+    pub(crate) root: PageId,
+}
+
+/// The bytes one page of a [`PageWrite`] changed, by range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PageDelta {
+    /// The page written.
+    pub(crate) page: PageId,
+    /// The kind byte the page carries once written, which [`super::meta::load`] reads to redo
+    /// the pages of the catalogue ahead of the others.
+    pub(crate) kind: u8,
+    /// Whether the ranges cover the page, its `page_lsn` and its checksum apart, the bytes they
+    /// leave out being zeros: the page was a free one, and its redo writes it without reading
+    /// what `data` holds there.
+    pub(crate) whole: bool,
+    /// The changed bytes: an offset in the page and the bytes found there after the write.
+    pub(crate) ranges: Vec<(u16, Vec<u8>)>,
+}
+
+/// The payload of a [`WalRecordKind::PageWrite`] record.
+///
+/// # Layout, little-endian
+///
+/// | Size | Field |
+/// |---|---|
+/// | 2 | number of pages, then for each page: |
+/// | 8 | the [`PageId`] |
+/// | 1 | the kind byte of the page once written |
+/// | 1 | 1 when the ranges cover the whole page, 0 otherwise |
+/// | 2 | number of ranges, then for each range a `u16` offset, a `u16` length and the bytes |
+/// | 1 | 1 when a [`RootMove`] follows, 0 otherwise |
+/// | 13 | the move: `u32` table, `u8` role, `u64` root |
+///
+/// The ranges of a page leave out its `page_lsn` and its checksum: the redo sets the first to
+/// the number of the record and the pool computes the second
+/// (`tests::a_page_write_reads_back_and_leaves_the_lsn_and_the_checksum_out`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct PageWrite {
+    /// The pages, in the order the write changed them first.
+    pub(crate) pages: Vec<PageDelta>,
+    /// The root a split moved, when it moved one.
+    pub(crate) root: Option<RootMove>,
+}
+
+impl PageWrite {
+    /// The bytes of the payload, in the layout above.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        // A write changes a handful of pages; `PageSet` bounds an overflow chain to
+        // `PAGES_PER_RECORD` of them per record.
+        out.extend_from_slice(&(self.pages.len() as u16).to_le_bytes());
+        for delta in &self.pages {
+            out.extend_from_slice(&delta.page.0.to_le_bytes());
+            out.push(delta.kind);
+            out.push(u8::from(delta.whole));
+            // A page holds 8 192 bytes, so a page has fewer ranges than a `u16` counts, and
+            // an offset and a length fit one.
+            out.extend_from_slice(&(delta.ranges.len() as u16).to_le_bytes());
+            for (at, bytes) in &delta.ranges {
+                out.extend_from_slice(&at.to_le_bytes());
+                out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
+        }
+        match self.root {
+            None => out.push(0),
+            Some(moved) => {
+                out.push(1);
+                out.extend_from_slice(&moved.table.0.to_le_bytes());
+                out.push(moved.role as u8);
+                out.extend_from_slice(&moved.root.0.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Reads a payload back.
+    ///
+    /// # Errors
+    ///
+    /// [`InternalError::Corruption`] for a payload cut short of what it announces, for a range
+    /// that leaves the page, for bytes left past the end, and for a role byte other than 1
+    /// and 2 (`tests::a_page_write_cut_short_is_corruption`).
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, InternalError> {
+        let mut at = 0usize;
+        let pages = usize::from(take_u16(bytes, &mut at)?);
+        let mut out = Self::default();
+        for _ in 0..pages {
+            let page = PageId(take_u64(bytes, &mut at)?);
+            let kind = take(bytes, &mut at, 1)?[0];
+            let whole = take(bytes, &mut at, 1)?[0] == 1;
+            let count = usize::from(take_u16(bytes, &mut at)?);
+            let mut ranges = Vec::with_capacity(count);
+            for _ in 0..count {
+                let offset = take_u16(bytes, &mut at)?;
+                let len = usize::from(take_u16(bytes, &mut at)?);
+                if usize::from(offset) + len > PAGE_SIZE {
+                    return Err(InternalError::Corruption(format!(
+                        "a page write names bytes {offset}..{} of page {page}, past the \
+                         {PAGE_SIZE} of a page",
+                        usize::from(offset) + len
+                    )));
+                }
+                ranges.push((offset, take(bytes, &mut at, len)?.to_vec()));
+            }
+            out.pages.push(PageDelta {
+                page,
+                kind,
+                whole,
+                ranges,
+            });
+        }
+        if take(bytes, &mut at, 1)?[0] == 1 {
+            let table = TableId(take_u32(bytes, &mut at)?);
+            let role = match take(bytes, &mut at, 1)?[0] {
+                1 => TreeRole::Versions,
+                2 => TreeRole::Directory,
+                other => {
+                    return Err(InternalError::Corruption(format!(
+                        "a page write names the root of tree role {other}, this build reads 1 \
+                         and 2"
+                    )));
+                }
+            };
+            let root = PageId(take_u64(bytes, &mut at)?);
+            out.root = Some(RootMove { table, role, root });
+        }
+        if at != bytes.len() {
+            return Err(InternalError::Corruption(format!(
+                "a page write carries {} payload bytes past the {at} it reads",
+                bytes.len() - at
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Replays the record of number `lsn` on the pages it names whose `page_lsn` is below
+    /// it, and answers how many pages it wrote and how many it left as they stood.
+    ///
+    /// A page behind the record takes its ranges and the number `lsn`; a page at or past it
+    /// already holds what the record wrote, and what came after. `only` restricts the redo to
+    /// the pages of that kind once written, which is how the catalogue is brought up to date
+    /// before it is read ([`super::meta::load`]); the others are left to the redo of
+    /// [`super::recover`], which passes `None`.
+    ///
+    /// A page that does not read back — the zeros of a file grown by the allocator, a page
+    /// whose checksum does not hold — is written whole from the record when the record covers
+    /// it whole ([`PageDelta::whole`]) and is an error otherwise.
+    ///
+    /// `on_data` holds the `page_lsn` each page carries in `data`, read once per page and
+    /// kept by the caller across the records of one pass: a page whose number there covers the
+    /// record is left alone without being read into the pool, so a redo over pages a
+    /// checkpoint wrote leaves the pool as cold as it found it
+    /// (`super::index::tests::shared_tree_uniqueness_reads_a_bounded_number_of_pages`). The
+    /// pool holds a page at that number or past it, the redo only moving it forward.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the buffer pool and of the data file.
+    pub(crate) fn redo(
+        &self,
+        storage: &DiskStorage,
+        lsn: Lsn,
+        only: Option<PageKind>,
+        on_data: &mut BTreeMap<PageId, Lsn>,
+    ) -> Result<(usize, usize), InternalError> {
+        let (mut applied, mut skipped) = (0, 0);
+        for delta in &self.pages {
+            if only.is_some_and(|kind| kind.as_byte() != delta.kind) {
+                continue;
+            }
+            let stored = *on_data.entry(delta.page).or_insert_with(|| {
+                storage
+                    .data
+                    .read_page(delta.page)
+                    .map_or(Lsn(0), |page| page.lsn())
+            });
+            if stored >= lsn {
+                skipped += 1;
+                continue;
+            }
+            let pin = match storage.pool.pin(delta.page) {
+                Ok(pin) => pin,
+                Err(_) if delta.whole => {
+                    write_whole(storage, delta, lsn)?;
+                    applied += 1;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if pin.with_page(Page::lsn)? >= lsn {
+                skipped += 1;
+                continue;
+            }
+            pin.with_page_mut(|page| {
+                apply_delta(page, delta);
+                page.set_lsn(lsn);
+            })?;
+            storage.pool.mark_dirty(delta.page, lsn)?;
+            applied += 1;
+        }
+        Ok((applied, skipped))
+    }
+}
+
+/// Writes the page of `delta` to `data` from the record alone, `page_lsn` `lsn`, growing the
+/// file when it does not reach the page.
+fn write_whole(storage: &DiskStorage, delta: &PageDelta, lsn: Lsn) -> Result<(), InternalError> {
+    let mut page = Page::empty(PageKind::Free, delta.page);
+    apply_delta(&mut page, delta);
+    page.set_lsn(lsn);
+    page.seal();
+    if storage.data.page_count()? <= delta.page.0 {
+        storage.data.extend_to(delta.page.0 + 1)?;
+    }
+    storage.data.write_page(delta.page, &page)
+}
+
+/// Copies the bytes of `ranges` into `page`.
+fn apply_ranges(page: &mut Page, ranges: &[(u16, Vec<u8>)]) {
+    for (at, bytes) in ranges {
+        let at = usize::from(*at);
+        page.0[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+}
+
+/// The ranges of `page` a whole write carries: the bytes of the page that are not zero, its
+/// unlogged header bytes apart. The redo zeroes the page before it copies them
+/// ([`apply_delta`]), so a fresh page of a few records costs a few records.
+fn whole_ranges(page: &Page) -> Vec<(u16, Vec<u8>)> {
+    changed_ranges(&Page([0u8; PAGE_SIZE]), page)
+}
+
+/// Writes `delta` into `page`: the page zeroed first, its unlogged header bytes apart, when
+/// the delta covers it whole, then the bytes of its ranges.
+fn apply_delta(page: &mut Page, delta: &PageDelta) {
+    if delta.whole {
+        page.0[..UNLOGGED_HEADER.start].fill(0);
+        page.0[UNLOGGED_HEADER.end..].fill(0);
+    }
+    apply_ranges(page, &delta.ranges);
+}
+
+/// The ranges where `after` differs from `before`, the unlogged header bytes apart, two ranges
+/// closer than [`MERGE_GAP`] carried as one.
+fn changed_ranges(before: &Page, after: &Page) -> Vec<(u16, Vec<u8>)> {
+    let differs = |at: usize| !UNLOGGED_HEADER.contains(&at) && before.0[at] != after.0[at];
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < PAGE_SIZE {
+        if !differs(at) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        let mut end = at + 1;
+        let mut probe = end;
+        while probe < PAGE_SIZE && probe - end < MERGE_GAP && !UNLOGGED_HEADER.contains(&probe) {
+            if differs(probe) {
+                end = probe + 1;
+            }
+            probe += 1;
+        }
+        // `start` is below `PAGE_SIZE`, which fits a `u16`.
+        out.push((start as u16, after.0[start..end].to_vec()));
+        at = end;
+    }
+    out
+}
+
+/// The `len` bytes of `bytes` at `*at`, the cursor moved past them.
+fn take<'a>(bytes: &'a [u8], at: &mut usize, len: usize) -> Result<&'a [u8], InternalError> {
+    let slice = bytes.get(*at..at.saturating_add(len)).ok_or_else(|| {
+        InternalError::Corruption(format!(
+            "a page write carries {} payload bytes, too few for the {len} it announces at {}",
+            bytes.len(),
+            *at
+        ))
+    })?;
+    *at += len;
+    Ok(slice)
+}
+
+/// A little-endian `u16` read by [`take`].
+fn take_u16(bytes: &[u8], at: &mut usize) -> Result<u16, InternalError> {
+    let raw = take(bytes, at, 2)?;
+    Ok(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
+/// A little-endian `u32` read by [`take`].
+fn take_u32(bytes: &[u8], at: &mut usize) -> Result<u32, InternalError> {
+    Ok(read_u32(take(bytes, at, 4)?, 0))
+}
+
+/// A little-endian `u64` read by [`take`].
+fn take_u64(bytes: &[u8], at: &mut usize) -> Result<u64, InternalError> {
+    Ok(read_u64(take(bytes, at, 8)?, 0))
+}
+
+/// One page a [`PageSet`] holds: what the pool held when the set first wrote it, and what the
+/// set made of it since.
+#[derive(Debug)]
+struct Staged {
+    /// The page.
+    id: PageId,
+    /// Its bytes when the set first wrote it.
+    before: Box<Page>,
+    /// Its bytes as the set left them.
+    after: Box<Page>,
+}
+
+/// The pages one change of structure writes, held as copies until the change is complete.
+///
+/// A split rewrites several pages, and a tree whose pages reached `data` from the middle of a
+/// split is not a tree. The set therefore takes a copy of each page the first time it writes it
+/// ([`PageSet::write`]), answers the reads of the change from those copies
+/// ([`PageSet::read`]), and only then, at [`PageSet::commit`], logs what changed in one
+/// [`WalRecordKind::PageWrite`] record and puts the bytes in the pool, each page taking the
+/// number of that record in the same change as its bytes. Until that call the pool holds the
+/// pages as they were before the change, so a flush in between writes nothing of it
+/// (`tests::a_page_set_leaves_the_pool_alone_until_its_commit`); after it the record precedes
+/// each page, which the pool does not write before the record is durable.
+///
+/// A crash keeps such a record in the journal or leaves it out, a torn tail being truncated
+/// by [`Wal::open`]; the redo replays its pages by their `page_lsn` ([`PageWrite::redo`]).
+///
+/// A set built with `logged` false writes no record and leaves the `page_lsn` of its pages
+/// where it stands: the trees of a non-clustered index, which the instance builds again from the
+/// rows at each `open` (`DiskStorage::rebuild_indexes`).
+///
+/// The pages are written under the lock of the table they belong to, or of the catalogue for
+/// its pages, which keeps another writer off them between the copy and the commit; a reader
+/// of the pool reads the pages as they were until the commit.
+#[derive(Debug)]
+pub(crate) struct PageSet<'storage> {
+    /// The instance the pages belong to.
+    storage: &'storage DiskStorage,
+    /// Whether the commit writes a record.
+    logged: bool,
+    /// The pages, in the order the set first wrote them.
+    staged: Vec<Staged>,
+    /// The root a split moved, carried by the record.
+    root: Option<RootMove>,
+}
+
+impl<'storage> PageSet<'storage> {
+    /// An empty set over the pages of `storage`, logged or not.
+    pub(crate) fn new(storage: &'storage DiskStorage, logged: bool) -> Self {
+        Self {
+            storage,
+            logged,
+            staged: Vec::new(),
+            root: None,
+        }
+    }
+
+    /// The instance the pages belong to.
+    pub(crate) fn storage(&self) -> &'storage DiskStorage {
+        self.storage
+    }
+
+    /// Applies `read` to the page `id` as the set left it: its copy when the set wrote it, the
+    /// page of the pool otherwise.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the buffer pool.
+    pub(crate) fn read<R>(
+        &self,
+        id: PageId,
+        read: impl FnOnce(&Page) -> R,
+    ) -> Result<R, InternalError> {
+        if let Some(staged) = self.staged.iter().find(|staged| staged.id == id) {
+            return Ok(read(&staged.after));
+        }
+        let pin = self.storage.pool.pin(id)?;
+        pin.with_page(read)
+    }
+
+    /// Applies `change` to the copy of the page `id`, taking the copy from the pool the first
+    /// time the set writes the page.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the buffer pool.
+    pub(crate) fn write<R>(
+        &mut self,
+        id: PageId,
+        change: impl FnOnce(&mut Page) -> R,
+    ) -> Result<R, InternalError> {
+        let at = match self.staged.iter().position(|staged| staged.id == id) {
+            Some(at) => at,
+            None => {
+                let pin = self.storage.pool.pin(id)?;
+                let before = Box::new(pin.with_page(Page::clone)?);
+                drop(pin);
+                self.staged.push(Staged {
+                    id,
+                    after: before.clone(),
+                    before,
+                });
+                self.staged.len() - 1
+            }
+        };
+        Ok(change(&mut self.staged[at].after))
+    }
+
+    /// Carries `moved` in the record of the commit.
+    pub(crate) fn note_root(&mut self, moved: RootMove) {
+        self.root = Some(moved);
+    }
+
+    /// Logs what the set changed and puts it in the pool, then hands each page it changed to
+    /// `on_page`, the page still pinned; answers the number of the record, `None` when the set
+    /// changed nothing or is not logged.
+    ///
+    /// A page the set copied from a free page is logged whole, so that its redo does not depend
+    /// on what `data` holds there; any other page by the ranges it changed. Each page takes the
+    /// bytes of those ranges and the number of the record under one change of the pool, and is
+    /// marked dirty at that number (at `Lsn(0)` in a set that is not logged). The pages logged
+    /// whole are put in the pool first, then the others in the order the set first wrote them.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the journal — a record past [`MAX_PAYLOAD_LEN`] among them — of the
+    /// buffer pool and of `on_page`.
+    pub(crate) fn commit(
+        self,
+        on_page: impl FnMut(PageId) -> Result<(), InternalError>,
+    ) -> Result<Option<Lsn>, InternalError> {
+        self.install(None, on_page)
+    }
+
+    /// Logs what the set changed as [`PageSet::commit`] does, but leaves each page it changed
+    /// at the number `behind`, a record the journal holds durably, rather than at the number
+    /// of its own record.
+    ///
+    /// The pool may then write the pages before their record is durable, so this is for a
+    /// change a crash may leave on `data` without its record: the counters and the roots a
+    /// commit rewrites in place in the pages of the catalogue, eight bytes each, which the
+    /// recovery takes from the journal (`super::meta::store`). The record keeps the pages
+    /// described for the changes that follow them: a later record is computed from the pages
+    /// this one left, and the redo replays the two in order
+    /// (`super::meta::tests::a_catalogue_of_the_same_length_is_rewritten_in_place_without_a_sync`).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`PageSet::commit`].
+    pub(crate) fn commit_behind(
+        self,
+        behind: Lsn,
+        on_page: impl FnMut(PageId) -> Result<(), InternalError>,
+    ) -> Result<Option<Lsn>, InternalError> {
+        self.install(Some(behind), on_page)
+    }
+
+    /// The body of [`PageSet::commit`] and [`PageSet::commit_behind`]: the pages take
+    /// `behind` when it is given, the number of the record otherwise.
+    fn install(
+        self,
+        behind: Option<Lsn>,
+        mut on_page: impl FnMut(PageId) -> Result<(), InternalError>,
+    ) -> Result<Option<Lsn>, InternalError> {
+        let mut deltas = Vec::new();
+        for staged in &self.staged {
+            let whole = matches!(staged.before.kind(), Ok(PageKind::Free))
+                && !matches!(staged.after.kind(), Ok(PageKind::Free));
+            let ranges = if whole {
+                whole_ranges(&staged.after)
+            } else {
+                changed_ranges(&staged.before, &staged.after)
+            };
+            if ranges.is_empty() {
+                continue;
+            }
+            deltas.push(PageDelta {
+                page: staged.id,
+                kind: staged.after.0[OFF_KIND],
+                whole,
+                ranges,
+            });
+        }
+        if deltas.is_empty() {
+            return Ok(None);
+        }
+        // A page the change cannot take — one the calling thread holds a second pin on — is
+        // refused before the record exists, so the journal holds no change the pool did not
+        // take ([`super::buffer::PinGuard::with_page_mut`]).
+        for delta in &deltas {
+            let pin = self.storage.pool.pin(delta.page)?;
+            pin.with_page_mut(|_| ())?;
+        }
+        // The pages written from a free one go first: a page that names one of them reaches
+        // the pool after it.
+        deltas.sort_by_key(|delta| !delta.whole);
+        let lsn = if self.logged {
+            let payload = PageWrite {
+                pages: deltas.clone(),
+                root: self.root,
+            }
+            .encode();
+            Some(
+                self.storage
+                    .wal
+                    .append(WalRecordKind::PageWrite, TxnId(0), &payload)?,
+            )
+        } else {
+            None
+        };
+        let page_lsn = behind.or(lsn).unwrap_or(Lsn(0));
+        for delta in &deltas {
+            let pin = self.storage.pool.pin(delta.page)?;
+            pin.with_page_mut(|page| {
+                apply_delta(page, delta);
+                if page_lsn > page.lsn() {
+                    page.set_lsn(page_lsn);
+                }
+            })?;
+            self.storage.pool.mark_dirty(delta.page, page_lsn)?;
+            on_page(delta.page)?;
+            drop(pin);
+        }
+        Ok(lsn)
+    }
+}
+
+/// Offset of the kind byte in the common header of a page ([`Page`]).
+const OFF_KIND: usize = 5;
 
 /// What the bytes at a given offset amount to, as [`frame`] read them.
 ///

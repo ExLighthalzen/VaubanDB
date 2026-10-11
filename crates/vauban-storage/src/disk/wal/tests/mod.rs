@@ -707,8 +707,9 @@ fn record_kind_bytes_are_part_of_the_format() {
         (WalRecordKind::RollbackTo, 15),
         (WalRecordKind::Compensation, 16),
         (WalRecordKind::Purge, 17),
+        (WalRecordKind::PageWrite, 18),
     ];
-    assert_eq!(kinds.len(), 17);
+    assert_eq!(kinds.len(), 18);
     for (kind, byte) in kinds {
         assert_eq!(kind.as_byte(), byte);
         assert_eq!(
@@ -718,7 +719,7 @@ fn record_kind_bytes_are_part_of_the_format() {
     }
     // 0 is not a kind, so a run of zero bytes does not read as one.
     assert!(WalRecordKind::from_byte(0).is_err());
-    assert!(WalRecordKind::from_byte(18).is_err());
+    assert!(WalRecordKind::from_byte(19).is_err());
     let err = WalRecordKind::from_byte(u8::MAX).expect_err("255 is outside the enum");
     assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
     assert!(err.to_string().contains("255"), "{err}");
@@ -745,6 +746,7 @@ fn records_of_every_kind_make_the_round_trip() {
         WalRecordKind::RollbackTo,
         WalRecordKind::Compensation,
         WalRecordKind::Purge,
+        WalRecordKind::PageWrite,
     ];
     for (index, kind) in kinds.iter().enumerate() {
         let payload = vec![index as u8; index];
@@ -1163,4 +1165,254 @@ fn a_poisoned_journal_lock_answers_a_durable_lsn_of_zero() {
 fn wal_handle_is_send_sync() {
     fn assert<T: Send + Sync>() {}
     assert::<WalHandle>();
+}
+
+// --- Page writes -------------------------------------------------------------------------
+
+/// An instance in a temporary directory, with the guard that removes it.
+fn instance(label: &str) -> (TempDir, DiskStorage) {
+    let dir = TempDir::created(label);
+    let storage = DiskStorage::open(dir.path(), super::super::DiskOptions::default())
+        .expect("create an instance");
+    (dir, storage)
+}
+
+#[test]
+fn a_page_write_reads_back_and_leaves_the_lsn_and_the_checksum_out() {
+    let mut before = Page::empty(PageKind::Heap, PageId(4));
+    before.set_lsn(Lsn(3));
+    let mut after = before.clone();
+    after.0[100..104].copy_from_slice(&[1, 2, 3, 4]);
+    // Two bytes apart: carried in the range of the first change.
+    after.0[106] = 9;
+    after.0[5000] = 7;
+    after.set_lsn(Lsn(99));
+    after.seal();
+    let ranges = changed_ranges(&before, &after);
+    assert_eq!(
+        ranges,
+        vec![(100, vec![1, 2, 3, 4, 0, 0, 9]), (5000, vec![7])],
+        "the number and the checksum are not ranges"
+    );
+    let write = PageWrite {
+        pages: vec![
+            PageDelta {
+                page: PageId(4),
+                kind: PageKind::Heap.as_byte(),
+                whole: false,
+                ranges,
+            },
+            PageDelta {
+                page: PageId(5),
+                kind: PageKind::BTreeLeaf.as_byte(),
+                whole: true,
+                ranges: whole_ranges(&after),
+            },
+        ],
+        root: Some(RootMove {
+            table: TableId(2),
+            role: TreeRole::Directory,
+            root: PageId(5),
+        }),
+    };
+    assert_eq!(PageWrite::decode(&write.encode()).expect("decode"), write);
+    // A whole write carries the bytes that are not zero, and its redo zeroes the rest.
+    let whole = PageDelta {
+        page: PageId(4),
+        kind: PageKind::Heap.as_byte(),
+        whole: true,
+        ranges: whole_ranges(&after),
+    };
+    assert!(
+        whole
+            .ranges
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>()
+            < 64,
+        "{:?}",
+        whole.ranges
+    );
+    let mut garbage = Page([0xAB; PAGE_SIZE]);
+    apply_delta(&mut garbage, &whole);
+    garbage.0[UNLOGGED_HEADER].copy_from_slice(&after.0[UNLOGGED_HEADER]);
+    assert_eq!(
+        garbage, after,
+        "the redo rebuilds the page from the ranges alone"
+    );
+}
+
+#[test]
+fn a_page_write_cut_short_is_corruption() {
+    let write = PageWrite {
+        pages: vec![PageDelta {
+            page: PageId(1),
+            kind: PageKind::Heap.as_byte(),
+            whole: false,
+            ranges: vec![(40, vec![1, 2, 3])],
+        }],
+        root: None,
+    };
+    let bytes = write.encode();
+    for cut in 0..bytes.len() {
+        let err = PageWrite::decode(&bytes[..cut]).expect_err("a payload cut short");
+        assert!(
+            matches!(err, InternalError::Corruption(_)),
+            "{cut}: {err:?}"
+        );
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert!(PageWrite::decode(&longer).is_err(), "a byte past the end");
+    let past = PageWrite {
+        pages: vec![PageDelta {
+            page: PageId(1),
+            kind: 1,
+            whole: false,
+            ranges: vec![(PAGE_SIZE as u16 - 2, vec![1, 2, 3])],
+        }],
+        root: None,
+    }
+    .encode();
+    assert!(
+        PageWrite::decode(&past).is_err(),
+        "a range that leaves the page"
+    );
+    let mut role = PageWrite {
+        pages: Vec::new(),
+        root: Some(RootMove {
+            table: TableId(1),
+            role: TreeRole::Versions,
+            root: PageId(2),
+        }),
+    }
+    .encode();
+    // The role byte follows the count of pages, the flag and the table.
+    role[2 + 1 + 4] = 3;
+    assert!(
+        PageWrite::decode(&role).is_err(),
+        "a role this build does not read"
+    );
+}
+
+#[test]
+fn a_page_set_leaves_the_pool_alone_until_its_commit() {
+    let (_dir, storage) = instance("wal-page-set");
+    let id = super::super::alloc::allocate(&storage).expect("allocate");
+    let before = storage.wal.last_lsn().expect("the last record");
+    let mut set = PageSet::new(&storage, true);
+    set.write(id, |page| {
+        page.set_kind(PageKind::Heap);
+        page.0[200] = 42;
+    })
+    .expect("write in the set");
+    assert_eq!(set.read(id, |page| page.0[200]).expect("read the copy"), 42);
+    // The pool still holds the free page, and a flush writes nothing of the change.
+    let pooled = storage
+        .pool
+        .pin(id)
+        .expect("pin")
+        .with_page(Page::clone)
+        .expect("read");
+    assert_eq!(pooled.kind().expect("kind"), PageKind::Free);
+    storage.pool.flush_all().expect("flush");
+    assert_eq!(
+        storage
+            .data
+            .read_page(id)
+            .expect("data")
+            .kind()
+            .expect("kind"),
+        PageKind::Free
+    );
+    assert_eq!(storage.wal.last_lsn().expect("the last record"), before);
+
+    let mut marked = Vec::new();
+    let lsn = set
+        .commit(|page| {
+            marked.push(page);
+            Ok(())
+        })
+        .expect("commit")
+        .expect("a record");
+    assert_eq!(marked, vec![id]);
+    assert_eq!(lsn, Lsn(before.0 + 1));
+    let pooled = storage
+        .pool
+        .pin(id)
+        .expect("pin")
+        .with_page(Page::clone)
+        .expect("read");
+    assert_eq!(
+        (pooled.kind().expect("kind"), pooled.0[200]),
+        (PageKind::Heap, 42)
+    );
+    assert_eq!(
+        pooled.lsn(),
+        lsn,
+        "the page carries the number of its record"
+    );
+    let record = storage
+        .wal
+        .records()
+        .expect("records")
+        .pop()
+        .expect("the record");
+    let write = PageWrite::decode(&record.payload).expect("decode");
+    assert_eq!(write.pages.len(), 1);
+    assert!(write.pages[0].whole, "a free page is logged whole");
+    // Not durable yet: the pool refuses to write the page ahead of its record.
+    assert!(storage.pool.flush(id).is_err());
+    storage.wal.flush().expect("sync");
+    storage.pool.flush(id).expect("flush once durable");
+    // A set that changes nothing writes nothing.
+    let mut idle = PageSet::new(&storage, true);
+    idle.write(id, |_| ()).expect("write nothing");
+    assert_eq!(idle.commit(|_| Ok(())).expect("commit"), None);
+}
+
+#[test]
+fn the_redo_of_a_page_write_skips_a_page_data_holds_past_it() {
+    let (_dir, storage) = instance("wal-page-redo");
+    let id = super::super::alloc::allocate(&storage).expect("allocate");
+    let mut set = PageSet::new(&storage, true);
+    set.write(id, |page| {
+        page.set_kind(PageKind::Heap);
+        page.0[300] = 1;
+    })
+    .expect("write");
+    let first = set.commit(|_| Ok(())).expect("commit").expect("a record");
+    let mut set = PageSet::new(&storage, true);
+    set.write(id, |page| page.0[300] = 2).expect("write");
+    let second = set.commit(|_| Ok(())).expect("commit").expect("a record");
+    storage.wal.flush().expect("sync");
+    storage.pool.flush(id).expect("flush");
+    let writes: Vec<(Lsn, PageWrite)> = storage
+        .wal
+        .records()
+        .expect("records")
+        .into_iter()
+        .filter(|record| record.kind == WalRecordKind::PageWrite)
+        .map(|record| {
+            (
+                record.lsn,
+                PageWrite::decode(&record.payload).expect("decode"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        writes.iter().map(|(lsn, _)| *lsn).collect::<Vec<_>>(),
+        vec![first, second]
+    );
+    let mut on_data = BTreeMap::new();
+    for (lsn, write) in &writes {
+        assert_eq!(
+            write
+                .redo(&storage, *lsn, None, &mut on_data)
+                .expect("redo"),
+            (0, 1),
+            "data holds the page at {second}"
+        );
+    }
+    assert_eq!(on_data.get(&id), Some(&second));
 }

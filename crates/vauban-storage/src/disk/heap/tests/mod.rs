@@ -1,6 +1,7 @@
 use super::super::buffer::DurableLsn;
 use super::super::control::Control;
 use super::super::temp::TempDir;
+use super::super::wal::{PageWrite, WalRecordKind};
 use super::super::{DATA_FILE_NAME, DiskOptions};
 use super::*;
 
@@ -645,7 +646,6 @@ fn overwrite_of_an_overflow_record_changes_the_first_page_of_its_chain() {
     let mut expected = row.clone();
     expected[16..24].fill(1);
     assert_eq!(heap.get(rid).expect("get"), Some(expected));
-    assert_eq!(lsn_of(&storage, rid.page), Lsn(3));
     // Past the first page of the chain is refused.
     let err = heap
         .overwrite(rid, OVERFLOW_CAPACITY, &[1], Lsn(3))
@@ -657,27 +657,109 @@ fn overwrite_of_an_overflow_record_changes_the_first_page_of_its_chain() {
     assert!(!heap.overwrite(short, 0, &[1], Lsn(4)).expect("overwrite"));
 }
 
-#[test]
-fn the_redo_formats_a_free_page_of_the_chain_and_ends_the_chain_there() {
-    let (_dir, storage) = instance("heap-redo-chain");
-    let heap = heap_of(&storage);
-    for seed in 0..3 {
-        heap.insert(&payload(5000, seed)).expect("insert");
-    }
-    let pages = pages_of(&heap);
-    assert_eq!(pages.len(), 3);
-    // The second page reads back as a free page, as the allocator left it on `data`.
-    let pin = storage.pool.pin(pages[1]).expect("pin");
-    pin.with_page_mut(|page| *page = Page::empty(PageKind::Free, pages[1]))
-        .expect("free the page");
-    storage.pool.mark_dirty(pages[1], Lsn(0)).expect("dirty");
-    drop(pin);
+/// The page records of the journal of `storage`, decoded, with their numbers.
+fn page_writes(storage: &DiskStorage) -> Vec<(Lsn, PageWrite)> {
+    storage
+        .wal
+        .records()
+        .expect("read the journal")
+        .into_iter()
+        .filter(|record| record.kind == WalRecordKind::PageWrite)
+        .map(|record| {
+            let write = PageWrite::decode(&record.payload).expect("a page record reads back");
+            (record.lsn, write)
+        })
+        .collect()
+}
 
-    assert_eq!(heap.redo_chain().expect("chain"), pages[..2].to_vec());
-    assert_eq!(heap.page_lsn(pages[1]).expect("lsn"), Some(Lsn(0)));
-    assert_eq!(pages_of(&heap), pages[..2].to_vec());
-    // The third page is chained back after the second, holding its record.
-    heap.redo_adopt(pages[1], pages[2]).expect("adopt");
-    assert_eq!(pages_of(&heap), pages);
-    assert_eq!(heap.scan().expect("scan").len(), 2);
+#[test]
+fn a_page_the_heap_grows_by_is_formatted_and_linked_by_one_record() {
+    let (_dir, storage) = instance("heap-grow-record");
+    let heap = heap_of(&storage);
+    let head = heap.first_page();
+    while pages_of(&heap).len() < 2 {
+        heap.insert(&payload(1000, 1)).expect("insert");
+    }
+    let fresh = pages_of(&heap)[1];
+    let (lsn, write) = page_writes(&storage)
+        .into_iter()
+        .find(|(_, write)| write.pages.iter().any(|delta| delta.page == fresh))
+        .expect("a record names the fresh page");
+    let pages: Vec<PageId> = write.pages.iter().map(|delta| delta.page).collect();
+    assert_eq!(
+        pages,
+        vec![fresh, head],
+        "the fresh page first, then its link"
+    );
+    assert!(write.pages[0].whole, "the fresh page is logged whole");
+    assert_eq!(write.pages[0].kind, PageKind::Heap.as_byte());
+    // The link of the head page, bytes 34..42, is what the record changes there.
+    let link: Vec<(u16, usize)> = write.pages[1]
+        .ranges
+        .iter()
+        .map(|(at, bytes)| (*at, bytes.len()))
+        .collect();
+    assert_eq!(link, vec![(OFF_HEAP_NEXT as u16, 8)]);
+    assert!(storage.wal.durable_lsn() >= lsn, "the growth is durable");
+    assert!(lsn_of(&storage, fresh) >= lsn);
+    assert!(lsn_of(&storage, head) >= lsn);
+}
+
+#[test]
+fn a_long_record_is_journalled_as_its_chain_and_its_stub() {
+    let (_dir, storage) = instance("heap-long-record");
+    let heap = heap_of(&storage);
+    let before = page_writes(&storage).len();
+    let rid = heap.reserve(3 * OVERFLOW_CAPACITY).expect("reserve");
+    let row = payload(3 * OVERFLOW_CAPACITY, 6);
+    assert!(heap.put(rid, &row, Lsn(0)).expect("put a long record"));
+    let written: Vec<(Lsn, PageWrite)> = page_writes(&storage).split_off(before);
+    assert_eq!(written.len(), 2, "the chain, then the stub");
+    let chain = &written[0].1;
+    assert_eq!(chain.pages.len(), 3);
+    assert!(
+        chain
+            .pages
+            .iter()
+            .all(|delta| delta.whole && delta.kind == PageKind::Overflow.as_byte())
+    );
+    let stub = &written[1].1;
+    assert_eq!(stub.pages.len(), 1);
+    assert_eq!(stub.pages[0].page, rid.page);
+    assert!(!stub.pages[0].whole);
+    assert!(
+        storage.wal.durable_lsn() >= written[1].0,
+        "synced before the answer"
+    );
+    assert_eq!(lsn_of(&storage, rid.page), written[1].0);
+    assert_eq!(heap.get(rid).expect("get"), Some(row));
+}
+
+#[test]
+fn an_overwrite_of_a_long_record_is_journalled_on_its_first_overflow_page() {
+    let (_dir, storage) = instance("heap-overwrite-long-record");
+    let heap = heap_of(&storage);
+    let rid = heap
+        .insert(&payload(MAX_INLINE_LEN + 100, 4))
+        .expect("insert a long row");
+    let stub_lsn = lsn_of(&storage, rid.page);
+    let before = page_writes(&storage).len();
+    assert!(heap.overwrite(rid, 16, &[1; 8], Lsn(3)).expect("overwrite"));
+    let written: Vec<(Lsn, PageWrite)> = page_writes(&storage).split_off(before);
+    assert_eq!(written.len(), 1);
+    let (lsn, write) = &written[0];
+    assert_eq!(write.pages.len(), 1);
+    let head = write.pages[0].page;
+    assert_ne!(head, rid.page, "the first page of the chain, not the stub");
+    assert_eq!(
+        write.pages[0].ranges,
+        vec![(OVERFLOW_PAYLOAD_START + 16, vec![1; 8])]
+    );
+    assert_eq!(lsn_of(&storage, head), *lsn);
+    assert_eq!(
+        lsn_of(&storage, rid.page),
+        stub_lsn,
+        "the stub page is left alone"
+    );
+    assert!(storage.wal.durable_lsn() >= *lsn);
 }

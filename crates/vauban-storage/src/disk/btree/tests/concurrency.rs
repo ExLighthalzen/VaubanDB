@@ -44,7 +44,7 @@ fn ascending_ints(arity: usize) -> KeyOrder {
 /// separator before its subtree and below the one after it; every leaf is at the same depth;
 /// and the `prev`/`next` links of the leaves follow the order of the descent, with no
 /// neighbour past the two ends.
-fn assert_tree_valid(storage: &DiskStorage, root: PageId, order: &KeyOrder) -> usize {
+pub(crate) fn assert_tree_valid(storage: &DiskStorage, root: PageId, order: &KeyOrder) -> usize {
     let mut leaves = Vec::new();
     let mut depth = None;
     let entries = check_subtree(

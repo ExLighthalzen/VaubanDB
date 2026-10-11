@@ -1,5 +1,6 @@
 use vauban_types::SqlType;
 
+use super::super::buffer::DurableLsn;
 use super::super::temp::TempDir;
 use super::super::{DiskOptions, DiskStorage};
 use super::*;
@@ -408,4 +409,144 @@ fn record(kind: WalRecordKind, payload: Vec<u8>) -> WalRecord {
         txn: TxnId(0),
         payload,
     }
+}
+
+/// A catalogue of one database and `tables` heap tables of ten columns, numbered from 1.
+fn wide_catalogue(tables: u32) -> Catalogue {
+    let mut catalogue = Catalogue::default();
+    catalogue.add_database(DbId(1), "wide");
+    for table in 1..=tables {
+        catalogue.add_table(TableEntry {
+            table: TableId(table),
+            db: DbId(1),
+            shape: shape(10, None),
+            first_page: PageId(u64::from(table)),
+            tree_root: None,
+            directory_root: None,
+            next_row_id: 1,
+        });
+    }
+    catalogue
+}
+
+/// The page records of the journal of `storage`.
+fn page_records(storage: &DiskStorage) -> usize {
+    storage
+        .wal
+        .records()
+        .expect("read the journal")
+        .iter()
+        .filter(|record| record.kind == WalRecordKind::PageWrite)
+        .count()
+}
+
+#[test]
+fn a_chain_whose_pages_missed_data_reads_back_from_the_journal() {
+    let dir = TempDir::created("meta-torn-chain");
+    let (root, pages, larger) = {
+        let storage =
+            DiskStorage::open(dir.path(), DiskOptions::default()).expect("create an instance");
+        let root = ensure_root(&storage).expect("allocate the root");
+        store(&storage, root, &wide_catalogue(150), Lsn(0)).expect("store");
+        storage.checkpoint().expect("the chain reaches data");
+        // A larger catalogue: the chain grows by a page, and its first page alone reaches
+        // `data`; the others stay in the pool the drop throws away.
+        let larger = wide_catalogue(230);
+        store(&storage, root, &larger, Lsn(0)).expect("store the larger one");
+        let pages = chain(&storage, root).expect("walk the chain").pages;
+        assert!(pages.len() >= 3, "{} pages", pages.len());
+        storage.pool.flush(pages[0]).expect("flush the first page");
+        (root, pages, larger)
+    };
+    let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+    // `data` holds the first page of the larger chain beside the others of the smaller one.
+    let on_data = storage
+        .data
+        .read_page(pages[0])
+        .expect("read the first page");
+    let behind = storage
+        .data
+        .read_page(pages[1])
+        .expect("read the second page");
+    assert!(
+        behind.lsn() < on_data.lsn(),
+        "the second page is the older one"
+    );
+    assert_eq!(load(&storage, Some(root)).expect("load"), larger);
+    assert_eq!(
+        storage
+            .lock_catalogue()
+            .expect("the catalogue")
+            .tables_of(DbId(1))
+            .len(),
+        230
+    );
+}
+
+#[test]
+fn a_chain_cut_by_a_free_page_is_an_error() {
+    let (_dir, storage) = instance("meta-cut-chain");
+    let root = ensure_root(&storage).expect("allocate the root");
+    store(&storage, root, &wide_catalogue(230), Lsn(0)).expect("store");
+    let pages = chain(&storage, root).expect("walk the chain").pages;
+    // The second page reads back as a free page past the record that wrote it, which the
+    // redo of the catalogue pages therefore leaves as it stands.
+    let pin = storage.pool.pin(pages[1]).expect("pin");
+    pin.with_page_mut(|page| {
+        page.set_kind(PageKind::Free);
+        page.set_lsn(Lsn(u64::MAX - 1));
+    })
+    .expect("free the page");
+    drop(pin);
+    let err = load(&storage, Some(root)).expect_err("a chain cut by a free page");
+    assert!(matches!(err, InternalError::Corruption(_)), "{err:?}");
+    assert!(err.to_string().contains("a free page"), "{err}");
+}
+
+#[test]
+fn a_catalogue_of_the_same_length_is_rewritten_in_place_without_a_sync() {
+    let (_dir, storage) = instance("meta-same-length");
+    let root = ensure_root(&storage).expect("allocate the root");
+    let first = wide_catalogue(230);
+    store(&storage, root, &first, Lsn(0)).expect("store");
+    let records = page_records(&storage);
+    let durable = storage.wal.durable_lsn();
+    assert!(
+        durable >= storage.wal.last_lsn().expect("last"),
+        "another length is synced"
+    );
+    // The counter of a table moves: eight bytes in place, one record, no sync, the pages left
+    // at the number the caller gives.
+    let mut moved = first.clone();
+    let entry = moved.table(TableId(17)).cloned().expect("table 17");
+    moved.add_table(TableEntry {
+        next_row_id: 9_000,
+        ..entry
+    });
+    assert_eq!(moved.encode().len(), first.encode().len());
+    store(&storage, root, &moved, durable).expect("store the counter");
+    assert_eq!(page_records(&storage), records + 1, "one record");
+    assert_eq!(storage.wal.durable_lsn(), durable, "and no sync");
+    let pages = chain(&storage, root).expect("walk the chain").pages;
+    for id in &pages {
+        let lsn = storage
+            .pool
+            .pin(*id)
+            .expect("pin")
+            .with_page(Page::lsn)
+            .expect("read");
+        assert!(
+            lsn <= durable,
+            "page {id} carries {lsn}, past the durable {durable}"
+        );
+    }
+    storage
+        .pool
+        .flush_all()
+        .expect("the pages may leave the pool");
+    assert_eq!(load(&storage, Some(root)).expect("load"), moved);
+    // A table more: another length, one more record, synced.
+    store(&storage, root, &wide_catalogue(231), Lsn(0)).expect("store a table more");
+    assert_eq!(page_records(&storage), records + 2);
+    assert!(storage.wal.durable_lsn() >= storage.wal.last_lsn().expect("last"));
 }
