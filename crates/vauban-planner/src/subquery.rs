@@ -1,4 +1,5 @@
-//! Subqueries: the decorrelated semi-join of an `IN` or an `EXISTS`, and
+//! Subqueries: the decorrelated semi-join of an `IN` or an `EXISTS` (anti-semi-join of a
+//! `NOT IN` or a `NOT EXISTS`), and
 //! [`SubqueryEval`](PhysicalPlan::SubqueryEval) for the ones that stay correlated.
 //!
 //! # Correlation
@@ -148,15 +149,21 @@ pub(crate) fn plan_statement_subplans(
     collect_subplans(expr, ctx)
 }
 
-/// Tries to turn an uncorrelated `EXISTS`, `NOT EXISTS` or `IN (SELECT …)` predicate, or
-/// one such conjunct of an `AND`, into a [`NestedLoopJoin`](PhysicalPlan::NestedLoopJoin).
+/// Tries to turn the uncorrelated `EXISTS`, `NOT EXISTS`, `IN (SELECT …)` and
+/// `NOT IN (SELECT …)` conjuncts of a predicate into semi- and anti-semi-joins, one
+/// [`NestedLoopJoin`](PhysicalPlan::NestedLoopJoin) over the other in the order of the
+/// conjuncts. A semi-join keeps the schema of its outer input, so each join of the chain
+/// reads the outer columns where the predicate reads them. The executor reads the inner
+/// input of such a join once and hashes it on the equality of an `IN`
+/// (`HashSemiJoin` in `vauban-executor`).
 ///
 /// When the predicate is `EXISTS (…) AND c = 1`, the semi-join replaces the `EXISTS`
 /// conjunct and a [`Filter`](PhysicalPlan::Filter) keeps the residual `c = 1`
 /// (`tests/subquery.rs`, `exists_and_a_residual_predicate_keeps_the_filter`). A residual
 /// that holds a subquery reads it from a [`SubqueryEval`](PhysicalPlan::SubqueryEval) laid
-/// over the semi-join (`tests/subquery.rs`,
-/// `a_residual_not_in_is_evaluated_over_the_semi_join`).
+/// over the joins (`tests/subquery.rs`,
+/// `a_residual_correlated_in_is_evaluated_over_the_semi_join`). Two decorrelated conjuncts
+/// give two joins (`tests/subquery.rs`, `exists_and_not_in_chain_a_semi_and_an_anti_semi_join`).
 fn try_decorrelate_predicate(
     predicate: &BoundExpr,
     outer: &PhysicalPlan,
@@ -164,30 +171,18 @@ fn try_decorrelate_predicate(
 ) -> SqlResult<Option<PhysicalPlan>> {
     let mut conjuncts = Vec::new();
     split_conjunction(predicate, &mut conjuncts);
-    if conjuncts.len() == 1 {
-        return try_decorrelate_conjunct(conjuncts[0], outer, ctx);
-    }
-    let mut decorrelated = None;
-    for (index, conjunct) in conjuncts.iter().enumerate() {
-        if is_decorrelatable_conjunct(conjunct) {
-            if decorrelated.is_some() {
-                return Ok(None);
-            }
-            decorrelated = Some(index);
+    let mut joined: Option<PhysicalPlan> = None;
+    let mut residual = Vec::new();
+    for conjunct in conjuncts {
+        let input = joined.as_ref().unwrap_or(outer);
+        match try_decorrelate_conjunct(conjunct, input, ctx)? {
+            Some(join) => joined = Some(join),
+            None => residual.push(conjunct.clone()),
         }
     }
-    let Some(index) = decorrelated else {
+    let Some(join) = joined else {
         return Ok(None);
     };
-    let Some(join) = try_decorrelate_conjunct(conjuncts[index], outer, ctx)? else {
-        return Ok(None);
-    };
-    let residual: Vec<BoundExpr> = conjuncts
-        .iter()
-        .enumerate()
-        .filter(|(position, _)| *position != index)
-        .map(|(_, conjunct)| (*conjunct).clone())
-        .collect();
     let Some(predicate) = residual
         .into_iter()
         .reduce(|left, right| and(left, right, predicate))
@@ -201,18 +196,15 @@ fn try_decorrelate_predicate(
     }))
 }
 
-/// True when `conjunct` is a whole `EXISTS`, `NOT EXISTS` or non-negated `IN (SELECT …)`.
-fn is_decorrelatable_conjunct(conjunct: &BoundExpr) -> bool {
-    matches!(
-        conjunct.kind,
-        BoundExprKind::Exists(_) | BoundExprKind::InSubquery { negated: false, .. }
-    ) || matches!(
-        &conjunct.kind,
-        BoundExprKind::Not(inner) if matches!(inner.kind, BoundExprKind::Exists(_))
-    )
-}
-
-/// Tries to turn one decorrelatable conjunct into a semi- or anti-semi-join.
+/// Tries to turn one conjunct into a semi- or anti-semi-join: `EXISTS` and `IN` give a
+/// semi-join, `NOT EXISTS` and `NOT IN` an anti-semi-join. The `on` of a `NOT IN` is the
+/// same equality as that of an `IN`; the anti-semi-join keeps an outer row when that
+/// equality is false for each row of the subquery, which is the three-valued logic of
+/// `NOT IN`. A `NOT IN` whose tested value holds a subquery stays a
+/// [`SubqueryEval`](PhysicalPlan::SubqueryEval), as a correlated one does
+/// (`tests/subquery.rs`, `uncorrelated_not_in_becomes_an_anti_semi_join`,
+/// `correlated_not_in_stays_a_subquery_eval`,
+/// `not_in_over_a_scalar_subquery_stays_a_subquery_eval`).
 fn try_decorrelate_conjunct(
     conjunct: &BoundExpr,
     outer: &PhysicalPlan,
@@ -226,21 +218,26 @@ fn try_decorrelate_conjunct(
             let inner = plan_node(&inner.plan, ctx)?;
             Ok(Some(semi_join(outer, inner, PhysicalJoinKind::Semi, None)))
         }
-        BoundExprKind::Not(inner) => {
-            let BoundExprKind::Exists(plan) = &inner.kind else {
-                return Ok(None);
-            };
-            if is_correlated(&plan.plan) {
-                return Ok(None);
+        BoundExprKind::Not(inner) => match &inner.kind {
+            BoundExprKind::Exists(plan) => {
+                if is_correlated(&plan.plan) {
+                    return Ok(None);
+                }
+                let inner = plan_node(&plan.plan, ctx)?;
+                Ok(Some(semi_join(
+                    outer,
+                    inner,
+                    PhysicalJoinKind::AntiSemi,
+                    None,
+                )))
             }
-            let inner = plan_node(&plan.plan, ctx)?;
-            Ok(Some(semi_join(
-                outer,
-                inner,
-                PhysicalJoinKind::AntiSemi,
-                None,
-            )))
-        }
+            BoundExprKind::InSubquery {
+                expr,
+                plan,
+                negated: false,
+            } => try_decorrelate_not_in(expr, plan, outer, ctx),
+            _ => Ok(None),
+        },
         BoundExprKind::InSubquery {
             expr,
             plan,
@@ -258,9 +255,34 @@ fn try_decorrelate_conjunct(
                 Some(on),
             )))
         }
-        BoundExprKind::InSubquery { negated: true, .. } => Ok(None),
+        BoundExprKind::InSubquery {
+            expr,
+            plan,
+            negated: true,
+        } => try_decorrelate_not_in(expr, plan, outer, ctx),
         _ => Ok(None),
     }
+}
+
+/// The anti-semi-join of `tested NOT IN (plan)`, or `None` when `plan` is correlated or
+/// `tested` holds a subquery.
+fn try_decorrelate_not_in(
+    tested: &BoundExpr,
+    plan: &BoundSubquery,
+    outer: &PhysicalPlan,
+    ctx: &PlanContext<'_>,
+) -> SqlResult<Option<PhysicalPlan>> {
+    if is_correlated(&plan.plan) || holds_subquery(tested) {
+        return Ok(None);
+    }
+    let inner = plan_node(&plan.plan, ctx)?;
+    let on = in_subquery_equality(tested, &plan.plan, outer)?;
+    Ok(Some(semi_join(
+        outer,
+        inner,
+        PhysicalJoinKind::AntiSemi,
+        Some(on),
+    )))
 }
 
 /// Appends to `out` the top-level conjunctions of `expr`: `a AND (b AND c)` gives `a`,

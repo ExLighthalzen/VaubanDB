@@ -1,4 +1,6 @@
 //! `NestedLoopJoin`: runs `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS` and correlated seek.
+//! A semi-join and an anti-semi-join are handed to
+//! [`HashSemiJoin`](crate::ops::hash_join::HashSemiJoin), which reads their inner input once.
 //!
 //! For each row of the outer input, the inner input is **reopened** and walked
 //! (`CROSS`, `INNER`, `LEFT`), or the inner is **materialised** once at `open`
@@ -24,8 +26,7 @@
 //! The row identifiers each side carries after its visible values go to the end of the
 //! joined row, the outer ones first, so that the `on` and the operators above read the
 //! visible values at the positions the plan gave them (`tests/row_id.rs`,
-//! `the_row_id_of_a_joined_table_crosses_the_joins_the_filter_and_the_sort`). A semi-join
-//! and an anti-semi-join hand over the outer row as it came, tail included.
+//! `the_row_id_of_a_joined_table_crosses_the_joins_the_filter_and_the_sort`).
 
 use vauban_binder::{BoundExpr, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
@@ -134,12 +135,20 @@ pub struct NestedLoopJoin<'a> {
     pub rows_since_cancel: u64,
 }
 
-/// Builds the operator of a [`PhysicalPlan::NestedLoopJoin`].
+/// Builds the operator of a [`PhysicalPlan::NestedLoopJoin`]; a semi-join or an
+/// anti-semi-join gets a [`HashSemiJoin`](crate::ops::hash_join::HashSemiJoin).
 ///
 /// # Errors
 ///
 /// What building the outer raises.
 pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> + 'a>> {
+    if let PhysicalPlan::NestedLoopJoin {
+        kind: PhysicalJoinKind::Semi | PhysicalJoinKind::AntiSemi,
+        ..
+    } = plan
+    {
+        return crate::ops::hash_join::build_semi(plan);
+    }
     let PhysicalPlan::NestedLoopJoin {
         outer,
         inner,
@@ -325,19 +334,6 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                             };
                             if holds {
                                 *had_match = true;
-                                if self.kind == PhysicalJoinKind::Semi {
-                                    inner.close();
-                                    let _ = ctx.pop_outer();
-                                    let row = outer_row.clone();
-                                    self.phase = Phase::NeedOuter;
-                                    return Ok(Some(row));
-                                }
-                                if self.kind == PhysicalJoinKind::AntiSemi {
-                                    inner.close();
-                                    let _ = ctx.pop_outer();
-                                    self.phase = Phase::NeedOuter;
-                                    continue;
-                                }
                                 if let Some(combined) =
                                     Self::pair(&self.on, widths, outer_row, &inner_row, ctx)?
                                 {
@@ -357,11 +353,6 @@ impl<'a> Operator<'a> for NestedLoopJoin<'a> {
                                 matched,
                                 &mut self.unmatched_outer,
                             );
-                            if self.kind == PhysicalJoinKind::AntiSemi && !matched {
-                                let row = outer_row.clone();
-                                self.phase = Phase::NeedOuter;
-                                return Ok(Some(row));
-                            }
                             // LEFT: emit padded row if no match.
                             if self.kind == PhysicalJoinKind::Left && !matched {
                                 let padded = widths.join(Some(outer_row), None);

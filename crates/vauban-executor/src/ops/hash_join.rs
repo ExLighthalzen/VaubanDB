@@ -11,14 +11,18 @@
 //! identifiers each side carries follow them, those of the probe side first, as in a
 //! nested-loop join (`tests/row_id.rs`,
 //! `the_row_id_of_a_joined_table_crosses_the_joins_the_filter_and_the_sort`).
+//!
+//! [`HashSemiJoin`] runs the semi-join and the anti-semi-join of a decorrelated `IN`,
+//! `NOT IN`, `EXISTS` or `NOT EXISTS` through the same table: the subquery is read once and
+//! each outer row looks its candidates up.
 
 use vauban_binder::{BoundExpr, BoundExprKind, CompareOp, LogicalOp, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::{PhysicalJoinKind, PhysicalPlan};
 use vauban_types::Value;
 
-use crate::context::ExecContext;
-use crate::expr::eval_expr;
+use crate::context::{CANCEL_CHECK_ROWS, ExecContext};
+use crate::expr::{as_condition, eval_expr};
 use crate::operator::hash_table::{HashTable, KeyEncoder};
 use crate::operator::{Operator, build_operator};
 use crate::ops::not_implemented;
@@ -583,4 +587,277 @@ pub(crate) fn build<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> +
         probe_matched: false,
         exhausted: false,
     }))
+}
+
+/// The semi-join and the anti-semi-join a [`PhysicalPlan::NestedLoopJoin`] of kind
+/// [`PhysicalJoinKind::Semi`] or [`PhysicalJoinKind::AntiSemi`] runs: the inner input is
+/// read once, into a hash table keyed on the equalities of the `on` that pair an inner
+/// expression with an outer one, and each outer row looks its candidates up there.
+///
+/// The planner builds these two kinds over an inner input that reads nothing of the outer
+/// row, so one reading of it serves the outer rows of one `open`. The output row is the
+/// outer row as it came, row identifiers included.
+///
+/// The full `on` is evaluated on each candidate pair, the hash table narrowing the
+/// candidates down: a key holds the sort keys of the members, under the collation the
+/// comparison applies (that of its left member, else of its right member).
+///
+/// - `Semi` keeps the outer row when the `on` is true for one inner row. An outer row with a
+///   `NULL` key has no candidate (`tests/hash_join.rs`,
+///   `semi_join_keeps_the_rows_found_and_drops_a_null_key`).
+/// - `AntiSemi` keeps the outer row when the `on` is false for each inner row: one inner
+///   row that makes it true or unknown drops the outer row. This is the three-valued
+///   logic of `v NOT IN (SELECT w …)`: a `NULL` among the `w` drops each outer row, and a
+///   `NULL` `v` is dropped unless the inner input is empty (`tests/hash_join.rs`,
+///   `anti_semi_join_follows_not_in_with_a_null_on_either_side`). Without an `on`, the
+///   outer row is kept when the inner input is empty, as a `NOT EXISTS` is.
+pub(crate) struct HashSemiJoin<'a> {
+    outer: Box<dyn Operator<'a> + 'a>,
+    inner: Box<dyn Operator<'a> + 'a>,
+    kind: PhysicalJoinKind,
+    /// The `on` over the concatenated row, evaluated on each candidate pair.
+    on: Option<BoundExpr>,
+    /// `(inner, outer)` members of the equalities used as keys, each over its own row.
+    keys: Vec<(BoundExpr, BoundExpr)>,
+    schema: OutputSchema,
+    outer_width: usize,
+    inner_width: usize,
+    outer_tail: usize,
+    inner_tail: usize,
+    encoder: KeyEncoder,
+    /// Whether the inner input has been read into the table.
+    built: bool,
+    table: HashTable<Vec<usize>>,
+    /// The inner rows whose keys hold no `NULL`, indexed by the table.
+    rows: Vec<Row>,
+    /// The inner rows with a `NULL` key: candidates of each outer row of an `AntiSemi`.
+    null_key_rows: Vec<Row>,
+    rows_since_cancel: u64,
+    exhausted: bool,
+}
+
+/// Builds the operator of a semi- or anti-semi [`PhysicalPlan::NestedLoopJoin`].
+///
+/// # Errors
+///
+/// What building either input raises.
+pub(crate) fn build_semi<'a>(plan: &PhysicalPlan) -> SqlResult<Box<dyn Operator<'a> + 'a>> {
+    let PhysicalPlan::NestedLoopJoin {
+        outer,
+        inner,
+        kind,
+        on,
+        schema,
+    } = plan
+    else {
+        return Err(not_implemented("semi join"));
+    };
+    let outer_width = outer.schema().columns.len();
+    let mut keys = Vec::new();
+    let mut key_types = Vec::new();
+    if let Some(on) = on {
+        let mut conjuncts = Vec::new();
+        split_and(on, &mut conjuncts);
+        for conjunct in conjuncts {
+            let BoundExprKind::Compare {
+                op: CompareOp::Eq,
+                left,
+                right,
+            } = &conjunct.kind
+            else {
+                continue;
+            };
+            let Some(pair) = orient_hash_keys(left, right, outer_width) else {
+                continue;
+            };
+            let mut ty = pair.0.ty.clone();
+            ty.collation = left.ty.collation.or(right.ty.collation);
+            key_types.push(ty);
+            keys.push(pair);
+        }
+    }
+    Ok(Box::new(HashSemiJoin {
+        outer: build_operator(outer)?,
+        inner: build_operator(inner)?,
+        kind: *kind,
+        on: on.clone(),
+        keys,
+        schema: schema.clone(),
+        outer_width,
+        inner_width: inner.schema().columns.len(),
+        outer_tail: outer.row_id_count(),
+        inner_tail: inner.row_id_count(),
+        encoder: KeyEncoder::new(key_types.iter()),
+        built: false,
+        table: HashTable::new(),
+        rows: Vec::new(),
+        null_key_rows: Vec::new(),
+        rows_since_cancel: 0,
+        exhausted: false,
+    }))
+}
+
+/// Appends the top-level conjunctions of `expr` to `out`.
+fn split_and<'e>(expr: &'e BoundExpr, out: &mut Vec<&'e BoundExpr>) {
+    match &expr.kind {
+        BoundExprKind::Logical {
+            op: LogicalOp::And,
+            left,
+            right,
+        } => {
+            split_and(left, out);
+            split_and(right, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+impl<'a> HashSemiJoin<'a> {
+    /// Reads the inner input into the table when the first outer row after an `open`
+    /// arrives: an outer input without rows leaves the inner one unread.
+    /// Without keys nor `on`, the first inner row settles each outer row, and the reading
+    /// stops there.
+    fn build_table(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<()> {
+        self.built = true;
+        let existence_only = self.keys.is_empty() && self.on.is_none();
+        let inner = &mut self.inner;
+        inner.open(ctx)?;
+        let mut read: u64 = 0;
+        while let Some(row) = inner.next(ctx)? {
+            read += 1;
+            if read.is_multiple_of(CANCEL_CHECK_ROWS) && ctx.cancelled() {
+                inner.close();
+                self.exhausted = true;
+                return Ok(());
+            }
+            let values = eval_side_keys(self.keys.iter().map(|(key, _)| key), &row, ctx)?;
+            let Some(values) = values else {
+                self.null_key_rows.push(row);
+                continue;
+            };
+            let key = self.encoder.encode(&values)?;
+            let (positions, _) = self.table.entry(key, || Ok(Vec::new()))?;
+            positions.push(self.rows.len());
+            self.rows.push(row);
+            if existence_only {
+                break;
+            }
+        }
+        inner.close();
+        Ok(())
+    }
+
+    /// The truth of the `on` for `outer` paired with `inner`; true without an `on`.
+    fn holds(
+        &self,
+        outer: &Row,
+        inner: &Row,
+        ctx: &mut ExecContext<'a>,
+    ) -> SqlResult<Option<bool>> {
+        let Some(on) = &self.on else {
+            return Ok(Some(true));
+        };
+        let joined = join_rows(
+            &JoinSide {
+                row: Some(outer),
+                width: self.outer_width,
+                tail: self.outer_tail,
+            },
+            &JoinSide {
+                row: Some(inner),
+                width: self.inner_width,
+                tail: self.inner_tail,
+            },
+        );
+        as_condition(&eval_expr(on, Some(&joined), ctx)?)
+    }
+
+    /// Whether `outer` passes the join.
+    fn keeps(&mut self, outer: &Row, ctx: &mut ExecContext<'a>) -> SqlResult<bool> {
+        let values = eval_side_keys(self.keys.iter().map(|(_, key)| key), outer, ctx)?;
+        let bucket: Vec<usize> = match &values {
+            Some(values) => {
+                let key = self.encoder.encode(values)?;
+                self.table
+                    .find(key)
+                    .and_then(|entry| self.table.get(entry))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        if self.kind == PhysicalJoinKind::Semi {
+            // A NULL key makes the equality unknown, so the `on` is not true.
+            for position in bucket {
+                if self.holds(outer, &self.rows[position], ctx)? == Some(true) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        // AntiSemi: the candidates are the rows the key finds and those with a NULL key,
+        // or each inner row when the outer key is NULL; any other row has a key that
+        // differs, which makes the `on` false.
+        let candidates: Vec<&Row> = if values.is_some() {
+            bucket
+                .iter()
+                .map(|&position| &self.rows[position])
+                .chain(self.null_key_rows.iter())
+                .collect()
+        } else {
+            self.rows.iter().chain(self.null_key_rows.iter()).collect()
+        };
+        for inner in candidates {
+            if self.holds(outer, inner, ctx)? != Some(false) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl<'a> Operator<'a> for HashSemiJoin<'a> {
+    fn open(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<()> {
+        self.outer.open(ctx)?;
+        self.rows_since_cancel = 0;
+        self.exhausted = false;
+        self.built = false;
+        self.table = HashTable::new();
+        self.rows.clear();
+        self.null_key_rows.clear();
+        Ok(())
+    }
+
+    fn next(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<Option<Row>> {
+        while !self.exhausted {
+            let Some(row) = self.outer.next(ctx)? else {
+                self.exhausted = true;
+                break;
+            };
+            self.rows_since_cancel += 1;
+            if self.rows_since_cancel.is_multiple_of(CANCEL_CHECK_ROWS) && ctx.cancelled() {
+                self.exhausted = true;
+                break;
+            }
+            if !self.built {
+                self.build_table(ctx)?;
+                if self.exhausted {
+                    break;
+                }
+            }
+            if self.keeps(&row, ctx)? {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+
+    fn close(&mut self) {
+        self.outer.close();
+        self.inner.close();
+    }
+
+    fn schema(&self) -> &OutputSchema {
+        &self.schema
+    }
 }

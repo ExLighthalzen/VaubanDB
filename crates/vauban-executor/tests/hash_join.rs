@@ -810,3 +810,194 @@ fn numeric_keys_match_whatever_their_scale_or_sign_of_zero() {
         vec![(10, 1)]
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Semi-join and anti-semi-join
+// ---------------------------------------------------------------------------------------
+
+/// A `(k, v)` key column `k` of type `ty`, read at `index` of the joined row.
+fn typed_key(ty: &TypeInfo, index: usize) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            ty: ty.clone(),
+            ..binding(index)
+        }),
+        ty: ty.clone(),
+        line: 1,
+    }
+}
+
+/// The payloads `v` of the outer rows a semi- or anti-semi-join of `outer` and `inner`
+/// keeps, in the order they come out; `on` reads the outer row then the inner one.
+fn semi_payloads(
+    kind: PhysicalJoinKind,
+    outer: PhysicalPlan,
+    inner: PhysicalPlan,
+    on: Option<BoundExpr>,
+) -> Vec<i32> {
+    let plan = PhysicalPlan::NestedLoopJoin {
+        schema: outer.schema().clone(),
+        outer: Box::new(outer),
+        inner: Box::new(inner),
+        kind,
+        on,
+    };
+    let eval = StaticContext::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default());
+    let mut sink = CollectSink::new();
+    execute(&PhysicalStatement::Query(plan), &mut ctx, &mut sink).expect("the plan runs");
+    sink.rows
+        .iter()
+        .map(|row| match &row[1] {
+            Value::I32(v) => *v,
+            other => panic!("an int payload, got {other:?}"),
+        })
+        .collect()
+}
+
+/// `k = k'` between the outer key, column 0, and the inner key, column 2.
+fn key_equality(outer_ty: &TypeInfo, inner_ty: &TypeInfo) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(typed_key(outer_ty, 0)),
+            right: Box::new(typed_key(inner_ty, 2)),
+        },
+        ty: TypeInfo::new(SqlType::Bit, true),
+        line: 1,
+    }
+}
+
+fn ints(rows: &[(Option<i32>, i32)]) -> PhysicalPlan {
+    let rows: Vec<(Value, i32)> = rows
+        .iter()
+        .map(|(k, v)| (k.map_or(Value::Null, Value::I32), *v))
+        .collect();
+    keyed_values(&int(), &rows)
+}
+
+/// `k IN (SELECT k' …)`: each outer row whose key is found comes out once, in the order of
+/// the outer input; a `NULL` key on either side finds nothing.
+#[test]
+fn semi_join_keeps_the_rows_found_and_drops_a_null_key() {
+    let inner = ints(&[(Some(2), 1), (Some(1), 2), (Some(2), 3), (None, 4)]);
+    let outer = ints(&[(Some(2), 20), (Some(3), 30), (None, 40), (Some(1), 10)]);
+    assert_eq!(
+        semi_payloads(
+            PhysicalJoinKind::Semi,
+            outer,
+            inner,
+            Some(key_equality(&int(), &int()))
+        ),
+        vec![20, 10]
+    );
+}
+
+/// `k NOT IN (SELECT k' …)`: a found key drops the row; a `NULL` among the `k'` drops each
+/// row; a `NULL` `k` is dropped unless the subquery is empty, where each row is kept.
+#[test]
+fn anti_semi_join_follows_not_in_with_a_null_on_either_side() {
+    let outer = || ints(&[(Some(1), 10), (Some(3), 30), (None, 40)]);
+    let on = || Some(key_equality(&int(), &int()));
+    for (inner, expected) in [
+        (ints(&[(Some(1), 1), (Some(2), 2)]), vec![30]),
+        (ints(&[(Some(1), 1), (None, 2)]), vec![]),
+        (ints(&[(Some(2), 1), (None, 2)]), vec![]),
+        (ints(&[]), vec![10, 30, 40]),
+    ] {
+        assert_eq!(
+            semi_payloads(PhysicalJoinKind::AntiSemi, outer(), inner, on()),
+            expected
+        );
+    }
+}
+
+/// Without an `on`, as for `EXISTS` and `NOT EXISTS`: a subquery with a row keeps each
+/// outer row of a semi-join and none of an anti-semi-join; an empty one, the reverse.
+#[test]
+fn semi_kinds_without_an_on_test_the_existence_of_a_row() {
+    let outer = || ints(&[(Some(1), 10), (None, 20)]);
+    for (kind, inner, expected) in [
+        (PhysicalJoinKind::Semi, ints(&[(None, 1)]), vec![10, 20]),
+        (PhysicalJoinKind::Semi, ints(&[]), vec![]),
+        (PhysicalJoinKind::AntiSemi, ints(&[(None, 1)]), vec![]),
+        (PhysicalJoinKind::AntiSemi, ints(&[]), vec![10, 20]),
+    ] {
+        assert_eq!(
+            semi_payloads(kind, outer(), inner, None),
+            expected,
+            "{kind:?}"
+        );
+    }
+}
+
+/// The key is hashed under the collation the comparison applies, that of its left member:
+/// `'X'` under a case-insensitive collation finds `'x'` of a case-sensitive column, and
+/// `'X'` under a case-sensitive one does not find `'x'` of a case-insensitive column.
+#[test]
+fn semi_join_hashes_under_the_collation_of_the_comparison() {
+    let text = |t: &str| Value::String(vauban_types::SqlString { text: t.to_owned() });
+    let typed = |name: &str| {
+        let mut ty = varchar();
+        ty.collation = Some(vauban_types::Collation::parse(name).expect("known"));
+        ty
+    };
+    let ci = typed("SQL_Latin1_General_CP1_CI_AS");
+    let cs = typed("Latin1_General_CS_AS");
+    for (outer_ty, inner_ty, expected) in [(&ci, &cs, vec![10]), (&cs, &ci, vec![])] {
+        let outer = keyed_values(outer_ty, &[(text("X"), 10)]);
+        let inner = keyed_values(inner_ty, &[(text("x"), 1)]);
+        assert_eq!(
+            semi_payloads(
+                PhysicalJoinKind::Semi,
+                outer,
+                inner,
+                Some(key_equality(outer_ty, inner_ty))
+            ),
+            expected
+        );
+    }
+}
+
+/// The subquery is read when the first outer row arrives: an outer input without rows
+/// leaves it unread, and the conversion error its row would raise does not occur.
+#[test]
+fn an_outer_input_without_rows_leaves_the_inner_unread() {
+    let failing = BoundExpr {
+        kind: BoundExprKind::Convert {
+            expr: Box::new(BoundExpr {
+                kind: BoundExprKind::Literal(Value::String(vauban_types::SqlString {
+                    text: "abc".to_owned(),
+                })),
+                ty: varchar(),
+                line: 1,
+            }),
+            style: None,
+            try_: false,
+        },
+        ty: int(),
+        line: 1,
+    };
+    let inner = || PhysicalPlan::Values {
+        rows: vec![vec![failing.clone(), lit(1)]],
+        schema: schema_of(&["k", "v"]),
+    };
+    let on = || Some(key_equality(&int(), &int()));
+    assert_eq!(
+        semi_payloads(PhysicalJoinKind::Semi, ints(&[]), inner(), on()),
+        Vec::<i32>::new()
+    );
+    let plan = PhysicalPlan::NestedLoopJoin {
+        schema: schema_of(&["k", "v"]),
+        outer: Box::new(ints(&[(Some(1), 10)])),
+        inner: Box::new(inner()),
+        kind: PhysicalJoinKind::Semi,
+        on: on(),
+    };
+    let eval = StaticContext::default();
+    let mut ctx = ExecContext::scalar(&eval, SessionOptions::default());
+    let mut sink = CollectSink::new();
+    let err = execute(&PhysicalStatement::Query(plan), &mut ctx, &mut sink)
+        .expect_err("the subquery is read for the outer row");
+    assert_eq!(err.number, 245);
+}

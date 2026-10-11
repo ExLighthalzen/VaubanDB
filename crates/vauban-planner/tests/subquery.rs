@@ -521,11 +521,19 @@ fn in_subquery_over_a_union_compares_its_output_column() {
     assert_eq!(inner.schema().columns.len(), 1);
 }
 
-/// `a.k IN (SELECT b.k FROM b) AND a.c NOT IN (SELECT b.c FROM b)`: the `IN` becomes the
-/// semi-join, and the residual `NOT IN` is filtered over a `SubqueryEval` that carries its
-/// plan, laid over the semi-join.
+/// `a.k IN (SELECT b.k FROM b) AND a.c IN (SELECT b.c FROM b WHERE b.k = a.k)`: the
+/// uncorrelated `IN` becomes the semi-join, and the residual correlated `IN` is filtered
+/// over a `SubqueryEval` that carries its plan, laid over the semi-join.
 #[test]
-fn a_residual_not_in_is_evaluated_over_the_semi_join() {
+fn a_residual_correlated_in_is_evaluated_over_the_semi_join() {
+    let correlated = LogicalPlan::Filter {
+        input: Box::new(scan_b()),
+        predicate: compare(
+            CompareOp::Eq,
+            column(binding_b("k", 11, 0)),
+            column(outer_a("k", 1, 0)),
+        ),
+    };
     let predicate = and(
         in_subquery(
             column(binding_a("k", 1, 0)),
@@ -534,8 +542,8 @@ fn a_residual_not_in_is_evaluated_over_the_semi_join() {
         ),
         in_subquery(
             column(binding_a("c", 2, 1)),
-            project_one(scan_b(), binding_b("c", 12, 1), "c"),
-            true,
+            project_one(correlated, binding_b("c", 12, 1), "c"),
+            false,
         ),
     );
     let filtered = LogicalPlan::Filter {
@@ -555,16 +563,116 @@ fn a_residual_not_in_is_evaluated_over_the_semi_join() {
         panic!("expected a SubqueryEval under the Filter, got {input:?}");
     };
     assert_eq!(subplans.len(), 1);
+    assert!(subplans[0].correlated);
     let (index, _) = produced_position(join);
     assert_eq!(index, 2);
 }
 
+/// The `on` of an anti-semi-join: the equality between the tested value and the column the
+/// inner plan produces, read right after the outer columns.
+fn anti_semi_on(planned: &PhysicalPlan) -> (&BoundExpr, usize) {
+    let PhysicalPlan::NestedLoopJoin {
+        kind: PhysicalJoinKind::AntiSemi,
+        on: Some(on),
+        schema,
+        ..
+    } = planned
+    else {
+        panic!("expected an anti-semi-join with an ON, got {planned:?}");
+    };
+    assert_eq!(schema.columns.len(), 2, "the join keeps the columns of a");
+    let BoundExprKind::Compare {
+        op: CompareOp::Eq,
+        left,
+        right,
+    } = &on.kind
+    else {
+        panic!("expected an equality ON, got {on:?}");
+    };
+    let BoundExprKind::ColumnRef(produced) = &right.kind else {
+        panic!("expected a column reference, got {right:?}");
+    };
+    (left.as_ref(), produced.index)
+}
+
+/// `a.k NOT IN (SELECT b.k FROM b)`, `NOT (a.k IN (SELECT b.k FROM b))` and
+/// `a.k <> ALL (SELECT b.k FROM b)`, the last bound as the first: an anti-semi-join whose
+/// `on` is the equality of the `IN`.
 #[test]
-fn not_in_stays_a_subquery_eval() {
-    let inner = project_one(scan_b(), binding_b("k", 11, 0), "k");
+fn uncorrelated_not_in_becomes_an_anti_semi_join() {
+    let inner = || project_one(scan_b(), binding_b("k", 11, 0), "k");
+    for predicate in [
+        in_subquery(column(binding_a("k", 1, 0)), inner(), true),
+        not(in_subquery(column(binding_a("k", 1, 0)), inner(), false)),
+    ] {
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(scan_a()),
+            predicate,
+        };
+        let planned = plan_with(&FakeCatalog::new(), filtered);
+        let (tested, index) = anti_semi_on(&planned);
+        assert_eq!(index, 2);
+        assert!(
+            matches!(&tested.kind, BoundExprKind::ColumnRef(binding) if binding.index == 0),
+            "expected a.k on the left, got {tested:?}"
+        );
+    }
+}
+
+/// `a.k NOT IN (SELECT b.k FROM b WHERE b.c = a.c)` reads `a` inside the subquery: it is
+/// evaluated per row, not turned into a join.
+#[test]
+fn correlated_not_in_stays_a_subquery_eval() {
+    let correlated = LogicalPlan::Filter {
+        input: Box::new(scan_b()),
+        predicate: compare(
+            CompareOp::Eq,
+            column(binding_b("c", 12, 1)),
+            column(outer_a("c", 2, 1)),
+        ),
+    };
     let filtered = LogicalPlan::Filter {
         input: Box::new(scan_a()),
-        predicate: in_subquery(column(binding_a("k", 1, 0)), inner, true),
+        predicate: in_subquery(
+            column(binding_a("k", 1, 0)),
+            project_one(correlated, binding_b("k", 11, 0), "k"),
+            true,
+        ),
+    };
+    let planned = plan_with(&FakeCatalog::new(), filtered);
+    let PhysicalPlan::Filter { input, .. } = &planned else {
+        panic!("expected Filter over SubqueryEval, got {planned:?}");
+    };
+    let PhysicalPlan::SubqueryEval {
+        input, subplans, ..
+    } = input.as_ref()
+    else {
+        panic!("expected SubqueryEval, got {input:?}");
+    };
+    assert!(subplans[0].correlated);
+    assert!(
+        matches!(input.as_ref(), PhysicalPlan::TableScan { .. }),
+        "expected the scan of a under the SubqueryEval, got {input:?}"
+    );
+}
+
+/// `(SELECT MAX(b.k) FROM b) NOT IN (SELECT b.k FROM b)`: the tested value holds a
+/// subquery, which an `on` cannot evaluate; the predicate stays a `SubqueryEval`.
+#[test]
+fn not_in_over_a_scalar_subquery_stays_a_subquery_eval() {
+    let max = LogicalPlan::Aggregate {
+        input: Box::new(scan_b()),
+        group_by: vec![],
+        aggregates: vec![max_on(binding_b("k", 11, 0))],
+        schema: schema(&["m"]),
+    };
+    let filtered = LogicalPlan::Filter {
+        input: Box::new(scan_a()),
+        predicate: in_subquery(
+            scalar(max),
+            project_one(scan_b(), binding_b("k", 11, 0), "k"),
+            true,
+        ),
     };
     let planned = plan_with(&FakeCatalog::new(), filtered);
     let PhysicalPlan::Filter { input, .. } = &planned else {
@@ -574,16 +682,44 @@ fn not_in_stays_a_subquery_eval() {
         matches!(input.as_ref(), PhysicalPlan::SubqueryEval { .. }),
         "expected SubqueryEval, got {input:?}"
     );
-    assert!(
-        !matches!(
-            planned,
-            PhysicalPlan::NestedLoopJoin {
-                kind: PhysicalJoinKind::AntiSemi,
-                ..
-            }
+}
+
+/// `EXISTS (SELECT … FROM b) AND a.c NOT IN (SELECT b.c FROM b)`: a semi-join, then an
+/// anti-semi-join over it; the anti-semi-join reads `a.c` where the scan of `a` puts it.
+#[test]
+fn exists_and_not_in_chain_a_semi_and_an_anti_semi_join() {
+    let predicate = and(
+        exists(inner_exists_scan()),
+        in_subquery(
+            column(binding_a("c", 2, 1)),
+            project_one(scan_b(), binding_b("c", 12, 1), "c"),
+            true,
         ),
-        "NOT IN must not become AntiSemi"
     );
+    let filtered = LogicalPlan::Filter {
+        input: Box::new(scan_a()),
+        predicate,
+    };
+    let planned = plan_with(&FakeCatalog::new(), filtered);
+    let (tested, index) = anti_semi_on(&planned);
+    assert_eq!(index, 2);
+    assert!(
+        matches!(&tested.kind, BoundExprKind::ColumnRef(binding) if binding.index == 1),
+        "expected a.c on the left, got {tested:?}"
+    );
+    let PhysicalPlan::NestedLoopJoin { outer, .. } = &planned else {
+        unreachable!("anti_semi_on matched a join");
+    };
+    let PhysicalPlan::NestedLoopJoin {
+        kind: PhysicalJoinKind::Semi,
+        on: None,
+        outer: scan,
+        ..
+    } = outer.as_ref()
+    else {
+        panic!("expected the semi-join of the EXISTS under the anti-semi-join, got {outer:?}");
+    };
+    assert!(matches!(scan.as_ref(), PhysicalPlan::TableScan { .. }));
 }
 
 /// `a.c > ALL (SELECT k FROM b)` as the binder rewrites it: `0 NOT IN` the outcomes
