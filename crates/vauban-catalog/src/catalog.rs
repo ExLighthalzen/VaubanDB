@@ -42,6 +42,9 @@ pub struct Catalog {
     /// `Catalog` is shared by the sessions behind an `Arc` while `create_table` and
     /// `drop_table` write to it.
     pub(crate) tables: std::sync::Mutex<crate::table::TableStore>,
+    /// The sessions connected to the engine, which a scan of the internal tables of the
+    /// `sys.dm_exec_*` views reads instead of `storage` (`views/dm_exec/live.rs`).
+    pub(crate) live: crate::views::dm_exec::live::LiveSessions,
 }
 
 thread_local! {

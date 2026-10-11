@@ -12,7 +12,9 @@
 //! # Where the rows come from
 //!
 //! Session facts come from [`SESSIONS_TABLE`] and connection facts from [`CONNECTIONS_TABLE`]
-//! of `bootstrap.rs`. Configuration options come from [`CONFIGURATIONS_TABLE`], host resource
+//! of `bootstrap.rs`. Those two tables declare the columns; their rows are the live sessions
+//! the catalogue holds in memory, which a scan reads instead of `storage` ([`live`]).
+//! Configuration options come from [`CONFIGURATIONS_TABLE`], host resource
 //! facts from [`OS_SYS_INFO_TABLE`] and host identity facts from [`HOST_INFO_TABLE`], three
 //! internal tables this file owns.
 //!
@@ -39,6 +41,8 @@ use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
 use crate::bootstrap::{CONNECTIONS_TABLE, SESSIONS_TABLE, SYSTEM_DATABASES};
 use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
 use crate::meta::QualifiedName;
+
+pub(crate) mod live;
 
 /// Internal table of the instance configuration options, read by `sys.configurations`.
 pub(crate) const CONFIGURATIONS_TABLE: &str = "vauban_sys_configurations";

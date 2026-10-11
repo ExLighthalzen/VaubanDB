@@ -1818,11 +1818,10 @@ mod tests {
             tables
         );
 
-        // Each `Engine::new` clears the session registry in its own transaction after
-        // bootstrap. The second manager starts at the storage high-water mark, then clears
-        // once; the first manager, already past bootstrap and clear, hands out the next id.
-        assert_eq!(second.txn.begin(IsolationLevel::ReadCommitted).id, TxnId(4));
-        assert_eq!(first.txn.begin(IsolationLevel::ReadCommitted).id, TxnId(3));
+        // The second manager starts at the storage high-water mark; the first manager,
+        // already past bootstrap, hands out the next id.
+        assert_eq!(second.txn.begin(IsolationLevel::ReadCommitted).id, TxnId(2));
+        assert_eq!(first.txn.begin(IsolationLevel::ReadCommitted).id, TxnId(2));
     }
 
     #[test]

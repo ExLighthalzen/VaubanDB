@@ -1368,6 +1368,7 @@ mod tests {
             storage,
             txn: Arc::clone(&manager),
             tables: std::sync::Mutex::default(),
+            live: Default::default(),
         };
         let handle = manager.begin(IsolationLevel::ReadCommitted);
         let snapshot = build(&catalog, &handle);
@@ -1840,6 +1841,7 @@ mod tests {
             storage,
             txn: Arc::clone(&manager),
             tables: std::sync::Mutex::default(),
+            live: Default::default(),
         };
         let meta = DatabaseMeta {
             id: master,

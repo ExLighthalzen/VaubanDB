@@ -47,11 +47,19 @@
 //! which is held answers two (`tests/locking.rs`, `readpast_skips_the_locked_row`); a dirty
 //! read answers the latest version of the row instead of the one the iterator produced
 //! (`tests/locking.rs`, `nolock_reads_the_uncommitted_row`).
+//!
+//! # Rows the catalogue serves
+//!
+//! A table for which [`Catalog::live_rows`](vauban_catalog::Catalog::live_rows) answers rows
+//! (the live sessions behind the `sys.dm_exec_*` views) is read from that answer, taken
+//! once when the operator opens, instead of from `storage`
+//! (`scan::tests::a_live_table_is_read_from_the_catalogue`). Those rows take no lock, and
+//! their row identifier is their position in the answer.
 
 use vauban_binder::{ColumnBinding, LockHints, OutputSchema};
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_planner::row_id_table;
-use vauban_storage::{RowIter, TableId};
+use vauban_storage::{RowId, RowIter, TableId};
 
 use crate::context::ExecContext;
 use crate::locking::{self, RowVisibility};
@@ -72,6 +80,8 @@ struct TableScan<'a> {
     hints: LockHints,
     /// The iterator of `storage.scan`, `Some` between `open` and the end of the rows.
     iter: Option<Box<dyn RowIter + 'a>>,
+    /// The rows the catalogue served at `open` for a live table, with their positions.
+    live: Option<std::iter::Enumerate<std::vec::IntoIter<vauban_storage::Row>>>,
 }
 
 /// Builds the operator of a [`PhysicalPlan::TableScan`](vauban_planner::PhysicalPlan::TableScan).
@@ -102,6 +112,7 @@ pub(crate) fn build<'a>(
         schema: schema.clone(),
         hints,
         iter: None,
+        live: None,
     }))
 }
 
@@ -149,6 +160,13 @@ impl<'a> Operator<'a> for TableScan<'a> {
     /// unknown table is its `InternalError::Bug`, an I/O failure its `InternalError::Io`.
     /// The internal error 50000 of a context with no engine ([`ExecContext::storage`]).
     fn open(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<()> {
+        if let Some(rows) = ctx
+            .catalog
+            .and_then(|catalog| catalog.live_rows(self.table))
+        {
+            self.live = Some(rows.into_iter().enumerate());
+            return Ok(());
+        }
         let storage = ctx.storage()?;
         let snap = locking::snapshot_for_scan(ctx, &self.hints)?;
         self.iter = Some(storage.scan(&snap, self.table)?);
@@ -164,6 +182,14 @@ impl<'a> Operator<'a> for TableScan<'a> {
     /// (1222, 1205); the internal error 50000 for an `index` past the end of the row
     /// `storage` handed out.
     fn next(&mut self, ctx: &mut ExecContext<'a>) -> SqlResult<Option<Row>> {
+        if let Some(live) = self.live.as_mut() {
+            let Some((position, source)) = live.next() else {
+                self.live = None;
+                return Ok(None);
+            };
+            let id = RowId(u64::try_from(position).unwrap_or(u64::MAX));
+            return self.project(&source, id).map(Some);
+        }
         loop {
             let Some(iter) = self.iter.as_mut() else {
                 return Ok(None);
@@ -188,19 +214,7 @@ impl<'a> Operator<'a> for TableScan<'a> {
                 }
                 RowVisibility::Visible => {}
             }
-            let mut row = Vec::with_capacity(self.columns.len() + self.row_ids);
-            for binding in &self.columns {
-                let value = source.0.get(binding.index).ok_or_else(|| {
-                    bug(&format!(
-                        "TableScan: column `{}` is at index {} of a row of {} value(s)",
-                        binding.name,
-                        binding.index,
-                        source.0.len()
-                    ))
-                })?;
-                row.push(value.clone());
-            }
-            row.extend(std::iter::repeat_n(row_id_value(id), self.row_ids));
+            let row = self.project(&source, id)?;
             locking::end_row_read(ctx, self.table, id)?;
             return Ok(Some(row));
         }
@@ -208,10 +222,36 @@ impl<'a> Operator<'a> for TableScan<'a> {
 
     fn close(&mut self) {
         self.iter = None;
+        self.live = None;
     }
 
     fn schema(&self) -> &OutputSchema {
         &self.schema
+    }
+}
+
+impl TableScan<'_> {
+    /// The columns of `source` the scan reads, then the row identifier `id` once per
+    /// row-identifier binding.
+    ///
+    /// # Errors
+    ///
+    /// The internal error 50000 for an `index` past the end of `source`.
+    fn project(&self, source: &vauban_storage::Row, id: RowId) -> SqlResult<Row> {
+        let mut row = Vec::with_capacity(self.columns.len() + self.row_ids);
+        for binding in &self.columns {
+            let value = source.0.get(binding.index).ok_or_else(|| {
+                bug(&format!(
+                    "TableScan: column `{}` is at index {} of a row of {} value(s)",
+                    binding.name,
+                    binding.index,
+                    source.0.len()
+                ))
+            })?;
+            row.push(value.clone());
+        }
+        row.extend(std::iter::repeat_n(row_id_value(id), self.row_ids));
+        Ok(row)
     }
 }
 
@@ -440,5 +480,64 @@ mod tests {
         let error = run(&fixture, &scan_node(fixture.table, &[3])).expect_err("index 3 of 1");
         assert_eq!(error.number, 50000);
         assert!(error.message.contains("c3"), "message: {}", error.message);
+    }
+
+    /// A table the catalogue serves live is read from the catalogue: the storage table is
+    /// empty, and the scan answers the registered session.
+    #[test]
+    fn a_live_table_is_read_from_the_catalogue() {
+        use vauban_catalog::{Catalog, LiveConnection, LiveSession};
+        use vauban_types::DateTime;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let txn = Arc::new(TransactionManager::new(Arc::clone(&storage)));
+        let catalog = Catalog::bootstrap(Arc::clone(&storage), Arc::clone(&txn)).expect("boot");
+        let handle = txn.begin(IsolationLevel::ReadCommitted);
+        let snapshot = catalog.snapshot(&handle);
+        let object = snapshot
+            .resolve_object("master", Some("dbo"), "vauban_sys_sessions", "dbo")
+            .expect("the sessions table");
+        let table = snapshot.table(object.id).expect("a table").storage_id;
+        let at = DateTime {
+            days: 1,
+            ticks_300th: 0,
+        };
+        catalog.live_sessions().register(
+            LiveSession {
+                session_id: 53,
+                login_name: "sa".into(),
+                host_name: "h".into(),
+                program_name: "p".into(),
+                database_name: "master".into(),
+                database_id: 1,
+                login_time: at,
+                last_request_time: at,
+                status: "running",
+                last_sql_text_len: 8,
+            },
+            LiveConnection {
+                client_net_address: "127.0.0.1".into(),
+                client_tcp_port: 1,
+                protocol_version: 1,
+                encrypt_option: "FALSE".into(),
+            },
+        );
+
+        let mut plan = scan_node(table, &[0]);
+        if let PhysicalPlan::TableScan {
+            columns, schema, ..
+        } = &mut plan
+        {
+            columns[0].ty = TypeInfo::new(SqlType::SmallInt, false);
+            schema.columns[0].ty = TypeInfo::new(SqlType::SmallInt, false);
+        }
+        let eval = StaticContext::default();
+        let snap = txn.statement_snapshot(&handle);
+        let mut ctx = ExecContext::scalar(&eval, SessionOptions::default())
+            .with_engine(storage.as_ref(), &txn, &snap)
+            .with_catalog(&catalog);
+        let stmt = PhysicalStatement::Query(plan);
+        let (_, set) = crate::execute_collect(&stmt, &mut ctx).expect("scan");
+        assert_eq!(set.rows, vec![vec![Value::I16(53)]]);
     }
 }

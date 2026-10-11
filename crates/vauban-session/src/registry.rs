@@ -1,47 +1,20 @@
-//! Live session registry: rows in `master.dbo.vauban_sys_sessions` and
-//! `master.dbo.vauban_sys_connections`, written outside the session transaction.
+//! Live session registry: the sessions of the engine, held in memory by its catalogue
+//! ([`vauban_catalog::LiveSessions`]) and read by the `sys.dm_exec_*` views. Keeping it up to
+//! date writes nothing to storage (`tests/registry.rs`,
+//! `a_thousand_select_one_append_nothing_to_the_journal`); the identifier of the current
+//! database is read through a read-only transaction of its own at login and at each request.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use vauban_errors::{InternalError, SqlError, SqlResult};
-use vauban_storage::{Row, RowId, TableId};
+use vauban_catalog::{LiveConnection, LiveSession};
+use vauban_errors::SqlResult;
 use vauban_txn::IsolationLevel;
 use vauban_types::{
-    Date, DateTime, DateTime2, SqlString, SqlType, Time, TypeInfo, Value,
-    calendar::days_from_civil, convert,
+    Date, DateTime, DateTime2, SqlType, Time, TypeInfo, Value, calendar::days_from_civil, convert,
 };
 
 use crate::server::Engine;
 use crate::state::SessionState;
-
-/// Names of the internal tables; column order matches `bootstrap.rs`.
-const SESSIONS_TABLE: &str = "vauban_sys_sessions";
-const CONNECTIONS_TABLE: &str = "vauban_sys_connections";
-
-mod sessions_columns {
-    pub(super) const SESSION_ID: usize = 0;
-    pub(super) const LOGIN_NAME: usize = 1;
-    pub(super) const HOST_NAME: usize = 2;
-    pub(super) const PROGRAM_NAME: usize = 3;
-    pub(super) const DATABASE_ID: usize = 4;
-    pub(super) const LOGIN_TIME: usize = 5;
-    pub(super) const LAST_REQUEST_TIME: usize = 6;
-    pub(super) const STATUS: usize = 7;
-    pub(super) const LAST_SQL_TEXT_LEN: usize = 8;
-    pub(super) const WIDTH: usize = 9;
-}
-
-mod connections_columns {
-    pub(super) const SESSION_ID: usize = 0;
-    pub(super) const CLIENT_NET_ADDRESS: usize = 1;
-    pub(super) const CLIENT_TCP_PORT: usize = 2;
-    pub(super) const PROTOCOL_VERSION: usize = 3;
-    pub(super) const ENCRYPT_OPTION: usize = 4;
-    pub(super) const NET_TRANSPORT: usize = 5;
-    pub(super) const PROTOCOL_TYPE: usize = 6;
-    pub(super) const AUTH_SCHEME: usize = 7;
-    pub(super) const WIDTH: usize = 8;
-}
 
 /// What the client negotiated at login, kept for the connection row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,17 +48,14 @@ impl SessionStatus {
 }
 
 impl Engine {
-    /// Clears the session tables (`clear_leaves_the_session_tables_empty`). Called from
+    /// Empties the registry (`clear_leaves_the_registry_empty`). Called from
     /// [`Engine::new`].
     pub(crate) fn clear_session_registry(&self) -> SqlResult<()> {
-        with_registry_txn(self, |engine, txn| {
-            clear_table(engine, txn, SESSIONS_TABLE)?;
-            clear_table(engine, txn, CONNECTIONS_TABLE)?;
-            Ok(())
-        })
+        self.catalog.live_sessions().clear();
+        Ok(())
     }
 
-    /// Inserts the session and connection rows after a successful login.
+    /// Registers the session and its connection after a successful login.
     pub(crate) fn register_session(
         &self,
         state: &SessionState,
@@ -93,38 +63,35 @@ impl Engine {
     ) -> SqlResult<()> {
         let database_id = database_id_of(self, &state.database)?;
         let now = now_datetime();
-        with_registry_txn(self, |engine, txn| {
-            let sessions = table_of(engine, txn, SESSIONS_TABLE)?;
-            let mut row = vec![Value::Null; sessions_columns::WIDTH];
-            row[sessions_columns::SESSION_ID] = Value::I16(state.spid);
-            row[sessions_columns::LOGIN_NAME] = text(&state.login);
-            row[sessions_columns::HOST_NAME] = text(&state.hostname);
-            row[sessions_columns::PROGRAM_NAME] = text(&state.app_name);
-            row[sessions_columns::DATABASE_ID] = Value::I32(database_id);
-            row[sessions_columns::LOGIN_TIME] = now.clone();
-            row[sessions_columns::LAST_REQUEST_TIME] = now;
-            row[sessions_columns::STATUS] = text(SessionStatus::Sleeping.as_str());
-            row[sessions_columns::LAST_SQL_TEXT_LEN] = Value::I32(0);
-            engine.storage.insert(txn.id, sessions, &Row(row))?;
-
-            let connections = table_of(engine, txn, CONNECTIONS_TABLE)?;
-            let mut row = vec![Value::Null; connections_columns::WIDTH];
-            row[connections_columns::SESSION_ID] = Value::I16(state.spid);
-            row[connections_columns::CLIENT_NET_ADDRESS] = text(&connection.client_address);
-            row[connections_columns::CLIENT_TCP_PORT] =
-                Value::I32(i32::from(connection.client_port));
-            row[connections_columns::PROTOCOL_VERSION] =
-                Value::I32(i32::try_from(connection.tds_version).unwrap_or(i32::MAX));
-            row[connections_columns::ENCRYPT_OPTION] = text(&connection.encrypt_option);
-            row[connections_columns::NET_TRANSPORT] = text("TCP");
-            row[connections_columns::PROTOCOL_TYPE] = text("TSQL");
-            row[connections_columns::AUTH_SCHEME] = text("SQL");
-            engine.storage.insert(txn.id, connections, &Row(row))?;
-            Ok(())
-        })
+        self.catalog.live_sessions().register(
+            LiveSession {
+                session_id: state.spid,
+                login_name: state.login.clone(),
+                host_name: state.hostname.clone(),
+                program_name: state.app_name.clone(),
+                database_name: state.database.clone(),
+                database_id,
+                login_time: now,
+                last_request_time: now,
+                status: SessionStatus::Sleeping.as_str(),
+                last_sql_text_len: 0,
+            },
+            LiveConnection {
+                client_net_address: connection.client_address.clone(),
+                client_tcp_port: i32::from(connection.client_port),
+                protocol_version: i32::try_from(connection.tds_version).unwrap_or(i32::MAX),
+                encrypt_option: connection.encrypt_option.clone(),
+            },
+        );
+        Ok(())
     }
 
-    /// Updates the session row after each batch or RPC.
+    /// Updates the entry of the session at the start and at the end of each batch or RPC.
+    ///
+    /// The identifier of the current database is looked up at each call, so a database
+    /// dropped and created again under the same name is followed
+    /// (`use_updates_database_id_in_the_registry`,
+    /// `a_database_created_again_under_its_name_gets_its_new_id`).
     pub(crate) fn touch_session(
         &self,
         spid: i16,
@@ -132,63 +99,30 @@ impl Engine {
         status: SessionStatus,
         database: &str,
     ) -> SqlResult<()> {
+        let live = self.catalog.live_sessions();
+        if live.get(spid).is_none() {
+            return Ok(());
+        }
         let database_id = database_id_of(self, database)?;
         let now = now_datetime();
-        with_registry_txn(self, |engine, txn| {
-            let table = table_of(engine, txn, SESSIONS_TABLE)?;
-            let Some((id, mut row)) = row_for_spid(engine, txn, table, spid)? else {
-                return Ok(());
-            };
-            row[sessions_columns::DATABASE_ID] = Value::I32(database_id);
-            row[sessions_columns::LAST_REQUEST_TIME] = now;
-            row[sessions_columns::STATUS] = text(status.as_str());
-            row[sessions_columns::LAST_SQL_TEXT_LEN] = Value::I32(sql_text_len);
-            engine.storage.update(txn.id, table, id, &Row(row))?;
-            Ok(())
-        })
+        live.update(spid, |session| {
+            session.database_name = database.to_owned();
+            session.database_id = database_id;
+            session.last_request_time = now;
+            session.status = status.as_str();
+            session.last_sql_text_len = sql_text_len;
+        });
+        Ok(())
     }
 
-    /// Deletes the session and connection rows when the connection ends.
+    /// Removes the session when the connection ends.
     pub(crate) fn unregister_session(&self, spid: i16) -> SqlResult<()> {
-        with_registry_txn(self, |engine, txn| {
-            delete_for_spid(engine, txn, SESSIONS_TABLE, spid)?;
-            delete_for_spid(engine, txn, CONNECTIONS_TABLE, spid)?;
-            Ok(())
-        })
+        self.catalog.live_sessions().unregister(spid);
+        Ok(())
     }
 }
 
-fn with_registry_txn<F>(engine: &Engine, work: F) -> SqlResult<()>
-where
-    F: FnOnce(&Engine, &vauban_txn::TxnHandle) -> SqlResult<()>,
-{
-    let handle = engine.txn.begin(IsolationLevel::ReadCommitted);
-    match work(engine, &handle) {
-        Ok(()) => engine.txn.commit(handle),
-        Err(err) => {
-            engine.txn.rollback(handle).ok();
-            Err(err)
-        }
-    }
-}
-
-fn table_of(engine: &Engine, txn: &vauban_txn::TxnHandle, name: &str) -> SqlResult<TableId> {
-    let snapshot = engine.catalog.snapshot(txn);
-    let object = snapshot
-        .resolve_object("master", Some("dbo"), name, "dbo")
-        .ok_or_else(|| {
-            SqlError::from(InternalError::Bug(format!(
-                "session registry: internal table {name} is not in this catalogue"
-            )))
-        })?;
-    let table = snapshot.table(object.id).ok_or_else(|| {
-        SqlError::from(InternalError::Bug(format!(
-            "session registry: {name} is not a table in this catalogue"
-        )))
-    })?;
-    Ok(table.storage_id)
-}
-
+/// The identifier of `database`, `0` when no database has that name.
 fn database_id_of(engine: &Engine, database: &str) -> SqlResult<i32> {
     let handle = engine.txn.begin(IsolationLevel::ReadCommitted);
     let id = engine
@@ -201,70 +135,8 @@ fn database_id_of(engine: &Engine, database: &str) -> SqlResult<i32> {
     Ok(id)
 }
 
-fn row_for_spid(
-    engine: &Engine,
-    txn: &vauban_txn::TxnHandle,
-    table: TableId,
-    spid: i16,
-) -> SqlResult<Option<(RowId, Vec<Value>)>> {
-    let snapshot = engine.txn.statement_snapshot(txn);
-    for row in engine.storage.scan(&snapshot, table)? {
-        let (id, values) = row?;
-        if values.0[sessions_columns::SESSION_ID] == Value::I16(spid) {
-            return Ok(Some((id, values.0)));
-        }
-    }
-    Ok(None)
-}
-
-fn delete_for_spid(
-    engine: &Engine,
-    txn: &vauban_txn::TxnHandle,
-    table_name: &str,
-    spid: i16,
-) -> SqlResult<()> {
-    let table = table_of(engine, txn, table_name)?;
-    let col = if table_name == SESSIONS_TABLE {
-        sessions_columns::SESSION_ID
-    } else {
-        connections_columns::SESSION_ID
-    };
-    let snapshot = engine.txn.statement_snapshot(txn);
-    let mut to_delete = Vec::new();
-    for row in engine.storage.scan(&snapshot, table)? {
-        let (id, values) = row?;
-        if values.0[col] == Value::I16(spid) {
-            to_delete.push(id);
-        }
-    }
-    for id in to_delete {
-        engine.storage.delete(txn.id, table, id)?;
-    }
-    Ok(())
-}
-
-fn clear_table(engine: &Engine, txn: &vauban_txn::TxnHandle, table_name: &str) -> SqlResult<()> {
-    let table = table_of(engine, txn, table_name)?;
-    let snapshot = engine.txn.statement_snapshot(txn);
-    let ids: Vec<RowId> = engine
-        .storage
-        .scan(&snapshot, table)?
-        .map(|row| row.map(|(id, _)| id))
-        .collect::<SqlResult<_>>()?;
-    for id in ids {
-        engine.storage.delete(txn.id, table, id)?;
-    }
-    Ok(())
-}
-
-fn text(value: &str) -> Value {
-    Value::String(SqlString {
-        text: value.to_owned(),
-    })
-}
-
-fn now_datetime() -> Value {
-    Value::DateTime(system_time_to_datetime(SystemTime::now()))
+fn now_datetime() -> DateTime {
+    system_time_to_datetime(SystemTime::now())
 }
 
 fn system_time_to_datetime(time: SystemTime) -> DateTime {
@@ -398,16 +270,11 @@ mod tests {
     }
 
     fn count_sessions(engine: &Engine) -> usize {
-        let handle = engine.txn.begin(IsolationLevel::ReadCommitted);
-        let table = table_of(engine, &handle, SESSIONS_TABLE).expect("sessions table");
-        let snapshot = engine.txn.statement_snapshot(&handle);
-        let count = engine.storage.scan(&snapshot, table).expect("scan").count();
-        engine.txn.commit(handle).expect("commit");
-        count
+        engine.catalog.live_sessions().len()
     }
 
     #[test]
-    fn clear_leaves_the_session_tables_empty() {
+    fn clear_leaves_the_registry_empty() {
         let engine = engine();
         let state = session(&engine, 51).state().clone();
         register(&engine, &state);
@@ -512,5 +379,64 @@ mod tests {
             .expect("touch");
         engine.unregister_session(52).expect("unregister");
         assert_eq!(count_sessions(&engine), 0);
+    }
+
+    #[test]
+    fn a_running_session_is_a_request_and_a_sleeping_one_is_not() {
+        let engine = engine();
+        let mut s = session(&engine, 84);
+        register(&engine, s.state());
+        let count = "SELECT COUNT(*) FROM sys.dm_exec_requests WHERE session_id = 84";
+        assert_eq!(one_int(&run(&mut s, count)), 0);
+        engine
+            .touch_session(84, 9, SessionStatus::Running, "master")
+            .expect("touch");
+        assert_eq!(one_int(&run(&mut s, count)), 1);
+        assert_eq!(
+            one_int(&run(
+                &mut s,
+                "SELECT client_tcp_port FROM sys.dm_exec_connections WHERE session_id = 84",
+            )),
+            55100
+        );
+    }
+
+    #[test]
+    fn a_database_created_again_under_its_name_gets_its_new_id() {
+        let engine = engine();
+        let mut s = session(&engine, 85);
+        register(&engine, s.state());
+        run(&mut s, "CREATE DATABASE RevDb");
+        run(&mut s, "USE RevDb");
+        engine
+            .touch_session(85, 0, SessionStatus::Sleeping, s.state().database.as_str())
+            .expect("touch after use");
+        run(
+            &mut s,
+            "USE master; DROP DATABASE RevDb; CREATE DATABASE RevDb; USE RevDb;",
+        );
+        engine
+            .touch_session(85, 0, SessionStatus::Sleeping, s.state().database.as_str())
+            .expect("touch after the batch");
+        let mut sink = Recording::default();
+        s.run_batch(
+            "SELECT DB_ID(), (SELECT database_id FROM sys.dm_exec_sessions WHERE session_id = @@SPID)",
+            &mut sink,
+        )
+        .expect("batch");
+        let row = sink
+            .0
+            .iter()
+            .find_map(|event| match event {
+                Event::Row(row) => Some(row.clone()),
+                Event::Error(_) => None,
+            })
+            .expect("one row");
+        assert_eq!(row.len(), 2);
+        assert_eq!(
+            row[0], row[1],
+            "registry id {:?} vs DB_ID() {:?}",
+            row[1], row[0]
+        );
     }
 }

@@ -353,6 +353,7 @@ fn open(
         storage,
         txn,
         tables: Default::default(),
+        live: Default::default(),
     };
     let (fresh, registry) = match find_database(&catalog, SYSTEM_DATABASES[0])? {
         None => (true, None),
@@ -1713,6 +1714,7 @@ mod tests {
             storage,
             txn,
             tables: Default::default(),
+            live: Default::default(),
         };
         assert_eq!(internal_table_id(&catalog, DATABASES_TABLE).unwrap(), None);
     }
