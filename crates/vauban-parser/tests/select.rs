@@ -1418,3 +1418,109 @@ fn legacy_word_alone_is_an_implicit_execute() {
     ));
     assert_eq!(p_err("file").number, 156);
 }
+
+/// The names and column lists of the common table expressions of `text`, in the order
+/// the `WITH` clause holds them, after checking the `parse` -> `Display` -> `parse` loop.
+fn ctes(text: &str) -> Vec<(Ident, Vec<String>)> {
+    rt(text);
+    let statement = statement(text);
+    let Some(with) = statement.with else {
+        unreachable!("{text} has a WITH clause")
+    };
+    assert!(with.recursive_allowed, "{text}");
+    with.ctes
+        .into_iter()
+        .map(|cte| {
+            let columns = cte.columns.into_iter().map(|c| c.value).collect();
+            (cte.name, columns)
+        })
+        .collect()
+}
+
+/// A bare name, as the AST holds it.
+fn bare(name: &str) -> Ident {
+    Ident {
+        value: name.to_owned(),
+        quoted: false,
+    }
+}
+
+/// A `WITH` at the head of a statement fills `SelectStatement::with`, one entry per
+/// expression in the order written, with its column list when one is written; the body
+/// that follows is an ordinary query body, set operators and parentheses included.
+#[test]
+fn common_table_expressions_head_a_select() {
+    assert_eq!(
+        ctes("WITH s AS (SELECT 1 AS a, 'x' AS b) SELECT * FROM s;"),
+        vec![(bare("s"), Vec::<String>::new())]
+    );
+    assert_eq!(
+        ctes("WITH s (a, b) AS (SELECT 1, 'x') SELECT b, a FROM s;"),
+        vec![(bare("s"), vec!["a".to_owned(), "b".to_owned()])]
+    );
+    let text = "WITH s AS (SELECT 1 AS a UNION ALL SELECT 2), \
+                t AS (SELECT a * 10 AS c FROM s) SELECT * FROM t ORDER BY c;";
+    assert_eq!(
+        ctes(text),
+        vec![(bare("s"), Vec::new()), (bare("t"), Vec::new())]
+    );
+    assert_eq!(statement(text).order_by.len(), 1);
+    assert_eq!(
+        ctes("WITH [my cte] AS (SELECT 1 AS c) SELECT * FROM [my cte];"),
+        vec![(
+            Ident {
+                value: "my cte".to_owned(),
+                quoted: true,
+            },
+            Vec::new()
+        )]
+    );
+    let text = "WITH s AS (SELECT 1 AS c) (SELECT c FROM s) UNION (SELECT c + 1 FROM s);";
+    assert_eq!(ctes(text), vec![(bare("s"), Vec::new())]);
+    assert!(matches!(
+        statement(text).body,
+        QueryBody::SetOp {
+            op: SetOp::Union,
+            all: false,
+            ..
+        }
+    ));
+}
+
+/// The body of each expression is a whole query, and `Display` writes the clause back in
+/// front of the body.
+#[test]
+fn a_common_table_expression_prints_before_its_body() {
+    assert_eq!(
+        rt("with s (a) as (select 1) select a from s order by a offset 0 rows"),
+        "WITH s (a) AS (SELECT 1) SELECT a FROM s ORDER BY a OFFSET 0 ROWS"
+    );
+    let statement = statement("WITH s AS (SELECT 1 AS c UNION SELECT 2) SELECT * FROM s");
+    let Some(with) = statement.with else {
+        unreachable!("a WITH clause")
+    };
+    assert!(matches!(
+        with.ctes[0].query.body,
+        QueryBody::SetOp {
+            op: SetOp::Union,
+            ..
+        }
+    ));
+}
+
+/// After a `;`, a `WITH` opens the next statement of the batch.
+#[test]
+fn a_common_table_expression_follows_a_semicolon() {
+    for text in [
+        "SELECT 1 AS x;\nWITH s AS (SELECT 1 AS c) SELECT * FROM s;",
+        "SELECT 1 AS x\n;WITH s AS (SELECT 1 AS c) SELECT * FROM s;",
+    ] {
+        let statements = p(text).statements;
+        assert_eq!(statements.len(), 2, "{text}");
+        assert!(
+            matches!(&statements[1], Statement::Select(select) if select.with.is_some()),
+            "{text}"
+        );
+        rt(text);
+    }
+}

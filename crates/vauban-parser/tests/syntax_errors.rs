@@ -279,3 +279,137 @@ fn parsed(text: &str) -> Batch {
         Err(error) => unreachable!("{text} parses: {error:?}"),
     }
 }
+
+/// The CTE used by the tests below; the line it starts on is the line of its `WITH`.
+const CTE: &str = "WITH s AS (SELECT 1 AS c) SELECT * FROM s;";
+
+/// A `WITH` that opens a common table expression right after a statement of the same list
+/// left without its `;` is refused with 319, severity 15, state 1, on the line of the
+/// `WITH`.
+#[test]
+fn a_cte_after_an_unterminated_statement_is_319() {
+    for previous in [
+        "SELECT 1 AS x",
+        "PRINT 'p'",
+        "SET NOCOUNT ON",
+        "USE master",
+        "DECLARE @x int = 1",
+        "BEGIN SELECT 1 AS x END",
+        "SELECT * FROM sys.objects WHERE 1 = 0",
+        "IF 1 = 1 SELECT 1 AS x",
+    ] {
+        let text = format!("{previous}\n{CTE}");
+        let error = err(&text);
+        assert_eq!(
+            (error.number, error.severity, error.state, error.line),
+            (319, 15, 1, 2),
+            "{text}: {}",
+            error.message
+        );
+    }
+    // The keyword is named in lower case, as written or not.
+    assert!(
+        err(&format!("SELECT 1 AS x\n{CTE}"))
+            .message
+            .contains("keyword 'with'")
+    );
+    // The same rule holds between two statements of one block.
+    let error = err(&format!("BEGIN\nSELECT 1 AS x\n{CTE}\nEND"));
+    assert_eq!((error.number, error.line), (319, 3));
+}
+
+/// The texts below parse: a `;` ends the statement before the `WITH`, or nothing of the
+/// same list comes before it (head of the batch, of a block, of the branch of an `IF` or
+/// an `ELSE`, of the body of a `WHILE`, comments aside).
+#[test]
+fn a_cte_with_no_unterminated_statement_before_it_parses() {
+    for text in [
+        format!("SELECT 1 AS x;\n{CTE}"),
+        format!("SELECT 1 AS x\n;{CTE}"),
+        format!("BEGIN SELECT 1 AS x END;\n{CTE}"),
+        CTE.to_owned(),
+        format!("BEGIN\n{CTE}\nEND"),
+        format!("SELECT 1 AS x;\nBEGIN\n{CTE}\nEND"),
+        format!("IF 1 = 1\n{CTE}"),
+        format!("SELECT 1 AS x\nIF 1 = 1\n{CTE}"),
+        format!("IF 1 = 0 SELECT 1 AS x ELSE\n{CTE}"),
+        format!("WHILE 1 = 0\n{CTE}"),
+        format!("-- one\n/* two */\n{CTE}"),
+    ] {
+        if let Err(error) = parse_batch(&text, &ParseOptions::default()) {
+            unreachable!("{text} should parse: {} {}", error.number, error.message);
+        }
+    }
+}
+
+/// A `BEGIN TRAN` keeps the `WITH` that follows it as its own syntax error, 156 on that
+/// word, rather than the 319 of a CTE.
+#[test]
+fn a_with_after_begin_tran_is_156() {
+    let error = err(&format!("BEGIN TRAN\n{CTE}"));
+    assert_eq!(error.number, 156);
+    assert_eq!(error.message, "Syntax error near the keyword 'WITH'.");
+}
+
+/// A badly formed CTE list reports the token where the grammar stops.
+#[test]
+fn a_badly_formed_cte_list_reports_its_token() {
+    for (text, number, message) in [
+        (
+            "WITH s AS (SELECT 1 AS c), SELECT 1;",
+            156,
+            "Syntax error near the keyword 'SELECT'.",
+        ),
+        (
+            "WITH s AS SELECT 1 AS c SELECT 1;",
+            156,
+            "Syntax error near the keyword 'SELECT'.",
+        ),
+        (
+            "WITH s () AS (SELECT 1 AS c) SELECT 1;",
+            102,
+            "Syntax error near ')'.",
+        ),
+        ("WITH s AS (SELECT 1 AS c)", 102, "Syntax error near ')'."),
+        (
+            "WITH s AS (SELECT 1 AS c)\n;",
+            102,
+            "Syntax error near ';'.",
+        ),
+    ] {
+        let error = err(text);
+        assert_eq!(
+            (error.number, error.message.as_str()),
+            (number, message),
+            "{text}"
+        );
+    }
+    assert_eq!(err("WITH s AS (SELECT 1 AS c)\n;").line, 2);
+}
+
+/// A CTE is read at the head of a statement only: in a derived table, a scalar subquery,
+/// an `EXISTS` or the body of another CTE, the first error is the 156 on that `WITH`.
+#[test]
+fn a_cte_inside_a_query_is_156() {
+    for text in [
+        "SELECT * FROM (WITH s AS (SELECT 1 AS c) SELECT * FROM s) d;",
+        "SELECT (WITH s AS (SELECT 1 AS c) SELECT c FROM s) AS x;",
+        "SELECT 1 AS x WHERE EXISTS (WITH s AS (SELECT 1 AS c) SELECT c FROM s);",
+        "WITH s AS (WITH t AS (SELECT 1 AS c) SELECT * FROM t) SELECT * FROM s;",
+    ] {
+        let error = err(text);
+        assert_eq!(error.number, 156, "{text}");
+        assert_eq!(
+            error.message, "Syntax error near the keyword 'WITH'.",
+            "{text}"
+        );
+    }
+}
+
+/// A CTE ahead of a data modification statement is not read: the error names the form.
+#[test]
+fn a_cte_ahead_of_an_insert_is_not_implemented() {
+    let error = err("WITH s AS (SELECT 1 AS c) INSERT INTO #nosuch SELECT c FROM s;");
+    assert_eq!(error.number, 50000);
+    assert!(error.message.contains("INSERT"), "{}", error.message);
+}

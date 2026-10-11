@@ -443,7 +443,7 @@ fn parse_if_chain(p: &mut Parser, elses: &mut u32) -> SqlResult<Statement> {
         let start = p.mark();
         p.expect_keyword(Keyword::If)?;
         let condition = parse_expr(p)?;
-        let then_branch = stmt::parse_statement(p, false)?;
+        let then_branch = stmt::parse_statement(p, false, false)?;
         links.push((start, condition, then_branch));
         let mut semicolons = 0usize;
         while matches!(
@@ -469,7 +469,7 @@ fn parse_if_chain(p: &mut Parser, elses: &mut u32) -> SqlResult<Statement> {
         *elses += 1;
         p.advance();
         if !p.at_keyword(Keyword::If) {
-            break Some(stmt::parse_statement(p, false)?);
+            break Some(stmt::parse_statement(p, false, false)?);
         }
     };
     // Fold from the innermost `IF` outwards; each span ends where the chain ends.
@@ -508,7 +508,7 @@ pub(crate) fn parse_while(p: &mut Parser) -> SqlResult<Statement> {
     let start = p.mark();
     p.expect_keyword(Keyword::While)?;
     let condition = parse_expr(p)?;
-    let body = Box::new(stmt::parse_statement(p, false)?);
+    let body = Box::new(stmt::parse_statement(p, false, false)?);
     Ok(Statement::While {
         condition,
         body,
@@ -533,8 +533,12 @@ pub(crate) fn parse_block(p: &mut Parser) -> SqlResult<Statement> {
     let start = p.mark();
     p.expect_keyword(Keyword::Begin)?;
     let mut statements: Vec<Statement> = Vec::new();
+    // Whether the statement just read ended without a `;`: a CTE cannot follow it.
+    let mut unterminated = false;
     loop {
-        while p.eat_punct(Punct::Semicolon) {}
+        while p.eat_punct(Punct::Semicolon) {
+            unterminated = false;
+        }
         if p.at_keyword(Keyword::End) {
             if statements.is_empty() {
                 return Err(p.error_here());
@@ -543,7 +547,8 @@ pub(crate) fn parse_block(p: &mut Parser) -> SqlResult<Statement> {
         }
         // At the end of the batch no rule claims the token and the dispatch reports the
         // error, so the loop cannot spin.
-        statements.push(stmt::parse_statement(p, false)?);
+        statements.push(stmt::parse_statement(p, false, unterminated)?);
+        unterminated = true;
     }
     p.expect_keyword(Keyword::End)?;
     Ok(Statement::Block {
@@ -580,6 +585,11 @@ pub(crate) fn parse_begin_transaction(p: &mut Parser) -> SqlResult<Statement> {
     } else {
         None
     };
+    // A `WITH` with no `MARK` after it belongs to this statement, not to a CTE that would
+    // follow it: it is the 156 on that word.
+    if p.at_keyword(Keyword::With) {
+        return Err(p.error_here());
+    }
     Ok(Statement::BeginTransaction {
         name,
         mark,

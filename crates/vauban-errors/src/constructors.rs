@@ -1067,6 +1067,21 @@ impl SqlError {
         from_catalog(156, 1, &[Arg::Str(keyword)]).with_line(line)
     }
 
+    /// Error 319, severity 15, state 1 (`SELECT 1 AS x` then, on the next line, `WITH s AS
+    /// (SELECT 1 AS c) SELECT * FROM s;`): a `WITH` opens a statement while the statement
+    /// before it in the same list (batch or `BEGIN...END`) has no `;`. `line` is the line of
+    /// the `WITH`. The keyword is printed in lower case
+    /// (`tests::with_after_unterminated_statement_is_319`).
+    ///
+    /// ```text
+    /// Syntax error near the keyword 'with': a common table expression, an XMLNAMESPACES
+    /// clause or a change tracking context needs the statement before it to end with a
+    /// semicolon.
+    /// ```
+    pub fn with_after_unterminated_statement(line: u32) -> Self {
+        from_catalog(319, 1, &[Arg::Str("with")]).with_line(line)
+    }
+
     /// Error 191, severity 15, state 1 (`SELECT ((…1016 parentheses…1…));`): the batch
     /// nests one level deeper than the parser will descend. No argument.
     ///

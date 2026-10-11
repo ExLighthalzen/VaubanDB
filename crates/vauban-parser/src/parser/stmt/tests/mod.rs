@@ -22,7 +22,7 @@ fn try_dispatch(text: &str, first_in_batch: bool) -> Result<Statement, (u32, Str
         Ok(parser) => parser,
         Err(error) => unreachable!("{text} lexes: {error:?}"),
     };
-    match parse_statement(&mut p, first_in_batch) {
+    match parse_statement(&mut p, first_in_batch, false) {
         Ok(statement) => Ok(statement),
         Err(error) => Err((error.number, error.message)),
     }
@@ -223,22 +223,43 @@ fn dispatch_ignores_the_case_of_the_head_keyword() {
     routes_to_a_table_statement("Create Table t (a int)", "CREATE TABLE");
 }
 
-/// The three heads of a `SELECT` statement reach `query::parse_select_statement`:
-/// `SELECT` and the parenthesised query of a set operation both parse, while the
-/// `WITH` of a common table expression is refused there (V2).
-/// A refusal is a syntax error, and a text that was not routed at all would give the
-/// very same 102: what proves the routing is that the first two parse.
+/// The three heads of a `SELECT` statement reach `query::parse_statement_select` and
+/// parse: `SELECT`, the parenthesised query of a set operation and the `WITH` of a common
+/// table expression.
 #[test]
 fn dispatch_routes_a_select() {
     routes_to_a_select("SELECT 1");
     routes_to_a_select("(SELECT 1) UNION SELECT 2");
-    let text = "WITH c AS (SELECT 1) SELECT * FROM c";
-    let (number, message) = dispatch(text, true);
-    // `WITH` is reserved and unexpected here, so this is a 156. This is a known gap:
-    // SQL Server does parse the common table expression and answers 8155, severity
-    // 16, state 2 on this very text; the number will follow when table expression
-    // queries are read.
-    assert_eq!(number, 156, "{text}: {number} {message}");
+    routes_to_a_select("WITH c AS (SELECT 1 AS a) SELECT * FROM c");
+}
+
+/// After a statement left without its `;`, a `WITH` is refused with 319 before any rule
+/// reads it, on the line of the `WITH`; a `SELECT` in the same place is not.
+#[test]
+fn dispatch_refuses_a_with_after_an_unterminated_statement() {
+    static OPTIONS: ParseOptions = ParseOptions {
+        quoted_identifier: true,
+    };
+    let text = "\n\nWITH c AS (SELECT 1 AS a) SELECT * FROM c";
+    let mut p = match Parser::new(text, &OPTIONS) {
+        Ok(parser) => parser,
+        Err(error) => unreachable!("it lexes: {error:?}"),
+    };
+    match parse_statement(&mut p, false, true) {
+        Ok(statement) => unreachable!("{text} should be refused, got {statement:?}"),
+        Err(error) => {
+            assert_eq!((error.number, error.severity, error.state), (319, 15, 1));
+            assert_eq!(error.line, 3);
+        }
+    }
+    let mut p = match Parser::new("SELECT 1", &OPTIONS) {
+        Ok(parser) => parser,
+        Err(error) => unreachable!("it lexes: {error:?}"),
+    };
+    assert!(matches!(
+        parse_statement(&mut p, false, true),
+        Ok(Statement::Select(_))
+    ));
 }
 
 /// The six spellings of the head of a `CREATE INDEX` reach the rule of `ddl_db`,
@@ -408,7 +429,7 @@ fn dispatch_consumes_nothing_before_routing() {
         Err(error) => unreachable!("it lexes: {error:?}"),
     };
     let start = p.mark();
-    let _ = parse_statement(&mut p, true);
+    let _ = parse_statement(&mut p, true, false);
     assert_eq!(p.mark(), start);
 
     let text = "CREATE UNIQUE CLUSTERED INDEX ix ON t (a)";

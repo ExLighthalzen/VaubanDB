@@ -39,6 +39,7 @@ fn all_constructors() -> Vec<SqlError> {
         SqlError::unclosed_quotation_mark("abc;", 4),
         SqlError::missing_end_comment_mark(2),
         SqlError::incorrect_syntax_near_keyword("FROM", 3),
+        SqlError::with_after_unterminated_statement(2),
         SqlError::out_of_range_conversion("date", "datetime"),
         SqlError::overflow_for_data_type("tinyint", 300),
         SqlError::overflow_for_type("real", 1e40),
@@ -1490,6 +1491,20 @@ fn incorrect_syntax_near_keyword_is_156() {
     assert_eq!(err.state, 1);
     assert_eq!(err.line, 3);
     assert_eq!(err.message, "Syntax error near the keyword 'FROM'.");
+}
+
+#[test]
+fn with_after_unterminated_statement_is_319() {
+    let err = SqlError::with_after_unterminated_statement(2);
+    assert_eq!(err.number, 319);
+    assert_eq!(err.severity, 15);
+    assert_eq!(err.state, 1);
+    assert_eq!(err.line, 2);
+    assert_eq!(err.procedure, None);
+    assert_eq!(
+        err.message,
+        "Syntax error near the keyword 'with': a common table expression, an XMLNAMESPACES clause or a change tracking context needs the statement before it to end with a semicolon."
+    );
 }
 
 #[test]

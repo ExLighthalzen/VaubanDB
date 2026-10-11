@@ -675,6 +675,12 @@ const CATALOG: &[ErrorDef] = &[
         exception: None,
     },
     ErrorDef {
+        number: 319,
+        severity: 15,
+        template: "Syntax error near the keyword '%.*ls': a common table expression, an XMLNAMESPACES clause or a change tracking context needs the statement before it to end with a semicolon.",
+        exception: None,
+    },
+    ErrorDef {
         number: 339,
         severity: 16,
         template: "DEFAULT and NULL cannot be given as explicit identity values.",

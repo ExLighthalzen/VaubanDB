@@ -8,7 +8,7 @@
 //! Routing is done on [`Keyword`] values, never on the source text: `select`, `Select` and
 //! `SELECT` are the same token to the lexer, and the dispatch has nothing to fold.
 
-use vauban_errors::SqlResult;
+use vauban_errors::{SqlError, SqlResult};
 
 use crate::ast::stmt::Statement;
 use crate::keyword::Keyword;
@@ -26,15 +26,26 @@ use crate::token::{Punct, TokenKind};
 /// call of the procedure of that name, so `sp_who` alone is `EXEC sp_who` while `SELECT 1
 /// sp_who` is a syntax error. The last row of the table below reads the flag.
 ///
+/// `after_unterminated` says whether a statement of the same list (the batch, or the
+/// statements of one `BEGIN...END`) comes right before this one with no `;` after it. A
+/// `WITH` that opens a common table expression there (`query::at_cte_head`) is refused
+/// with 319 on the line of the `WITH`. The first statement of a list has no statement
+/// before it, and neither has the branch of an `IF` or an `ELSE` nor the body of a
+/// `WHILE`: their callers pass `false` (`tests/syntax_errors.rs`).
+///
 /// # Errors
 ///
-/// The syntax error of the head token when no rule claims it, or whatever error the
-/// owner function returns. A statement whose rule is a stub gives the generic internal
-/// error 50000.
-pub(crate) fn parse_statement(p: &mut Parser, first_in_batch: bool) -> SqlResult<Statement> {
+/// The syntax error of the head token when no rule claims it, 319 as above, or the error
+/// the owner function returns. A statement whose rule is a stub gives the generic
+/// internal error 50000.
+pub(crate) fn parse_statement(
+    p: &mut Parser,
+    first_in_batch: bool,
+    after_unterminated: bool,
+) -> SqlResult<Statement> {
     // `BEGIN…END`, `IF` and `WHILE` nest statements inside statements. The levels are
     // counted here, the one door the three come back through.
-    p.in_statement(|p| p.nested(|p| parse_statement_inner(p, first_in_batch)))
+    p.in_statement(|p| p.nested(|p| parse_statement_inner(p, first_in_batch, after_unterminated)))
 }
 
 /// The body of [`parse_statement`], one level deeper on the nesting counter.
@@ -43,11 +54,19 @@ pub(crate) fn parse_statement(p: &mut Parser, first_in_batch: bool) -> SqlResult
 ///
 /// The syntax error of the head token when no rule claims it, or whatever error the
 /// owner function returns.
-fn parse_statement_inner(p: &mut Parser, first_in_batch: bool) -> SqlResult<Statement> {
+fn parse_statement_inner(
+    p: &mut Parser,
+    first_in_batch: bool,
+    after_unterminated: bool,
+) -> SqlResult<Statement> {
     match head_keyword(p, 0) {
-        // `WITH` heads a CTE (V2) and `(` a parenthesised query, and both are a SELECT
+        // A CTE needs the statement before it to end with a `;`.
+        Some(Keyword::With) if after_unterminated && query::at_cte_head(p) => Err(
+            SqlError::with_after_unterminated_statement(p.peek().span.line),
+        ),
+        // `WITH` heads a CTE and `(` a parenthesised query, and both are a SELECT
         // statement; the query rule reports whatever they turn out not to be.
-        Some(Keyword::Select | Keyword::With) => query::parse_select_statement(p),
+        Some(Keyword::Select | Keyword::With) => query::parse_statement_select(p),
         Some(Keyword::Insert) => dml::parse_insert(p),
         Some(Keyword::Update) => dml::parse_update(p),
         Some(Keyword::Delete) => dml::parse_delete(p),
@@ -75,7 +94,7 @@ fn parse_statement_inner(p: &mut Parser, first_in_batch: bool) -> SqlResult<Stat
             | Keyword::Waitfor
             | Keyword::Throw,
         ) => flow::parse_simple(p),
-        _ if p.at_punct(Punct::LeftParen) => query::parse_select_statement(p),
+        _ if p.at_punct(Punct::LeftParen) => query::parse_statement_select(p),
         // A name immediately followed by `:` is a label, regardless of its position in
         // the batch: this is checked ahead of the implicit `EXEC` below, which a bare
         // name with no `:` falls through to instead. A reserved word does not reach

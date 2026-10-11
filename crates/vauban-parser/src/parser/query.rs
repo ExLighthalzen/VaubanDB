@@ -39,12 +39,12 @@
 
 use std::mem;
 
-use vauban_errors::SqlResult;
+use vauban_errors::{InternalError, SqlError, SqlResult};
 
 use crate::ast::expr::{Expr, Ident, Literal, ObjectName};
 use crate::ast::query::{
-    AliasStyle, OffsetFetch, OrderItem, QueryBody, QuerySpec, SelectItem, SelectStatement, SetOp,
-    TableRef, Top,
+    AliasStyle, CommonTableExpr, OffsetFetch, OrderItem, QueryBody, QuerySpec, SelectItem,
+    SelectStatement, SetOp, TableRef, Top, With,
 };
 use crate::ast::stmt::Statement;
 use crate::keyword::Keyword;
@@ -56,17 +56,119 @@ use crate::token::{Op, Punct, TokenKind};
 
 /// Parses a `SELECT` statement, starting on its first token.
 ///
-/// The head token is still unconsumed: `SELECT`, `WITH` (a CTE, V2) or `(` (a
-/// parenthesised query such as `(SELECT 1) UNION SELECT 2`). The function reads it back
-/// itself, because it needs it for the statement span.
+/// The head token is still unconsumed: `SELECT` or `(` (a parenthesised query such as
+/// `(SELECT 1) UNION SELECT 2`). The function reads it back itself, because it needs it
+/// for the statement span. A `WITH` is not read here: this entry also serves the
+/// subqueries of an expression, where a CTE is a 156 on its `WITH`
+/// (`tests/syntax_errors.rs`); [`parse_statement_select`] reads it at the head of a
+/// statement.
 ///
 /// # Errors
 ///
-/// The syntax error that stopped the parse. A `WITH` is one: common table expressions
-/// are V2, the AST declares [`SelectStatement::with`] but no rule fills it yet, and
-/// `WITH` is a reserved word, so a 156 is reported on it.
+/// The syntax error that stopped the parse.
 pub(crate) fn parse_select_statement(p: &mut Parser) -> SqlResult<Statement> {
     Ok(Statement::Select(Box::new(parse_select(p)?)))
+}
+
+/// Parses a `SELECT` statement written at the head of a statement, common table
+/// expressions included, starting on its first token: `SELECT`, `(` or `WITH`.
+///
+/// # Common table expressions
+///
+/// `WITH name [(col, ...)] AS (query) [, name ...]` is read here when a name follows the
+/// `WITH` ([`at_cte_head`]). [`parse_subquery`] keeps refusing a `WITH`, so a CTE written
+/// in a derived table, a subquery or the body of another CTE is a 156 on that `WITH`
+/// (`tests/syntax_errors.rs`). The clause is followed by the body of a `SELECT`, its
+/// `ORDER BY` and its `OFFSET`/`FETCH`. A CTE ahead of `INSERT`, `UPDATE`, `DELETE` or
+/// `MERGE` has nowhere to go in the AST, which carries [`SelectStatement::with`] alone: it
+/// gets the internal error 50000 that names it.
+///
+/// # Errors
+///
+/// The syntax error that stopped the parse, or the internal error above.
+pub(crate) fn parse_statement_select(p: &mut Parser) -> SqlResult<Statement> {
+    if !at_cte_head(p) {
+        return parse_select_statement(p);
+    }
+    let start = p.mark();
+    let with = parse_with_clause(p)?;
+    if matches!(
+        p.peek().kind,
+        TokenKind::Keyword(Keyword::Insert | Keyword::Update | Keyword::Delete | Keyword::Merge)
+    ) {
+        return Err(SqlError::from(InternalError::Bug(
+            "a common table expression ahead of INSERT, UPDATE, DELETE or MERGE is not implemented"
+                .into(),
+        )));
+    }
+    let mut select = parse_select(p)?;
+    select.with = Some(with);
+    select.span = p.span_from(start);
+    Ok(Statement::Select(Box::new(select)))
+}
+
+/// Whether the cursor sits on the `WITH` of a common table expression: the word, then a
+/// name ([`at_name`]).
+///
+/// A `WITH` followed by anything else -- the `(` of a misplaced option or hint list, the
+/// end of the batch -- is not read as one, and stays the syntax error of that `WITH`
+/// (`tests/syntax_errors.rs`).
+pub(crate) fn at_cte_head(p: &Parser) -> bool {
+    p.at_keyword(Keyword::With) && at_name(p, 1)
+}
+
+/// Reads `WITH cte [, cte ...]`, the cursor on the `WITH`.
+///
+/// T-SQL has no `RECURSIVE` word: [`With::recursive_allowed`] is set, and whether a CTE
+/// may name itself is the binder's decision.
+///
+/// # Errors
+///
+/// The syntax error that stopped the parse of the clause.
+fn parse_with_clause(p: &mut Parser) -> SqlResult<With> {
+    let start = p.mark();
+    p.expect_keyword(Keyword::With)?;
+    let mut ctes = vec![parse_common_table_expr(p)?];
+    while p.eat_punct(Punct::Comma) {
+        ctes.push(parse_common_table_expr(p)?);
+    }
+    Ok(With {
+        recursive_allowed: true,
+        ctes,
+        span: p.span_from(start),
+    })
+}
+
+/// Reads one `name [(col, ...)] AS (query)`.
+///
+/// The column list, when written, holds at least one name: `s ()` is a 102 on the `)`.
+/// The query between the parentheses goes through [`parse_subquery`], so a `WITH` in it
+/// is refused.
+///
+/// # Errors
+///
+/// The syntax error that stopped the parse of the expression.
+fn parse_common_table_expr(p: &mut Parser) -> SqlResult<CommonTableExpr> {
+    let start = p.mark();
+    let name = p.parse_ident()?;
+    let mut columns = Vec::new();
+    if p.eat_punct(Punct::LeftParen) {
+        columns.push(p.parse_ident()?);
+        while p.eat_punct(Punct::Comma) {
+            columns.push(p.parse_ident()?);
+        }
+        p.expect_punct(Punct::RightParen)?;
+    }
+    p.expect_keyword(Keyword::As)?;
+    p.expect_punct(Punct::LeftParen)?;
+    let query = parse_subquery(p)?;
+    p.expect_punct(Punct::RightParen)?;
+    Ok(CommonTableExpr {
+        name,
+        columns,
+        query,
+        span: p.span_from(start),
+    })
 }
 
 /// Parses a query in **expression** position -- a derived table, a subquery of a `WHERE`,
@@ -90,6 +192,8 @@ pub(crate) fn parse_subquery(p: &mut Parser) -> SqlResult<Box<SelectStatement>> 
 /// The syntax error that stopped the parse.
 fn parse_select(p: &mut Parser) -> SqlResult<SelectStatement> {
     let start = p.mark();
+    // A CTE is read by `parse_statement_select`, at the head of a statement; anywhere a
+    // query is read through here, a `WITH` is the 156 on that word.
     if p.at_keyword(Keyword::With) {
         return Err(p.error_here());
     }

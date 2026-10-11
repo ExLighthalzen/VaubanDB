@@ -78,14 +78,21 @@ impl Default for ParseOptions {
 pub fn parse_batch(text: &str, opts: &ParseOptions) -> SqlResult<Batch> {
     let mut p = Parser::new(text, opts)?;
     let mut statements = Vec::new();
+    // Whether the statement just read ended without a `;`: a CTE cannot follow it.
+    let mut unterminated = false;
     while !p.at_eof() {
         if p.eat_punct(Punct::Semicolon) {
+            unterminated = false;
             continue;
         }
         // `first_in_batch`: the flag the implicit `EXEC` rule reads.
-        statements.push(stmt::parse_statement(&mut p, statements.is_empty())?);
+        statements.push(stmt::parse_statement(
+            &mut p,
+            statements.is_empty(),
+            unterminated,
+        )?);
         // A `;` after a statement is optional: it is eaten when it is there.
-        let _ = p.eat_punct(Punct::Semicolon);
+        unterminated = !p.eat_punct(Punct::Semicolon);
     }
     // A batch that reads to its end without a syntax error but holds a shape too deep for
     // the engine is refused as a whole, with the first such error: a syntax error later in
