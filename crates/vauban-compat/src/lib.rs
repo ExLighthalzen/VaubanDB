@@ -379,8 +379,9 @@ mod tests {
                 other => panic!("{name} reads as {other:?}, not as {:?}", declared.ty),
             }
         }
-        // 36 names in the table, of which 5 answer NULL (`NULL_PROPERTY_NAMES` in
-        // `server_properties.rs`): 31 values carry text.
-        assert_eq!(non_null, 31);
+        // 44 names in the table, of which 8 answer NULL (`NULL_PROPERTY_NAMES` in
+        // `server_properties.rs`): 36 values carry text.
+        assert_eq!(server_properties::PROPERTY_NAMES.len(), 44);
+        assert_eq!(non_null, 36);
     }
 }

@@ -6,12 +6,16 @@
 //! evaluation context (`ServerName`, `MachineName`, and `Edition` when the operator
 //! overrides it), from the process (`ProcessID`), or from the VaubanDB identity: `Edition`
 //! defaults to [`EDITION`] (`VaubanDB (64-bit)`) and `VaubanDB` answers `1`, two values that
-//! describe VaubanDB and are a deliberate difference from SQL Server. Properties that need a
-//! capability the engine does not have (`ResourceVersion`, `InstanceDefaultDataPath`)
-//! answer `NULL`.
+//! describe VaubanDB and are a deliberate difference from SQL Server. Six properties name
+//! a capability the engine does not have and answer `NULL` where SQL Server answers a value:
+//! `BuildClrVersion` (no CLR), `ErrorLogFileName` (no error log file; the server logs to
+//! standard output), `InstanceDefaultDataPath` and `InstanceDefaultLogPath` (the evaluation
+//! context carries no data directory), `ResourceVersion` and `ResourceLastUpdateDateTime`
+//! (no resource database).
 //!
 //! In the table, each value carries the base type that SQL Server stores in the
-//! `sql_variant`: integer properties are [`Value::I32`], text properties [`Value::String`].
+//! `sql_variant`: `int` properties are [`Value::I32`], `tinyint` properties (`SqlCharSet`,
+//! `SqlSortOrder`) [`Value::I8`], text properties [`Value::String`].
 //! The V1 type system does not represent `sql_variant`, so `SERVERPROPERTY` declares
 //! `nvarchar(128)` at bind time (`server_property_return_type` in `lib.rs`);
 //! [`server_property_as`] renders a value under that declared type, which is what the
@@ -22,7 +26,8 @@ use vauban_sysfn::EvalContext;
 use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value, convert};
 
 use crate::version::{
-    EDITION, ENGINE_EDITION, PRODUCT_LEVEL, PRODUCT_UPDATE_LEVEL, PRODUCT_VERSION, version_parts,
+    EDITION, EDITION_ID, ENGINE_EDITION, PRODUCT_LEVEL, PRODUCT_UPDATE_LEVEL, PRODUCT_VERSION,
+    version_parts,
 };
 
 /// `SERVERPROPERTY('Collation')`: the default collation of the instance.
@@ -34,6 +39,19 @@ const COMPARISON_STYLE: i32 = 196_609;
 
 /// `SERVERPROPERTY('LCID')`: English (United States).
 const LCID: i32 = 1033;
+
+/// `SERVERPROPERTY('CollationID')`: the identifier of `SQL_Latin1_General_CP1_CI_AS`
+/// (base type `int`).
+const COLLATION_ID: i32 = 872_468_488;
+
+/// `SERVERPROPERTY('SqlCharSet')`: `1` (base type `tinyint`), the identifier of the
+/// `iso_1` character set that [`SQL_CHAR_SET_NAME`] names.
+const SQL_CHAR_SET: u8 = 1;
+
+/// `SERVERPROPERTY('SqlSortOrder')`: `52` (base type `tinyint`), the sort order that
+/// [`SQL_SORT_ORDER_NAME`] names. The `SortId` of [`vauban_types::Collation::DEFAULT`], tied
+/// to it by the test `sql_sort_order_is_that_of_the_default_collation`.
+const SQL_SORT_ORDER: u8 = 52;
 
 /// `SERVERPROPERTY('SqlCharSetName')` for `SQL_Latin1_General_CP1_CI_AS` (code page 1252).
 const SQL_CHAR_SET_NAME: &str = "iso_1";
@@ -65,12 +83,16 @@ pub(crate) const PROPERTY_NAMES: &[&str] = &[
     "ProductUpdateLevel",
     "Edition",
     "EngineEdition",
+    "EditionID",
     "VaubanDB",
     "MachineName",
     "ServerName",
+    "ComputerNamePhysicalNetBIOS",
     "InstanceName",
     "InstanceDefaultDataPath",
+    "InstanceDefaultLogPath",
     "Collation",
+    "CollationID",
     "IsClustered",
     "IsHadrEnabled",
     "IsIntegratedSecurityOnly",
@@ -81,7 +103,9 @@ pub(crate) const PROPERTY_NAMES: &[&str] = &[
     "ProcessID",
     "ComparisonStyle",
     "LCID",
+    "SqlCharSet",
     "SqlCharSetName",
+    "SqlSortOrder",
     "SqlSortOrderName",
     "ResourceVersion",
     "ResourceLastUpdateDateTime",
@@ -93,20 +117,26 @@ pub(crate) const PROPERTY_NAMES: &[&str] = &[
     "IsExternalAuthenticationOnly",
     "PathSeparator",
     "SuspendedDatabaseCount",
+    "BuildClrVersion",
+    "ErrorLogFileName",
 ];
 
 /// Names of [`PROPERTY_NAMES`] whose value is [`Value::Null`] with the table below,
 /// either because SQL Server itself answers `NULL` (`InstanceName` on a default instance,
 /// `IsExternalAuthenticationOnly` outside Azure SQL) or because the capability is missing
-/// (`InstanceDefaultDataPath`, `ResourceVersion`, `ResourceLastUpdateDateTime`). Used by the
-/// tests below to tell a `NULL` value from a misspelt name.
+/// (`BuildClrVersion`, `ErrorLogFileName`, `InstanceDefaultDataPath`, `InstanceDefaultLogPath`,
+/// `ResourceVersion`, `ResourceLastUpdateDateTime`). Used by the tests below to tell a `NULL`
+/// value from a misspelt name.
 #[cfg(test)]
 const NULL_PROPERTY_NAMES: &[&str] = &[
     "InstanceName",
     "InstanceDefaultDataPath",
+    "InstanceDefaultLogPath",
     "ResourceVersion",
     "ResourceLastUpdateDateTime",
     "IsExternalAuthenticationOnly",
+    "BuildClrVersion",
+    "ErrorLogFileName",
 ];
 
 /// Builds a text property value.
@@ -134,16 +164,23 @@ pub(crate) fn server_property(name: &str, ctx: &dyn EvalContext) -> Value {
         "PRODUCTUPDATELEVEL" => text(PRODUCT_UPDATE_LEVEL),
         "EDITION" => text(ctx.edition().unwrap_or(EDITION)),
         "ENGINEEDITION" => Value::I32(ENGINE_EDITION),
+        // A number, not the `Edition` text: an operator override of the text leaves it as is.
+        "EDITIONID" => Value::I32(EDITION_ID),
         // Property added by VaubanDB, which SQL Server does not know (it answers NULL for
         // the name): a deliberate difference that tells the two products apart.
         "VAUBANDB" => Value::I32(1),
-        "MACHINENAME" | "SERVERNAME" => text(ctx.server_name()),
+        // Outside a failover cluster, the NetBIOS name of the computer is the machine name.
+        "MACHINENAME" | "SERVERNAME" | "COMPUTERNAMEPHYSICALNETBIOS" => text(ctx.server_name()),
         // Default instance: no instance name.
         "INSTANCENAME" => Value::Null,
         // `/var/opt/mssql/data/` (`nvarchar`) on SQL Server for Linux; NULL here, the
         // engine has no data directory.
         "INSTANCEDEFAULTDATAPATH" => Value::Null,
+        // Same directory as `InstanceDefaultDataPath` on SQL Server for Linux; NULL here for
+        // the same reason.
+        "INSTANCEDEFAULTLOGPATH" => Value::Null,
         "COLLATION" => text(COLLATION),
+        "COLLATIONID" => Value::I32(COLLATION_ID),
         "ISCLUSTERED" => Value::I32(0),
         "ISHADRENABLED" => Value::I32(0),
         "ISINTEGRATEDSECURITYONLY" => Value::I32(0),
@@ -156,7 +193,9 @@ pub(crate) fn server_property(name: &str, ctx: &dyn EvalContext) -> Value {
         "PROCESSID" => i32::try_from(std::process::id()).map_or(Value::Null, Value::I32),
         "COMPARISONSTYLE" => Value::I32(COMPARISON_STYLE),
         "LCID" => Value::I32(LCID),
+        "SQLCHARSET" => Value::I8(SQL_CHAR_SET),
         "SQLCHARSETNAME" => text(SQL_CHAR_SET_NAME),
+        "SQLSORTORDER" => Value::I8(SQL_SORT_ORDER),
         "SQLSORTORDERNAME" => text(SQL_SORT_ORDER_NAME),
         // The version of the resource database (`16.00.4275`, `nvarchar`) on SQL Server;
         // NULL here, there is no resource database.
@@ -178,6 +217,12 @@ pub(crate) fn server_property(name: &str, ctx: &dyn EvalContext) -> Value {
         "ISEXTERNALAUTHENTICATIONONLY" => Value::Null,
         "PATHSEPARATOR" => text(PATH_SEPARATOR),
         "SUSPENDEDDATABASECOUNT" => Value::I32(0),
+        // The version of the CLR hosted by SQL Server (`nvarchar`); NULL here, the engine
+        // hosts no CLR.
+        "BUILDCLRVERSION" => Value::Null,
+        // The path of the error log file (`nvarchar`); NULL here, the server writes its log
+        // to standard output and keeps no error log file.
+        "ERRORLOGFILENAME" => Value::Null,
         _ => Value::Null,
     }
 }
@@ -185,7 +230,8 @@ pub(crate) fn server_property(name: &str, ctx: &dyn EvalContext) -> Value {
 /// Base type of a property value: the type SQL Server stores inside the `sql_variant`, and
 /// the source type [`server_property_as`] reads to convert the value to the declared type.
 ///
-/// The table produces [`Value::String`], [`Value::I32`] and [`Value::Null`]; another variant
+/// The table produces [`Value::String`], [`Value::I32`], [`Value::I8`] and [`Value::Null`];
+/// another variant
 /// gets its base type here. Until it does, [`server_property_as`] answers `NULL` for it and
 /// the test `every_property_reads_as_the_declared_type` of `lib.rs` fails on that property,
 /// which is where the omission is meant to be caught.
@@ -194,6 +240,7 @@ fn base_type(value: &Value) -> Option<TypeInfo> {
         // The declared type of `SERVERPROPERTY`; a text property is already under it.
         Value::String(_) => SqlType::NVarChar(Len::Fixed(128)),
         Value::I32(_) => SqlType::Int,
+        Value::I8(_) => SqlType::TinyInt,
         _ => return None,
     };
     Some(TypeInfo::new(ty, true))
@@ -419,8 +466,12 @@ mod tests {
     }
 
     #[test]
-    fn base_type_of_the_two_variants_the_table_produces() {
+    fn base_type_of_the_three_variants_the_table_produces() {
         assert_eq!(base_type(&Value::I32(3)).map(|t| t.ty), Some(SqlType::Int));
+        assert_eq!(
+            base_type(&Value::I8(52)).map(|t| t.ty),
+            Some(SqlType::TinyInt)
+        );
         assert_eq!(
             base_type(&text("x")).map(|t| t.ty),
             Some(SqlType::NVarChar(Len::Fixed(128)))
@@ -431,11 +482,76 @@ mod tests {
     #[test]
     fn properties_without_a_backing_capability_are_null() {
         for name in [
+            "BuildClrVersion",
+            "ErrorLogFileName",
             "InstanceDefaultDataPath",
+            "InstanceDefaultLogPath",
             "ResourceVersion",
             "ResourceLastUpdateDateTime",
         ] {
             assert_eq!(server_property(name, &ctx()), Value::Null, "{name}");
+            assert!(NULL_PROPERTY_NAMES.contains(&name), "{name}");
+            assert!(PROPERTY_NAMES.contains(&name), "{name}");
         }
+    }
+
+    #[test]
+    fn edition_id_ignores_the_edition_override() {
+        assert_eq!(
+            server_property("EditionID", &ctx()),
+            Value::I32(-2_117_995_310)
+        );
+        // The spelling some clients send.
+        assert_eq!(
+            server_property("EditionId", &ctx()),
+            Value::I32(-2_117_995_310)
+        );
+        let custom = StaticContext {
+            edition: Some("Custom Edition".into()),
+            ..ctx()
+        };
+        assert_eq!(
+            server_property("EditionID", &custom),
+            Value::I32(-2_117_995_310)
+        );
+        assert_eq!(
+            server_property_as("EditionID", &ctx(), &declared()).expect("no conversion error"),
+            text("-2117995310")
+        );
+    }
+
+    #[test]
+    fn collation_id_and_character_set_of_the_default_collation() {
+        assert_eq!(
+            server_property("CollationID", &ctx()),
+            Value::I32(872_468_488)
+        );
+        assert_eq!(server_property("SqlCharSet", &ctx()), Value::I8(1));
+        assert_eq!(
+            server_property_as("SqlCharSet", &ctx(), &declared()).expect("no conversion error"),
+            text("1")
+        );
+    }
+
+    #[test]
+    fn sql_sort_order_is_that_of_the_default_collation() {
+        assert_eq!(server_property("SqlSortOrder", &ctx()), Value::I8(52));
+        assert_eq!(vauban_types::Collation::DEFAULT.sort_id, SQL_SORT_ORDER);
+        assert_eq!(
+            server_property_as("SqlSortOrder", &ctx(), &declared()).expect("no conversion error"),
+            text("52")
+        );
+    }
+
+    #[test]
+    fn computer_name_physical_netbios_is_the_machine_name() {
+        assert_eq!(
+            server_property("ComputerNamePhysicalNetBIOS", &ctx()),
+            server_property("MachineName", &ctx())
+        );
+        assert_eq!(
+            as_text(server_property("ComputerNamePhysicalNetBIOS", &ctx())),
+            "VAUBAN"
+        );
     }
 }

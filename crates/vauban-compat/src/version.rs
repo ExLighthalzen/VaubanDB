@@ -18,6 +18,11 @@ pub(crate) const PRODUCT_UPDATE_LEVEL: &str = "CU26";
 /// SQL Server reports for its free non-production edition as well.
 pub(crate) const ENGINE_EDITION: i32 = 3;
 
+/// `SERVERPROPERTY('EditionID')`: the number of the free non-production edition of SQL Server
+/// 2022, an edition of the engine family [`ENGINE_EDITION`] names. Its base type is `int`.
+/// The number is fixed: the `Edition` text an operator may override does not change it.
+pub(crate) const EDITION_ID: i32 = -2_117_995_310;
+
 /// The four components of [`PRODUCT_VERSION`], computed at compile time so that a
 /// malformed constant fails the build rather than a query.
 const VERSION_PARTS: (u16, u16, u16, u16) = parse_version(PRODUCT_VERSION);
@@ -76,6 +81,12 @@ mod tests {
     fn parse_version_handles_other_builds() {
         assert_eq!(parse_version("15.0.2000.5"), (15, 0, 2000, 5));
         assert_eq!(parse_version("0.0.0.0"), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn edition_id_is_the_number_of_the_announced_edition() {
+        assert_eq!(EDITION_ID, -2_117_995_310);
+        assert_eq!(ENGINE_EDITION, 3);
     }
 
     #[test]
