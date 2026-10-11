@@ -1,4 +1,8 @@
-use super::{implicit_result_type, numeric_precision_scale, operand_precision_scale, rank};
+use super::{
+    CollationLabel, collation_of_comparison, collation_of_result, implicit_result_type,
+    numeric_precision_scale, operand_precision_scale, rank,
+};
+use crate::collation::Collation;
 use crate::sql_type::{Len, SqlType, TypeInfo};
 
 /// The 24 types of [`SqlType`] in the order of the data type precedence, strongest
@@ -189,4 +193,109 @@ fn precision_saturates_at_thirty_eight() {
             scale: 10
         }
     );
+}
+
+fn named(name: &str) -> Collation {
+    Collation::parse(name).expect("a known collation")
+}
+
+/// `cs = ci COLLATE Latin1_General_CI_AS` compares under the explicit collation, whichever
+/// side carries it, and `cs = 'A'` under the collation of the column.
+#[test]
+fn an_explicit_collation_wins_over_a_column() {
+    let cs = CollationLabel::Implicit(named("Latin1_General_CS_AS"));
+    let ci = CollationLabel::Explicit(named("Latin1_General_CI_AS"));
+    let literal = CollationLabel::CoercibleDefault(Collation::DEFAULT);
+    assert_eq!(collation_of_comparison(cs, ci, "equal to").unwrap(), ci);
+    assert_eq!(collation_of_comparison(ci, cs, "equal to").unwrap(), ci);
+    assert_eq!(
+        collation_of_comparison(cs, literal, "equal to").unwrap(),
+        cs
+    );
+    assert_eq!(
+        collation_of_comparison(literal, cs, "equal to").unwrap(),
+        cs
+    );
+    assert_eq!(collation_of_comparison(literal, ci, "like").unwrap(), ci);
+}
+
+/// Two labels of one strength and one collation agree; two defaults keep the left one.
+#[test]
+fn equal_labels_agree() {
+    let cs = named("Latin1_General_CS_AS");
+    let ai = named("Latin1_General_CI_AI");
+    for label in [CollationLabel::Explicit(cs), CollationLabel::Implicit(cs)] {
+        assert_eq!(
+            collation_of_comparison(label, label, "equal to").unwrap(),
+            label
+        );
+        assert_eq!(
+            collation_of_result(label, label, "add", &SqlType::VarChar(Len::Fixed(2))).unwrap(),
+            label
+        );
+    }
+    let left = CollationLabel::CoercibleDefault(cs);
+    let right = CollationLabel::CoercibleDefault(ai);
+    assert_eq!(
+        collation_of_comparison(left, right, "equal to").unwrap(),
+        left
+    );
+}
+
+/// Two columns of different collations: 468 in a comparison, 457 in a concatenation; two
+/// different `COLLATE` clauses: 468 in both.
+#[test]
+fn two_columns_leave_a_concatenation_without_collation() {
+    let ty = SqlType::VarChar(Len::Fixed(20));
+    let (cs, ci) = (named("Latin1_General_CS_AS"), named("Latin1_General_CI_AS"));
+    let (left, right) = (CollationLabel::Implicit(cs), CollationLabel::Implicit(ci));
+    let err = collation_of_comparison(left, right, "equal to").unwrap_err();
+    assert_eq!((err.number, err.severity, err.state), (468, 16, 9));
+    assert!(err.message.contains("equal to"), "{}", err.message);
+    // The right operand's collation is named first.
+    let first = err
+        .message
+        .find("Latin1_General_CI_AS")
+        .expect("names the right one");
+    let second = err
+        .message
+        .find("Latin1_General_CS_AS")
+        .expect("names the left one");
+    assert!(first < second, "{}", err.message);
+    let err = collation_of_result(left, right, "add", &ty).unwrap_err();
+    assert_eq!((err.number, err.severity, err.state), (457, 16, 1));
+    assert!(err.message.contains("add") && err.message.contains("varchar"));
+
+    let (left, right) = (CollationLabel::Explicit(cs), CollationLabel::Explicit(ci));
+    let err = collation_of_comparison(left, right, "less than").unwrap_err();
+    assert_eq!((err.number, err.state), (468, 9));
+    let err = collation_of_result(left, right, "CASE", &ty).unwrap_err();
+    assert_eq!((err.number, err.state), (468, 9));
+    assert!(err.message.contains("CASE"), "{}", err.message);
+}
+
+/// Each family of names, parsed then named again; a non-UTF8 `_SC` name loses its `_SC`,
+/// which has no bit.
+#[test]
+fn a_collation_spells_back_its_name() {
+    for name in [
+        "SQL_Latin1_General_CP1_CI_AS",
+        "SQL_Latin1_General_CP1_CS_AS",
+        "SQL_Latin1_General_CP1_CI_AI",
+        "Latin1_General_CS_AS",
+        "Latin1_General_CI_AI_KS_WS",
+        "Latin1_General_BIN",
+        "Latin1_General_BIN2",
+        "Latin1_General_100_CI_AS",
+        "Latin1_General_100_CS_AI_WS",
+        "Latin1_General_100_CI_AS_SC_UTF8",
+        "Latin1_General_100_BIN2_UTF8",
+    ] {
+        assert_eq!(named(name).name(), name);
+    }
+    assert_eq!(
+        named("Latin1_General_100_CI_AS_SC").name(),
+        "Latin1_General_100_CI_AS"
+    );
+    assert_eq!(Collation::DEFAULT.name(), "SQL_Latin1_General_CP1_CI_AS");
 }

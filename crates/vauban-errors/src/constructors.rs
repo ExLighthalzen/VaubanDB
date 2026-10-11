@@ -1148,6 +1148,46 @@ impl SqlError {
         from_catalog(448, 1, &[Arg::Str(name)])
     }
 
+    /// Error 457, severity 16, state 1 (`SELECT cs + ci FROM dbo.t;` over two columns of
+    /// different collations): a concatenation, a `CASE` or a `COALESCE` combines two
+    /// implicit collations that differ, which leaves its result without a collation.
+    /// `ty` is the type of the result, `first` and `second` the two collations, the right
+    /// operand's first, and `operator` is `add` or `CASE`.
+    ///
+    /// ```text
+    /// The varchar value cannot become a varchar: the collations "Latin1_General_CI_AS" and "Latin1_General_CS_AS" conflict in the add operator and leave it without a collation.
+    /// ```
+    pub fn unresolved_collation(ty: &str, first: &str, second: &str, operator: &str) -> Self {
+        from_catalog(
+            457,
+            1,
+            &[
+                Arg::Str(ty),
+                Arg::Str(ty),
+                Arg::Str(first),
+                Arg::Str(second),
+                Arg::Str(operator),
+            ],
+        )
+    }
+
+    /// Error 468, severity 16, state 9 (`SELECT 1 FROM dbo.t WHERE cs = ci;` over two columns
+    /// of different collations): an operation that compares strings meets two collations of
+    /// the same rank that differ, two implicit or two explicit ones. `operation` names it:
+    /// `equal to`, `less than`, `like`, `add`, `CASE`, or a function such as `charindex`;
+    /// `first` and `second` are the two collations, the right operand's first.
+    ///
+    /// ```text
+    /// The collations "Latin1_General_CI_AS" and "Latin1_General_CS_AS" conflict in the equal to operation, and neither takes precedence over the other.
+    /// ```
+    pub fn collation_conflict(first: &str, second: &str, operation: &str) -> Self {
+        from_catalog(
+            468,
+            9,
+            &[Arg::Str(first), Arg::Str(second), Arg::Str(operation)],
+        )
+    }
+
     /// Error 8169, severity 16, state 2 (`SELECT CAST('a' AS uniqueidentifier);`): a
     /// character string is not a GUID. No argument: SQL Server does not echo the value.
     ///

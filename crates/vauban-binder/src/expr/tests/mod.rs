@@ -17,6 +17,8 @@ use crate::bound::{BoundExpr, BoundExprKind, CompareOp, LogicalOp};
 use crate::call::tests::registry;
 use crate::context::{BindContext, SessionOptions, VariableScope};
 
+mod collation;
+
 #[test]
 fn invalid_niladic_binding_preserves_variable_order() {
     registry();

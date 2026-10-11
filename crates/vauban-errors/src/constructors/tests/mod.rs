@@ -83,6 +83,13 @@ fn all_constructors() -> Vec<SqlError> {
         SqlError::arithmetic_overflow_to_numeric("varchar"),
         SqlError::arithmetic_overflow_to_numeric("float"),
         SqlError::collate_on_non_string("int"),
+        SqlError::unresolved_collation(
+            "varchar",
+            "Latin1_General_CI_AS",
+            "Latin1_General_CS_AS",
+            "add",
+        ),
+        SqlError::collation_conflict("Latin1_General_CI_AS", "Latin1_General_CS_AS", "equal to"),
         SqlError::top_negative(),
         SqlError::top_null(),
         SqlError::select_star_without_from(),
@@ -453,6 +460,31 @@ fn literal_and_conversion_messages_are_rendered() {
             16,
             0,
             "COLLATE cannot apply to an expression of type int.",
+        ),
+        (
+            // SELECT cs + ci FROM dbo.t; -- cs and ci of two different collations
+            SqlError::unresolved_collation(
+                "varchar",
+                "Latin1_General_CI_AS",
+                "Latin1_General_CS_AS",
+                "add",
+            ),
+            457,
+            16,
+            1,
+            "The varchar value cannot become a varchar: the collations \"Latin1_General_CI_AS\" and \"Latin1_General_CS_AS\" conflict in the add operator and leave it without a collation.",
+        ),
+        (
+            // SELECT 1 FROM dbo.t WHERE cs = ci; -- cs and ci of two different collations
+            SqlError::collation_conflict(
+                "Latin1_General_CI_AS",
+                "Latin1_General_CS_AS",
+                "equal to",
+            ),
+            468,
+            16,
+            9,
+            "The collations \"Latin1_General_CI_AS\" and \"Latin1_General_CS_AS\" conflict in the equal to operation, and neither takes precedence over the other.",
         ),
         (
             // SELECT TOP (-1) 1;

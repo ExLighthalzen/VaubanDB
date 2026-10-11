@@ -64,14 +64,17 @@ use vauban_parser::{
     BinaryOp as AstBinaryOp, CaseArm, ColumnRef, Expr, Ident, InList, ObjectName, Span, UnaryOp,
 };
 use vauban_types::{
-    BinaryOp, Collation, Len, SqlType, TypeFamily, TypeInfo, Value, binary_op_type,
-    implicit_result_type,
+    BinaryOp, Collation, CollationLabel, Len, SqlType, TypeFamily, TypeInfo, Value, binary_op_type,
+    collation_of_comparison, collation_of_result, implicit_result_type,
 };
 
 use crate::aggregate;
-use crate::bound::{BoundCaseArm, BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LogicalOp};
+use crate::bound::{
+    BoundCaseArm, BoundExpr, BoundExprKind, ColumnBinding, CompareOp, LogicalOp, LogicalPlan,
+};
 use crate::call::{
     bind_cast, bind_convert, bind_function, bind_niladic, bind_variable_function, is_untyped_null,
+    labelled_arguments,
 };
 use crate::context::BindContext;
 use crate::depth;
@@ -768,10 +771,20 @@ fn bind_arith(
             convert_operand(right, &right_ty, &common),
         )
     };
-    let ty = TypeInfo {
+    let mut ty = TypeInfo {
         nullable: arith_is_nullable(op, &left, &right),
         ..ty
     };
+    if op == BinaryOp::Concat {
+        let label = collation_of_result(
+            collation_label(&left),
+            collation_label(&right),
+            "add",
+            &ty.ty,
+        )
+        .map_err(|e| at_line(e, op_line))?;
+        ty.collation = Some(label.collation());
+    }
     Ok(BoundExpr {
         kind: BoundExprKind::Arith {
             op,
@@ -1084,13 +1097,22 @@ pub(crate) fn compare_node(
     // The operands are passed in the order the query wrote them: error 206 names them in
     // that order (`SELECT CASE WHEN CAST('2000-01-01' AS date) = 1 THEN 1 ELSE 0 END;`
     // names `date` then `tinyint`).
-    let common = implicit_result_type(&left_ty, &right_ty).map_err(|e| at_line(e, line))?;
+    let mut common = implicit_result_type(&left_ty, &right_ty).map_err(|e| at_line(e, line))?;
+    if common.ty.is_string() {
+        let label = collation_of_comparison(
+            collation_label(&left),
+            collation_label(&right),
+            comparison_name(op),
+        )
+        .map_err(|e| at_line(e, line))?;
+        common.collation = Some(label.collation());
+    }
     let nullable = left.ty.nullable || right.ty.nullable;
     Ok(BoundExpr {
         kind: BoundExprKind::Compare {
             op,
-            left: Box::new(convert_to(left, &common)),
-            right: Box::new(convert_to(right, &common)),
+            left: Box::new(convert_collated(left, &common)),
+            right: Box::new(convert_collated(right, &common)),
         },
         ty: TypeInfo::new(SqlType::Bit, nullable),
         line,
@@ -1309,14 +1331,17 @@ fn bind_in(
     for view in views.iter().skip(1) {
         common = implicit_result_type(view, &common).map_err(|e| at_line(e, line))?;
     }
+    if common.ty.is_string() {
+        common.collation = Some(in_collation(&operand, &items, line)?);
+    }
 
     let nullable = branches.iter().any(|branch| branch.ty.nullable);
     Ok(BoundExpr {
         kind: BoundExprKind::In {
-            expr: Box::new(convert_to(operand, &common)),
+            expr: Box::new(convert_collated(operand, &common)),
             list: items
                 .into_iter()
-                .map(|item| convert_to(item, &common))
+                .map(|item| convert_collated(item, &common))
                 .collect(),
             negated,
         },
@@ -1365,11 +1390,15 @@ fn bind_like(
     let nullable = operand.ty.nullable
         || pattern.ty.nullable
         || escape.as_ref().is_some_and(|e| e.ty.nullable);
+    let label =
+        collation_of_comparison(collation_label(&operand), collation_label(&pattern), "like")
+            .map_err(|e| at_line(e, line))?;
+    let collated = |e: BoundExpr| recollate(to_string_operand(e, target), label.collation());
 
     Ok(BoundExpr {
         kind: BoundExprKind::Like {
-            expr: Box::new(to_string_operand(operand, target)),
-            pattern: Box::new(to_string_operand(pattern, target)),
+            expr: Box::new(collated(operand)),
+            pattern: Box::new(collated(pattern)),
             escape: escape.map(|e| {
                 let escape_target = if matches!(e.ty.ty, SqlType::Binary(_) | SqlType::VarBinary(_))
                 {
@@ -1537,10 +1566,13 @@ fn bind_case(
         || branches.iter().any(|branch| {
             branch.ty.nullable || implicit_conversion_may_be_null(&branch.ty.ty, &ty.ty)
         });
-    let ty = TypeInfo {
+    let mut ty = TypeInfo {
         nullable,
         ..ty.clone()
     };
+    if ty.ty.is_string() {
+        ty.collation = Some(result_collation(&branches, "CASE", &ty.ty, line)?.collation());
+    }
 
     Ok(BoundExpr {
         kind: BoundExprKind::Case {
@@ -1739,6 +1771,172 @@ pub(crate) fn convert_to(expr: BoundExpr, target: &TypeInfo) -> BoundExpr {
         },
         ty,
         line,
+    }
+}
+
+/// [`convert_to`], then [`recollate`] to the collation of `target` when it has one.
+fn convert_collated(expr: BoundExpr, target: &TypeInfo) -> BoundExpr {
+    let expr = convert_to(expr, target);
+    match target.collation {
+        Some(collation) => recollate(expr, collation),
+        None => expr,
+    }
+}
+
+/// A character `expr` carried under `collation`. A column or a subquery is wrapped in a
+/// `Convert` to its own type, since a seek reads a `ColumnRef` operand as a key of an index
+/// ordered under the column's collation; a literal or a computed value is retyped in place.
+pub(crate) fn recollate(mut expr: BoundExpr, collation: Collation) -> BoundExpr {
+    if !expr.ty.ty.is_string() || expr.ty.collation == Some(collation) {
+        return expr;
+    }
+    match expr.kind {
+        BoundExprKind::Literal(_)
+        | BoundExprKind::Variable { .. }
+        | BoundExprKind::Arith { .. }
+        | BoundExprKind::Case { .. }
+        | BoundExprKind::Convert { .. }
+        | BoundExprKind::Function { .. }
+        | BoundExprKind::Collate { .. } => {
+            expr.ty.collation = Some(collation);
+            expr
+        }
+        _ => {
+            let ty = TypeInfo {
+                collation: Some(collation),
+                ..expr.ty.clone()
+            };
+            let line = expr.line;
+            BoundExpr {
+                kind: BoundExprKind::Convert {
+                    expr: Box::new(expr),
+                    style: None,
+                    try_: false,
+                },
+                ty,
+                line,
+            }
+        }
+    }
+}
+
+/// Where the collation of `expr` comes from ([`CollationLabel`]).
+///
+/// A `COLLATE` is explicit, a column implicit, a scalar subquery takes the label of the
+/// expression it projects. A concatenation, a `CASE` and a function take the strongest
+/// label of the arguments `call::labelled_arguments` names. A conversion takes the label
+/// of a string operand. A literal or a variable takes the default.
+///
+/// A column reads as implicit when its collation differs from the default one, and as
+/// coercible by default otherwise. A column of a derived table, of `VALUES` or of a view
+/// that projects a literal carries the default collation, so it never conflicts with a
+/// column that names another one, as in SQL Server (`expr/tests/collation.rs`,
+/// `a_derived_column_of_a_literal_does_not_conflict`); two columns of the default and of
+/// another collation compare under the other one where SQL Server raises 468, a difference
+/// on the side of answering.
+pub(crate) fn collation_label(expr: &BoundExpr) -> CollationLabel {
+    let own = expr.ty.collation.unwrap_or(Collation::DEFAULT);
+    let strongest = |operands: &mut dyn Iterator<Item = &BoundExpr>| {
+        operands
+            .filter(|operand| operand.ty.ty.is_string())
+            .map(collation_label)
+            .reduce(|kept, next| {
+                if next.strength() > kept.strength() {
+                    next
+                } else {
+                    kept
+                }
+            })
+            .unwrap_or(CollationLabel::CoercibleDefault(own))
+    };
+    if !expr.ty.ty.is_string() {
+        return CollationLabel::CoercibleDefault(own);
+    }
+    match &expr.kind {
+        BoundExprKind::Collate { .. } => CollationLabel::Explicit(own),
+        BoundExprKind::ColumnRef(_)
+            if expr.ty.collation.is_some_and(|c| c != Collation::DEFAULT) =>
+        {
+            CollationLabel::Implicit(own)
+        }
+        BoundExprKind::ColumnRef(_) => CollationLabel::CoercibleDefault(own),
+        BoundExprKind::ScalarSubquery(subquery) => match projected(&subquery.plan) {
+            Some(inner) => collation_label(inner),
+            None => CollationLabel::Implicit(own),
+        },
+        BoundExprKind::Convert { expr: inner, .. } if inner.ty.ty.is_string() => {
+            collation_label(inner)
+        }
+        BoundExprKind::Arith { left, right, .. } => {
+            strongest(&mut [left.as_ref(), right.as_ref()].into_iter())
+        }
+        BoundExprKind::Case { arms, else_, .. } => strongest(
+            &mut arms
+                .iter()
+                .map(|arm| &arm.then)
+                .chain(else_.iter().map(AsRef::as_ref)),
+        ),
+        BoundExprKind::Function { def, args } => strongest(&mut labelled_arguments(def, args)),
+        _ => CollationLabel::CoercibleDefault(own),
+    }
+}
+
+/// The first expression the select list of `plan` projects, under the nodes that keep it.
+fn projected(plan: &LogicalPlan) -> Option<&BoundExpr> {
+    match plan {
+        LogicalPlan::Project { exprs, .. } => exprs.first().map(|projection| &projection.expr),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Distinct(input) => projected(input),
+        _ => None,
+    }
+}
+
+/// The collation of `CASE` or `COALESCE` branches, folded by [`collation_of_result`].
+pub(crate) fn result_collation(
+    branches: &[&BoundExpr],
+    operator: &str,
+    ty: &SqlType,
+    line: u32,
+) -> SqlResult<CollationLabel> {
+    let mut labels = branches
+        .iter()
+        .filter(|branch| branch.ty.ty.is_string())
+        .map(|branch| collation_label(branch));
+    let first = labels
+        .next()
+        .unwrap_or(CollationLabel::CoercibleDefault(Collation::DEFAULT));
+    labels.try_fold(first, |kept, next| {
+        collation_of_result(kept, next, operator, ty).map_err(|e| at_line(e, line))
+    })
+}
+
+/// The collation `x IN (a, b, …)` compares under. Each element is resolved against `x` on
+/// its own (`in_resolves_each_element_on_its_own`); the executor compares the list under one
+/// collation, the first explicit one or else the first: a deliberate difference.
+fn in_collation(operand: &BoundExpr, items: &[BoundExpr], line: u32) -> SqlResult<Collation> {
+    let tested = collation_label(operand);
+    let mut chosen: Option<CollationLabel> = None;
+    for item in items {
+        let label = collation_of_comparison(tested, collation_label(item), "equal to")
+            .map_err(|e| at_line(e, line))?;
+        if chosen.is_none_or(|kept| label.strength() > kept.strength()) {
+            chosen = Some(label);
+        }
+    }
+    Ok(chosen.unwrap_or(tested).collation())
+}
+
+/// The operation a comparison names in error 468.
+fn comparison_name(op: CompareOp) -> &'static str {
+    match op {
+        CompareOp::Eq => "equal to",
+        CompareOp::Ne => "not equal to",
+        CompareOp::Lt => "less than",
+        CompareOp::Le => "less than or equal to",
+        CompareOp::Gt => "greater than",
+        CompareOp::Ge => "greater than or equal to",
     }
 }
 

@@ -91,6 +91,8 @@ const CONTRACT: &[(u32, u8, &[&str])] = &[
     (402, 16, &["%s", "%s", "%s"]),
     (447, 16, &["%ls"]),
     (448, 16, &["%.*ls"]),
+    (457, 16, &["%ls", "%ls", "%ls", "%ls", "%ls"]),
+    (468, 16, &["%.*ls", "%.*ls", "%ls"]),
     (506, 16, &["%.*ls", "%ls"]),
     (512, 16, &[]),
     (515, 16, &["%.*ls", "%.*ls", "%ls"]),
@@ -487,6 +489,9 @@ fn known_errors_carry_their_behaviour() {
         (1012, Level, Compilation, false, true),
         (2715, Level, Compilation, false, true),
         (8120, Level, Compilation, false, true),
+        // Collations an operator cannot resolve, found while the statement is bound.
+        (457, Level, Compilation, false, true),
+        (468, Level, Compilation, false, true),
         // Syntax and other compilation checks of severity 15.
         (102, Level, Compilation, false, false),
         (105, Level, Compilation, false, false),

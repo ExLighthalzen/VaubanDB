@@ -431,6 +431,55 @@ impl Collation {
             .map(|at| at + 1)
     }
 
+    /// The name of the collation, as the server spells it in a message.
+    ///
+    /// A non-zero `SortId` names a legacy `SQL_Latin1_General_CP1` collation, the version of
+    /// the `_100_` family adds `_100`, a binary collation names `_BIN` or `_BIN2` alone, and
+    /// the others spell `_CI`/`_CS`, `_AI`/`_AS`, then `_KS` and `_WS` for the bits they do
+    /// not ignore. `_SC` has no bit and is restored before `_UTF8` on a linguistic `_100_`
+    /// name, where the `_UTF8` spelling without `_SC` does not exist
+    /// (`precedence::tests::a_collation_spells_back_its_name`).
+    pub fn name(&self) -> String {
+        let mut name = String::from(if self.sort_id != 0 {
+            "SQL_Latin1_General_CP1"
+        } else if self.version == WINDOWS_100_VERSION {
+            "Latin1_General_100"
+        } else {
+            "Latin1_General"
+        });
+        let flags = self.flags;
+        let binary = flags & (FLAG_BINARY | FLAG_BINARY2) != 0;
+        if flags & FLAG_BINARY2 != 0 {
+            name.push_str("_BIN2");
+        } else if flags & FLAG_BINARY != 0 {
+            name.push_str("_BIN");
+        } else {
+            name.push_str(if flags & FLAG_IGNORE_CASE == 0 {
+                "_CS"
+            } else {
+                "_CI"
+            });
+            name.push_str(if flags & FLAG_IGNORE_ACCENT == 0 {
+                "_AS"
+            } else {
+                "_AI"
+            });
+            if flags & FLAG_IGNORE_KANA == 0 {
+                name.push_str("_KS");
+            }
+            if flags & FLAG_IGNORE_WIDTH == 0 {
+                name.push_str("_WS");
+            }
+        }
+        if flags & FLAG_UTF8 != 0 {
+            if self.sort_id == 0 && self.version == WINDOWS_100_VERSION && !binary {
+                name.push_str("_SC");
+            }
+            name.push_str("_UTF8");
+        }
+        name
+    }
+
     /// The family of rules this collation compares with.
     pub(crate) fn rules(&self) -> Rules {
         if self.flags & FLAG_BINARY2 != 0 {

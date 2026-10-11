@@ -699,6 +699,18 @@ const CATALOG: &[ErrorDef] = &[
         exception: None,
     },
     ErrorDef {
+        number: 457,
+        severity: 16,
+        template: "The %ls value cannot become a %ls: the collations \"%ls\" and \"%ls\" conflict in the %ls operator and leave it without a collation.",
+        exception: Some(BINDING),
+    },
+    ErrorDef {
+        number: 468,
+        severity: 16,
+        template: "The collations \"%.*ls\" and \"%.*ls\" conflict in the %ls operation, and neither takes precedence over the other.",
+        exception: Some(BINDING),
+    },
+    ErrorDef {
         number: 506,
         severity: 16,
         template: "The escape character \"%.*ls\" of the %ls predicate must be a single character.",

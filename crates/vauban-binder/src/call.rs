@@ -49,13 +49,18 @@
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{ColumnRef, DataType, Expr, Ident, Literal, ObjectName, Span};
 use vauban_sysfn::{FunctionDef, FunctionKind, check_call, lookup, parse_datepart};
-use vauban_types::{Len, SqlString, SqlType, TypeFamily, TypeInfo, Value, implicit_result_type};
+use vauban_types::{
+    Len, SqlString, SqlType, TypeFamily, TypeInfo, Value, collation_of_comparison,
+    implicit_result_type,
+};
 
 use crate::bound::{AggregateCall, BoundExpr, BoundExprKind};
 use crate::context::BindContext;
 use crate::datatype::{is_sysname, resolve_data_type, resolve_sysname_cast};
 use crate::errors::{line_at, line_of};
-use crate::expr::{Scope, implicit_conversion_may_be_null};
+use crate::expr::{
+    Scope, collation_label, implicit_conversion_may_be_null, recollate, result_collation,
+};
 
 /// Length a character or binary type gets in a `CAST`/`CONVERT` target written without
 /// one, where a declaration would give it 1.
@@ -417,12 +422,99 @@ pub(crate) fn bind_function(
     let types: Vec<TypeInfo> = bound.iter().map(|arg| arg.ty.clone()).collect();
     let ty = check_call(def, &types).map_err(|err| err.with_line(line))?;
     let ty = with_inferred_nullability(def, &bound, ty);
-    let ty = with_narrowed_nullif(def, &bound, ty);
+    let mut ty = with_narrowed_nullif(def, &bound, ty);
+    let bound = collate_arguments(def, bound, &mut ty, line)?;
     Ok(BoundExpr {
         kind: BoundExprKind::Function { def, args: bound },
         ty,
         line,
     })
+}
+
+/// The arguments whose collation label the result of a call takes, the strongest of them
+/// winning (`expr::collation_label`).
+///
+/// `ISNULL` and `NULLIF` take their first argument, or the second when the first is the
+/// bare `NULL`: `cs = ISNULL('A', ci)` raises nothing and `cs = ISNULL(ci, 'A')` raises 468.
+/// The other functions take their arguments, the strongest winning: `cs = REPLACE('A', 'x', ci)`
+/// raises 468 (`a_result_carries_the_label_of_what_it_returns`).
+pub(crate) fn labelled_arguments<'a>(
+    def: &FunctionDef,
+    args: &'a [BoundExpr],
+) -> Box<dyn Iterator<Item = &'a BoundExpr> + 'a> {
+    match def.name {
+        "ISNULL" | "NULLIF" => Box::new(
+            args.iter()
+                .skip_while(|arg| matches!(arg.kind, BoundExprKind::Literal(Value::Null)))
+                .take(1),
+        ),
+        _ => Box::new(args.iter()),
+    }
+}
+
+/// The functions that search or compare one string argument against another, under one
+/// collation shared by their arguments: a conflict between two of them is error 468,
+/// naming the function in lower case (`SELECT CHARINDEX(cs, ci) FROM dbo.t;` over two
+/// columns of different collations).
+const SEARCHING_FUNCTIONS: [&str; 6] = [
+    "CHARINDEX",
+    "PATINDEX",
+    "REPLACE",
+    "STUFF",
+    "DIFFERENCE",
+    "TRANSLATE",
+];
+
+/// Resolves the collation of the character arguments of a call, and gives it to them and to
+/// a character result.
+///
+/// - `COALESCE` returns one of its arguments, as a `CASE` does: two columns of different
+///   collations leave it without one, error 457, and two `COLLATE` clauses that differ
+///   are 468, both naming `CASE` (`expr::result_collation`);
+/// - `NULLIF` compares its two arguments: 468 naming `equal to`;
+/// - the [`SEARCHING_FUNCTIONS`] compare theirs: 468 naming the function.
+///
+/// `ISNULL` resolves nothing: its result takes the collation of its first argument, and
+/// two columns of different collations answer a row. The other functions keep the
+/// collation `sysfn` gave their result.
+fn collate_arguments(
+    def: &FunctionDef,
+    args: Vec<BoundExpr>,
+    ty: &mut TypeInfo,
+    line: u32,
+) -> SqlResult<Vec<BoundExpr>> {
+    let label = if def.name == "COALESCE" {
+        let branches: Vec<&BoundExpr> = args.iter().collect();
+        result_collation(&branches, "CASE", &ty.ty, line)?
+    } else if def.name == "NULLIF" || SEARCHING_FUNCTIONS.contains(&def.name) {
+        let operation = if def.name == "NULLIF" {
+            "equal to".to_owned()
+        } else {
+            def.name.to_ascii_lowercase()
+        };
+        let mut labels = args
+            .iter()
+            .filter(|arg| arg.ty.ty.is_string())
+            .map(collation_label);
+        let Some(first) = labels.next() else {
+            return Ok(args);
+        };
+        labels.try_fold(first, |kept, next| {
+            collation_of_comparison(kept, next, &operation).map_err(|e| e.with_line(line))
+        })?
+    } else {
+        return Ok(args);
+    };
+    if ty.ty.is_string() {
+        ty.collation = Some(label.collation());
+    }
+    if def.name == "COALESCE" {
+        return Ok(args);
+    }
+    Ok(args
+        .into_iter()
+        .map(|arg| recollate(arg, label.collation()))
+        .collect())
 }
 
 /// Binds an aggregate call — `COUNT(*)`, `SUM(c)`, `COUNT(DISTINCT c)` — into the

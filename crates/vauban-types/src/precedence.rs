@@ -9,6 +9,7 @@
 
 use vauban_errors::{SqlError, SqlResult};
 
+use crate::collation::Collation;
 use crate::errors;
 use crate::sql_type::{Len, SqlType, TypeFamily, TypeInfo};
 
@@ -496,6 +497,124 @@ pub fn implicit_result_type(a: &TypeInfo, b: &TypeInfo) -> SqlResult<TypeInfo> {
         nullable: a.nullable || b.nullable,
         collation,
     })
+}
+
+/// Where the collation of a character expression comes from, which decides which side wins
+/// when an operator meets two of them.
+///
+/// The three labels rank, strongest first:
+///
+/// - [`CollationLabel::Explicit`]: the expression carries a `COLLATE` clause;
+/// - [`CollationLabel::Implicit`]: the expression reads a column, whose collation is the
+///   one its declaration gave it;
+/// - [`CollationLabel::CoercibleDefault`]: a literal, a variable, a parameter or the
+///   conversion of a value that is not a string, which takes the default collation and
+///   gives way to anything stronger.
+///
+/// The fourth label of the rules, the *no-collation* of two implicit collations that
+/// differ, is not a variant: [`collation_of_result`] answers it with error 457 as soon as
+/// it appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CollationLabel {
+    /// A `COLLATE` clause.
+    Explicit(Collation),
+    /// The collation of a column.
+    Implicit(Collation),
+    /// The default collation, which any other label overrides.
+    CoercibleDefault(Collation),
+}
+
+impl CollationLabel {
+    /// The collation the label carries.
+    pub fn collation(&self) -> Collation {
+        match self {
+            CollationLabel::Explicit(c)
+            | CollationLabel::Implicit(c)
+            | CollationLabel::CoercibleDefault(c) => *c,
+        }
+    }
+
+    /// 2 for an explicit collation, 1 for an implicit one, 0 for the default: the stronger
+    /// label wins.
+    pub fn strength(&self) -> u8 {
+        match self {
+            CollationLabel::Explicit(_) => 2,
+            CollationLabel::Implicit(_) => 1,
+            CollationLabel::CoercibleDefault(_) => 0,
+        }
+    }
+}
+
+/// The collation two strings are compared under, by a comparison, `LIKE`, `IN` or a
+/// function that searches one string in another (`CHARINDEX`, `REPLACE`).
+///
+/// The stronger label wins; two labels of the same strength must carry the same
+/// collation, except two defaults, where the left one is kept. `cs = 'A'` compares under
+/// the collation of the column `cs`, `cs = ci COLLATE Latin1_General_CI_AS` under the
+/// explicit one (`tests::an_explicit_collation_wins_over_a_column`).
+///
+/// # Errors
+///
+/// Error 468, naming `operation`, when the two labels are both explicit or both implicit
+/// and their collations differ: `SELECT 1 FROM dbo.t WHERE cs = ci;` over a
+/// `Latin1_General_CS_AS` column and a `Latin1_General_CI_AS` one.
+pub fn collation_of_comparison(
+    left: CollationLabel,
+    right: CollationLabel,
+    operation: &str,
+) -> SqlResult<CollationLabel> {
+    // A conflict names the right operand's collation first.
+    combine(left, right).map_err(|_| {
+        SqlError::collation_conflict(
+            &right.collation().name(),
+            &left.collation().name(),
+            operation,
+        )
+    })
+}
+
+/// The collation of the result of an operator that returns one of its string operands: a
+/// concatenation, a `CASE`, `COALESCE`, `IIF`.
+///
+/// The rule of [`collation_of_comparison`], except for two implicit collations that differ:
+/// the result has no collation at all, which SQL Server refuses at once, whatever then
+/// reads the value (`tests::two_columns_leave_a_concatenation_without_collation`).
+///
+/// # Errors
+///
+/// - error 468, naming `operator`, for two explicit collations that differ:
+///   `SELECT 'a' COLLATE Latin1_General_CI_AS + 'b' COLLATE Latin1_General_CS_AS;`;
+/// - error 457, naming `operator` and the type `ty` of the result, for two implicit
+///   collations that differ: `SELECT cs + ci FROM dbo.t;`.
+pub fn collation_of_result(
+    left: CollationLabel,
+    right: CollationLabel,
+    operator: &str,
+    ty: &SqlType,
+) -> SqlResult<CollationLabel> {
+    combine(left, right).map_err(|explicit| {
+        let (first, second) = (right.collation().name(), left.collation().name());
+        if explicit {
+            SqlError::collation_conflict(&first, &second, operator)
+        } else {
+            SqlError::unresolved_collation(ty.name(), &first, &second, operator)
+        }
+    })
+}
+
+/// The stronger of two labels, or `Err(true)` for two explicit collations that differ and
+/// `Err(false)` for two implicit ones.
+fn combine(left: CollationLabel, right: CollationLabel) -> Result<CollationLabel, bool> {
+    match left.strength().cmp(&right.strength()) {
+        std::cmp::Ordering::Greater => Ok(left),
+        std::cmp::Ordering::Less => Ok(right),
+        std::cmp::Ordering::Equal => match left {
+            CollationLabel::CoercibleDefault(_) => Ok(left),
+            _ if left.collation() == right.collation() => Ok(left),
+            CollationLabel::Explicit(_) => Err(true),
+            CollationLabel::Implicit(_) => Err(false),
+        },
+    }
 }
 
 #[cfg(test)]
