@@ -14,9 +14,9 @@
 
 use vauban_errors::SqlError;
 use vauban_parser::{
-    AliasStyle, ApplyKind, Batch, ColumnRef, Expr, Ident, JoinKind, Literal, ParseOptions,
-    QueryBody, QuerySpec, SelectItem, SelectStatement, SetOp, Span, Statement, TableRef,
-    parse_batch,
+    AliasStyle, ApplyKind, Batch, ColumnRef, ExecuteTarget, Expr, Ident, JoinKind, Literal,
+    ParseOptions, QueryBody, QuerySpec, SelectItem, SelectStatement, SetOp, Span, Statement,
+    TableRef, parse_batch,
 };
 
 /// Parses `text`, which must parse.
@@ -1323,4 +1323,98 @@ fn clause_order() {
     // `OFFSET` without an `ORDER BY` is refused, as SQL Server refuses it.
     // SQL Server: `SELECT * FROM t OFFSET 1 ROWS` => 102.
     assert_eq!(p_err("SELECT * FROM t OFFSET 1 ROWS").number, 102);
+}
+
+/// `DISK`, `DUMP`, `LOAD`, `PRECISION` and `SECURITYAUDIT` are plain names: a column, an
+/// alias, a table, a derived column. These are the forms read here for `precision`.
+#[test]
+fn legacy_words_parse_as_names() {
+    let derived = "(SELECT 1 AS [precision]) AS t";
+    for text in [
+        format!("SELECT t.precision FROM {derived}"),
+        format!("SELECT precision FROM {derived}"),
+        format!("SELECT 1 AS a FROM {derived} WHERE t.precision = 1"),
+        format!("SELECT 1 AS a FROM {derived} WHERE precision = 1"),
+        "SELECT 1 AS precision".to_owned(),
+        format!("SELECT CAST(t.precision AS int) AS [NumericPrecision] FROM {derived}"),
+        format!("SELECT CAST(precision AS int) FROM {derived}"),
+        format!("SELECT t.precision FROM {derived} ORDER BY t.precision"),
+        "CREATE TABLE dbo.w (precision int)".to_owned(),
+        "SELECT precision.a FROM (SELECT 1 AS a) AS precision".to_owned(),
+        "SELECT precision.a FROM (SELECT 1 AS a) precision".to_owned(),
+        "SELECT a FROM dbo.w AS precision".to_owned(),
+        "SELECT a FROM dbo.w precision".to_owned(),
+        format!("SELECT t.precision FROM {derived} GROUP BY t.precision"),
+        "SELECT 1 precision".to_owned(),
+        "SELECT precision = 1".to_owned(),
+        "INSERT INTO dbo.w (precision) VALUES (1)".to_owned(),
+        "UPDATE dbo.w SET precision = 2".to_owned(),
+        format!("SELECT precision FROM {derived} ORDER BY precision"),
+        "SELECT t.precision FROM (SELECT 1) AS t(precision)".to_owned(),
+        "SELECT c.precision FROM sys.columns AS c".to_owned(),
+        "SELECT * FROM dbo.precision".to_owned(),
+    ] {
+        let printed = rt(&text);
+        assert!(
+            !printed.contains("[precision]") || text.contains("[precision]"),
+            "{printed}"
+        );
+    }
+    // Display leaves the qualified name bare.
+    assert_eq!(
+        rt("SELECT t.precision FROM dbo.w AS t"),
+        "SELECT t.precision FROM dbo.w AS t"
+    );
+
+    for word in ["disk", "dump", "load", "securityaudit"] {
+        rt(&format!("SELECT t.{word} FROM (SELECT 1 AS [{word}]) AS t"));
+        rt(&format!("SELECT {word} FROM (SELECT 1 AS [{word}]) AS t"));
+        rt(&format!("CREATE TABLE dbo.w ({word} int)"));
+        rt(&format!("SELECT 1 AS {word}"));
+    }
+}
+
+/// `double precision` is still a type name of two words.
+#[test]
+fn double_precision_stays_a_type() {
+    let items = items("SELECT CAST(1 AS double precision)");
+    let [SelectItem::Expr { expr, .. }] = items.as_slice() else {
+        unreachable!("one item")
+    };
+    let Expr::Cast { ty, .. } = expr else {
+        unreachable!("a CAST, got {expr:?}")
+    };
+    assert_eq!(ty.name, "double precision");
+    rt("DECLARE @d double precision = 2");
+}
+
+/// Misplaced, a former reserved word is a name, hence 102; `file` is still reserved,
+/// hence 156.
+#[test]
+fn legacy_words_misplaced_are_102() {
+    for word in ["precision", "disk", "dump", "load", "securityaudit"] {
+        let error = p_err(&format!(
+            "SELECT 1 AS a FROM (SELECT 1 AS x) AS t {word} {word};"
+        ));
+        assert_eq!(error.number, 102, "{word}");
+    }
+    let error = p_err("SELECT 1 AS a FROM (SELECT 1 AS x) AS t file file;");
+    assert_eq!(error.number, 156);
+}
+
+/// A batch of the one word `precision` is the implicit `EXECUTE` of a procedure of that
+/// name; with `file` it is a syntax error.
+#[test]
+fn legacy_word_alone_is_an_implicit_execute() {
+    let mut statements = p("precision").statements;
+    assert_eq!(statements.len(), 1);
+    let Some(Statement::Execute(execute)) = statements.pop() else {
+        unreachable!("an EXECUTE")
+    };
+    assert!(execute.implicit);
+    assert!(matches!(
+        &execute.target,
+        ExecuteTarget::Procedure(name) if name.name.value == "precision"
+    ));
+    assert_eq!(p_err("file").number, 156);
 }

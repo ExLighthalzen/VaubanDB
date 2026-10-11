@@ -8,8 +8,10 @@
 //!
 //! The reserved words are the ones of the T-SQL reference
 //! <https://learn.microsoft.com/en-us/sql/t-sql/language-elements/reserved-keywords-transact-sql>,
-//! **first table** (the SQL Server reserved keywords, `keyword_reserved_set` below);
-//! neither the Synapse `LABEL`
+//! **first table** (the SQL Server reserved keywords, `keyword_reserved_set` below),
+//! **minus** `DISK`, `DUMP`, `LOAD`, `PRECISION` and `SECURITYAUDIT`, which SQL Server 2022
+//! accepts as plain names (`SELECT t.precision FROM (SELECT 1 AS [precision]) AS t;`
+//! returns one row); neither the Synapse `LABEL`
 //! table, nor the ODBC reserved keywords, nor the future keywords further down that page.
 //! The other words come from the statement grammars of [MS-TSQL] that the module parses.
 //!
@@ -554,10 +556,15 @@ impl Keyword {
     /// Whether the word is a **reserved** keyword, which T-SQL refuses as a bare
     /// identifier and which the parser reports with error 156 instead of 102.
     ///
-    /// The set is exactly the first table of the page cited at the top of this file
-    /// (184 one-word entries; see [`KEYWORDS`] for the 185th, `WITHIN GROUP`). A word
-    /// missing from it, such as `VARCHAR`, `SUM` or `OFFSET`, stays usable as an
-    /// identifier: `SELECT varchar FROM t` is legal T-SQL.
+    /// The set is the first table of the page cited at the top of this file (184 one-word
+    /// entries; see [`KEYWORDS`] for the 185th, `WITHIN GROUP`) minus five words that the
+    /// page lists but SQL Server 2022 accepts as names: `DISK`, `DUMP`, `LOAD`, `PRECISION`
+    /// and `SECURITYAUDIT`. `SELECT t.precision FROM (SELECT 1 AS [precision]) AS t;`
+    /// returns one row, and `CREATE TABLE t (disk int, dump int, load int)` creates a
+    /// table; 179 words remain (`keyword_reserved_set_size`). A word missing from the set,
+    /// such as `VARCHAR`, `SUM` or `OFFSET`, stays usable as an identifier:
+    /// `SELECT varchar FROM t` is legal T-SQL. `double precision` stays a type name, read
+    /// word by word by the data type grammar.
     ///
     /// Callers: `display::is_reserved_keyword` (the safety rule that brackets a bare
     /// reserved word) and the error 156 of the parser.
@@ -611,12 +618,10 @@ impl Keyword {
                 | Keyword::Delete
                 | Keyword::Deny
                 | Keyword::Desc
-                | Keyword::Disk
                 | Keyword::Distinct
                 | Keyword::Distributed
                 | Keyword::Double
                 | Keyword::Drop
-                | Keyword::Dump
                 | Keyword::Else
                 | Keyword::End
                 | Keyword::Errlvl
@@ -659,7 +664,6 @@ impl Keyword {
                 | Keyword::Left
                 | Keyword::Like
                 | Keyword::Lineno
-                | Keyword::Load
                 | Keyword::Merge
                 | Keyword::National
                 | Keyword::NoCheck
@@ -684,7 +688,6 @@ impl Keyword {
                 | Keyword::Percent
                 | Keyword::Pivot
                 | Keyword::Plan
-                | Keyword::Precision
                 | Keyword::Primary
                 | Keyword::Print
                 | Keyword::Proc
@@ -708,7 +711,6 @@ impl Keyword {
                 | Keyword::Rule
                 | Keyword::Save
                 | Keyword::Schema
-                | Keyword::SecurityAudit
                 | Keyword::Select
                 | Keyword::SemanticKeyPhraseTable
                 | Keyword::SemanticSimilarityDetailsTable

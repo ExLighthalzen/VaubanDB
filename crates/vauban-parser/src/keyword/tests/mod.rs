@@ -37,15 +37,34 @@ fn keyword_reserved_set() {
 ///
 /// The first table of that page has 185 entries, one of which, `WITHIN GROUP`, is
 /// written in two words and cannot be recognised word by word. The remaining 184 are
-/// the ones counted here. Adding a variant to [`Keyword`] later must not change this
-/// number unless the page changes.
+/// the ones of that table. Five of them, `DISK`, `DUMP`, `LOAD`, `PRECISION` and
+/// `SECURITYAUDIT`, are plain names for SQL Server 2022 and leave the set, which keeps
+/// 179. Adding a variant to [`Keyword`] later must not change this number unless the
+/// page changes.
 #[test]
 fn keyword_reserved_set_size() {
     let reserved = KEYWORDS
         .iter()
         .filter(|(_, keyword)| keyword.is_reserved())
         .count();
-    assert_eq!(reserved, 184);
+    assert_eq!(reserved, 179);
+}
+
+#[test]
+fn keyword_legacy_words_are_not_reserved() {
+    for keyword in [
+        Keyword::Disk,
+        Keyword::Dump,
+        Keyword::Load,
+        Keyword::Precision,
+        Keyword::SecurityAudit,
+    ] {
+        assert!(!keyword.is_reserved(), "{keyword:?} must not be reserved");
+    }
+    // Neighbours of the same table that stay reserved.
+    for keyword in [Keyword::File, Keyword::Key, Keyword::Plan] {
+        assert!(keyword.is_reserved(), "{keyword:?} must be reserved");
+    }
 }
 
 #[test]
@@ -70,7 +89,6 @@ fn keyword_reserved_spot_checks() {
         Keyword::Read,
         Keyword::Transaction,
         Keyword::Double,
-        Keyword::Precision,
         Keyword::National,
         Keyword::Varying,
         Keyword::Left,
@@ -102,6 +120,11 @@ fn keyword_reserved_spot_checks() {
         Keyword::Character,
         Keyword::Varchar,
         Keyword::Sum,
+        Keyword::Precision,
+        Keyword::Disk,
+        Keyword::Dump,
+        Keyword::Load,
+        Keyword::SecurityAudit,
     ] {
         assert!(!keyword.is_reserved(), "{keyword:?} must not be reserved");
     }

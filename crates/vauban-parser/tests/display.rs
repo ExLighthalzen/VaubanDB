@@ -787,6 +787,23 @@ fn display_niladic_column_is_never_bracketed() {
     assert_eq!(column("select").to_string(), "[select]");
 }
 
+/// `DISK`, `DUMP`, `LOAD`, `PRECISION` and `SECURITYAUDIT` are plain names, so the
+/// safety rule that brackets a reserved word leaves them bare; `FILE`, reserved, is still
+/// bracketed.
+#[test]
+fn display_legacy_words_are_not_bracketed() {
+    assert_eq!(
+        qualified_column("t", "precision").to_string(),
+        "t.precision"
+    );
+    for name in ["disk", "dump", "load", "precision", "securityaudit"] {
+        assert_eq!(ident(name).to_string(), name);
+        assert_eq!(column(name).to_string(), name);
+    }
+    assert_eq!(ident("file").to_string(), "[file]");
+    assert_eq!(qualified_column("t", "file").to_string(), "t.[file]");
+}
+
 #[test]
 fn display_select() {
     let mut query = spec(vec![

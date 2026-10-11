@@ -1604,8 +1604,8 @@ mod tests {
     fn the_four_definitions_parse() {
         // The text of a view is T-SQL the engine reads, so the parser of the workspace is
         // the first judge of it. The counter-check of this test is
-        // `a_reserved_column_name_is_delimited`, which shows the same text refused once the
-        // brackets of `precision` are gone.
+        // `a_reserved_column_name_is_delimited`, which shows the same text refused once a
+        // reserved column name loses its brackets.
         for (name, definition) in definitions() {
             let batch = parse_batch(&definition, &ParseOptions::default());
             assert!(batch.is_ok(), "sys.{name}: {batch:?}\n{definition}");
@@ -1616,11 +1616,18 @@ mod tests {
     fn a_reserved_column_name_is_delimited() {
         let identity = definition_of("identity_columns");
         assert!(identity.contains("[precision]"), "{identity}");
-        let bare = identity.replace("[precision]", "precision");
+        // `file` stays a reserved word: in place of the column, it parses bracketed and is
+        // refused bare.
+        let bracketed = identity.replace("[precision]", "[file]");
+        assert!(
+            parse_batch(&bracketed, &ParseOptions::default()).is_ok(),
+            "{bracketed}"
+        );
+        let bare = identity.replace("[precision]", "file");
         let refused = parse_batch(&bare, &ParseOptions::default());
         assert!(
             refused.is_err(),
-            "a bare `precision` in the select list is read by the parser: {bare}"
+            "a bare `file` in the select list is read by the parser: {bare}"
         );
         assert_eq!(RESERVED_COLUMN_NAMES, ["precision"]);
     }
