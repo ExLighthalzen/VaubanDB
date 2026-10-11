@@ -206,7 +206,7 @@ pub(crate) fn bind_and_plan(
         variables: &declared,
         options: ctx.options,
     };
-    let bound = vauban_binder::bind(&deferred.statement, &bind_ctx)?;
+    let bound = deferred.bind(&bind_ctx)?;
     let indexes = ctx
         .storage
         .zip(snapshot.as_ref())

@@ -10,11 +10,13 @@
 //! `parser::Statement` breaks this file rather than being silently reported as something
 //! else.
 
+use std::cell::Cell;
+
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_parser::{QueryBody, Span, Statement};
 
 use crate::alter::bind_alter_table;
-use crate::bound::BoundStatement;
+use crate::bound::{BoundStatement, DeferredStatement};
 use crate::context::BindContext;
 use crate::control::{
     bind_block, bind_break, bind_continue, bind_goto, bind_if, bind_label, bind_print, bind_return,
@@ -106,6 +108,8 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
             condition, body, ..
         } => bind_while(condition, body, ctx),
         Statement::Block { statements, .. } => bind_block(statements, ctx),
+        Statement::Break(_) if jumps_left_to_the_program() => Ok(BoundStatement::Break),
+        Statement::Continue(_) if jumps_left_to_the_program() => Ok(BoundStatement::Continue),
         Statement::Break(span) => bind_break(span.line, ctx),
         Statement::Continue(span) => bind_continue(span.line, ctx),
         Statement::Return { value, span } => bind_return(value.as_ref(), span.line, ctx),
@@ -121,6 +125,39 @@ pub fn bind(stmt: &Statement, ctx: &BindContext<'_>) -> SqlResult<BoundStatement
         Statement::Label { name, .. } => Ok(bind_label(name)),
         Statement::SetOption(set) => Ok(BoundStatement::SetOption(set.clone())),
         other => Err(unsupported(other)),
+    }
+}
+
+thread_local! {
+    /// Set while [`DeferredStatement::bind`] runs: a `BREAK` or a `CONTINUE` met then is
+    /// bound as is, and the program that runs the statement resolves it.
+    static JUMPS_LEFT_TO_THE_PROGRAM: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a `BREAK` or a `CONTINUE` is bound as is rather than checked against the
+/// `WHILE` statements being bound around it.
+fn jumps_left_to_the_program() -> bool {
+    JUMPS_LEFT_TO_THE_PROGRAM.with(Cell::get)
+}
+
+impl DeferredStatement {
+    /// Binds the statement against `ctx`, as [`bind`] does, with one difference: a
+    /// `BREAK` or a `CONTINUE` it holds binds without a `WHILE` around it in the statement.
+    ///
+    /// The statement was written inside an `IF`, a `WHILE` or a `BEGIN … END` whose loop
+    /// is no longer in view when the program reaches it: the program that runs it holds
+    /// that loop, and it is the program that sends the jump to its exit or to its head, or
+    /// answers 135 or 136 when no loop of its own encloses the statement
+    /// (`statement::tests::a_deferred_break_binds_without_its_loop`).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`bind`], 135 and 136 excepted.
+    pub fn bind(&self, ctx: &BindContext<'_>) -> SqlResult<BoundStatement> {
+        let before = JUMPS_LEFT_TO_THE_PROGRAM.with(|flag| flag.replace(true));
+        let bound = bind(&self.statement, ctx);
+        JUMPS_LEFT_TO_THE_PROGRAM.with(|flag| flag.set(before));
+        bound
     }
 }
 

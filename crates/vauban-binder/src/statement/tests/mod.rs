@@ -370,3 +370,61 @@ fn the_alter_statements_name_themselves() {
         "DROP INDEX is bound, catalogue or not"
     );
 }
+
+/// The one statement of `text`, kept unbound as the binder keeps a statement of a branch.
+fn kept(text: &str) -> crate::bound::DeferredStatement {
+    let batch = parse_batch(text, &ParseOptions::default())
+        .unwrap_or_else(|e| unreachable!("{text} parses, got {e:?}"));
+    let [statement] = <[Statement; 1]>::try_from(batch.statements)
+        .unwrap_or_else(|s| unreachable!("{text} holds one statement, got {s:?}"));
+    crate::bound::DeferredStatement {
+        text: std::sync::Arc::from(text),
+        statement: Box::new(statement),
+        database: "master".to_owned(),
+        default_schema: "dbo".to_owned(),
+        line: 1,
+    }
+}
+
+#[test]
+fn a_deferred_break_binds_without_its_loop() {
+    use crate::bound::BoundStatement;
+    register_builtins();
+    // (statement, number `bind` answers on it with no `WHILE` around)
+    let vectors: &[(&str, u32)] = &[
+        ("IF 1 = 1 BREAK;", 135),
+        ("IF 1 = 1 CONTINUE;", 136),
+        ("IF 1 = 0 PRINT 'x'; ELSE BREAK;", 135),
+        ("BEGIN PRINT 'x'; IF 1 = 1 IF 2 = 2 CONTINUE; END", 136),
+    ];
+    for &(text, number) in vectors {
+        let ctx = BindContext::scalar(text, SessionOptions::default());
+        let deferred = kept(text);
+        // Counter-proof: the same statement bound as a statement of the batch is refused.
+        let refused = bind(&deferred.statement, &ctx).err().map(|e| e.number);
+        assert_eq!(refused, Some(number), "{text}");
+        let bound = deferred
+            .bind(&ctx)
+            .unwrap_or_else(|e| unreachable!("{text} binds as a deferred statement, got {e:?}"));
+        assert!(
+            matches!(bound, BoundStatement::If { .. } | BoundStatement::Block(_)),
+            "{text}: {bound:?}"
+        );
+        // The jump is left to the program for the deferred binding alone: the statement of
+        // the batch that follows is checked again.
+        let after = bind(&deferred.statement, &ctx).err().map(|e| e.number);
+        assert_eq!(after, Some(number), "{text}");
+    }
+}
+
+#[test]
+fn a_deferred_statement_that_fails_leaves_the_jumps_checked_again() {
+    register_builtins();
+    let text = "IF 1 = 1 SELECT nosuch;";
+    let ctx = BindContext::scalar(text, SessionOptions::default());
+    assert!(kept(text).bind(&ctx).is_err(), "{text}");
+    let after = bind(&kept("IF 1 = 1 BREAK;").statement, &ctx)
+        .err()
+        .map(|e| e.number);
+    assert_eq!(after, Some(135));
+}
