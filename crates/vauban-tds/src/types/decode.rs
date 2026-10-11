@@ -31,12 +31,19 @@
 //! `char` / `varchar` are read from code page 1252 (the inverse of [`super::cp1252`]),
 //! `nchar` / `nvarchar` from UTF-16LE.
 //!
+//! # LONGLEN parameters ([MS-TDS] 2.2.5.4.3, 2.2.5.2.3)
+//!
+//! A `text`, `ntext` or `image` parameter has no `SqlType` of its own: [`decode_long_len_param`]
+//! reads its TYPE_INFO and its LONGLEN value together and delivers it as `varchar(max)`,
+//! `nvarchar(max)` or `varbinary(max)`. [`decode_type_info`] alone refuses these three tokens
+//! with `Unsupported`, since the `(max)` type it would return announces a PLP_BODY.
+//!
 //! # Errors and cursor
 //!
 //! A truncated or inconsistent stream (a BYTELEN value whose length differs from the one the
 //! TYPE_INFO announces, a PLP chunk longer than the remaining bytes, a decimal precision
 //! above 38, a scale above 7…) fails with `Malformed`; the types this version does not decode
-//! (`text`, `ntext`, `image`, `xml`, `sql_variant`, UDT, table-valued parameters, the
+//! (`xml`, `sql_variant`, UDT, table-valued parameters, the
 //! pre-TDS 7 short forms of `char` / `binary`, and the untyped NULLTYPE) fail with
 //! `Unsupported`. The functions never panic on any input. The cursor advances past the bytes
 //! consumed **only on success**; after an error its position is unspecified and the caller
@@ -90,6 +97,9 @@ const UDTTYPE: u8 = 0xF0;
 const XMLTYPE: u8 = 0xF1;
 /// [MS-TDS] 2.2.5.5.5.1 TVPTYPE (table-valued parameter).
 const TVPTYPE: u8 = 0xF3;
+
+/// [MS-TDS] 2.2.5.2.3 CHARBIN_NULL of a LONGLEN value: the NULL `text`, `ntext` or `image`.
+const LONGLEN_NULL: u32 = 0xFFFF_FFFF;
 
 /// Largest buffer preallocated from the total length a PLP value announces: a hostile
 /// client must not make the server allocate gigabytes before sending a single chunk.
@@ -203,10 +213,14 @@ pub(crate) fn decode_type_info(input: &mut &[u8]) -> Result<TypeInfo, TdsError> 
             decode_string_type_info(token, input)
         }
 
+        // LONGLEN tokens: their value is a LONGLEN, a layout `decode_value` cannot infer
+        // from the `(max)` type they are delivered as. Read with their value by
+        // `decode_long_len_param` instead.
+        TEXTTYPE => Err(TdsError::Unsupported("TEXTTYPE (text) without its value")),
+        NTEXTTYPE => Err(TdsError::Unsupported("NTEXTTYPE (ntext) without its value")),
+        IMAGETYPE => Err(TdsError::Unsupported("IMAGETYPE (image) without its value")),
+
         // Valid tokens this version refuses on purpose.
-        TEXTTYPE => Err(TdsError::Unsupported("TEXTTYPE (text)")),
-        NTEXTTYPE => Err(TdsError::Unsupported("NTEXTTYPE (ntext)")),
-        IMAGETYPE => Err(TdsError::Unsupported("IMAGETYPE (image)")),
         XMLTYPE => Err(TdsError::Unsupported("XMLTYPE (xml)")),
         SSVARIANTTYPE => Err(TdsError::Unsupported("SSVARIANTTYPE (sql_variant)")),
         UDTTYPE => Err(TdsError::Unsupported("UDTTYPE (CLR user-defined type)")),
@@ -218,6 +232,60 @@ pub(crate) fn decode_type_info(input: &mut &[u8]) -> Result<TypeInfo, TdsError> 
 
         _ => Err(TdsError::Malformed("TYPE_INFO unknown type token")),
     }
+}
+
+/// Whether `token` is one of the three LONGLEN tokens of [MS-TDS] 2.2.5.4.3 (`TEXTTYPE`,
+/// `NTEXTTYPE`, `IMAGETYPE`) that [`decode_long_len_param`] reads.
+pub(crate) fn is_long_len_token(token: u8) -> bool {
+    matches!(token, TEXTTYPE | NTEXTTYPE | IMAGETYPE)
+}
+
+/// Reads the TYPE_INFO and the value of a `text`, `ntext` or `image` parameter
+/// ([MS-TDS] 2.2.5.6, 2.2.5.2.3) from the front of `input` and advances it.
+///
+/// TYPE_INFO: the token, the maximum length on four bytes (not checked: the value carries
+/// its own length), then the 5-byte collation for `TEXTTYPE` and `NTEXTTYPE`; `IMAGETYPE`
+/// has no collation. Value: a LONGLEN, `0xFFFFFFFF` for NULL (CHARBIN_NULL on four bytes),
+/// otherwise up to `0x7FFFFFFF` bytes of data. `text` is read from code page 1252 like
+/// `varchar`, `ntext` from UTF-16LE, `image` as raw bytes.
+///
+/// The parameter is delivered as `varchar(max)`, `nvarchar(max)` or `varbinary(max)`,
+/// nullable, with the collation of the TYPE_INFO for the two character types. A length
+/// between `0x80000000` and `0xFFFFFFFE`, a length beyond the remaining bytes or an odd
+/// `ntext` length is `Malformed`; any other token is `Malformed` too. On error the position
+/// of `input` is unspecified.
+pub(crate) fn decode_long_len_param(input: &mut &[u8]) -> Result<(TypeInfo, Value), TdsError> {
+    let token = read_u8(input, "TYPE_INFO type token")?;
+    let (ty, encoding) = match token {
+        TEXTTYPE => (SqlType::VarChar(Len::Max), Encoding::Cp1252),
+        NTEXTTYPE => (SqlType::NVarChar(Len::Max), Encoding::Utf16Le),
+        IMAGETYPE => (SqlType::VarBinary(Len::Max), Encoding::Raw),
+        _ => return Err(TdsError::Malformed("TYPE_INFO token is not a LONGLEN type")),
+    };
+    let _max_len = read_u32_le(input, "TYPE_INFO LONGLEN maximum length")?;
+    let collation = if token == IMAGETYPE {
+        None
+    } else {
+        Some(decode_collation(input)?)
+    };
+    let ti = TypeInfo {
+        ty,
+        nullable: true,
+        collation,
+    };
+    let len = read_u32_le(input, "LONGLEN value length")?;
+    if len == LONGLEN_NULL {
+        return Ok((ti, Value::Null));
+    }
+    let len = usize::try_from(len)
+        .ok()
+        .filter(|len| *len <= PLP_MAX_VALUE_LEN)
+        .ok_or(TdsError::Malformed(
+            "LONGLEN value length exceeds 2^31 - 1 bytes",
+        ))?;
+    let bytes = take(input, len, "LONGLEN value data")?;
+    let value = decode_payload(encoding, bytes)?;
+    Ok((ti, value))
 }
 
 /// Reads the rest of the TYPE_INFO of a USHORTLEN or PLP type: maximum length, then the
@@ -786,7 +854,7 @@ mod tests {
         Time, TypeInfo, Value,
     };
 
-    use super::{decode_type_info, decode_value};
+    use super::{decode_long_len_param, decode_type_info, decode_value, is_long_len_token};
     use crate::error::TdsError;
     use crate::types::collation::DEFAULT_COLLATION_BYTES;
     use crate::types::{encode_type_info, encode_value};
@@ -1644,9 +1712,6 @@ mod tests {
     #[test]
     fn decode_unsupported_types() {
         for (bytes, label) in [
-            ("23", "TEXTTYPE"),
-            ("63", "NTEXTTYPE"),
-            ("22", "IMAGETYPE"),
             ("F1", "XMLTYPE"),
             ("62", "SSVARIANTTYPE"),
             ("F0", "UDTTYPE"),
@@ -1665,6 +1730,121 @@ mod tests {
         // A token the spec does not define is malformed, not unsupported.
         assert!(matches!(type_info_err(&hex("00")), TdsError::Malformed(_)));
         assert!(matches!(type_info_err(&hex("FF")), TdsError::Malformed(_)));
+    }
+
+    /// Decodes a LONGLEN parameter from `bytes` followed by two sentinel bytes, and checks
+    /// that the cursor stops exactly on them.
+    fn long_len(bytes: &[u8]) -> (TypeInfo, Value) {
+        let mut buf = bytes.to_vec();
+        buf.extend_from_slice(&[0xAA, 0xBB]);
+        let mut cursor = &buf[..];
+        let decoded = decode_long_len_param(&mut cursor).unwrap();
+        assert_eq!(cursor, &[0xAA, 0xBB]);
+        decoded
+    }
+
+    /// `hex(prefix)`, the default collation, then `hex(value)`.
+    fn hex_collated_value(prefix: &str, value: &str) -> Vec<u8> {
+        let mut v = hex_collated(prefix);
+        v.extend_from_slice(&hex(value));
+        v
+    }
+
+    fn long_len_err(bytes: &[u8]) -> TdsError {
+        decode_long_len_param(&mut &bytes[..]).unwrap_err()
+    }
+
+    #[test]
+    fn decode_type_info_alone_refuses_long_len_tokens() {
+        for (bytes, label) in [("23", "TEXTTYPE"), ("63", "NTEXTTYPE"), ("22", "IMAGETYPE")] {
+            match type_info_err(&hex(bytes)) {
+                TdsError::Unsupported(name) => assert!(name.starts_with(label), "{bytes}: {name}"),
+                other => panic!("{bytes}: {other:?}"),
+            }
+            assert!(is_long_len_token(hex(bytes)[0]));
+        }
+        assert!(!is_long_len_token(0xE7));
+        assert!(!is_long_len_token(0xA5));
+    }
+
+    #[test]
+    fn decode_long_len_values() {
+        let collation = super::decode_collation(&mut &DEFAULT_COLLATION_BYTES[..]).unwrap();
+        // NTEXTTYPE, maximum length 0x7FFFFFFE, collation, LONGLEN 6, UTF-16LE 'abc'.
+        let (ti, v) = long_len(&hex_collated_value(
+            "63 FE FF FF 7F",
+            "06 00 00 00 61 00 62 00 63 00",
+        ));
+        assert_eq!(ti.ty, SqlType::NVarChar(Len::Max));
+        assert!(ti.nullable);
+        assert_eq!(ti.collation, Some(collation));
+        assert_eq!(v, s("abc"));
+        // TEXTTYPE, maximum length 0x7FFFFFFF, collation, LONGLEN 3, 'abc'.
+        let (ti, v) = long_len(&hex_collated_value(
+            "23 FF FF FF 7F",
+            "03 00 00 00 61 62 63",
+        ));
+        assert_eq!(ti.ty, SqlType::VarChar(Len::Max));
+        assert!(ti.nullable);
+        assert_eq!(ti.collation, Some(collation));
+        assert_eq!(v, s("abc"));
+        // TEXTTYPE goes through code page 1252: 0x80 is the euro sign.
+        let (_, v) = long_len(&hex_collated_value("23 FF FF FF 7F", "01 00 00 00 80"));
+        assert_eq!(v, s("\u{20AC}"));
+        // IMAGETYPE: no collation, LONGLEN 2, 0xABCD.
+        let (ti, v) = long_len(&hex("22 FF FF FF 7F 02 00 00 00 AB CD"));
+        assert_eq!(ti.ty, SqlType::VarBinary(Len::Max));
+        assert!(ti.nullable);
+        assert_eq!(ti.collation, None);
+        assert_eq!(v, Value::Bytes(vec![0xAB, 0xCD]));
+    }
+
+    #[test]
+    fn decode_long_len_null_and_empty() {
+        for (prefix, collated, empty) in [
+            ("63 FE FF FF 7F", true, s("")),
+            ("23 FF FF FF 7F", true, s("")),
+            ("22 FF FF FF 7F", false, Value::Bytes(Vec::new())),
+        ] {
+            let build = |value: &str| {
+                if collated {
+                    hex_collated_value(prefix, value)
+                } else {
+                    hex(&format!("{prefix} {value}"))
+                }
+            };
+            let (ti, v) = long_len(&build("FF FF FF FF"));
+            assert!(ti.nullable, "{prefix}");
+            assert_eq!(v, Value::Null, "{prefix}");
+            let (_, v) = long_len(&build("00 00 00 00"));
+            assert_eq!(v, empty, "{prefix}");
+        }
+    }
+
+    #[test]
+    fn decode_long_len_malformed() {
+        for bytes in [
+            // Length beyond the remaining bytes.
+            hex_collated_value("63 FE FF FF 7F", "08 00 00 00 61 00 62 00"),
+            hex("22 FF FF FF 7F 03 00 00 00 AB CD"),
+            // Lengths from 0x80000000 to 0xFFFFFFFE.
+            hex_collated_value("63 FE FF FF 7F", "00 00 00 80"),
+            hex("22 FF FF FF 7F FE FF FF FF"),
+            // Odd ntext length.
+            hex_collated_value("63 FE FF FF 7F", "03 00 00 00 61 00 62"),
+            // Truncated TYPE_INFO: maximum length, collation, value length.
+            hex("63 FE FF"),
+            hex("63 FE FF FF 7F 09 04"),
+            hex("22 FF FF FF 7F 02 00"),
+            // Not a LONGLEN token.
+            hex("E7 40 1F"),
+            Vec::new(),
+        ] {
+            assert!(
+                matches!(long_len_err(&bytes), TdsError::Malformed(_)),
+                "{bytes:02X?}"
+            );
+        }
     }
 
     #[test]

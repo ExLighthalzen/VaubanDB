@@ -28,7 +28,10 @@
 //! zeroed collation, which `types::decode` delivers as `Some(Collation { lcid: 0, .. })`.
 //!
 //! The TYPE_INFO and the value of each parameter are read by [`crate::types::decode_type_info`]
-//! and [`crate::types::decode_value`], with one exception handled here: NULLTYPE
+//! and [`crate::types::decode_value`], with two exceptions handled here. The LONGLEN tokens
+//! `TEXTTYPE`, `NTEXTTYPE` and `IMAGETYPE` ([MS-TDS] 2.2.5.4.3) carry a LONGLEN value
+//! ([MS-TDS] 2.2.5.2.3) and are read by [`crate::types::decode_long_len_param`], which
+//! delivers them as `varchar(max)`, `nvarchar(max)` and `varbinary(max)`. NULLTYPE
 //! (`0x1F`, [MS-TDS] 2.2.5.4.1), the untyped NULL of a parameter, whose value takes no byte
 //! at all. `SqlType` has no variant for it; the parameter is delivered as `Value::Null` with
 //! a nullable `int` TYPE_INFO, the type T-SQL itself gives a bare `NULL` literal (`SELECT NULL`
@@ -46,8 +49,10 @@
 //!   later (unit test `decode_param_name_of_128_characters`). A
 //!   batch is refused as a whole rather than run one RPC at a time: each RPC but the last
 //!   would need its DONEPROC to carry `DONE_MORE`;
-//! - table-valued, `xml`, `sql_variant` and legacy `text` / `ntext` / `image` parameters:
-//!   `Unsupported` from `types::decode`.
+//! - table-valued, `xml` and `sql_variant` parameters: `Unsupported` from `types::decode`;
+//! - an OUTPUT `text`, `ntext` or `image` parameter: `Unsupported("OUTPUT text, ntext or
+//!   image parameter")`, since its RETURNVALUE would carry the `(max)` type it is delivered
+//!   as rather than the type the client declared.
 //!
 //! `Unsupported` is told apart from `Malformed` by `message::decode_client_message`, which
 //! turns the first into `ClientMessage::Refused`: the session answers it with an error and
@@ -65,7 +70,9 @@ use vauban_types::{SqlType, TypeInfo, Value};
 use crate::ResetConnection;
 use crate::error::TdsError;
 use crate::headers::decode_all_headers;
-use crate::types::{NULLTYPE, decode_type_info, decode_value};
+use crate::types::{
+    NULLTYPE, decode_long_len_param, decode_type_info, decode_value, is_long_len_token,
+};
 
 /// `ProcIDSwitch` ([MS-TDS] 2.2.6.6): the `ProcName` length that announces a `ProcID`.
 const PROC_ID_SWITCH: u16 = 0xFFFF;
@@ -234,6 +241,14 @@ fn decode_param(input: &mut &[u8]) -> Result<RpcParam, TdsError> {
     let (ty, value) = if input.first() == Some(&NULLTYPE) {
         *input = &input[1..];
         (TypeInfo::new(SqlType::Int, true), Value::Null)
+    } else if input.first().copied().is_some_and(is_long_len_token) {
+        // LONGLEN value; see the module documentation.
+        if output {
+            return Err(TdsError::Unsupported(
+                "OUTPUT text, ntext or image parameter",
+            ));
+        }
+        decode_long_len_param(input)?
     } else {
         let ty = decode_type_info(input)?;
         let value = decode_value(&ty, input)?;

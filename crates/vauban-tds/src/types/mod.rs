@@ -31,7 +31,7 @@ mod ushortlen;
 use bytes::BytesMut;
 use vauban_types::{Len, SqlType, TypeInfo, Value};
 
-pub(crate) use decode::{decode_type_info, decode_value};
+pub(crate) use decode::{decode_long_len_param, decode_type_info, decode_value, is_long_len_token};
 
 use crate::error::TdsError;
 

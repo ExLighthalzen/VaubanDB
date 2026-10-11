@@ -1,8 +1,10 @@
 //! Integration tests of the client messages a server reads whole but does not handle: an
-//! RPC whose parameter has an `xml`, table-valued, `sql_variant`, `text` or `ntext` type,
-//! a batch of RPCs, an encrypted parameter, a BULK_LOAD message. Each one gets an ERROR
-//! and a DONE carrying `DONE_ERROR`, and the next `SELECT 1` on the same connection
-//! answers its row. A malformed RPC, by contrast, closes the connection.
+//! RPC whose parameter has an `xml`, table-valued or `sql_variant` type, a batch of RPCs,
+//! an encrypted parameter, a BULK_LOAD message. Each one gets an ERROR and a DONE carrying
+//! `DONE_ERROR`, and the next `SELECT 1` on the same connection answers its row. A
+//! malformed RPC, by contrast, closes the connection. The LONGLEN parameters (`text`,
+//! `ntext`, `image`) are read, and the tests at the end of the file follow them through
+//! `sp_executesql`.
 //!
 //! The client side is written by hand from [MS-TDS] 2.2.3.1 (packet header), 2.2.5.3
 //! (ALL_HEADERS), 2.2.5.4 (TYPE_INFO), 2.2.6.4 (LOGIN7), 2.2.6.5 (PRELOGIN), 2.2.6.6 (RPC
@@ -18,9 +20,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use vauban_errors::InternalError;
-use vauban_session::{EncryptPolicy, Engine, NoAuth, Server, ServerConfig};
+use vauban_errors::{InternalError, SqlError};
+use vauban_session::{
+    EncryptPolicy, Engine, NoAuth, ProcAction, ProcArg, ProcParam, Server, ServerConfig,
+};
 use vauban_storage::MemoryStorage;
+use vauban_types::{SqlType, Value};
 
 /// Packet size in force before the login; also the `default_packet_size` of the server.
 const DEFAULT_PACKET_SIZE: u16 = 4096;
@@ -59,12 +64,60 @@ impl Running {
 
 /// Starts a `NoAuth` server on an ephemeral port.
 async fn start() -> Running {
+    start_with(Engine::new(Arc::new(MemoryStorage::new()))).await
+}
+
+/// A stand-in for the `sp_executesql` of the system procedure layer, which this crate does
+/// not depend on: the statement is the first argument and must be `nvarchar` or `nchar`
+/// (error 214, state 2 otherwise); the arguments after the declaration are bound with the
+/// type and value the RPC decoder delivered.
+fn executesql_stand_in(name: &str, args: &[ProcArg<'_>]) -> Option<Result<ProcAction, SqlError>> {
+    if name != "sp_executesql" {
+        return None;
+    }
+    let statement = args.first()?;
+    let text = match (statement.ty.ty, statement.value) {
+        (SqlType::NVarChar(_) | SqlType::NChar(_), Value::String(text)) => text.text.clone(),
+        _ => {
+            return Some(Err(SqlError::procedure_expects_type(
+                "@statement",
+                "ntext/nchar/nvarchar",
+            )));
+        }
+    };
+    let params = args
+        .iter()
+        .skip(2)
+        .map(|arg| ProcParam {
+            name: arg.name.unwrap_or_default().to_owned(),
+            ty: arg.ty.clone(),
+            value: arg.value.clone(),
+            output: arg.output,
+        })
+        .collect();
+    Some(Ok(ProcAction::ExecuteSql {
+        statement: text,
+        params,
+    }))
+}
+
+/// Starts a `NoAuth` server whose engine resolves `sp_executesql` by [`executesql_stand_in`].
+async fn start_with_executesql() -> Running {
+    start_with(Engine::with_system_procedures(
+        Arc::new(MemoryStorage::new()),
+        Arc::new(executesql_stand_in),
+    ))
+    .await
+}
+
+/// Starts a `NoAuth` server on `engine`, on an ephemeral port.
+async fn start_with(engine: Engine) -> Running {
     vauban_sysfn::register_builtins();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let shutdown = CancellationToken::new();
     let server = Server::new(
-        Arc::new(Engine::new(Arc::new(MemoryStorage::new()))),
+        Arc::new(engine),
         ServerConfig {
             encrypt: EncryptPolicy::Off,
             tls: None,
@@ -115,6 +168,14 @@ const TOKEN_LOGINACK: u8 = 0xAD;
 const TOKEN_ROW: u8 = 0xD1;
 const TOKEN_ENVCHANGE: u8 = 0xE3;
 const TOKEN_DONE: u8 = 0xFD;
+/// RETURNSTATUS token ([MS-TDS] 2.2.7.18).
+const TOKEN_RETURNSTATUS: u8 = 0x79;
+/// DONEPROC token ([MS-TDS] 2.2.7.7).
+const TOKEN_DONEPROC: u8 = 0xFE;
+/// DONEINPROC token ([MS-TDS] 2.2.7.6).
+const TOKEN_DONEINPROC: u8 = 0xFF;
+/// BIGVARBINTYPE ([MS-TDS] 2.2.5.4.2): `varbinary(n)`.
+const BIGVARBINTYPE: u8 = 0xA5;
 /// TYPE_INFO tokens ([MS-TDS] 2.2.5.4.1).
 const INT4TYPE: u8 = 0x38;
 /// INTNTYPE ([MS-TDS] 2.2.5.4.2): the nullable `int` of a column such as `@@TRANCOUNT`.
@@ -274,6 +335,12 @@ enum Tok {
     ColMetaData(Vec<(u16, u8, String)>),
     /// ROW: every value as a little-endian integer.
     Row(Vec<i64>),
+    /// ROW of `varbinary` columns: the bytes of each value.
+    BinaryRow(Vec<Vec<u8>>),
+    /// DONEPROC or DONEINPROC: token, `Status`, `CurCmd`.
+    DoneInProc { kind: u8, status: u16, cur_cmd: u16 },
+    /// RETURNSTATUS: the value.
+    ReturnStatus(i32),
     /// DONE with `Status`, `CurCmd` and `DoneRowCount`.
     Done {
         status: u16,
@@ -298,13 +365,23 @@ fn utf16_at(bytes: &[u8], pos: usize, units: usize) -> String {
     String::from_utf16(&units).unwrap()
 }
 
-/// Walks a token stream ([MS-TDS] 2.2.7). Only what these tests send is decoded: the `int`
-/// and nullable `int` columns, their ROW, and the DONE tokens.
+/// The wire form of a column, for reading its ROW values.
+#[derive(Clone, Copy, PartialEq)]
+enum Column {
+    /// INT4TYPE: four bytes, no length.
+    Int,
+    /// INTNTYPE of width 4: a length byte then four bytes.
+    IntN,
+    /// BIGVARBINTYPE: a two-byte length then the bytes.
+    VarBinary,
+}
+
+/// Walks a token stream ([MS-TDS] 2.2.7). Only what these tests send is decoded: the `int`,
+/// nullable `int` and `varbinary(n)` columns, their ROW, RETURNSTATUS and the DONE tokens.
 fn tokens(payload: &[u8]) -> Vec<Tok> {
     let mut pos = 0;
     let mut out = Vec::new();
-    // Per column: whether its value carries a length byte (INTNTYPE).
-    let mut columns: Vec<bool> = Vec::new();
+    let mut columns: Vec<Column> = Vec::new();
     while pos < payload.len() {
         let kind = payload[pos];
         pos += 1;
@@ -320,12 +397,16 @@ fn tokens(payload: &[u8]) -> Vec<Tok> {
                     pos += 2;
                     let ty = payload[pos];
                     pos += 1;
-                    let nullable = match ty {
-                        INT4TYPE => false,
+                    let column = match ty {
+                        INT4TYPE => Column::Int,
                         INTNTYPE => {
                             assert_eq!(payload[pos], 4, "INTNTYPE of another width");
                             pos += 1;
-                            true
+                            Column::IntN
+                        }
+                        BIGVARBINTYPE => {
+                            pos += 2; // maximum length
+                            Column::VarBinary
                         }
                         _ => panic!("TYPE_INFO 0x{ty:02X} not decoded by this test"),
                     };
@@ -333,15 +414,26 @@ fn tokens(payload: &[u8]) -> Vec<Tok> {
                     pos += 1;
                     let name = utf16_at(payload, pos, chars);
                     pos += 2 * chars;
-                    columns.push(nullable);
+                    columns.push(column);
                     decoded.push((flags, ty, name));
                 }
                 out.push(Tok::ColMetaData(decoded));
             }
+            TOKEN_ROW if columns.iter().all(|c| *c == Column::VarBinary) => {
+                let mut values = Vec::new();
+                for _ in &columns {
+                    let len = usize::from(u16_at(payload, pos));
+                    pos += 2;
+                    values.push(payload[pos..pos + len].to_vec());
+                    pos += len;
+                }
+                out.push(Tok::BinaryRow(values));
+            }
             TOKEN_ROW => {
                 let mut values = Vec::new();
-                for &nullable in &columns {
-                    if nullable {
+                for &column in &columns {
+                    assert!(column != Column::VarBinary, "mixed ROW not decoded");
+                    if column == Column::IntN {
                         assert_eq!(payload[pos], 4, "NULL or odd-width int");
                         pos += 1;
                     }
@@ -360,6 +452,20 @@ fn tokens(payload: &[u8]) -> Vec<Tok> {
                     row_count: u64::from_le_bytes(payload[pos + 4..pos + 12].try_into().unwrap()),
                 });
                 pos += 12;
+            }
+            TOKEN_DONEPROC | TOKEN_DONEINPROC => {
+                out.push(Tok::DoneInProc {
+                    kind,
+                    status: u16_at(payload, pos),
+                    cur_cmd: u16_at(payload, pos + 2),
+                });
+                pos += 12;
+            }
+            TOKEN_RETURNSTATUS => {
+                out.push(Tok::ReturnStatus(i32::from_le_bytes(
+                    payload[pos..pos + 4].try_into().unwrap(),
+                )));
+                pos += 4;
             }
             TOKEN_ERROR => {
                 let len = usize::from(u16_at(payload, pos));
@@ -464,11 +570,21 @@ fn xml_param(name: &str, text: &str) -> Vec<u8> {
 }
 
 /// A `text` (TEXTTYPE) or `ntext` (NTEXTTYPE) parameter: LONGLEN maximum, collation,
-/// then a four-byte length and the bytes ([MS-TDS] 2.2.5.4.2).
+/// then a four-byte length and the bytes ([MS-TDS] 2.2.5.4.3, 2.2.5.6, 2.2.5.2.3).
 fn long_text_param(name: &str, token: u8, data: &[u8]) -> Vec<u8> {
     let mut type_info = vec![token];
     type_info.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
     type_info.extend_from_slice(&COLLATION);
+    let mut value = (data.len() as u32).to_le_bytes().to_vec();
+    value.extend_from_slice(data);
+    param(name, &type_info, &value)
+}
+
+/// An `image` (IMAGETYPE) parameter: LONGLEN maximum, no collation, then a four-byte
+/// length and the bytes ([MS-TDS] 2.2.5.4.3, 2.2.5.6, 2.2.5.2.3).
+fn image_param(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut type_info = vec![0x22];
+    type_info.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
     let mut value = (data.len() as u32).to_le_bytes().to_vec();
     value.extend_from_slice(data);
     param(name, &type_info, &value)
@@ -557,18 +673,6 @@ fn refused_rpcs() -> Vec<(&'static str, Vec<u8>)> {
         (
             "sql_variant",
             executesql_payload("SELECT @x", "@x sql_variant", sql_variant_param("@x")),
-        ),
-        (
-            "text",
-            executesql_payload("SELECT @x", "@x text", long_text_param("@x", 0x23, b"abc")),
-        ),
-        (
-            "ntext",
-            executesql_payload(
-                "SELECT @x",
-                "@x ntext",
-                long_text_param("@x", 0x63, &utf16le("abc")),
-            ),
         ),
         ("RPC batch", batch),
         ("encrypted", encrypted),
@@ -790,5 +894,95 @@ async fn refused_rpc_leaves_the_open_transaction_as_it_was() {
     batch(&mut client, "COMMIT", descriptor).await;
     assert_eq!(single_int(&batch(&mut client, trancount, 0).await), 0);
     assert_eq!(single_int(&batch(&mut client, visible, 0).await), 1);
+    running.stop().await;
+}
+
+/// Sends one RPC to `sp_executesql` by ProcID with `params` and returns the tokens of its
+/// response.
+async fn executesql(client: &mut TcpStream, params: &[Vec<u8>]) -> Vec<Tok> {
+    let mut payload = all_headers();
+    payload.extend_from_slice(&executesql_body(params));
+    client
+        .write_all(&packet(PACKET_RPC, &payload))
+        .await
+        .unwrap();
+    tokens(&read_response(client, BUDGET).await)
+}
+
+/// The rows of a response, whatever their form.
+fn rows(answer: &[Tok]) -> Vec<&Tok> {
+    answer
+        .iter()
+        .filter(|tok| matches!(tok, Tok::Row(_) | Tok::BinaryRow(_)))
+        .collect()
+}
+
+/// The errors of a response, as `(number, state)`.
+fn errors(answer: &[Tok]) -> Vec<(u32, u8)> {
+    answer
+        .iter()
+        .filter_map(|tok| match tok {
+            Tok::Error { number, state, .. } => Some((*number, *state)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn executesql_statement_as_ntext_runs() {
+    let running = start_with_executesql().await;
+    let mut client = connect_and_login(running.addr).await;
+    let answer = executesql(
+        &mut client,
+        &[long_text_param("", 0x63, &utf16le("SELECT 1"))],
+    )
+    .await;
+    assert_eq!(errors(&answer), [], "{answer:?}");
+    assert_eq!(rows(&answer), [&Tok::Row(vec![1])], "{answer:?}");
+    assert!(
+        matches!(
+            answer.last(),
+            Some(Tok::DoneInProc {
+                kind: TOKEN_DONEPROC,
+                ..
+            })
+        ),
+        "{answer:?}"
+    );
+    assert_still_usable(&mut client).await;
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn executesql_statement_as_text_is_error_214() {
+    let running = start_with_executesql().await;
+    let mut client = connect_and_login(running.addr).await;
+    let answer = executesql(&mut client, &[long_text_param("", 0x23, b"SELECT 1")]).await;
+    assert_eq!(errors(&answer), [(214, 2)], "{answer:?}");
+    assert_eq!(rows(&answer), Vec::<&Tok>::new(), "{answer:?}");
+    assert_still_usable(&mut client).await;
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn executesql_image_value_reaches_a_varbinary_parameter() {
+    let running = start_with_executesql().await;
+    let mut client = connect_and_login(running.addr).await;
+    let answer = executesql(
+        &mut client,
+        &[
+            nvarchar_param("", "SELECT CAST(@a AS varbinary(10))"),
+            nvarchar_param("", "@a varbinary(10)"),
+            image_param("@a", &[0xAB, 0xCD]),
+        ],
+    )
+    .await;
+    assert_eq!(errors(&answer), [], "{answer:?}");
+    assert_eq!(
+        rows(&answer),
+        [&Tok::BinaryRow(vec![vec![0xAB, 0xCD]])],
+        "{answer:?}"
+    );
+    assert_still_usable(&mut client).await;
     running.stop().await;
 }

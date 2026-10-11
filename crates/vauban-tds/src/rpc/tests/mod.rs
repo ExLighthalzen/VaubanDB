@@ -285,3 +285,121 @@ fn well_known_names() {
         Some("sp_cursoropen")
     );
 }
+
+/// The 5-byte collation `09 04 D0 00 34` of the parameters below.
+const COLLATION: &str = "09 04 D0 00 34";
+
+/// `sp_executesql` by ProcID, no options, then `params` as the parameter data.
+fn sp_executesql_with(params: &[u8]) -> Vec<u8> {
+    let mut body = hex("FF FF 0A 00 00 00");
+    body.extend_from_slice(params);
+    message(&body)
+}
+
+/// An unnamed `ntext` parameter ([MS-TDS] 2.2.5.6 LONGLEN TYPE_INFO with collation, then a
+/// LONGLEN value of `value_len` followed by `data`), with `status` as its StatusFlags.
+fn ntext_param(status: u8, value_len: &str, data: &[u8]) -> Vec<u8> {
+    let mut param = vec![0x00, status];
+    param.extend_from_slice(&hex(&format!("63 FE FF FF 7F {COLLATION} {value_len}")));
+    param.extend_from_slice(data);
+    param
+}
+
+#[test]
+fn decode_ntext_text_and_image_params() {
+    let mut params = ntext_param(0, "06 00 00 00", &utf16le("abc"));
+    params.extend_from_slice(&hex(&format!(
+        "00 00 23 FF FF FF 7F {COLLATION} 03 00 00 00 61 62 63"
+    )));
+    params.extend_from_slice(&hex("00 00 22 FF FF FF 7F 02 00 00 00 AB CD"));
+    let rpc = decode(&sp_executesql_with(&params)).unwrap();
+    assert_eq!(rpc.params.len(), 3);
+    let collation = Some(vauban_types::Collation {
+        lcid: 0x0409,
+        flags: 0x0D,
+        version: 0,
+        sort_id: 0x34,
+    });
+
+    let ntext = &rpc.params[0];
+    assert_eq!(ntext.ty.ty, SqlType::NVarChar(Len::Max));
+    assert!(ntext.ty.nullable);
+    assert_eq!(ntext.ty.collation, collation);
+    assert_eq!(ntext.value, s("abc"));
+    assert!(!ntext.output);
+
+    let text = &rpc.params[1];
+    assert_eq!(text.ty.ty, SqlType::VarChar(Len::Max));
+    assert!(text.ty.nullable);
+    assert_eq!(text.ty.collation, collation);
+    assert_eq!(text.value, s("abc"));
+
+    let image = &rpc.params[2];
+    assert_eq!(image.ty.ty, SqlType::VarBinary(Len::Max));
+    assert!(image.ty.nullable);
+    assert_eq!(image.ty.collation, None);
+    assert_eq!(image.value, Value::Bytes(vec![0xAB, 0xCD]));
+}
+
+#[test]
+fn decode_long_len_params_null_and_empty() {
+    for (value_len, expected) in [
+        ("FF FF FF FF", [Value::Null, Value::Null, Value::Null]),
+        ("00 00 00 00", [s(""), s(""), Value::Bytes(Vec::new())]),
+    ] {
+        let mut params = ntext_param(0, value_len, &[]);
+        params.extend_from_slice(&hex(&format!(
+            "00 00 23 FF FF FF 7F {COLLATION} {value_len}"
+        )));
+        params.extend_from_slice(&hex(&format!("00 00 22 FF FF FF 7F {value_len}")));
+        let rpc = decode(&sp_executesql_with(&params)).unwrap();
+        let values: Vec<Value> = rpc.params.into_iter().map(|p| p.value).collect();
+        assert_eq!(values, expected, "{value_len}");
+    }
+}
+
+#[test]
+fn decode_param_after_ntext_is_read_in_place() {
+    // `ntext` statement, then `@a int` = 7 as an INTNTYPE.
+    let mut params = ntext_param(0, "12 00 00 00", &utf16le("SELECT @a"));
+    params.extend_from_slice(&hex("02 40 00 61 00 00 26 04 04 07 00 00 00"));
+    let rpc = decode(&sp_executesql_with(&params)).unwrap();
+    assert_eq!(rpc.params.len(), 2);
+    assert_eq!(rpc.params[0].value, s("SELECT @a"));
+    assert_eq!(rpc.params[1].name, "@a");
+    assert_eq!(rpc.params[1].ty.ty, SqlType::Int);
+    assert_eq!(rpc.params[1].value, Value::I32(7));
+}
+
+#[test]
+fn decode_long_len_param_malformed() {
+    for params in [
+        // Length beyond the remaining bytes.
+        ntext_param(0, "08 00 00 00", &utf16le("abc")),
+        // Length 0x80000000.
+        ntext_param(0, "00 00 00 80", &utf16le("abc")),
+        // Odd ntext length.
+        ntext_param(0, "05 00 00 00", &hex("61 00 62 00 63")),
+        // Image length beyond the remaining bytes.
+        hex("00 00 22 FF FF FF 7F 03 00 00 00 AB CD"),
+    ] {
+        assert!(
+            matches!(
+                decode(&sp_executesql_with(&params)),
+                Err(TdsError::Malformed(_))
+            ),
+            "{params:02X?}"
+        );
+    }
+}
+
+#[test]
+fn decode_output_ntext_param_unsupported() {
+    let params = ntext_param(STATUS_BY_REF_VALUE, "06 00 00 00", &utf16le("abc"));
+    assert!(matches!(
+        decode(&sp_executesql_with(&params)),
+        Err(TdsError::Unsupported(
+            "OUTPUT text, ntext or image parameter"
+        ))
+    ));
+}

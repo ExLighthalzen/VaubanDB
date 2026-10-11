@@ -64,8 +64,8 @@
 //! # A message this version does not handle is not a broken stream
 //!
 //! The reader hands over a message once its last packet is in, so a message whose content
-//! the codec refuses (`ClientMessage::Refused`: an RPC with an `xml`, `text`, `sql_variant`
-//! or table-valued parameter, a batch of RPCs, a BULK_LOAD message) has left nothing on the
+//! the codec refuses (`ClientMessage::Refused`: an RPC with an `xml`, `sql_variant` or
+//! table-valued parameter, a batch of RPCs, a BULK_LOAD message) has left nothing on the
 //! socket (`tests/unsupported_input.rs`, `refused_rpc_over_several_packets_is_read_to_its_end`). It is answered by error 50000 (severity 16, state 1) naming what
 //! was refused and a DONE carrying `DoneStatus::ERROR` ([`report_refused`]), and the
 //! connection serves the next request. A stream the codec cannot read (`TdsError::Malformed`)

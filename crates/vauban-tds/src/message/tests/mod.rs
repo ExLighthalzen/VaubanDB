@@ -81,8 +81,8 @@ fn rpc_payload(params: &[u8]) -> Vec<u8> {
 #[test]
 fn rpc_content_this_version_does_not_handle_is_refused_not_failed() {
     // Unnamed parameter, no status flag, then a TYPE_INFO token the decoder refuses:
-    // xml, text, ntext, image, sql_variant, CLR UDT, table-valued.
-    for token in [0xF1u8, 0x23, 0x63, 0x22, 0x62, 0xF0, 0xF3] {
+    // xml, sql_variant, CLR UDT, table-valued.
+    for token in [0xF1u8, 0x62, 0xF0, 0xF3] {
         let payload = rpc_payload(&[0x00, 0x00, token, 0x00, 0x00, 0x00, 0x00]);
         match decode_client_message(PacketType::Rpc, &payload, ResetConnection::Full) {
             Ok(ClientMessage::Refused {
@@ -101,6 +101,46 @@ fn rpc_content_this_version_does_not_handle_is_refused_not_failed() {
         Ok(ClientMessage::Refused {
             packet_type: 0x03,
             reason: "RPC batch"
+        })
+    ));
+}
+
+#[test]
+fn rpc_with_ntext_param_is_decoded() {
+    // Unnamed `ntext` parameter ([MS-TDS] 2.2.5.6 LONGLEN TYPE_INFO, collation, LONGLEN
+    // value) holding UTF-16LE `SELECT 1`.
+    let mut params = vec![
+        0x00, 0x00, 0x63, 0xFE, 0xFF, 0xFF, 0x7F, 0x09, 0x04, 0xD0, 0x00, 0x34, 0x10, 0x00, 0x00,
+        0x00,
+    ];
+    params.extend("SELECT 1".encode_utf16().flat_map(u16::to_le_bytes));
+    match decode_client_message(
+        PacketType::Rpc,
+        &rpc_payload(&params),
+        ResetConnection::None,
+    ) {
+        Ok(ClientMessage::Rpc(rpc)) => {
+            assert_eq!(rpc.params.len(), 1);
+            assert_eq!(
+                rpc.params[0].value,
+                vauban_types::Value::String(vauban_types::SqlString {
+                    text: "SELECT 1".into()
+                })
+            );
+        }
+        other => panic!("expected Rpc, got {other:?}"),
+    }
+    // The same parameter flagged OUTPUT is refused, not failed.
+    params[1] = 0x01;
+    assert!(matches!(
+        decode_client_message(
+            PacketType::Rpc,
+            &rpc_payload(&params),
+            ResetConnection::None
+        ),
+        Ok(ClientMessage::Refused {
+            packet_type: 0x03,
+            ..
         })
     ));
 }
