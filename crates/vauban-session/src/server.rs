@@ -597,7 +597,7 @@ async fn run_connection(
     if let Err(err) = login::register_live_session(
         &engine,
         &state,
-        &login::connection_info(&login, peer, cfg.encrypt),
+        &login::connection_info(&login, peer, stream.stays_encrypted_after_login()),
     ) {
         warn!(error = %err, spid, "session registry insert failed after login");
     }

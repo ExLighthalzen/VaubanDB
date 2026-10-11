@@ -699,3 +699,56 @@ async fn oversized_message_keeps_its_reset_request() {
     assert!(reader.read_message().await.is_err());
     assert_eq!(reader.take_skipped_reset(), ResetConnection::None);
 }
+
+#[tokio::test]
+async fn stays_encrypted_after_login_follows_the_negotiated_mode() {
+    // Optional policy, client asks for encryption: the whole connection is encrypted.
+    let (stream, _client) = accept_pair(
+        EncryptPolicy::Optional,
+        true,
+        ENCRYPT_ON,
+        Encryption::On,
+        true,
+    )
+    .await;
+    let stream = stream.expect("accept").downgrade_encryption().await;
+    assert!(stream.stays_encrypted_after_login());
+
+    // Required policy, client ENCRYPT_OFF: the server forces full encryption.
+    let (stream, _client) = accept_pair(
+        EncryptPolicy::Required,
+        true,
+        ENCRYPT_OFF,
+        Encryption::Req,
+        true,
+    )
+    .await;
+    let stream = stream.expect("accept").downgrade_encryption().await;
+    assert!(stream.stays_encrypted_after_login());
+
+    // Optional policy, client ENCRYPT_OFF: only the login is encrypted.
+    let (stream, _client) = accept_pair(
+        EncryptPolicy::Optional,
+        true,
+        ENCRYPT_OFF,
+        Encryption::Off,
+        true,
+    )
+    .await;
+    let stream = stream.expect("accept");
+    assert!(!stream.stays_encrypted_after_login());
+    let stream = stream.downgrade_encryption().await;
+    assert!(!stream.stays_encrypted_after_login());
+
+    // Off policy: clear text from the start.
+    let (stream, _client) = accept_pair(
+        EncryptPolicy::Off,
+        false,
+        ENCRYPT_OFF,
+        Encryption::NotSup,
+        false,
+    )
+    .await;
+    let stream = stream.expect("accept").downgrade_encryption().await;
+    assert!(!stream.stays_encrypted_after_login());
+}

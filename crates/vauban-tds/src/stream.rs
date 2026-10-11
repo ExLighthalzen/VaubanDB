@@ -505,6 +505,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TdsStream<S> {
         }
     }
 
+    /// Whether the connection stays encrypted once the login is over: true when the client
+    /// and the server agreed on encrypting the whole connection, false when the connection
+    /// goes back to clear text after the login (ENCRYPT_OFF) or is in clear text from the
+    /// start. Depends on the negotiated mode, so it answers the same before and after
+    /// [`TdsStream::downgrade_encryption`].
+    pub fn stays_encrypted_after_login(&self) -> bool {
+        matches!(self.mode, TlsMode::Full)
+    }
+
     /// Splits the connection into independent halves so that an ATTENTION can be read
     /// while a response is being written. The writer takes the buffer, the packet size,
     /// the `PacketID` counter and the SPID with it.

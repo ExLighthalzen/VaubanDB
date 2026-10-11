@@ -364,3 +364,14 @@ fn client_sees_state_1_for_18456_only() {
     let other = SqlError::new(50000, 16, 7, "custom");
     assert_eq!(for_client(other).state, 7);
 }
+
+#[test]
+fn encrypt_option_follows_the_negotiated_mode() {
+    let login = login7(0x7400_0004, 4096);
+    let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    // Encrypted end to end.
+    assert_eq!(connection_info(&login, peer, true).encrypt_option, "TRUE");
+    // Login only encrypted, or clear text from the start: the connection is not
+    // encrypted once the login is over.
+    assert_eq!(connection_info(&login, peer, false).encrypt_option, "FALSE");
+}

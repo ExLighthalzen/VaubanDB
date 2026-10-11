@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 
 use vauban_errors::{InfoMessage, SqlError, SqlResult, message_template};
-use vauban_tds::{DoneStatus, EncryptPolicy, EnvChange, Login7, Token};
+use vauban_tds::{DoneStatus, EnvChange, Login7, Token};
 use vauban_types::Collation;
 
 use crate::registry::ConnectionInfo;
@@ -82,19 +82,20 @@ pub fn banner_with_edition(edition: &str) -> String {
 pub(crate) const MASTER: &str = "master";
 
 /// Builds the connection metadata written into `vauban_sys_connections` at login.
+///
+/// `encrypt_option` follows the negotiated encryption, not the server policy: a connection
+/// that stays encrypted after the login reports `TRUE`; a connection back in clear text
+/// after the login, or in clear text from the start, reports `FALSE`.
 pub(crate) fn connection_info(
     login: &Login7,
     peer: SocketAddr,
-    encrypt: EncryptPolicy,
+    stays_encrypted: bool,
 ) -> ConnectionInfo {
     ConnectionInfo {
         client_address: peer.ip().to_string(),
         client_port: peer.port(),
         tds_version: login.tds_version,
-        encrypt_option: match encrypt {
-            EncryptPolicy::Required => "TRUE".to_owned(),
-            EncryptPolicy::Off | EncryptPolicy::Optional => "FALSE".to_owned(),
-        },
+        encrypt_option: if stays_encrypted { "TRUE" } else { "FALSE" }.to_owned(),
     }
 }
 

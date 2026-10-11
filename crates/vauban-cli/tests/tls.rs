@@ -1,7 +1,8 @@
 //! `vauban serve` with the default encryption policy starts without any TLS
 //! option, answers PRELOGIN with the negotiated ENCRYPTION byte, writes its generated
 //! certificate under `--data`, and completes the TLS handshake with a real TDS client
-//! (`tiberius`, trusting any certificate) in the two modes that encrypt the login.
+//! (`tiberius`, trusting any certificate) in the two modes that encrypt the login, where
+//! `sys.dm_exec_connections.encrypt_option` follows the negotiated encryption.
 //!
 //! Everything runs on `127.0.0.1`; the server is a child process killed at the end of
 //! each test.
@@ -395,9 +396,12 @@ fn missing_cert_file_exits_2_naming_the_path() {
     assert!(err.contains("/nonexistent/server.crt"), "{err}");
 }
 
-/// Connects with `tiberius` at `level`, trusting any certificate, and returns the result
-/// of the login.
-async fn tiberius_login(port: u16, level: EncryptionLevel) -> Result<(), tiberius::error::Error> {
+/// Connects with `tiberius` at `level`, trusting any certificate, and returns the
+/// `encrypt_option` that `sys.dm_exec_connections` reports for the session.
+async fn tiberius_encrypt_option(
+    port: u16,
+    level: EncryptionLevel,
+) -> Result<String, tiberius::error::Error> {
     let mut config = Config::new();
     config.host("127.0.0.1");
     config.port(port);
@@ -407,31 +411,47 @@ async fn tiberius_login(port: u16, level: EncryptionLevel) -> Result<(), tiberiu
 
     let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
     tcp.set_nodelay(true)?;
-    let client = tokio::time::timeout(wait_cap(), Client::connect(config, tcp.compat_write()))
+    let mut client = tokio::time::timeout(wait_cap(), Client::connect(config, tcp.compat_write()))
         .await
         .expect("login within the timeout")?;
+    let row = client
+        .query(
+            "SELECT encrypt_option FROM sys.dm_exec_connections WHERE session_id = @@SPID",
+            &[],
+        )
+        .await?
+        .into_row()
+        .await?
+        .expect("one row for the session");
+    let encrypt_option = row
+        .get::<&str, _>(0)
+        .expect("encrypt_option is not NULL")
+        .to_owned();
     client.close().await?;
-    Ok(())
+    Ok(encrypt_option)
 }
 
-/// The TLS handshake with a real client, in the two modes that encrypt the login.
+/// The TLS handshake with a real client, in the two modes that encrypt the login, then
+/// the `encrypt_option` the session reports, which must be `expected`.
 ///
-/// In both modes the LOGIN7 travels inside TLS: the server can only log it once the
-/// handshake, encapsulated in PRELOGIN packets, has completed. A login the client reports
-/// as failed is accepted here as long as the server logged the LOGIN7 it received over
-/// TLS: the handshake is what this checks, not the login.
-fn tls_handshake_with_tiberius(offset: u16, level: EncryptionLevel, extra: &[&str]) {
+/// In both modes the LOGIN7 travels inside TLS: the server can only read it once the
+/// handshake, encapsulated in PRELOGIN packets, has completed. `encrypt_option` is `TRUE`
+/// when the connection stays encrypted after the login, `FALSE` when only the login was.
+fn tls_handshake_with_tiberius(
+    offset: u16,
+    level: EncryptionLevel,
+    extra: &[&str],
+    expected: &str,
+) {
     let server = Running::start(offset, extra);
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let result = runtime.block_on(tiberius_login(server.port, level));
+    let result = runtime.block_on(tiberius_encrypt_option(server.port, level));
     let output = server.stop();
     let log = String::from_utf8_lossy(&output.stdout);
     assert!(log.contains("PRELOGIN negotiated"), "{log}");
-    if let Err(err) = result {
-        assert!(
-            log.contains("\"message\":\"LOGIN7\""),
-            "login failed ({err}) and the server never received the LOGIN7 over TLS:\n{log}"
-        );
+    match result {
+        Ok(encrypt_option) => assert_eq!(encrypt_option, expected, "{log}"),
+        Err(err) => panic!("login or query failed ({err}):\n{log}"),
     }
     assert!(
         !log.contains("\"level\":\"WARN\"") || log.contains("changes at every start"),
@@ -441,21 +461,36 @@ fn tls_handshake_with_tiberius(offset: u16, level: EncryptionLevel, extra: &[&st
 
 #[test]
 fn tiberius_encrypts_the_login_with_the_ephemeral_certificate() {
-    tls_handshake_with_tiberius(16, EncryptionLevel::Off, &["--encrypt", "optional"]);
+    tls_handshake_with_tiberius(
+        16,
+        EncryptionLevel::Off,
+        &["--encrypt", "optional"],
+        "FALSE",
+    );
 }
 
 #[test]
 fn tiberius_encrypts_everything_with_the_ephemeral_certificate() {
-    tls_handshake_with_tiberius(17, EncryptionLevel::Required, &["--encrypt", "optional"]);
+    tls_handshake_with_tiberius(
+        17,
+        EncryptionLevel::Required,
+        &["--encrypt", "optional"],
+        "TRUE",
+    );
 }
 
 #[test]
 fn tiberius_encrypts_everything_against_encrypt_required() {
-    tls_handshake_with_tiberius(18, EncryptionLevel::Required, &["--encrypt", "required"]);
+    tls_handshake_with_tiberius(
+        18,
+        EncryptionLevel::Required,
+        &["--encrypt", "required"],
+        "TRUE",
+    );
 }
 
 #[test]
 fn tiberius_encrypts_the_login_with_the_data_dir_certificate() {
     let data = TempDir::new("tiberius");
-    tls_handshake_with_tiberius(19, EncryptionLevel::Off, &["--data", data.arg()]);
+    tls_handshake_with_tiberius(19, EncryptionLevel::Off, &["--data", data.arg()], "FALSE");
 }
