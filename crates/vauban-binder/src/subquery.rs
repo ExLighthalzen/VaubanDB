@@ -288,8 +288,9 @@ pub(crate) fn bind_scalar(
 ///
 /// The inner query must carry **exactly one** column in its select list (116 otherwise).
 /// The tested value `e` and the column of the subquery are brought to their common type
-/// ([`vauban_types::implicit_result_type`]), and the one not already of that type is
-/// wrapped in a [`BoundExprKind::Convert`].
+/// ([`vauban_types::implicit_result_type`]): `e` is wrapped in a [`BoundExprKind::Convert`]
+/// when it is not of that type, and the column under a projection that converts it
+/// ([`convert_produced_column`]).
 ///
 /// # Errors
 ///
@@ -314,6 +315,7 @@ pub(crate) fn bind_in_subquery(
     let common = vauban_types::implicit_result_type(&expr.ty, &subquery_ty)
         .map_err(|e| if e.line == 0 { e.with_line(line) } else { e })?;
     let nullable = expr.ty.nullable || subquery_ty.nullable;
+    let plan = convert_produced_column(plan, &common, line);
     Ok(BoundExpr {
         kind: BoundExprKind::InSubquery {
             expr: Box::new(crate::expr::convert_to(expr, &common)),
@@ -323,6 +325,50 @@ pub(crate) fn bind_in_subquery(
         ty: vauban_types::TypeInfo::new(vauban_types::SqlType::Bit, nullable),
         line,
     })
+}
+
+/// Puts the single column `plan` produces under a [`BoundExprKind::Convert`] towards
+/// `common`, through a [`LogicalPlan::Project`] over `plan`; `plan` is returned as is when
+/// its column already has the type of `common`.
+///
+/// The membership test then compares two values of one type, whether the planner turns
+/// it into a semi-join or evaluates the subquery row by row: `d IN (SELECT i …)`, `d`
+/// `decimal(5,2)` and `i` `int`, compares two decimals (`tests/bind_subquery.rs`,
+/// `in_subquery_converts_the_produced_column_to_the_common_type`).
+fn convert_produced_column(plan: LogicalPlan, common: &TypeInfo, line: u32) -> LogicalPlan {
+    let [produced] = plan.schema().columns.as_slice() else {
+        return plan;
+    };
+    if produced.ty.ty == common.ty {
+        return plan;
+    }
+    let produced = produced.clone();
+    let column = BoundExpr {
+        kind: BoundExprKind::ColumnRef(ColumnBinding {
+            column: ColumnId(1),
+            index: 0,
+            name: produced.name.clone(),
+            ty: produced.ty.clone(),
+            depth: 0,
+        }),
+        ty: produced.ty,
+        line,
+    };
+    let converted = convert_to(column, common);
+    let schema = OutputSchema {
+        columns: vec![OutputColumn {
+            name: produced.name.clone(),
+            ty: converted.ty.clone(),
+        }],
+    };
+    LogicalPlan::Project {
+        input: Box::new(plan),
+        exprs: vec![BoundProjection {
+            expr: converted,
+            name: produced.name,
+        }],
+        schema,
+    }
 }
 
 /// Binds `v <op> ANY | SOME | ALL (SELECT …)`.

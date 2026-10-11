@@ -556,6 +556,86 @@ fn in_a_subquery_converts_to_the_common_type() {
     assert!(matches!(predicate.kind, BoundExprKind::InSubquery { .. }));
 }
 
+/// The type of the single column the plan of an `IN (SELECT ...)` produces, and whether
+/// the tested value sits under a conversion.
+fn in_subquery_sides(text: &str) -> (SqlType, bool, LogicalPlan) {
+    let plan = bind_with(text).expect("binds");
+    let LogicalPlan::Project { input, .. } = &plan else {
+        panic!("root is not a Project: {plan:?}");
+    };
+    let LogicalPlan::Filter { predicate, .. } = input.as_ref() else {
+        panic!("input is not a Filter: {input:?}");
+    };
+    let BoundExprKind::InSubquery { expr, plan, .. } = &predicate.kind else {
+        panic!("not an InSubquery: {predicate:?}");
+    };
+    let produced = plan.plan.schema().columns[0].ty.ty;
+    let tested_converted = matches!(expr.kind, BoundExprKind::Convert { .. });
+    assert_eq!(expr.ty.ty, produced, "{text}: the two sides differ in type");
+    (produced, tested_converted, plan.plan.as_ref().clone())
+}
+
+/// Both sides of `IN (SELECT ...)` reach the common type: the tested value under a
+/// `Convert`, the produced column under a projection that converts it. A `decimal(5,2)`
+/// tested against an `int` column compares two `decimal(12,2)` values; the column is
+/// read from the plan the query wrote, under the projection.
+#[test]
+fn in_subquery_converts_the_produced_column_to_the_common_type() {
+    let common = SqlType::Decimal {
+        precision: 12,
+        scale: 2,
+    };
+    for text in [
+        "SELECT k FROM a WHERE CAST(c AS decimal(5,2)) IN (SELECT k FROM b)",
+        "SELECT k FROM a WHERE CAST(c AS decimal(5,2)) NOT IN (SELECT k FROM b)",
+    ] {
+        let (produced, tested_converted, inner) = in_subquery_sides(text);
+        assert_eq!(produced, common, "{text}");
+        assert!(tested_converted, "{text}");
+        let LogicalPlan::Project { input, exprs, .. } = &inner else {
+            panic!("{text}: the column is not converted: {inner:?}");
+        };
+        let BoundExprKind::Convert { expr, .. } = &exprs[0].expr.kind else {
+            panic!("{text}: no Convert over the column: {inner:?}");
+        };
+        let BoundExprKind::ColumnRef(column) = &expr.kind else {
+            panic!("{text}: the Convert does not read the column: {expr:?}");
+        };
+        assert_eq!((column.index, column.depth), (0, 0), "{text}");
+        assert_eq!(column.ty.ty, SqlType::Int, "{text}");
+        assert!(
+            matches!(input.as_ref(), LogicalPlan::Project { .. }),
+            "{text}: the written plan is not under the conversion: {input:?}"
+        );
+    }
+}
+
+/// A subquery column already of the common type is left as written: `int IN (SELECT
+/// decimal(12,2) ...)` converts the tested value only, and `int IN (SELECT int ...)` converts
+/// neither side.
+#[test]
+fn in_subquery_leaves_a_column_of_the_common_type_unconverted() {
+    let (produced, tested_converted, inner) =
+        in_subquery_sides("SELECT k FROM a WHERE c IN (SELECT CAST(k AS decimal(12,2)) FROM b)");
+    assert!(tested_converted);
+    assert!(matches!(produced, SqlType::Decimal { .. }));
+    let LogicalPlan::Project { exprs, .. } = &inner else {
+        panic!("inner root is not a Project: {inner:?}");
+    };
+    assert!(matches!(exprs[0].expr.kind, BoundExprKind::Convert { .. }));
+    let LogicalPlan::Project { input, .. } = &inner else {
+        unreachable!("matched above")
+    };
+    assert!(
+        !matches!(input.as_ref(), LogicalPlan::Project { .. }),
+        "a projection was added over a column of the common type: {inner:?}"
+    );
+
+    let (produced, tested_converted, _) =
+        in_subquery_sides("SELECT k FROM a WHERE c IN (SELECT k FROM b)");
+    assert_eq!((produced, tested_converted), (SqlType::Int, false));
+}
+
 // ---------------------------------------------------------------------------------------
 // v <op> ANY | SOME | ALL (SELECT ...)
 // ---------------------------------------------------------------------------------------
