@@ -1097,3 +1097,201 @@ fn a_clustered_row_whose_old_versions_a_vacuum_took_reopens() {
         Storage::rollback(&storage, txn).expect("rollback");
     }
 }
+
+// --- Writes a savepoint took back ------------------------------------------------------
+
+/// One row as [`rows_of`] answers it.
+type ScannedRow = (RowId, Option<i32>, Option<i32>);
+
+/// What a committed transaction does between its savepoint and the `ROLLBACK TO` in
+/// [`a_clustered_write_a_savepoint_took_back_stays_out_after_a_crash`].
+#[derive(Debug, Clone, Copy)]
+enum TakenBackWrite {
+    /// Updates row 0, its key kept.
+    Update,
+    /// Updates row 0 to another key.
+    MoveKey,
+    /// Deletes row 1.
+    Delete,
+    /// Inserts a row of key 77.
+    Insert,
+    /// Updates row 0, and after the `ROLLBACK TO` updates it again to `(0, 555)`.
+    UpdateAgain,
+}
+
+/// An instance in `dir` with a clustered table of five committed rows `(k, 100 + k)`, then a
+/// transaction that takes a savepoint, makes `write`, lets a second transaction share the
+/// leaf, commit and checkpoint (so the leaf reaches `data` holding the write), rolls back to
+/// the savepoint and commits. Dropped without a checkpoint. Answers the table, the rows
+/// expected, and the number of compensations the `ROLLBACK TO` journalled.
+fn a_savepoint_took_back(
+    dir: &TempDir,
+    write: TakenBackWrite,
+) -> (TableId, Vec<ScannedRow>, usize) {
+    use crate::Storage;
+    let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+    let db = Storage::create_database(&storage, "a").expect("database");
+    let table = Storage::create_table(&storage, db, &pair_shape()).expect("table");
+    Storage::checkpoint(&storage).expect("checkpoint");
+    let first = TxnId(Storage::next_txn_id(&storage));
+    let ids: Vec<RowId> = (0..5)
+        .map(|k| Storage::insert(&storage, first, table, &pair(k, 100 + k)).expect("insert"))
+        .collect();
+    Storage::commit(&storage, first).expect("commit the rows");
+    let mut expected: Vec<_> = ids
+        .iter()
+        .zip(0..)
+        .map(|(id, k)| (*id, Some(k), Some(100 + k)))
+        .collect();
+    let txn = TxnId(Storage::next_txn_id(&storage));
+    let sp = Storage::savepoint(&storage, txn).expect("savepoint");
+    match write {
+        TakenBackWrite::Update | TakenBackWrite::UpdateAgain => {
+            Storage::update(&storage, txn, table, ids[0], &pair(0, 999)).expect("update");
+        }
+        TakenBackWrite::MoveKey => {
+            Storage::update(&storage, txn, table, ids[0], &pair(900, 999)).expect("update");
+        }
+        TakenBackWrite::Delete => Storage::delete(&storage, txn, table, ids[1]).expect("delete"),
+        TakenBackWrite::Insert => {
+            Storage::insert(&storage, txn, table, &pair(77, 999)).expect("insert");
+        }
+    }
+    let other = TxnId(Storage::next_txn_id(&storage));
+    let shared = Storage::insert(&storage, other, table, &pair(50, 50)).expect("insert");
+    Storage::commit(&storage, other).expect("commit the other");
+    Storage::checkpoint(&storage).expect("checkpoint with the write on the leaf");
+    expected.push((shared, Some(50), Some(50)));
+    let before = journal(&storage)
+        .iter()
+        .filter(|record| record.kind == WalRecordKind::Compensation)
+        .count();
+    Storage::rollback_to(&storage, txn, sp).expect("rollback to");
+    let compensations = journal(&storage)
+        .iter()
+        .filter(|record| record.kind == WalRecordKind::Compensation)
+        .count()
+        - before;
+    if let TakenBackWrite::UpdateAgain = write {
+        Storage::update(&storage, txn, table, ids[0], &pair(0, 555)).expect("update again");
+        expected[0].2 = Some(555);
+    }
+    Storage::commit(&storage, txn).expect("commit");
+    expected.sort_by_key(|row| row.1);
+    (table, expected, compensations)
+}
+
+#[test]
+fn a_clustered_write_a_savepoint_took_back_stays_out_after_a_crash() {
+    use crate::Storage;
+    for (write, journalled) in [
+        (TakenBackWrite::Update, 2),
+        (TakenBackWrite::MoveKey, 2),
+        (TakenBackWrite::Delete, 1),
+        (TakenBackWrite::Insert, 1),
+        (TakenBackWrite::UpdateAgain, 2),
+    ] {
+        let dir = TempDir::created("clustered-rollback-to");
+        let (table, mut expected, compensations) = a_savepoint_took_back(&dir, write);
+        // One compensation per version taken out and per `xmax` unset.
+        assert_eq!(compensations, journalled, "{write:?}");
+        for life in 0..3 {
+            let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+            let got = rows_of(&storage, table);
+            assert_eq!(got, expected, "{write:?}, life {life}");
+            for &(id, _, _) in &got {
+                let txn = TxnId(Storage::next_txn_id(&storage));
+                Storage::update(&storage, txn, table, id, &pair(7, 7))
+                    .unwrap_or_else(|e| panic!("{write:?}, life {life}: update {id}: {e:?}"));
+                Storage::rollback(&storage, txn).expect("rollback the update");
+                let txn = TxnId(Storage::next_txn_id(&storage));
+                Storage::delete(&storage, txn, table, id)
+                    .unwrap_or_else(|e| panic!("{write:?}, life {life}: delete {id}: {e:?}"));
+                Storage::rollback(&storage, txn).expect("rollback the delete");
+            }
+            assert_eq!(rows_of(&storage, table), got, "{write:?}, life {life}");
+            let txn = TxnId(Storage::next_txn_id(&storage));
+            let (id, key, _) = expected[0];
+            Storage::update(&storage, txn, table, id, &pair(key.expect("a key"), life))
+                .unwrap_or_else(|e| panic!("{write:?}, life {life}: update: {e:?}"));
+            Storage::commit(&storage, txn).expect("commit the update");
+            expected[0].2 = Some(life);
+            if life == 1 {
+                Storage::checkpoint(&storage).expect("checkpoint");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_second_rollback_to_the_same_savepoint_cancels_the_write_between() {
+    use crate::Storage;
+    for (write, checkpoint) in [
+        (TakenBackWrite::Update, false),
+        (TakenBackWrite::Delete, false),
+        (TakenBackWrite::Insert, false),
+        (TakenBackWrite::Update, true),
+        (TakenBackWrite::Delete, true),
+        (TakenBackWrite::Insert, true),
+    ] {
+        let dir = TempDir::created("clustered-rollback-to-twice");
+        let (table, expected) = {
+            let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("open");
+            let db = Storage::create_database(&storage, "a").expect("database");
+            let table = Storage::create_table(&storage, db, &pair_shape()).expect("table");
+            Storage::checkpoint(&storage).expect("checkpoint");
+            let first = TxnId(Storage::next_txn_id(&storage));
+            let ids: Vec<RowId> = (0..5)
+                .map(|k| {
+                    Storage::insert(&storage, first, table, &pair(k, 100 + k)).expect("insert")
+                })
+                .collect();
+            Storage::commit(&storage, first).expect("commit the rows");
+            let expected = rows_of(&storage, table);
+            let txn = TxnId(Storage::next_txn_id(&storage));
+            let sp = Storage::savepoint(&storage, txn).expect("savepoint");
+            for (round, &id) in ids.iter().enumerate().take(2) {
+                match write {
+                    TakenBackWrite::Delete => {
+                        Storage::delete(&storage, txn, table, id).expect("delete");
+                    }
+                    TakenBackWrite::Insert => {
+                        Storage::insert(&storage, txn, table, &pair(70 + key_of(round), 999))
+                            .expect("insert");
+                    }
+                    _ => {
+                        Storage::update(&storage, txn, table, id, &pair(key_of(round), 999))
+                            .expect("update");
+                    }
+                }
+                if checkpoint {
+                    let other = TxnId(Storage::next_txn_id(&storage));
+                    Storage::insert(&storage, other, table, &pair(50 + 10 * key_of(round), 50))
+                        .expect("insert");
+                    Storage::commit(&storage, other).expect("commit the other");
+                    Storage::checkpoint(&storage).expect("checkpoint");
+                }
+                Storage::rollback_to(&storage, txn, sp).expect("rollback to");
+            }
+            Storage::commit(&storage, txn).expect("commit");
+            let mut expected = expected;
+            if checkpoint {
+                expected = rows_of(&storage, table);
+            }
+            (table, expected)
+        };
+        for life in 0..2 {
+            let storage = DiskStorage::open(dir.path(), DiskOptions::default()).expect("reopen");
+            assert_eq!(
+                rows_of(&storage, table),
+                expected,
+                "{write:?}, checkpoint {checkpoint}, life {life}"
+            );
+        }
+    }
+}
+
+/// The round as a key offset.
+fn key_of(round: usize) -> i32 {
+    i32::try_from(round).expect("a round")
+}

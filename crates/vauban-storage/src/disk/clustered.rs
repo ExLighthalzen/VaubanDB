@@ -144,9 +144,49 @@ use crate::{
     Direction, KeyColumn, KeyRange, Row, RowId, Snapshot, TableId, TableShape, TxnId, TxnStatus,
 };
 
-/// The changes [`ClusteredTable::take_back_losers`] finds a record for in the journal, by
-/// `(RowId, seq, Release as u8)` of the version, with the number of that record.
-pub(crate) type TakenBack = BTreeMap<(RowId, u64, u8), Lsn>;
+/// The compensations of a clustered table the journal holds, with the number of each record:
+/// what an earlier recovery took back from a loser, and what the undo of a `ROLLBACK TO` took
+/// out ([`ClusteredTable::rollback_to_savepoint`]). [`ClusteredTable::take_back_losers`] makes
+/// each again on the version it names while the tree still holds that version.
+#[derive(Debug, Default)]
+pub(crate) struct TakenBack {
+    /// Versions taken out, by `(RowId, seq)`. Serials grow within an instance
+    /// ([`ClusteredTable::take_seq`]) and a reopen starts past the largest one the journal
+    /// names (`Recovery::next_seq`); on those two counters, a version a record names here is
+    /// out of the table for good.
+    removed: BTreeMap<(RowId, u64), Lsn>,
+    /// `xmax` unset, by `(RowId, seq, xmax)`: the version and the writer whose mark went away.
+    cleared: BTreeMap<(RowId, u64, TxnId), Lsn>,
+}
+
+impl TakenBack {
+    /// Notes the compensation `release`, of number `lsn`.
+    pub(crate) fn note(&mut self, release: &SlotRelease, lsn: Lsn) {
+        let (row, seq) = (release.header.row, release.header.seq);
+        match release.release {
+            Release::Removed => {
+                self.removed.insert((row, seq), lsn);
+            }
+            Release::XmaxCleared => {
+                if let Some(xmax) = release.header.xmax {
+                    self.cleared.insert((row, seq, xmax), lsn);
+                }
+            }
+        }
+    }
+
+    /// The record that took `header` out of the table, or unset its `xmax`, when the journal
+    /// holds one.
+    fn of(&self, header: &VersionHeader, release: Release) -> Option<Lsn> {
+        let (row, seq) = (header.row, header.seq);
+        match release {
+            Release::Removed => self.removed.get(&(row, seq)).copied(),
+            Release::XmaxCleared => header
+                .xmax
+                .and_then(|xmax| self.cleared.get(&(row, seq, xmax)).copied()),
+        }
+    }
+}
 
 /// Offset, in the payload of an entry, of the length of the key of the previous version.
 const OFF_PREV_LEN: usize = VERSION_PREFIX_LEN;
@@ -480,6 +520,15 @@ impl<'storage> ClusteredTable<'storage> {
     /// set on the version of another writer is unset. The directory is then rebuilt, so each
     /// row names the newest version left.
     ///
+    /// The same goes for a version a compensation of `journalled` names, whoever wrote it: the
+    /// undo of a `ROLLBACK TO` journals what it takes out, and a leaf that reached `data` before
+    /// that undo still holds the write of a transaction that went on to commit. The redo leaves
+    /// the records of such a write out, so what the leaf holds of it leaves here, under the
+    /// record of its undo (`a_clustered_write_a_savepoint_took_back_stays_out_after_a_crash`).
+    /// An `xmax` the transaction set again after its `ROLLBACK TO` is unset with the one the
+    /// undo unset, and its own record, which the redo replays after this call, sets it back
+    /// (`TakenBackWrite::UpdateAgain` in that test).
+    ///
     /// Such entries are in the tree when a leaf a loser wrote reached `data` through a leaf
     /// shared with a transaction that ended first (the shapes of the module documentation).
     /// Left there, the version of a loser is the newest of its row and an `xmax` of a loser
@@ -512,10 +561,15 @@ impl<'storage> ClusteredTable<'storage> {
         let mut doomed = Vec::new();
         for entry in self.tree.seek(&KeyRange::Full, Direction::Forward)? {
             let stored = StoredVersion::read(entry)?;
-            if losers.contains(&stored.header.xmin) {
+            if losers.contains(&stored.header.xmin)
+                || journalled.of(&stored.header, Release::Removed).is_some()
+            {
                 doomed.push((stored.header.xmin, stored, Release::Removed));
             } else if let Some(writer) = stored.header.xmax
-                && losers.contains(&writer)
+                && (losers.contains(&writer)
+                    || journalled
+                        .of(&stored.header, Release::XmaxCleared)
+                        .is_some())
             {
                 doomed.push((writer, stored, Release::XmaxCleared));
             }
@@ -529,8 +583,7 @@ impl<'storage> ClusteredTable<'storage> {
         };
         let mut records = Vec::with_capacity(doomed.len());
         for (writer, stored, release) in &doomed {
-            let change = (stored.header.row, stored.header.seq, *release as u8);
-            if let Some(&lsn) = journalled.get(&change) {
+            if let Some(lsn) = journalled.of(&stored.header, *release) {
                 records.push(lsn);
                 continue;
             }
@@ -1537,8 +1590,10 @@ impl<'storage> ClusteredTable<'storage> {
 
     /// Applies one undo entry of `txn`, the pages it rewrites flagged for `txn`.
     ///
-    /// The undo writes no journal record of its own, as the undo of a heap table does not
-    /// ([`super::version::HeapTable`]): `Lsn(0)` leaves each page the LSN it carries
+    /// The undo of a `rollback` writes no journal record of its own, the recovery taking a
+    /// loser back from the tree ([`ClusteredTable::take_back_losers`]); the undo of a `ROLLBACK
+    /// TO` goes through [`ClusteredTable::rollback_to_savepoint`], which journals it. Here
+    /// `Lsn(0)` leaves each page the LSN it carries
     /// ([`super::buffer::BufferPool::mark_dirty`] does not move one backwards), and the flag
     /// keeps the page in the pool until [`ClusteredTable::release_pages`], which
     /// [`ClusteredTable::rollback`] calls once the undo log is replayed.
@@ -1688,9 +1743,17 @@ impl<'storage> ClusteredTable<'storage> {
 
     /// Rolls back the writes of `txn` after position `mark`.
     ///
+    /// Each version the undo takes out, and each `xmax` it unsets, is first a
+    /// [`WalRecordKind::Compensation`] under `txn`, the payload [`ClusteredTable::take_back_losers`]
+    /// writes; the pages the undo changes take the number of the last record of their write, and
+    /// the journal is `sync_all`ed once the walk is done. The transaction may commit afterwards
+    /// while a leaf that reached `data` before the undo still holds what it took out; the
+    /// recovery takes it out again under that record
+    /// (`a_clustered_write_a_savepoint_took_back_stays_out_after_a_crash`).
+    ///
     /// # Errors
     ///
-    /// Those of the undo path.
+    /// Those of the undo path and of the journal.
     pub(crate) fn rollback_to_savepoint(
         &mut self,
         txn: TxnId,
@@ -1700,10 +1763,61 @@ impl<'storage> ClusteredTable<'storage> {
             return Ok(());
         };
         let tail: Vec<UndoEntry> = state.writes.split_off(mark);
-        for entry in tail.into_iter().rev() {
-            self.undo(txn, entry)?;
+        if tail.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        for entry in tail.into_iter().rev() {
+            let lsn = self.journal_undo(txn, entry)?;
+            self.hold_trees(lsn);
+            self.undo_entry(txn, entry)?;
+            self.claim_tree_pages(txn)?;
+        }
+        self.storage.wal.flush()
+    }
+
+    /// Appends one [`WalRecordKind::Compensation`] per version the undo of `entry` changes, and
+    /// answers the number of the last one: the version an `Insert` or an `Update` created,
+    /// taken out, then the version whose `xmax` an `Update` or a `Delete` set, unset.
+    ///
+    /// The checks the undo makes are left to [`ClusteredTable::undo_entry`], which runs next.
+    fn journal_undo(&mut self, txn: TxnId, entry: UndoEntry) -> Result<Lsn, InternalError> {
+        let mut changes = Vec::with_capacity(2);
+        match entry {
+            UndoEntry::Insert(row) => {
+                changes.push((self.tail_created_by(txn, row)?.header, Release::Removed));
+            }
+            UndoEntry::Update(row) => {
+                let created = self.tail_created_by(txn, row)?;
+                let previous = created.parsed()?.prev;
+                changes.push((created.header, Release::Removed));
+                if !previous.is_empty() {
+                    let replaced = self.entry_at(&previous, row)?;
+                    changes.push((replaced.header, Release::XmaxCleared));
+                }
+            }
+            UndoEntry::Delete(row) => {
+                changes.push((self.current(row)?.header, Release::XmaxCleared));
+            }
+        }
+        let at = Rid {
+            page: self.first_page(),
+            slot: 0,
+        };
+        let mut last = Lsn(0);
+        for (header, release) in changes {
+            let payload = SlotRelease {
+                table: self.table,
+                header,
+                at,
+                release,
+            }
+            .encode();
+            last = self
+                .storage
+                .wal
+                .append(WalRecordKind::Compensation, txn, &payload)?;
+        }
+        Ok(last)
     }
 
     /// Replays one row record of a winner at recovery into the tree, without journal or index

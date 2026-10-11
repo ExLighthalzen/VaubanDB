@@ -130,6 +130,10 @@
 //! of a clustered table the journal already holds is made again under its own record, so a
 //! recovery whose changes stayed in the pool of the instance that crashed adds no record the
 //! next time (`a_clustered_take_back_lost_with_the_pool_is_made_again_under_its_records`).
+//! The compensations a `ROLLBACK TO` journalled on a clustered table are made again in the
+//! same call, the transaction having committed or not: the redo leaves the records of the
+//! writes it took back out, and a leaf that reached `data` before its undo holds them
+//! (`a_clustered_write_a_savepoint_took_back_stays_out_after_a_crash`).
 //!
 //! The `in_progress` flag itself is a field of a frame of the pool
 //! ([`super::buffer::BufferPool::set_in_progress`] writes it on the frame of a pinned page),
@@ -454,10 +458,16 @@ impl Scan {
                     open.insert((record.txn, id), record.lsn);
                 }
                 WalRecordKind::RollbackTo => {
+                    // The savepoint stays open after its rollback, as
+                    // [`super::DiskStorage::rollback_to`] keeps it: a second `ROLLBACK TO` the
+                    // same savepoint cancels from it again
+                    // (`a_second_rollback_to_the_same_savepoint_cancels_the_write_between`). The
+                    // savepoints the transaction took after it are closed.
                     let id = savepoint_id(record)?;
-                    let Some(at) = open.remove(&(record.txn, id)) else {
+                    let Some(&at) = open.get(&(record.txn, id)) else {
                         continue;
                     };
+                    open.retain(|&(txn, _), &mut taken| txn != record.txn || taken <= at);
                     for r in records {
                         if r.txn == record.txn && r.lsn > at && r.lsn < record.lsn {
                             scan.cancelled.insert(r.lsn);
@@ -561,19 +571,16 @@ fn redo(
         let kind = record.kind;
         if matches!(kind, WalRecordKind::Compensation | WalRecordKind::Purge) {
             let release = SlotRelease::decode(&record.payload)?;
-            // A clustered table journals the versions of losers an earlier recovery took back
-            // ([`ClusteredTable::take_back_losers`]), which takes them back again under these
-            // records; a heap the catalogue no longer holds has nothing to take out.
+            // A clustered table journals the versions of losers an earlier recovery took back,
+            // and what the undo of a `ROLLBACK TO` took out
+            // ([`ClusteredTable::rollback_to_savepoint`]); [`ClusteredTable::take_back_losers`]
+            // takes them back again under these records. A heap the catalogue no longer holds
+            // has nothing to take out.
             if clustered_tables.contains(&release.table) {
-                let change = (
-                    release.header.row,
-                    release.header.seq,
-                    release.release as u8,
-                );
                 taken_back
                     .entry(release.table)
                     .or_default()
-                    .insert(change, record.lsn);
+                    .note(&release, record.lsn);
             } else if let Some(redo) = heaps.get_mut(&release.table)
                 && redo.release(record, &release)?
             {
