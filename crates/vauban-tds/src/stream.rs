@@ -28,11 +28,12 @@ use std::task::{Context, Poll};
 
 use bytes::{BufMut, BytesMut};
 use rustls::ServerConfig;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
+use crate::ResetConnection;
 use crate::error::TdsError;
 use crate::message::{ClientMessage, decode_client_message};
 use crate::packet::{
@@ -49,9 +50,9 @@ const DEFAULT_PACKET_SIZE: u16 = 4096;
 /// Upper bound on the size of the client PRELOGIN message: the largest legitimate one
 /// (every option present, including TRACEID and NONCEOPT) is under 150 bytes.
 const MAX_PRELOGIN_SIZE: usize = 4096;
-/// Upper bound on the size of any other client message (a SQL batch or an RPC with
-/// large parameters) before `read_message` fails with `MessageTooLarge`.
-const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+/// Default upper bound on the size of any other client message (a SQL batch or an RPC
+/// with large parameters), see [`TdsStream::set_max_message_size`].
+pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
 /// `UL_VERSION` + `US_SUBBUILD` announced in the PRELOGIN response ([MS-TDS] 2.2.6.5):
 /// 16.0.1000, sub-build 0, a 16.x version like the one drivers expect from SQL Server 2022.
 const SERVER_VERSION: [u8; 6] = [0x10, 0x00, 0x03, 0xE8, 0x00, 0x00];
@@ -158,10 +159,96 @@ impl WriteState {
     }
 }
 
+/// Reads exactly `buf.len()` bytes, mapping an early EOF to `ConnectionClosed`.
+async fn read_exact_on<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> Result<(), TdsError> {
+    match r.read_exact(buf).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(TdsError::ConnectionClosed),
+        Err(e) => Err(TdsError::Io(e)),
+    }
+}
+
 /// Reads one complete message and decodes it.
-async fn read_message_on<R: AsyncRead + Unpin>(r: &mut R) -> Result<ClientMessage, TdsError> {
-    let raw = packet::read_message(r, MAX_MESSAGE_SIZE).await?;
-    decode_client_message(raw.kind, &raw.payload, raw.reset)
+///
+/// Packets are accumulated until one carries EOM, as `packet::read_message` does, with
+/// one difference: a message whose size would exceed `max` is not cut short. Once the
+/// limit is crossed the rest of the message is read and dropped up to its EOM packet,
+/// then the call fails with `MessageTooLarge` carrying the full size. The stream is thus
+/// positioned on the next message, and the caller may answer the client and go on (unit
+/// test `oversized_message_is_skipped_and_the_next_one_is_read`). A message whose last
+/// packet carries IGNORE is dropped, oversized or not, and the next one is returned (unit
+/// test `oversized_message_with_ignore_is_dropped_without_error`).
+///
+/// The reset request carried by the first packet of a dropped oversized message is written
+/// to `skipped_reset`, so that the caller still honours it
+/// (unit test `oversized_message_keeps_its_reset_request`).
+async fn read_message_on<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max: usize,
+    skipped_reset: &mut ResetConnection,
+) -> Result<ClientMessage, TdsError> {
+    let mut header_buf = [0u8; HEADER_LEN];
+    let mut payload = BytesMut::new();
+    // Bytes of the current message, kept or dropped.
+    let mut total = 0usize;
+    let mut oversized = false;
+    // Landing place of a dropped packet body, allocated once the limit is crossed.
+    let mut scratch = Vec::new();
+    // `None` until the first packet of the current message has been read.
+    let mut first: Option<(PacketType, ResetConnection)> = None;
+    loop {
+        read_exact_on(r, &mut header_buf).await?;
+        let header = PacketHeader::decode(&header_buf)?;
+        let (kind, reset) = match first {
+            None => {
+                let reset = if header
+                    .status
+                    .contains(PacketStatus::RESET_CONNECTION_SKIP_TRAN)
+                {
+                    ResetConnection::SkipTransaction
+                } else if header.status.contains(PacketStatus::RESET_CONNECTION) {
+                    ResetConnection::Full
+                } else {
+                    ResetConnection::None
+                };
+                first = Some((header.kind, reset));
+                (header.kind, reset)
+            }
+            Some((kind, _reset)) if kind != header.kind => {
+                return Err(TdsError::Malformed("packet type changed inside a message"));
+            }
+            Some(state) => state,
+        };
+        let body_len = usize::from(header.length) - HEADER_LEN;
+        total = total.saturating_add(body_len);
+        if !oversized && total > max {
+            oversized = true;
+            payload = BytesMut::new();
+        }
+        if oversized {
+            scratch.resize(body_len, 0);
+            read_exact_on(r, &mut scratch).await?;
+        } else {
+            let start = payload.len();
+            payload.resize(total, 0);
+            read_exact_on(r, &mut payload[start..]).await?;
+        }
+        if !header.status.contains(PacketStatus::EOM) {
+            continue;
+        }
+        if header.status.contains(PacketStatus::IGNORE) {
+            payload.clear();
+            total = 0;
+            oversized = false;
+            first = None;
+            continue;
+        }
+        if oversized {
+            *skipped_reset = reset;
+            return Err(TdsError::MessageTooLarge(total));
+        }
+        return decode_client_message(kind, &payload, reset);
+    }
 }
 
 /// Writes `payload` as one complete message (EOM on its last packet) with the current
@@ -263,6 +350,8 @@ pub struct TdsStream<S = TcpStream> {
     /// Encryption mode negotiated by `accept`; decides what `downgrade_encryption` does.
     mode: TlsMode,
     write: WriteState,
+    /// Largest client message `read_message` accepts; see [`TdsStream::set_max_message_size`].
+    max_message_size: usize,
 }
 
 impl TdsStream<TcpStream> {
@@ -348,12 +437,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TdsStream<S> {
             transport,
             mode,
             write,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         })
     }
 
     /// Reads and decodes the next client message, whatever the transport.
+    ///
+    /// A message larger than the limit set by [`TdsStream::set_max_message_size`] is read
+    /// to its end and dropped, then reported as `MessageTooLarge`: after that error the
+    /// stream is still in step with the client and the next call reads the next message.
+    ///
+    /// Before the split the stream serves the LOGIN7, where a reset request has no
+    /// meaning: the one of a dropped message is not kept here (see
+    /// [`TdsReader::take_skipped_reset`]).
     pub async fn read_message(&mut self) -> Result<ClientMessage, TdsError> {
-        read_message_on(&mut self.transport).await
+        let mut ignored = ResetConnection::None;
+        read_message_on(&mut self.transport, self.max_message_size, &mut ignored).await
+    }
+
+    /// Largest client message, in payload bytes, that `read_message` hands over; the
+    /// reader half returned by [`TdsStream::split`] keeps it. 32 MiB until set. The PRELOGIN keeps its own, much smaller, bound.
+    pub fn set_max_message_size(&mut self, max: usize) {
+        self.max_message_size = max;
     }
 
     /// Encodes `tokens` into the response buffer; every packet that becomes full leaves
@@ -396,6 +501,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TdsStream<S> {
             transport,
             mode: self.mode,
             write: self.write,
+            max_message_size: self.max_message_size,
         }
     }
 
@@ -405,7 +511,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TdsStream<S> {
     pub fn split(self) -> (TdsReader<S>, TdsWriter<S>) {
         let (read, write) = tokio::io::split(self.transport);
         (
-            TdsReader { inner: read },
+            TdsReader {
+                inner: read,
+                max_message_size: self.max_message_size,
+                skipped_reset: ResetConnection::None,
+            },
             TdsWriter {
                 inner: write,
                 write: self.write,
@@ -436,12 +546,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TdsStream<S> {
 /// Read half of a `TdsStream` after `split`.
 pub struct TdsReader<S = TcpStream> {
     inner: ReadHalf<Transport<S>>,
+    /// Inherited from the `TdsStream` at `split`.
+    max_message_size: usize,
+    /// Reset request of the last message dropped for its size, until taken.
+    skipped_reset: ResetConnection,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> TdsReader<S> {
-    /// Reads and decodes the next client message.
+    /// Reads and decodes the next client message; an oversized one is skipped and
+    /// reported as `TdsStream::read_message` does.
     pub async fn read_message(&mut self) -> Result<ClientMessage, TdsError> {
-        read_message_on(&mut self.inner).await
+        read_message_on(
+            &mut self.inner,
+            self.max_message_size,
+            &mut self.skipped_reset,
+        )
+        .await
+    }
+
+    /// The RESETCONNECTION or RESETCONNECTIONSKIPTRAN of the last message `read_message`
+    /// dropped for its size ([MS-TDS] 2.2.3.1.2), then `None` until another such message.
+    /// A client that set the bit expects the reset even though its request is refused.
+    pub fn take_skipped_reset(&mut self) -> ResetConnection {
+        std::mem::take(&mut self.skipped_reset)
     }
 }
 

@@ -12,10 +12,11 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
-use vauban_session::EncryptPolicy;
+use vauban_session::{DEFAULT_LOGIN_TIMEOUT, DEFAULT_MAX_CONNECTIONS, EncryptPolicy};
 
 /// Name of the environment variable that carries the `sa` password.
 pub(crate) const SA_PASSWORD_ENV: &str = "VAUBAN_SA_PASSWORD";
@@ -38,6 +39,8 @@ pub(crate) const PROGRAM_NAME_MAX_UNITS: usize = 255;
 const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 /// Default TCP port (the SQL Server default instance port).
 const DEFAULT_PORT: u16 = 1433;
+/// Largest `--max-connections`: the largest value of the `user connections` option.
+pub(crate) const MAX_CONNECTIONS_LIMIT: usize = 32_767;
 
 /// Options of `vauban serve`. All optional: see the module documentation.
 /// No `Debug`: `sa_password` must not reach the log through the raw arguments.
@@ -87,6 +90,14 @@ pub(crate) struct ServeArgs {
     /// Log format [default: text]
     #[arg(long, value_name = "FORMAT")]
     pub(crate) log_format: Option<LogFormat>,
+
+    /// Seconds a connection has to send its LOGIN7 once accepted [default: 60]
+    #[arg(long, value_name = "SECONDS")]
+    pub(crate) login_timeout: Option<u64>,
+
+    /// Connections served at once; the next one is refused with error 17809 [default: 32767]
+    #[arg(long, value_name = "N")]
+    pub(crate) max_connections: Option<usize>,
 
     /// Configuration file [default: ./vauban.toml if it exists]
     #[arg(long, value_name = "FILE")]
@@ -200,6 +211,10 @@ pub(crate) struct ConfigLayer {
     pub(crate) version_banner: Option<String>,
     /// `VAUBAN_EDITION` / `edition`.
     pub(crate) edition: Option<String>,
+    /// `--login-timeout`, in seconds.
+    pub(crate) login_timeout: Option<u64>,
+    /// `--max-connections`.
+    pub(crate) max_connections: Option<usize>,
 }
 
 impl ConfigLayer {
@@ -221,6 +236,8 @@ impl ConfigLayer {
             program_name: None,
             version_banner: None,
             edition: None,
+            login_timeout: args.login_timeout,
+            max_connections: args.max_connections,
         }
     }
 
@@ -263,6 +280,8 @@ impl ConfigLayer {
             program_name: self.program_name.or(lower.program_name),
             version_banner: self.version_banner.or(lower.version_banner),
             edition: self.edition.or(lower.edition),
+            login_timeout: self.login_timeout.or(lower.login_timeout),
+            max_connections: self.max_connections.or(lower.max_connections),
         }
     }
 }
@@ -302,6 +321,10 @@ pub(crate) struct Config {
     pub(crate) version_banner: Option<String>,
     /// `SERVERPROPERTY('Edition')` override.
     pub(crate) edition: Option<String>,
+    /// Time a connection has to log in.
+    pub(crate) login_timeout: Duration,
+    /// Connections served at once.
+    pub(crate) max_connections: usize,
 }
 
 impl fmt::Debug for Config {
@@ -325,6 +348,8 @@ impl fmt::Debug for Config {
             .field("program_name", &self.program_name)
             .field("version_banner", &self.version_banner)
             .field("edition", &self.edition)
+            .field("login_timeout", &self.login_timeout)
+            .field("max_connections", &self.max_connections)
             .finish()
     }
 }
@@ -346,6 +371,10 @@ pub(crate) enum ConfigError {
     /// `program_name` longer than [`PROGRAM_NAME_MAX_UNITS`]; holds its length in UTF-16
     /// code units.
     ProgramNameTooLong(usize),
+    /// `--login-timeout 0`: no connection could ever log in.
+    LoginTimeoutZero,
+    /// `--max-connections` outside `1..=32767`; holds the value given.
+    MaxConnectionsOutOfRange(usize),
 }
 
 impl fmt::Display for ConfigError {
@@ -369,6 +398,13 @@ impl fmt::Display for ConfigError {
                 f,
                 "program_name is {units} UTF-16 code units long; \
                  LOGINACK carries at most {PROGRAM_NAME_MAX_UNITS}"
+            ),
+            ConfigError::LoginTimeoutZero => {
+                write!(f, "--login-timeout must be at least 1 second")
+            }
+            ConfigError::MaxConnectionsOutOfRange(n) => write!(
+                f,
+                "--max-connections is {n}; it must lie between 1 and {MAX_CONNECTIONS_LIMIT}"
             ),
         }
     }
@@ -417,6 +453,10 @@ impl Config {
             program_name: nonempty_string(layer.program_name),
             version_banner: nonempty_string(layer.version_banner),
             edition: nonempty_string(layer.edition),
+            login_timeout: layer
+                .login_timeout
+                .map_or(DEFAULT_LOGIN_TIMEOUT, Duration::from_secs),
+            max_connections: layer.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
         }
     }
 
@@ -442,6 +482,12 @@ impl Config {
             if units > PROGRAM_NAME_MAX_UNITS {
                 return Err(ConfigError::ProgramNameTooLong(units));
             }
+        }
+        if self.login_timeout.is_zero() {
+            return Err(ConfigError::LoginTimeoutZero);
+        }
+        if !(1..=MAX_CONNECTIONS_LIMIT).contains(&self.max_connections) {
+            return Err(ConfigError::MaxConnectionsOutOfRange(self.max_connections));
         }
         Ok(())
     }
@@ -476,6 +522,16 @@ impl Config {
             (None, None) => None,
         };
         (self.program_name.clone(), version_banner, edition)
+    }
+
+    /// The connection limits to hand to [`vauban_session::Server::with_limits`]; the
+    /// message size keeps the default of the TDS stream.
+    pub(crate) fn connection_limits(&self) -> vauban_session::ConnectionLimits {
+        vauban_session::ConnectionLimits {
+            login_timeout: self.login_timeout,
+            max_connections: self.max_connections,
+            max_message_size: None,
+        }
     }
 
     /// `"sa"` or `"no-auth"`, for the startup log line.

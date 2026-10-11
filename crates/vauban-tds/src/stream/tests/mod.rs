@@ -191,6 +191,7 @@ fn plain_pair() -> (TdsStream<DuplexStream>, DuplexStream) {
         transport: Transport::Plain(server_io),
         mode: TlsMode::None,
         write: WriteState::new(),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
     (stream, client_io)
 }
@@ -574,4 +575,127 @@ async fn split_allows_concurrent_read_and_write() {
         reading.await.unwrap(),
         Ok(ClientMessage::Attention)
     ));
+}
+
+/// SQL_BATCH payload: ALL_HEADERS with a transaction descriptor, then `text` in UTF-16LE.
+fn batch_payload(text: &str) -> Vec<u8> {
+    let mut body = vec![
+        0x16, 0x00, 0x00, 0x00, // ALL_HEADERS total length 22
+        0x12, 0x00, 0x00, 0x00, // header length 18
+        0x02, 0x00, // transaction descriptor header
+        0, 0, 0, 0, 0, 0, 0, 0, // descriptor
+        0x01, 0x00, 0x00, 0x00, // outstanding requests
+    ];
+    for unit in text.encode_utf16() {
+        body.extend_from_slice(&unit.to_le_bytes());
+    }
+    body
+}
+
+/// Sends `payload` as one SQL_BATCH message cut into packets of `chunk` body bytes.
+async fn send_batch<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8], chunk: usize, status: u8) {
+    let chunks: Vec<&[u8]> = payload.chunks(chunk).collect();
+    for (i, body) in chunks.iter().enumerate() {
+        let last = i + 1 == chunks.len();
+        let flags = if last { 0x01 | status } else { 0x00 };
+        w.write_all(&packet(PacketType::SqlBatch, flags, (i + 1) as u8, body))
+            .await
+            .unwrap();
+    }
+}
+
+fn batch_text(message: ClientMessage) -> String {
+    match message {
+        ClientMessage::SqlBatch(batch) => batch.text,
+        other => panic!("expected a SQL batch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn oversized_message_is_skipped_and_the_next_one_is_read() {
+    let (mut stream, mut client) = plain_pair();
+    stream.set_max_message_size(1000);
+    let big = batch_payload(&"x".repeat(2000));
+    let big_len = big.len();
+    let client_task = tokio::spawn(async move {
+        send_batch(&mut client, &big, 300, 0).await;
+        send_batch(&mut client, &batch_payload("SELECT 1"), 300, 0).await;
+        client
+    });
+    match stream.read_message().await {
+        Err(TdsError::MessageTooLarge(size)) => assert_eq!(size, big_len),
+        other => panic!("expected MessageTooLarge, got {other:?}"),
+    }
+    assert_eq!(batch_text(stream.read_message().await.unwrap()), "SELECT 1");
+    client_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn message_at_the_limit_is_read_whole() {
+    let (mut stream, mut client) = plain_pair();
+    let payload = batch_payload("SELECT 42");
+    stream.set_max_message_size(payload.len());
+    send_batch(&mut client, &payload, 7, 0).await;
+    assert_eq!(
+        batch_text(stream.read_message().await.unwrap()),
+        "SELECT 42"
+    );
+}
+
+#[tokio::test]
+async fn oversized_message_with_ignore_is_dropped_without_error() {
+    let (mut stream, mut client) = plain_pair();
+    stream.set_max_message_size(100);
+    // IGNORE (0x02) on the last packet: the client withdrew the message.
+    send_batch(&mut client, &batch_payload(&"y".repeat(500)), 200, 0x02).await;
+    send_batch(&mut client, &batch_payload("SELECT 2"), 200, 0).await;
+    assert_eq!(batch_text(stream.read_message().await.unwrap()), "SELECT 2");
+}
+
+#[tokio::test]
+async fn reader_half_keeps_the_message_limit() {
+    let (mut stream, mut client) = plain_pair();
+    stream.set_max_message_size(64);
+    let (mut reader, _writer) = stream.split();
+    let big = batch_payload(&"z".repeat(100));
+    let big_len = big.len();
+    send_batch(&mut client, &big, 512, 0).await;
+    send_batch(&mut client, &batch_payload("SELECT 3"), 512, 0).await;
+    match reader.read_message().await {
+        Err(TdsError::MessageTooLarge(size)) => assert_eq!(size, big_len),
+        other => panic!("expected MessageTooLarge, got {other:?}"),
+    }
+    assert_eq!(batch_text(reader.read_message().await.unwrap()), "SELECT 3");
+}
+
+#[tokio::test]
+async fn oversized_message_keeps_its_reset_request() {
+    let (mut stream, mut client) = plain_pair();
+    stream.set_max_message_size(100);
+    let (mut reader, _writer) = stream.split();
+    // RESETCONNECTION (0x08) rides on the first packet only.
+    let big = batch_payload(&"r".repeat(300));
+    let mut first = packet(PacketType::SqlBatch, 0x08, 1, &big[..200]);
+    first.extend_from_slice(&packet(PacketType::SqlBatch, 0x01, 2, &big[200..]));
+    client.write_all(&first).await.unwrap();
+    assert!(matches!(
+        reader.read_message().await,
+        Err(TdsError::MessageTooLarge(_))
+    ));
+    assert_eq!(reader.take_skipped_reset(), ResetConnection::Full);
+    assert_eq!(reader.take_skipped_reset(), ResetConnection::None);
+
+    // RESETCONNECTIONSKIPTRAN (0x10), then a message without any reset.
+    client
+        .write_all(&packet(PacketType::SqlBatch, 0x10 | 0x01, 3, &big))
+        .await
+        .unwrap();
+    send_batch(&mut client, &big, 512, 0).await;
+    assert!(reader.read_message().await.is_err());
+    assert_eq!(
+        reader.take_skipped_reset(),
+        ResetConnection::SkipTransaction
+    );
+    assert!(reader.read_message().await.is_err());
+    assert_eq!(reader.take_skipped_reset(), ResetConnection::None);
 }

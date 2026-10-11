@@ -262,10 +262,13 @@ async fn run_server(cfg: Config, tls: Option<Arc<rustls::ServerConfig>>) -> anyh
         auth = cfg.auth_mode(),
         storage = if on_disk { "disk" } else { "in-memory" },
         server_name = %server_cfg.server_name,
+        login_timeout_s = cfg.login_timeout.as_secs(),
+        max_connections = cfg.max_connections,
         "vauban listening"
     );
 
     Server::new(engine, server_cfg)
+        .with_limits(cfg.connection_limits())
         .serve(listener, shutdown)
         .await
         .context("server failed")?;

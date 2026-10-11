@@ -396,3 +396,70 @@ impl Config {
         Self::assemble_from_layers(args, ConfigLayer::from_env_password(env_password), file)
     }
 }
+
+#[test]
+fn connection_limits_default_to_60_seconds_and_32767_connections() {
+    let cfg = Config::assemble(&args(&[]), None, None);
+    assert_eq!(cfg.login_timeout, Duration::from_secs(60));
+    assert_eq!(cfg.max_connections, 32_767);
+    let limits = cfg.connection_limits();
+    assert_eq!(limits.login_timeout, Duration::from_secs(60));
+    assert_eq!(limits.max_connections, 32_767);
+    assert_eq!(limits.max_message_size, None);
+}
+
+#[test]
+fn connection_limits_command_line_beats_file() {
+    let cfg = Config::assemble(
+        &args(&["--login-timeout", "5", "--max-connections", "10"]),
+        None,
+        file("login_timeout = 30\nmax_connections = 20"),
+    );
+    assert_eq!(cfg.login_timeout, Duration::from_secs(5));
+    assert_eq!(cfg.max_connections, 10);
+}
+
+#[test]
+fn connection_limits_are_read_from_the_file() {
+    let cfg = Config::assemble(
+        &args(&[]),
+        None,
+        file("login_timeout = 30\nmax_connections = 20"),
+    );
+    assert_eq!(cfg.login_timeout, Duration::from_secs(30));
+    assert_eq!(cfg.max_connections, 20);
+}
+
+#[test]
+fn validate_refuses_a_zero_login_timeout() {
+    let cfg = Config::assemble(
+        &args(&["--in-memory", "--no-auth", "--login-timeout", "0"]),
+        None,
+        None,
+    );
+    assert_eq!(cfg.validate(), Err(ConfigError::LoginTimeoutZero));
+}
+
+#[test]
+fn validate_bounds_max_connections_to_1_through_32767() {
+    let with = |n: &str| {
+        Config::assemble(
+            &args(&["--in-memory", "--no-auth", "--max-connections", n]),
+            None,
+            None,
+        )
+        .validate()
+    };
+    assert_eq!(with("0"), Err(ConfigError::MaxConnectionsOutOfRange(0)));
+    assert_eq!(with("1"), Ok(()));
+    assert_eq!(with("32767"), Ok(()));
+    assert_eq!(
+        with("32768"),
+        Err(ConfigError::MaxConnectionsOutOfRange(32_768))
+    );
+    assert!(
+        ConfigError::MaxConnectionsOutOfRange(0)
+            .to_string()
+            .contains("32767")
+    );
+}

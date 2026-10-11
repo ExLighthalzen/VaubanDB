@@ -5,8 +5,11 @@
 //!
 //! 1. `serve` accepts a socket, assigns a SPID and spawns a task under the span
 //!    `connection{spid, peer}`.
+//!    Beyond [`ConnectionLimits::max_connections`] served connections, the new one is
+//!    answered error 17809 once its LOGIN7 is in, and closed.
 //! 2. The task runs `TdsStream::accept`: PRELOGIN exchange and, if negotiated, the TLS
-//!    handshake ([MS-TDS] 2.2.6.5, 3.3.5.1).
+//!    handshake ([MS-TDS] 2.2.6.5, 3.3.5.1). Those and the LOGIN7 of step 3 have
+//!    [`ConnectionLimits::login_timeout`] to arrive, after which the socket is closed.
 //! 3. The next client message must be the LOGIN7 ([MS-TDS] 3.3.5.2); anything else closes
 //!    the connection. The login is then checked in this order: TDS version (older
 //!    than 7.2 closes without a response), SSPI request (18452), `Authenticator` (18456),
@@ -88,7 +91,7 @@ use std::sync::atomic::{AtomicI16, Ordering};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, warn};
@@ -96,8 +99,8 @@ use vauban_catalog::Catalog;
 use vauban_errors::{InternalError, SqlError, SqlResult};
 use vauban_storage::Storage;
 use vauban_tds::{
-    ClientMessage, DoneStatus, EncryptPolicy, Login7, Rpc, RpcParam, RpcProc, TdsError, TdsReader,
-    TdsStream, TdsWriter, Token,
+    ClientMessage, DoneStatus, EncryptPolicy, Login7, ResetConnection, Rpc, RpcParam, RpcProc,
+    TdsError, TdsReader, TdsStream, TdsWriter, Token,
 };
 use vauban_txn::TransactionManager;
 use vauban_types::{SqlType, TypeInfo, Value, default_display};
@@ -263,22 +266,71 @@ pub struct ServerConfig {
     pub edition: Option<String>,
 }
 
+/// Default of [`ConnectionLimits::login_timeout`].
+pub const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default of [`ConnectionLimits::max_connections`]: the largest value the
+/// `user connections` server option accepts.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 32_767;
+
+/// Error 17809, severity 20: the connection would exceed the connection limit.
+const TOO_MANY_CONNECTIONS: u32 = 17809;
+/// Error number, severity and state of a client message larger than the size limit: the
+/// ones of a message this version does not handle ([`refused_error`]).
+const OVERSIZED_MESSAGE: (u32, u8, u8) = (50000, 16, 1);
+
+/// Bounds on what one client may hold of the server before its login and after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionLimits {
+    /// Time a connection has, from its acceptance, to complete the PRELOGIN exchange, the
+    /// TLS handshake and to send its LOGIN7; past it the socket is closed without a
+    /// response (`tests/resource_limits.rs`, `a_silent_connection_is_closed_after_the_login_timeout`).
+    pub login_timeout: Duration,
+    /// Connections served at once. The one beyond is answered error 17809 at its LOGIN7
+    /// and closed, while the others go on
+    /// (`tests/resource_limits.rs`, `the_connection_beyond_the_limit_is_refused_with_17809`).
+    pub max_connections: usize,
+    /// Largest client message after the login, in payload bytes; `None` keeps the 32 MiB
+    /// of the TDS stream. A larger one is read to its end, dropped, and answered by an
+    /// error, and the connection serves the next request
+    /// (`tests/resource_limits.rs`, `an_oversized_batch_gets_an_error_and_the_connection_goes_on`).
+    pub max_message_size: Option<usize>,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self {
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_message_size: None,
+        }
+    }
+}
+
 /// The TCP front of the engine: accepts connections and runs one task per connection.
 pub struct Server {
     engine: Arc<Engine>,
     cfg: Arc<ServerConfig>,
     /// Next SPID to hand out; see [`Server::next_spid`].
     next_spid: AtomicI16,
+    limits: ConnectionLimits,
 }
 
 impl Server {
-    /// Builds a server; nothing is bound until [`Server::serve`].
+    /// Builds a server with [`ConnectionLimits::default`]; nothing is bound until
+    /// [`Server::serve`].
     pub fn new(engine: Arc<Engine>, cfg: ServerConfig) -> Self {
         Self {
             engine,
             cfg: Arc::new(cfg),
             next_spid: AtomicI16::new(SPID_FIRST),
+            limits: ConnectionLimits::default(),
         }
+    }
+
+    /// Replaces the connection limits of the server.
+    pub fn with_limits(mut self, limits: ConnectionLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Accepts connections on `listener` until `shutdown` is cancelled, then stops
@@ -294,6 +346,10 @@ impl Server {
     ) -> Result<(), InternalError> {
         let connections = shutdown.child_token();
         let mut tasks = JoinSet::new();
+        // One permit per served connection, held by its task until it ends.
+        let slots = Arc::new(Semaphore::new(
+            self.limits.max_connections.min(Semaphore::MAX_PERMITS),
+        ));
 
         loop {
             tokio::select! {
@@ -302,15 +358,35 @@ impl Server {
                     Ok((tcp, addr)) => {
                         let spid = self.next_spid();
                         let span = info_span!("connection", spid, peer = %addr);
-                        let task = handle_connection(
-                            Arc::clone(&self.engine),
-                            Arc::clone(&self.cfg),
-                            tcp,
-                            spid,
-                            addr,
-                            connections.child_token(),
-                        );
-                        tasks.spawn(task.instrument(span));
+                        match Arc::clone(&slots).try_acquire_owned() {
+                            Ok(slot) => {
+                                let task = handle_connection(
+                                    Arc::clone(&self.engine),
+                                    Arc::clone(&self.cfg),
+                                    self.limits,
+                                    tcp,
+                                    spid,
+                                    addr,
+                                    connections.child_token(),
+                                );
+                                tasks.spawn(
+                                    async move {
+                                        task.await;
+                                        drop(slot);
+                                    }
+                                    .instrument(span),
+                                );
+                            }
+                            Err(_) => {
+                                let task = refuse_connection(
+                                    Arc::clone(&self.cfg),
+                                    self.limits,
+                                    tcp,
+                                    connections.child_token(),
+                                );
+                                tasks.spawn(task.instrument(span));
+                            }
+                        }
                     }
                     Err(err) => {
                         warn!(error = %err, "accept failed");
@@ -369,6 +445,7 @@ fn log_task_end(finished: Result<(), tokio::task::JoinError>) {
 async fn handle_connection(
     engine: Arc<Engine>,
     cfg: Arc<ServerConfig>,
+    limits: ConnectionLimits,
     tcp: TcpStream,
     spid: i16,
     peer: std::net::SocketAddr,
@@ -379,7 +456,7 @@ async fn handle_connection(
             info!("connection closed by server shutdown");
             return;
         }
-        outcome = run_connection(engine, &cfg, tcp, spid, peer) => outcome,
+        outcome = run_connection(engine, &cfg, limits, tcp, spid, peer) => outcome,
     };
     match outcome {
         Ok(()) => info!("connection closed"),
@@ -389,28 +466,99 @@ async fn handle_connection(
     }
 }
 
-/// PRELOGIN (and TLS) through `TdsStream::accept`, the LOGIN7 and its response, then the
-/// client messages until the peer leaves.
+/// A connection beyond [`ConnectionLimits::max_connections`]: once its LOGIN7 is in,
+/// answered error 17809 and a DONE `ERROR`, then closed. The login itself is not checked.
+async fn refuse_connection(
+    cfg: Arc<ServerConfig>,
+    limits: ConnectionLimits,
+    tcp: TcpStream,
+    shutdown: CancellationToken,
+) {
+    warn!(
+        max_connections = limits.max_connections,
+        "connection limit reached, refusing the login"
+    );
+    let refused = async {
+        let Some((stream, _login)) = read_login(&cfg, limits, tcp).await? else {
+            return Ok(());
+        };
+        let mut stream = stream.downgrade_encryption().await;
+        stream
+            .write_tokens(&login::failure_response(vec![too_many_connections(
+                limits.max_connections,
+            )]))
+            .await?;
+        stream.flush().await
+    };
+    let outcome = tokio::select! {
+        _ = shutdown.cancelled() => return,
+        outcome = refused => outcome,
+    };
+    if let Err(err) = outcome {
+        info!(error = %err, "refused connection closed");
+    }
+}
+
+/// Error 17809, severity 20, state 1, with the configured limit in its text.
+fn too_many_connections(max: usize) -> SqlError {
+    SqlError::new(
+        TOO_MANY_CONNECTIONS,
+        20,
+        1,
+        format!(
+            "The server already serves its maximum of {max} user connections; \
+             this connection has been closed."
+        ),
+    )
+}
+
+/// PRELOGIN (and TLS) through `TdsStream::accept`, then the LOGIN7, both within
+/// [`ConnectionLimits::login_timeout`]. `None` when the time runs out or when the message
+/// after the PRELOGIN is not a LOGIN7; both are logged and close the connection.
+async fn read_login(
+    cfg: &ServerConfig,
+    limits: ConnectionLimits,
+    tcp: TcpStream,
+) -> Result<Option<(TdsStream, Login7)>, TdsError> {
+    let exchange = async {
+        let mut stream = TdsStream::accept(tcp, cfg.tls.clone(), cfg.encrypt).await?;
+        info!("PRELOGIN negotiated");
+        // [MS-TDS] 3.3.5.2: the message that follows the PRELOGIN exchange is the LOGIN7.
+        match stream.read_message().await? {
+            ClientMessage::Login7(login) => Ok(Some((stream, login))),
+            other => {
+                warn!(
+                    message = message_kind(&other),
+                    "expected a LOGIN7 after PRELOGIN, closing"
+                );
+                Ok(None)
+            }
+        }
+    };
+    match tokio::time::timeout(limits.login_timeout, exchange).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            warn!(
+                timeout_ms = limits.login_timeout.as_millis(),
+                "no LOGIN7 within the login timeout, closing"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// PRELOGIN (and TLS) and the LOGIN7 through [`read_login`], the response to the LOGIN7,
+/// then the client messages until the peer leaves.
 async fn run_connection(
     engine: Arc<Engine>,
     cfg: &ServerConfig,
+    limits: ConnectionLimits,
     tcp: TcpStream,
     spid: i16,
     peer: std::net::SocketAddr,
 ) -> Result<(), TdsError> {
-    let mut stream = TdsStream::accept(tcp, cfg.tls.clone(), cfg.encrypt).await?;
-    info!("PRELOGIN negotiated");
-
-    // [MS-TDS] 3.3.5.2: the message that follows the PRELOGIN exchange is the LOGIN7.
-    let login = match stream.read_message().await? {
-        ClientMessage::Login7(login) => login,
-        other => {
-            warn!(
-                message = message_kind(&other),
-                "expected a LOGIN7 after PRELOGIN, closing"
-            );
-            return Ok(());
-        }
+    let Some((mut stream, login)) = read_login(cfg, limits, tcp).await? else {
+        return Ok(());
     };
 
     // The verdict is taken first, the response written afterwards: `downgrade_encryption`
@@ -456,6 +604,9 @@ async fn run_connection(
     // The response above still travelled at the previous size; the negotiated one
     // applies from the next packet ([MS-TDS] 2.2.6.4 PacketSize).
     stream.set_packet_size(state.packet_size);
+    if let Some(max) = limits.max_message_size {
+        stream.set_max_message_size(max);
+    }
     info!(
         login = %state.login,
         app_name = %state.app_name,
@@ -485,7 +636,63 @@ async fn run_connection(
             let _ = release(&mut session, Release::Disconnect);
             return Ok(());
         };
-        match message? {
+        let message = match message {
+            Ok(message) => message,
+            Err(ReadFailure {
+                error: TdsError::MessageTooLarge(size),
+                reset: ResetConnection::None,
+            }) => {
+                report_oversized(&mut writer, size).await?;
+                continue;
+            }
+            // The client asked for a reset on the message it is refused: the reset is
+            // still applied, otherwise the next user of a pooled connection would
+            // inherit the database, options and transaction of the previous one
+            // (`tests/resource_limits.rs`, `an_oversized_batch_marked_reset_still_resets_the_session`).
+            Err(ReadFailure {
+                error: TdsError::MessageTooLarge(size),
+                reset,
+            }) => {
+                request_seq += 1;
+                let seq = request_seq;
+                let login_db = login_database.clone();
+                let engine_for_reset = Arc::clone(&transaction_engine);
+                let outcome = run_request(
+                    &mut writer,
+                    &mut client_rx,
+                    session,
+                    false,
+                    None,
+                    0,
+                    spid,
+                    seq,
+                    move |session, sink| {
+                        crate::reset::apply_reset(
+                            session,
+                            &engine_for_reset,
+                            &login_db,
+                            reset,
+                            sink,
+                        )?;
+                        warn!(
+                            size,
+                            "client message larger than the size limit, reset applied, \
+                             answering an error"
+                        );
+                        sink.error(&oversized_error(size))?;
+                        sink.done(None, false)
+                    },
+                )
+                .await?;
+                match outcome {
+                    RequestOutcome::Served(back) => session = back,
+                    RequestOutcome::Close => return Ok(()),
+                }
+                continue;
+            }
+            Err(failure) => return Err(failure.error),
+        };
+        match message {
             ClientMessage::SqlBatch(batch) => {
                 let descriptor = batch.transaction_descriptor;
                 let text = batch.text;
@@ -620,15 +827,32 @@ async fn run_connection(
     }
 }
 
+/// What the reader task hands over: a client message, or the read that failed.
+type Incoming = Result<ClientMessage, ReadFailure>;
+
+/// A failed read, with the reset request of the message it dropped when the failure is
+/// `MessageTooLarge` (`TdsReader::take_skipped_reset`); `None` otherwise.
+struct ReadFailure {
+    error: TdsError,
+    reset: ResetConnection,
+}
+
 /// Reads client messages and forwards them, in order, to the connection task.
 ///
 /// Stops after forwarding a failed read (a closed connection is one of them) and when the
-/// receiver is gone. The channel bound is the whole flow control: the task blocks on
-/// `send` instead of reading ahead.
-async fn read_messages(mut reader: TdsReader, tx: mpsc::Sender<Result<ClientMessage, TdsError>>) {
+/// receiver is gone. `MessageTooLarge` is not a failed read: the reader skipped the
+/// message and stands on the next one. The channel bound is the whole flow control: the
+/// task blocks on `send` instead of reading ahead.
+async fn read_messages(mut reader: TdsReader, tx: mpsc::Sender<Incoming>) {
     loop {
-        let message = reader.read_message().await;
-        let failed = message.is_err();
+        let message = reader.read_message().await.map_err(|error| ReadFailure {
+            reset: reader.take_skipped_reset(),
+            error,
+        });
+        let failed = matches!(
+            &message,
+            Err(failure) if !matches!(failure.error, TdsError::MessageTooLarge(_))
+        );
         if tx.send(message).await.is_err() || failed {
             return;
         }
@@ -690,7 +914,7 @@ enum Relayed {
 #[allow(clippy::too_many_arguments)] // relay needs SPID and seq alongside the existing request parameters.
 async fn run_request<F>(
     writer: &mut TdsWriter,
-    client_rx: &mut mpsc::Receiver<Result<ClientMessage, TdsError>>,
+    client_rx: &mut mpsc::Receiver<Incoming>,
     mut session: Session,
     rpc: bool,
     done_cur_cmd: Option<u16>,
@@ -856,7 +1080,7 @@ async fn report_request_panic(writer: &mut TdsWriter, spid: i16, seq: u64) -> Re
 async fn relay(
     writer: &mut TdsWriter,
     rx: &mut mpsc::Receiver<Token>,
-    client_rx: &mut mpsc::Receiver<Result<ClientMessage, TdsError>>,
+    client_rx: &mut mpsc::Receiver<Incoming>,
     cancel: &CancelHandle,
     done_cur_cmd: Option<u16>,
     spid: i16,
@@ -902,7 +1126,7 @@ async fn relay(
                         );
                         Relayed::Aborted(None)
                     }
-                    Some(Err(err)) => Relayed::Aborted(Some(err)),
+                    Some(Err(failure)) => Relayed::Aborted(Some(failure.error)),
                     // The reader task ended without a message: it cannot, but closing is
                     // the safe reading of it.
                     None => Relayed::Aborted(None),
@@ -998,6 +1222,41 @@ async fn report_refused(
         ])
         .await?;
     writer.flush().await
+}
+
+/// Answers a client message the reader skipped for its size: error 50000 (severity 16,
+/// state 1) naming the size, a DONE carrying `ERROR`, and the `flush` that ends the
+/// response. Nothing runs, so the session is as the previous request left it.
+async fn report_oversized(writer: &mut TdsWriter, size: usize) -> Result<(), TdsError> {
+    warn!(
+        size,
+        "client message larger than the size limit, answering an error"
+    );
+    writer
+        .write_tokens(&[
+            Token::Error(oversized_error(size)),
+            Token::Done {
+                status: DoneStatus::ERROR,
+                cur_cmd: 0,
+                row_count: None,
+            },
+        ])
+        .await?;
+    writer.flush().await
+}
+
+/// Error 50000, severity 16, state 1, naming the size of the dropped message.
+fn oversized_error(size: usize) -> SqlError {
+    let (number, severity, state) = OVERSIZED_MESSAGE;
+    SqlError::new(
+        number,
+        severity,
+        state,
+        format!(
+            "The client message of {size} bytes is larger than this server accepts; \
+             it was not run."
+        ),
+    )
 }
 
 /// Drops every token the cancelled request still had to send, until it lets go of the
