@@ -328,3 +328,47 @@ fn a_row_written_in_the_principals_table_is_a_row_of_the_view() {
         "a row of kind D is not a row of sys.server_principals"
     );
 }
+
+/// `server_principal_sid` answers, for each server row of the principals table, the `sid` that
+/// row carries; the name compares under the default collation; a database principal and a name
+/// the table does not carry answer `None`.
+#[test]
+fn server_principal_sid_reads_the_published_rows() {
+    let (catalog, storage, txn) = instance();
+    let all = principal_rows(&catalog, &storage, &txn);
+    let server_rows: Vec<&Vec<Value>> = all.iter().filter(|row| is_text(&row[0], "S")).collect();
+    assert_eq!(server_rows.len(), 10, "{all:?}");
+    for row in server_rows {
+        let Value::String(name) = &row[2] else {
+            panic!("a server row carries its name: {row:?}");
+        };
+        let Value::Bytes(sid) = &row[3] else {
+            panic!("a server row carries its sid: {row:?}");
+        };
+        assert_eq!(
+            vauban_catalog::server_principal_sid(&name.text).as_ref(),
+            Some(sid),
+            "{}",
+            name.text
+        );
+    }
+    for (name, expected) in [
+        ("sa", Some(vec![0x01])),
+        ("SA", Some(vec![0x01])),
+        ("sa ", Some(vec![0x01])),
+        ("public", Some(vec![0x02])),
+        ("sysadmin", Some(vec![0x03])),
+        ("bulkadmin", Some(vec![0x0A])),
+        (" sa", None),
+        ("nosuch", None),
+        ("", None),
+        ("dbo", None),
+        ("db_owner", None),
+    ] {
+        assert_eq!(
+            vauban_catalog::server_principal_sid(name),
+            expected,
+            "{name:?}"
+        );
+    }
+}

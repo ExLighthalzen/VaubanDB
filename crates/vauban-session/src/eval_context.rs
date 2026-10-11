@@ -728,6 +728,26 @@ impl EvalContext for SessionEvalContext<'_> {
     fn edition(&self) -> Option<&str> {
         Some(&self.state.edition)
     }
+
+    /// The `sid` `sys.server_principals` publishes for `name`, read from the rows the
+    /// catalogue writes for that view (`suser_sid_reads_the_published_principals`). A login
+    /// the view does not publish, such as a name accepted without authentication, answers `None`.
+    fn server_principal_sid(&self, name: &str) -> Option<Vec<u8>> {
+        vauban_catalog::server_principal_sid(name)
+    }
+
+    /// The file `sys.database_files` publishes under `name` in the current database: its
+    /// `file_id`, its `type` and its `is_read_only` flag (`database_file_of_the_current_database`).
+    fn database_file(&self, name: &str) -> Option<(i32, u8, bool)> {
+        vauban_catalog::database_file_facts(&self.state.database, name)
+            .map(|facts| (facts.file_id, facts.file_type, facts.is_read_only))
+    }
+
+    /// The service name is the program name the server announces at login
+    /// (`service_name_is_the_program_name`).
+    fn service_name(&self) -> Option<&str> {
+        Some(crate::PROGRAM_NAME)
+    }
 }
 
 #[cfg(test)]

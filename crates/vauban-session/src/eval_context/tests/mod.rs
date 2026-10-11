@@ -548,3 +548,99 @@ fn a_written_name_is_split_on_its_undelimited_dots() {
         Some("t ".to_owned())
     );
 }
+
+/// Evaluates the registered function `name` on `values` typed `types` through `ctx`, the way
+/// the executor does once the binder has typed the call.
+fn evaluate(name: &str, values: &[Value], types: &[TypeInfo], ctx: &dyn EvalContext) -> Value {
+    vauban_sysfn::register_builtins();
+    let def = vauban_sysfn::lookup(name).unwrap_or_else(|| panic!("{name} is registered"));
+    let result = vauban_sysfn::check_call(def, types).expect("the call types");
+    let args = vauban_sysfn::EvalArgs {
+        values,
+        types,
+        result: &result,
+    };
+    (def.eval)(&args, ctx).expect("the call evaluates")
+}
+
+fn nvarchar_text(text: &str) -> (Value, TypeInfo) {
+    (
+        Value::String(vauban_types::SqlString {
+            text: text.to_owned(),
+        }),
+        TypeInfo::new(SqlType::NVarChar(vauban_types::Len::Fixed(128)), true),
+    )
+}
+
+#[test]
+fn suser_sid_reads_the_published_principals() {
+    let (snapshot, _) = catalogue_with_a_table();
+    let state = state();
+    let ctx = SessionEvalContext::new(&state, Some(&snapshot));
+    let suser_sid = |name: &str| {
+        let (value, ty) = nvarchar_text(name);
+        evaluate("SUSER_SID", &[value], &[ty], &ctx)
+    };
+    for (name, expected) in [
+        ("sa", Value::Bytes(vec![0x01])),
+        ("SA", Value::Bytes(vec![0x01])),
+        ("sa ", Value::Bytes(vec![0x01])),
+        ("", Value::Bytes(vec![0x01])),
+        ("sysadmin", Value::Bytes(vec![0x03])),
+        ("public", Value::Bytes(vec![0x02])),
+        (" sa", Value::Null),
+        ("nosuch", Value::Null),
+    ] {
+        assert_eq!(suser_sid(name), expected, "{name:?}");
+    }
+    assert_eq!(
+        evaluate("SUSER_SID", &[], &[], &ctx),
+        Value::Bytes(vec![0x01])
+    );
+
+    // A login the view does not publish: its own SID is NULL.
+    let mut bob = state.clone();
+    bob.login = "bob".into();
+    let ctx = SessionEvalContext::new(&bob, Some(&snapshot));
+    assert_eq!(evaluate("SUSER_SID", &[], &[], &ctx), Value::Null);
+    let (value, ty) = nvarchar_text("");
+    assert_eq!(evaluate("SUSER_SID", &[value], &[ty], &ctx), Value::Null);
+}
+
+#[test]
+fn service_name_is_the_program_name() {
+    let state = state();
+    let ctx = SessionEvalContext::new(&state, None);
+    assert_eq!(
+        evaluate("@@SERVICENAME", &[], &[], &ctx),
+        Value::String(vauban_types::SqlString {
+            text: crate::PROGRAM_NAME.to_owned(),
+        })
+    );
+}
+
+#[test]
+fn database_file_of_the_current_database() {
+    let mut state = state();
+    let ctx = SessionEvalContext::new(&state, None);
+    let ctx: &dyn EvalContext = &ctx;
+    assert_eq!(ctx.database_file("master_data"), Some((1, 0, false)));
+    assert_eq!(ctx.database_file("MASTER_LOG"), Some((2, 1, false)));
+    assert_eq!(ctx.database_file("tempdb_data"), None);
+    state.database = "tempdb".into();
+    let ctx = SessionEvalContext::new(&state, None);
+    let ctx: &dyn EvalContext = &ctx;
+    assert_eq!(ctx.database_file("tempdb_data"), Some((1, 0, false)));
+    assert_eq!(ctx.database_file("master_data"), None);
+    let (file, file_ty) = nvarchar_text("tempdb_log");
+    let (property, property_ty) = nvarchar_text("IsLogFile");
+    assert_eq!(
+        evaluate(
+            "FILEPROPERTY",
+            &[file, property],
+            &[file_ty, property_ty],
+            ctx
+        ),
+        Value::I32(1)
+    );
+}

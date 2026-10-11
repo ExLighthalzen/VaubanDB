@@ -373,3 +373,53 @@ fn a_created_table_writes_its_rows_in_four_of_the_five_tables() {
         .collect();
     assert_eq!(written, vec![1, 2, 1, 1, 0]);
 }
+
+/// The facts `database_file_facts` answers for the two files of `master` are those of the rows
+/// the bootstrap wrote for database 1, the database `sys.database_files` shows in `master`; a
+/// database a client creates, and a name `master` does not carry, answer `None`.
+#[test]
+fn database_file_facts_are_those_of_the_published_rows() {
+    let (catalog, storage, txn) = instance();
+    let files = rows(&storage, &txn, table_shaped(&storage, &files_shape()));
+    let of_master: Vec<&Vec<Value>> = files.iter().filter(|row| row[0] == Value::I32(1)).collect();
+    assert_eq!(of_master.len(), 2, "{files:?}");
+    for row in of_master {
+        let Value::String(name) = &row[4] else {
+            panic!("a file row carries its name: {row:?}");
+        };
+        let facts = vauban_catalog::database_file_facts("master", &name.text)
+            .unwrap_or_else(|| panic!("{} is a file of master", name.text));
+        assert_eq!(Value::I32(facts.file_id), row[1], "{}", name.text);
+        assert_eq!(Value::I8(facts.file_type), row[2], "{}", name.text);
+        assert!(!facts.is_read_only, "{}", name.text);
+    }
+    let data = vauban_catalog::database_file_facts("MASTER", "Master_Data ").expect("data file");
+    assert_eq!((data.file_id, data.file_type), (1, 0));
+    let log = vauban_catalog::database_file_facts("master", "master_log").expect("log file");
+    assert_eq!((log.file_id, log.file_type), (2, 1));
+    assert_eq!(
+        vauban_catalog::database_file_facts("master", " master_log"),
+        None
+    );
+    assert_eq!(
+        vauban_catalog::database_file_facts("master", "nosuch"),
+        None
+    );
+    assert_eq!(
+        vauban_catalog::database_file_facts("master", "tempdb_data"),
+        None
+    );
+
+    let creating = txn.begin(IsolationLevel::ReadCommitted);
+    catalog
+        .create_database(&creating, "app", None)
+        .expect("create database");
+    txn.commit(creating).expect("commit");
+    for name in ["app_data", "app_log", "app", "master_data"] {
+        assert_eq!(
+            vauban_catalog::database_file_facts("app", name),
+            None,
+            "{name}"
+        );
+    }
+}

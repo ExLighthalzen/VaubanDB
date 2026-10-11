@@ -418,7 +418,9 @@ pub(crate) fn bind_function(
     }
     let mut bound: Vec<BoundExpr> = bind_arguments(def, args, line, ctx, scope)?;
     refuse_untyped_nulls(def, args, line)?;
-    retype_untyped_nulls(&mut bound, args);
+    if !UNTYPED_NULL_KEPT.contains(&def.name) {
+        retype_untyped_nulls(&mut bound, args);
+    }
     let types: Vec<TypeInfo> = bound.iter().map(|arg| arg.ty.clone()).collect();
     let ty = check_call(def, &types).map_err(|err| err.with_line(line))?;
     let ty = with_inferred_nullability(def, &bound, ty);
@@ -1095,6 +1097,11 @@ fn untyped_null_is_refused(function: &str, position: u8, line: u32) -> Option<Sq
     }
 }
 
+/// The functions whose bare `NULL` argument keeps its own type rather than the one its siblings
+/// imply ([`retype_untyped_nulls`]): `SELECT SUSER_SID('sa', NULL);` is accepted, where
+/// `SELECT SUSER_SID('sa', N'x');` is 8116 on argument 2.
+const UNTYPED_NULL_KEPT: [&str; 1] = ["SUSER_SID"];
+
 /// Gives the arguments written as the bare constant `NULL` the type their siblings imply.
 ///
 /// A bare `NULL` has no type of its own. `bind_literal` types it as a nullable `int`,
@@ -1312,7 +1319,7 @@ fn nullability_class(name: &str) -> FunctionNullability {
 }
 
 /// The functions that are nullable whatever they receive ([`with_inferred_nullability`]).
-const ALWAYS_NULLABLE: [&str; 65] = [
+const ALWAYS_NULLABLE: [&str; 71] = [
     "LEN",
     "UPPER",
     "LOWER",
@@ -1382,10 +1389,18 @@ const ALWAYS_NULLABLE: [&str; 65] = [
     "MAX",
     "MIN",
     "SUM",
+    // The server, login and file functions: `SUSER_SID`, `SID_BINARY` and the three property
+    // functions answer NULL for a name they do not know, `@@SERVICENAME` outside a session.
+    "SUSER_SID",
+    "SID_BINARY",
+    "@@SERVICENAME",
+    "FILEPROPERTY",
+    "FULLTEXTSERVICEPROPERTY",
+    "FULLTEXTCATALOGPROPERTY",
 ];
 
 /// The functions that are never nullable ([`with_inferred_nullability`]).
-const NEVER_NULLABLE: [&str; 13] = [
+const NEVER_NULLABLE: [&str; 14] = [
     "CONCAT",
     "PI",
     "GETDATE",
@@ -1399,6 +1414,7 @@ const NEVER_NULLABLE: [&str; 13] = [
     "@@TRANCOUNT",
     "@@LOCK_TIMEOUT",
     "@@MICROSOFTVERSION",
+    "@@MAX_PRECISION",
 ];
 
 /// The functions whose result follows their arguments ([`with_inferred_nullability`]);

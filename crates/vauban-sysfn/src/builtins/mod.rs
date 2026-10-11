@@ -19,6 +19,7 @@ mod datetime_clock;
 mod math;
 mod nulls;
 mod objects;
+mod server_info;
 mod strings_codes;
 mod strings_core;
 mod strings_search;
@@ -52,6 +53,7 @@ pub fn register_builtins() {
         datetime_calc::register_all();
         math::register_all();
         aggregates::register_all();
+        server_info::register_all();
     });
 }
 

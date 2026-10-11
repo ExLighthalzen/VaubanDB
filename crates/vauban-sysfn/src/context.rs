@@ -204,6 +204,32 @@ pub trait EvalContext {
     fn client_net_address(&self) -> Option<&str> {
         None
     }
+
+    /// The security identifier the server publishes for the login or server role `name`
+    /// (`SUSER_SID`), `None` for a name it does not publish.
+    ///
+    /// `None` by default: a context without a catalogue knows no principal. The session
+    /// answers from the rows of `sys.server_principals`, the name compared under the default
+    /// collation.
+    fn server_principal_sid(&self, name: &str) -> Option<Vec<u8>> {
+        let _ = name;
+        None
+    }
+
+    /// The file of the current database whose logical name is `name` (`FILEPROPERTY`): its
+    /// `file_id`, its `type` (`0` data, `1` log) and its `is_read_only` flag, the three columns
+    /// of the row `sys.database_files` publishes for it. `None` for a name the database
+    /// publishes no file under, and by default.
+    fn database_file(&self, name: &str) -> Option<(i32, u8, bool)> {
+        let _ = name;
+        None
+    }
+
+    /// The name of the service the server runs as (`@@SERVICENAME`), `None` by default and
+    /// outside a session.
+    fn service_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// An [`EvalContext`] made of fixed values, without any session.

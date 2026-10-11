@@ -57,6 +57,8 @@ pub use meta::{
     ObjectMeta, QualifiedName, SnapshotIsolationState, TableMeta,
 };
 pub use snapshot::CatalogSnapshot;
+pub use views::sys_extra::{DatabaseFileFacts, database_file_facts};
+pub use views::sys_principals::server_principal_sid;
 // Re-exported so that a crate which names a table of `storage` through the catalogue —
 // `binder`, for `LogicalPlan::Scan` — does not have to depend on `vauban-storage`.
 pub use vauban_storage::TableId;

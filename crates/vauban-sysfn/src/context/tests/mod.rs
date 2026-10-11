@@ -116,6 +116,9 @@ fn eval_context_defaults() {
     assert_eq!(ctx.ident_current("dbo.t"), None);
     assert_eq!(ctx.datefirst(), 7);
     assert_eq!(ctx.language(), "us_english");
+    assert_eq!(ctx.server_principal_sid("sa"), None);
+    assert_eq!(ctx.database_file("master_data"), None);
+    assert_eq!(ctx.service_name(), None);
 }
 
 #[test]

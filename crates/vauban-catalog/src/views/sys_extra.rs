@@ -113,9 +113,11 @@
 //! internal tables out of `sys.all_objects` (the rule `views/sys_tables.rs` follows for
 //! `sys.objects`). Deliberate differences for now.
 
+use std::cmp::Ordering;
+
 use vauban_errors::{InternalError, SqlResult};
 use vauban_storage::{DbId, Row};
-use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+use vauban_types::{Collation, Len, SqlString, SqlType, TypeInfo, Value};
 
 use crate::bootstrap::{DATABASES_TABLE, SCHEMAS_TABLE, SYSTEM_DATABASES, SYSTEM_SCHEMAS};
 use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
@@ -933,6 +935,48 @@ pub(crate) fn file_rows(database: i32, name: &str) -> Vec<Row> {
         file_row(database, &format!("{name}{DATA_NAME_SUFFIX}"), &DATA_FILE),
         file_row(database, &format!("{name}{LOG_NAME_SUFFIX}"), &LOG_FILE),
     ]
+}
+
+/// What `sys.database_files` publishes about one file: `file_id`, `type` (`0` data, `1` log) and
+/// `is_read_only`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseFileFacts {
+    /// `file_id`: `1` for the data file, `2` for the log file.
+    pub file_id: i32,
+    /// `type`: `0` for `ROWS`, `1` for `LOG`.
+    pub file_type: u8,
+    /// `is_read_only`.
+    pub is_read_only: bool,
+}
+
+/// The file of logical name `file` that `sys.database_files` publishes in `database`, `None`
+/// for a database whose files it does not publish or a name it does not carry. Both names
+/// compare under the default collation (integration test
+/// `database_file_facts_are_those_of_the_published_rows`).
+pub fn database_file_facts(database: &str, file: &str) -> Option<DatabaseFileFacts> {
+    let same = |a: &str, b: &str| Collation::DEFAULT.compare(a, b) == Ordering::Equal;
+    let rank = SYSTEM_DATABASES.iter().position(|d| same(d, database))?;
+    let name = SYSTEM_DATABASES[rank];
+    file_rows(i32::try_from(rank).ok()? + 1, name)
+        .into_iter()
+        .find_map(|Row(row)| {
+            match (
+                &row[files_columns::NAME],
+                &row[files_columns::FILE_ID],
+                &row[files_columns::TYPE],
+            ) {
+                (Value::String(n), Value::I32(file_id), Value::I8(file_type))
+                    if same(&n.text, file) =>
+                {
+                    Some(DatabaseFileFacts {
+                        file_id: *file_id,
+                        file_type: *file_type,
+                        is_read_only: false,
+                    })
+                }
+                _ => None,
+            }
+        })
 }
 
 /// One row of [`FILES_TABLE`], of logical name `name`. See [`file_rows`].

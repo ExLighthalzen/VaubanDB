@@ -54,8 +54,10 @@
 //! the text of the four definitions, checked by the tests of `views/sys_principals.rs` and
 //! `tests/sys_principals.rs`; the binder expands the text in place of the name.
 
+use std::cmp::Ordering;
+
 use vauban_storage::Row;
-use vauban_types::{Len, SqlString, SqlType, TypeInfo, Value};
+use vauban_types::{Collation, Len, SqlString, SqlType, TypeInfo, Value};
 
 use crate::bootstrap::{SA_OWNER_SID, SYSTEM_DATABASES};
 use crate::def::{InternalColumnDef, InternalTableDef, SystemViewDef};
@@ -591,6 +593,26 @@ fn principal_rows() -> Vec<Row> {
             None,
         ),
     ]
+}
+
+/// The `sid` `sys.server_principals` publishes for the login or server role `name`, `None` for a
+/// name it does not publish.
+///
+/// Read from the rows the bootstrap writes in [`PRINCIPALS_TABLE`] for the server kind, the
+/// rows the view shows. The name compares under the default collation: `SA` and `sa ` name
+/// `sa`, ` sa` names nothing (integration test `server_principal_sid_reads_the_published_rows`).
+pub fn server_principal_sid(name: &str) -> Option<Vec<u8>> {
+    principal_rows().into_iter().find_map(|Row(row)| {
+        let server = row[principals_columns::KIND] == text(SERVER_KIND);
+        let named = matches!(
+            &row[principals_columns::NAME],
+            Value::String(s) if Collation::DEFAULT.compare(&s.text, name) == Ordering::Equal
+        );
+        match &row[principals_columns::SID] {
+            Value::Bytes(sid) if server && named => Some(sid.clone()),
+            _ => None,
+        }
+    })
 }
 
 fn role_member_row(scope: &str, role_principal_id: i32, member_principal_id: i32) -> Row {
